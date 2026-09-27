@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/charp2p-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98.1"
+
+[workspace.dependencies]
+libp2p-identity = { version = "0.3.0", features = ["ed25519", "peerid", "rand"] }
+

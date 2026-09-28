@@ -143,10 +143,11 @@ Clients enter the network through a versioned list of built-in bootstrap
 multiaddresses. Invitations and learned routing tables provide additional
 entry points. No internet address scanning occurs.
 
-The client bounds bootstrap configuration to 16 entries and provider searches
-to 12 seconds. When no built-in or development bootstrap address is available,
-the UI reports that discovery requires a bootstrap node instead of pretending
-that the group is offline.
+The client bounds bootstrap configuration to 16 entries, provider searches to
+8 seconds, and direct reachability checks to 32 providers and 4 seconds. When
+no built-in or development bootstrap address is available, the UI reports that
+discovery requires a bootstrap node instead of pretending that the group is
+offline.
 
 LAN discovery may use mDNS as an additional path, never as the only discovery
 mechanism.
@@ -164,6 +165,10 @@ Preferred connectivity order:
 All peer streams use authenticated transport encryption. The relay sees source
 and destination peer metadata and traffic characteristics but not group
 payloads.
+
+A provider record means a peer recently advertised the invitation rendezvous
+key. The UI reports a peer as reachable only after an authenticated QUIC
+connection succeeds; stale provider records remain a separate status.
 
 ## Group protocol
 

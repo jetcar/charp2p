@@ -14,8 +14,9 @@ type InvitationPreview = {
 };
 type PendingGroup = InvitationPreview;
 type PeerSearchResult = {
-  status: "bootstrapRequired" | "peersFound" | "noPeers" | "unavailable";
+  status: "bootstrapRequired" | "peerReachable" | "peersFound" | "noPeers" | "unavailable";
   discoveredPeers: number;
+  reachablePeers: number;
 };
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -68,6 +69,9 @@ function expiryDescription(expiresAtUnix: number) {
 function peerSearchDescription(result: PeerSearchResult | null) {
   if (!result) return "Not searched";
   if (result.status === "bootstrapRequired") return "Bootstrap node needed";
+  if (result.status === "peerReachable") {
+    return `Reached ${result.reachablePeers} ${result.reachablePeers === 1 ? "peer" : "peers"}`;
+  }
   if (result.status === "peersFound") {
     return `${result.discoveredPeers} ${result.discoveredPeers === 1 ? "peer" : "peers"} found`;
   }

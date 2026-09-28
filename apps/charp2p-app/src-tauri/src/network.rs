@@ -10,7 +10,9 @@ const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
 const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
 const MAX_BOOTSTRAP_PEERS: usize = 16;
 const MAX_BOOTSTRAP_ADDRESS_BYTES: usize = 512;
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_DISCOVERED_PEERS: usize = 32;
+const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone)]
 struct BootstrapPeer {
@@ -23,6 +25,7 @@ struct BootstrapPeer {
 pub struct PeerSearchResult {
     pub status: &'static str,
     pub discovered_peers: usize,
+    pub reachable_peers: usize,
 }
 
 pub struct NetworkService {
@@ -63,6 +66,7 @@ impl NetworkService {
             return Ok(PeerSearchResult {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
+                reachable_peers: 0,
             });
         }
 
@@ -80,48 +84,88 @@ impl NetworkService {
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.find_group_peers(key);
 
-        timeout(SEARCH_TIMEOUT, async {
+        let discovery = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut discovered = BTreeSet::new();
+            let mut connected = BTreeSet::new();
             loop {
                 match node.next_event().await {
+                    NetworkEvent::PeerConnected { peer_id } => {
+                        connected.insert(peer_id);
+                    }
                     NetworkEvent::GroupPeersFound {
                         key: found_key,
                         providers,
                     } if found_key == key => {
-                        for provider in providers {
+                        for provider in providers.into_iter().take(MAX_DISCOVERED_PEERS) {
                             if provider != node.peer_id() {
                                 discovered.insert(provider);
                             }
                         }
                         if !discovered.is_empty() {
-                            return PeerSearchResult {
-                                status: "peersFound",
-                                discovered_peers: discovered.len(),
-                            };
+                            return Ok((discovered, connected));
                         }
                     }
                     NetworkEvent::GroupPeerSearchFinished { key: found_key }
                         if found_key == key =>
                     {
-                        return PeerSearchResult {
+                        return Err(PeerSearchResult {
                             status: "noPeers",
                             discovered_peers: 0,
-                        };
+                            reachable_peers: 0,
+                        });
                     }
                     NetworkEvent::DiscoveryFailed {
                         key: failed_key, ..
                     } if failed_key == key => {
-                        return PeerSearchResult {
+                        return Err(PeerSearchResult {
                             status: "unavailable",
                             discovered_peers: 0,
-                        };
+                            reachable_peers: 0,
+                        });
                     }
                     _ => {}
                 }
             }
         })
         .await
-        .map_err(|_| "network_search_timed_out")
+        .map_err(|_| "network_search_timed_out")?;
+        let (discovered, connected) = match discovery {
+            Ok(found) => found,
+            Err(result) => return Ok(result),
+        };
+
+        if discovered.iter().any(|peer| connected.contains(peer)) {
+            return Ok(PeerSearchResult {
+                status: "peerReachable",
+                discovered_peers: discovered.len(),
+                reachable_peers: 1,
+            });
+        }
+
+        for peer_id in discovered.iter().copied() {
+            let _ = node.dial_peer(peer_id);
+        }
+        let reachable = timeout(CONNECT_TIMEOUT, async {
+            loop {
+                if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
+                    if discovered.contains(&peer_id) {
+                        return peer_id;
+                    }
+                }
+            }
+        })
+        .await
+        .is_ok();
+
+        Ok(PeerSearchResult {
+            status: if reachable {
+                "peerReachable"
+            } else {
+                "peersFound"
+            },
+            discovered_peers: discovered.len(),
+            reachable_peers: usize::from(reachable),
+        })
     }
 }
 
@@ -201,6 +245,7 @@ mod tests {
             PeerSearchResult {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
+                reachable_peers: 0,
             }
         );
     }
@@ -253,7 +298,8 @@ mod tests {
             .unwrap()
         });
 
-        assert_eq!(result.status, "peersFound");
+        assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
+        assert_eq!(result.reachable_peers, 1);
     }
 }

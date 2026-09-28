@@ -27,9 +27,10 @@ over this foundation.
 
 Expose an explicit routing-node mode that answers Kademlia queries while client
 applications remain in client mode. Client searches use a bounded list of at
-most 16 bootstrap multiaddresses and a 12-second provider-query deadline. The
-development application may read this list from `CHARP2P_BOOTSTRAP_NODES`;
-release bootstrap addresses remain a versioned built-in list.
+most 16 bootstrap multiaddresses, an 8-second provider-query deadline, and a
+4-second direct QUIC reachability check against at most 32 providers. The
+development application may read the bootstrap list from
+`CHARP2P_BOOTSTRAP_NODES`; release addresses remain a versioned built-in list.
 
 ## Consequences
 
@@ -38,6 +39,8 @@ release bootstrap addresses remain a versioned built-in list.
 - A client requires at least one reachable bootstrap address when its routing
   table is empty.
 - The node API exposes bounded lifecycle events rather than the full swarm.
+- Provider records are distinguished from peers that complete an authenticated
+  QUIC connection, so stale records are not presented as reachable members.
 - An empty built-in list is a visible configuration state until an operated or
   community bootstrap node is ready to ship.
 

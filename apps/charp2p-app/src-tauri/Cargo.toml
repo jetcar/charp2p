@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 charp2p-core = { path = "../../../crates/charp2p-core" }
+charp2p-store = { path = "../../../crates/charp2p-store" }
 keyring-core = "1.0.0"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

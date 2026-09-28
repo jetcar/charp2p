@@ -111,10 +111,14 @@ button { cursor: pointer; }
 .ready-identity { display: grid; gap: 4px; margin: -12px 0 30px; padding: 17px; border: 1px solid #dde5ec; border-radius: 14px; background: #fff; }
 .ready-identity span { font-weight: 700; }
 .join-preview { align-items: stretch; }
+.pending-card { align-items: stretch; }
+.pending-card header { margin-bottom: 26px; text-align: center; }
+.pending-card header > p:last-child { font-size: 20px; }
 .join-preview header { margin-bottom: 26px; text-align: center; }
 .join-preview header > p:last-child { font-size: 20px; }
 .join-icon { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 24px; border-radius: 20px; background: #e6faf7; }
 .join-icon .brand-mark { width: 48px; height: 48px; stroke-width: 5.5; }
+.pending-icon { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 24px; border-radius: 50%; color: #0b9f96; background: #e6faf7; font-size: 42px; font-weight: 700; }
 .status-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 24px; }
 .status-chip { padding: 8px 13px; border-radius: 999px; color: #087d75; background: #e2f8f4; font-size: 14px; font-weight: 700; }
 .status-chip.muted { color: #63708b; background: #edf1f5; }
@@ -125,6 +129,7 @@ button { cursor: pointer; }
 .preview-facts dd { margin: 0; color: #172044; font-weight: 650; text-align: right; }
 .preview-facts code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
 .preview-note { margin: 0 0 22px; color: #68748f; font-size: 15px; text-align: center; }
+.preview-error { margin-top: -8px; text-align: center; }
 .join-button { background: linear-gradient(100deg, #ff7463, #ea584e); box-shadow: 0 13px 26px rgba(219, 77, 67, .18); }
 
 .setup-footer { width: min(100%, 900px); display: flex; justify-content: space-between; margin: auto auto 0; padding-top: 28px; border-top: 1px solid #dfe5ec; }

@@ -261,6 +261,10 @@ Each client stores:
 - Pending invitations and synchronization state.
 - User preferences and local blocks.
 
+Pending invitation metadata is indexed in SQLite. The signed bearer credential
+is stored separately in platform-protected storage and is revalidated against
+the indexed metadata whenever the pending join is loaded.
+
 Secrets must be excluded from diagnostics, notifications, URLs sent to web
 servers, and routine logs.
 

@@ -1,0 +1,44 @@
+# ADR-008: Split storage for pending invitations
+
+## Status
+
+Accepted
+
+## Date
+
+2026-09-28
+
+## Context
+
+A user may accept an invitation while no group member is reachable. The app
+must retain that pending join across restarts. The signed invitation contains a
+bearer discovery secret, while the groups screen needs searchable display
+metadata.
+
+## Decision
+
+Store authenticated pending-group metadata in the versioned SQLite application
+database. Store each canonical signed invitation separately in the platform
+credential store, keyed by its group ID. Limit protected invitation records to
+2 KiB for compatibility with Windows Credential Manager.
+
+Whenever pending groups are loaded, retrieve and verify the protected signed
+invitation and compare every SQLite metadata field with its authenticated
+claims. Fail closed on a missing, damaged, or mismatched record. Remove expired
+pending invitations from both stores after successful verification.
+
+## Consequences
+
+- The discovery secret does not enter SQLite or the JavaScript runtime.
+- Editable metadata cannot change what the UI displays without detection.
+- Saving one newer invitation for the same group replaces the previous pending
+  capability and metadata.
+- Larger future invitation formats need another protected-storage strategy.
+- Writes span two storage systems and cannot use one atomic transaction; a
+  failed metadata write may leave an unreachable credential record.
+
+## Sources
+
+- https://learn.microsoft.com/windows/win32/api/wincred/ns-wincred-credentialw
+- https://developer.android.com/privacy-and-security/keystore
+- https://www.sqlite.org/stricttables.html

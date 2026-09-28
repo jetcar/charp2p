@@ -40,7 +40,7 @@ fn preview_invitation_at(input: &str, now_unix: u64) -> Result<InvitationPreview
     })
 }
 
-fn public_error_code(error: InvitationError) -> &'static str {
+pub(crate) fn public_error_code(error: InvitationError) -> &'static str {
     match error {
         InvitationError::Expired => "invitation_expired",
         InvitationError::InvalidSignature => "invitation_signature_invalid",

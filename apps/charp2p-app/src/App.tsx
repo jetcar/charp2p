@@ -12,6 +12,7 @@ type InvitationPreview = {
   historyPolicy: "none" | "fromInvitation" | "allRetained";
   reusable: boolean;
 };
+type PendingGroup = InvitationPreview;
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -23,6 +24,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter a device name between 1 and 48 characters.",
+  pending_invitation_service_unavailable: "Pending invitations are temporarily unavailable.",
+  pending_invitation_record_invalid: "A saved invitation is damaged and cannot be opened.",
+  pending_invitation_store_unavailable: "The invitation could not be saved securely.",
+  pending_invitation_too_large: "This invitation is too large for protected device storage.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -119,6 +124,8 @@ function App() {
   const [inviteInput, setInviteInput] = useState("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
   const [verifyingInvite, setVerifyingInvite] = useState(false);
+  const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
+  const [acceptingInvite, setAcceptingInvite] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -128,15 +135,25 @@ function App() {
     if (!isTauri()) return;
 
     let active = true;
-    invoke<DeviceProfile | null>("identity_status")
-      .then((storedProfile) => {
-        if (!active || !storedProfile) return;
-        setProfile(storedProfile);
-        setDeviceName(storedProfile.deviceName);
-        setStep(3);
-      })
-      .catch((reason: unknown) => {
-        if (active) setError(errorMessage(reason));
+    Promise.allSettled([
+      invoke<DeviceProfile | null>("identity_status"),
+      invoke<PendingGroup[]>("pending_invitations"),
+    ])
+      .then(([identityResult, pendingResult]) => {
+        if (!active) return;
+        if (identityResult.status === "fulfilled" && identityResult.value) {
+          const storedProfile = identityResult.value;
+          setProfile(storedProfile);
+          setDeviceName(storedProfile.deviceName);
+          setStep(3);
+        } else if (identityResult.status === "rejected") {
+          setError(errorMessage(identityResult.reason));
+        }
+        if (pendingResult.status === "fulfilled") {
+          setPendingGroup(pendingResult.value[0] ?? null);
+        } else {
+          setError(errorMessage(pendingResult.reason));
+        }
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -182,6 +199,26 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setVerifyingInvite(false);
+    }
+  }
+
+  async function acceptInvitation() {
+    if (!inviteInput.trim() || acceptingInvite || !isTauri()) return;
+
+    setError("");
+    setAcceptingInvite(true);
+    try {
+      const accepted = await invoke<PendingGroup>("accept_invitation", {
+        input: inviteInput,
+      });
+      setPendingGroup(accepted);
+      setInvitationPreview(null);
+      setInviteInput("");
+      setJoinMode(false);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setAcceptingInvite(false);
     }
   }
 
@@ -270,7 +307,29 @@ function App() {
             </section>
           )}
 
-          {step === 3 && !joinMode && (
+          {step === 3 && pendingGroup && (
+            <section className="setup-form pending-card">
+              <div className="pending-icon" aria-hidden="true">⌁</div>
+              <header>
+                <p className="eyebrow">Pending group</p>
+                <h2>Invitation saved</h2>
+                <p>{pendingGroup.groupName} is ready for peer discovery.</p>
+              </header>
+              <div className="status-row" aria-label="Join status">
+                <span className="status-chip">✓ Verified invitation</span>
+                <span className="status-chip muted">○ Not connected</span>
+              </div>
+              <dl className="preview-facts">
+                <div><dt>Invited by</dt><dd>{pendingGroup.inviterName}</dd></div>
+                <div><dt>History</dt><dd>{historyDescription(pendingGroup.historyPolicy)}</dd></div>
+                <div><dt>Invitation</dt><dd>{expiryDescription(pendingGroup.expiresAtUnix)}</dd></div>
+                <div><dt>Group fingerprint</dt><dd><code title={pendingGroup.groupId}>{shortPeerId(pendingGroup.groupId)}</code></dd></div>
+              </dl>
+              <p className="preview-note">Your invitation is stored securely on this device.</p>
+            </section>
+          )}
+
+          {step === 3 && !pendingGroup && !joinMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>
@@ -293,7 +352,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && joinMode && !invitationPreview && (
+          {step === 3 && !pendingGroup && joinMode && !invitationPreview && (
             <form className="setup-form join-form" onSubmit={verifyInvitation}>
               <header>
                 <p className="eyebrow">Invitation</p>
@@ -325,7 +384,7 @@ function App() {
             </form>
           )}
 
-          {step === 3 && joinMode && invitationPreview && (
+          {step === 3 && !pendingGroup && joinMode && invitationPreview && (
             <section className="setup-form join-preview">
               <div className="join-icon" aria-hidden="true"><BrandMark decorative /></div>
               <header>
@@ -347,8 +406,9 @@ function App() {
               </dl>
 
               <p className="preview-note">Your peer identity will be visible to group members.</p>
-              <button className="primary-button join-button" disabled title="Peer connection and membership exchange are not available yet" type="button">
-                Join group
+              {error && <p className="form-error preview-error" role="alert">{error}</p>}
+              <button className="primary-button join-button" disabled={acceptingInvite} onClick={acceptInvitation} type="button">
+                {acceptingInvite ? "Saving invitation…" : "Join group"}
               </button>
               <button
                 className="text-button"

@@ -7,13 +7,30 @@ use std::{
     path::Path,
 };
 
-use charp2p_core::{EventError, EventId, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent};
+use charp2p_core::{EventError, EventId, HistoryPolicy, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Non-secret metadata for an invitation waiting for a reachable group peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingInvitationMetadata {
+    /// Stable identifier derived from the group root public key.
+    pub group_id: PeerId,
+    /// Authenticated group display name.
+    pub group_name: String,
+    /// Authenticated inviter display name.
+    pub inviter_name: String,
+    /// Invitation expiry as a Unix timestamp.
+    pub expires_at_unix: u64,
+    /// History access granted by the invitation.
+    pub history_policy: HistoryPolicy,
+    /// Whether the invitation may authorize multiple memberships.
+    pub reusable: bool,
+}
 
 /// Largest event-identifier page returned for one synchronization request.
 pub const MAX_SYNC_BATCH_EVENTS: usize = MAX_SYNC_BATCH_ITEMS;
@@ -36,7 +53,7 @@ pub struct PutEventsOutcome {
     pub already_present: usize,
 }
 
-/// SQLite-backed storage for signed group events.
+/// SQLite-backed storage for signed events and non-secret application metadata.
 pub struct EventStore {
     connection: Connection,
 }
@@ -174,6 +191,80 @@ impl EventStore {
         Ok(event_ids)
     }
 
+    /// Adds or refreshes non-secret metadata for one pending invitation.
+    pub fn put_pending_invitation(
+        &mut self,
+        pending: &PendingInvitationMetadata,
+    ) -> Result<(), StoreError> {
+        let expires_at_unix = i64::try_from(pending.expires_at_unix)
+            .map_err(|_| StoreError::TimestampTooLarge(pending.expires_at_unix))?;
+        self.connection.execute(
+            "INSERT INTO pending_invitations (
+                group_id, group_name, inviter_name, expires_at_unix,
+                history_policy, reusable
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(group_id) DO UPDATE SET
+                group_name = excluded.group_name,
+                inviter_name = excluded.inviter_name,
+                expires_at_unix = excluded.expires_at_unix,
+                history_policy = excluded.history_policy,
+                reusable = excluded.reusable",
+            params![
+                pending.group_id.to_bytes(),
+                pending.group_name,
+                pending.inviter_name,
+                expires_at_unix,
+                history_policy_code(pending.history_policy),
+                pending.reusable
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lists pending invitations without exposing their bearer credentials.
+    pub fn pending_invitations(&self) -> Result<Vec<PendingInvitationMetadata>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, group_name, inviter_name, expires_at_unix,
+                    history_policy, reusable
+             FROM pending_invitations
+             ORDER BY group_name, group_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?;
+        let mut pending = Vec::new();
+
+        for row in rows {
+            let (group_id, group_name, inviter_name, expires_at_unix, history_policy, reusable) =
+                row?;
+            pending.push(PendingInvitationMetadata {
+                group_id: PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?,
+                group_name,
+                inviter_name,
+                expires_at_unix: u64::try_from(expires_at_unix)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                history_policy: history_policy_from_code(history_policy)?,
+                reusable,
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Removes a pending invitation after joining or cancellation.
+    pub fn remove_pending_invitation(&mut self, group_id: PeerId) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM pending_invitations WHERE group_id = ?1",
+            [group_id.to_bytes()],
+        )? != 0)
+    }
+
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -194,7 +285,31 @@ impl EventStore {
                      ) STRICT;
 
                      CREATE INDEX events_by_group_author_sequence
-                        ON events(group_id, author_id, author_sequence);",
+                        ON events(group_id, author_id, author_sequence);
+
+                     CREATE TABLE pending_invitations (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        group_name TEXT NOT NULL,
+                        inviter_name TEXT NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0),
+                        history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2),
+                        reusable INTEGER NOT NULL CHECK(reusable IN (0, 1))
+                     ) STRICT;",
+                )?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            1 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "CREATE TABLE pending_invitations (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        group_name TEXT NOT NULL,
+                        inviter_name TEXT NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0),
+                        history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2),
+                        reusable INTEGER NOT NULL CHECK(reusable IN (0, 1))
+                     ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -204,6 +319,23 @@ impl EventStore {
         }
 
         Ok(Self { connection })
+    }
+}
+
+fn history_policy_code(policy: HistoryPolicy) -> i64 {
+    match policy {
+        HistoryPolicy::None => 0,
+        HistoryPolicy::FromInvitation => 1,
+        HistoryPolicy::AllRetained => 2,
+    }
+}
+
+fn history_policy_from_code(code: i64) -> Result<HistoryPolicy, StoreError> {
+    match code {
+        0 => Ok(HistoryPolicy::None),
+        1 => Ok(HistoryPolicy::FromInvitation),
+        2 => Ok(HistoryPolicy::AllRetained),
+        _ => Err(StoreError::CorruptIndex),
     }
 }
 
@@ -265,6 +397,9 @@ pub enum StoreError {
     /// SQLite cannot represent this unsigned author sequence.
     #[error("author sequence {0} exceeds the local-store limit")]
     SequenceTooLarge(u64),
+    /// SQLite cannot represent this unsigned timestamp.
+    #[error("timestamp {0} exceeds the local-store limit")]
+    TimestampTooLarge(u64),
     /// One author attempted to reuse a sequence for different content.
     #[error("author sequence {sequence} is already assigned to another event")]
     SequenceConflict {
@@ -292,11 +427,16 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use charp2p_core::{DeviceIdentity, EventKind, EventSpec, GroupIdentity, SignedEvent};
-    use rusqlite::params;
+    use charp2p_core::{
+        DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, SignedEvent,
+    };
+    use rusqlite::{Connection, params};
     use tempfile::NamedTempFile;
 
-    use super::{AuthorHead, EventStore, MAX_SYNC_BATCH_EVENTS, PutEventOutcome, StoreError};
+    use super::{
+        AuthorHead, EventStore, MAX_SYNC_BATCH_EVENTS, PendingInvitationMetadata, PutEventOutcome,
+        StoreError,
+    };
 
     fn message_event(
         author: &DeviceIdentity,
@@ -500,6 +640,109 @@ mod tests {
                 .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn pending_invitation_metadata_survives_restart_and_can_be_removed() {
+        let file = NamedTempFile::new().unwrap();
+        let group = GroupIdentity::generate();
+        let pending = PendingInvitationMetadata {
+            group_id: group.group_id(),
+            group_name: "Design Crew".to_owned(),
+            inviter_name: "Maya".to_owned(),
+            expires_at_unix: 1_800_003_600,
+            history_policy: HistoryPolicy::FromInvitation,
+            reusable: false,
+        };
+
+        EventStore::open(file.path())
+            .unwrap()
+            .put_pending_invitation(&pending)
+            .unwrap();
+
+        let mut reopened = EventStore::open(file.path()).unwrap();
+        assert_eq!(
+            reopened.pending_invitations().unwrap(),
+            vec![pending.clone()]
+        );
+        assert!(
+            reopened
+                .remove_pending_invitation(group.group_id())
+                .unwrap()
+        );
+        assert!(reopened.pending_invitations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn saving_a_new_invitation_for_the_same_group_refreshes_metadata() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let mut pending = PendingInvitationMetadata {
+            group_id,
+            group_name: "Design Crew".to_owned(),
+            inviter_name: "Maya".to_owned(),
+            expires_at_unix: 1_800_003_600,
+            history_policy: HistoryPolicy::None,
+            reusable: false,
+        };
+        store.put_pending_invitation(&pending).unwrap();
+
+        pending.inviter_name = "Noah".to_owned();
+        pending.expires_at_unix += 3_600;
+        pending.history_policy = HistoryPolicy::AllRetained;
+        pending.reusable = true;
+        store.put_pending_invitation(&pending).unwrap();
+
+        assert_eq!(store.pending_invitations().unwrap(), vec![pending]);
+    }
+
+    #[test]
+    fn version_one_database_migrates_without_losing_events() {
+        let file = NamedTempFile::new().unwrap();
+        let event = message_event(
+            &DeviceIdentity::generate(),
+            &GroupIdentity::generate(),
+            1,
+            b"before migration",
+        );
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (
+                    event_id BLOB PRIMARY KEY NOT NULL CHECK(length(event_id) = 32),
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    encoded BLOB NOT NULL,
+                    UNIQUE(group_id, author_id, author_sequence)
+                 ) STRICT;
+                 CREATE INDEX events_by_group_author_sequence
+                    ON events(group_id, author_id, author_sequence);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (
+                    event_id, group_id, author_id, author_sequence, encoded
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.id().as_bytes().as_slice(),
+                    event.group_id().to_bytes(),
+                    event.author_id().to_bytes(),
+                    event.author_sequence() as i64,
+                    event.encode().unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = EventStore::open(file.path()).unwrap();
+        assert!(store.pending_invitations().unwrap().is_empty());
+        assert_eq!(
+            store.get_event(event.id()).unwrap().unwrap().id(),
+            event.id()
         );
     }
 }

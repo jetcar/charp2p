@@ -47,7 +47,7 @@ impl IdentityService {
         let (identity, secret) =
             DeviceIdentity::generate_persistable().map_err(|_| "identity_creation_failed")?;
         let record = encode_record(&device_name, &secret)?;
-        identity_entry()?
+        protected_entry(CREDENTIAL_USER)?
             .set_secret(record.as_slice())
             .map_err(|_| "identity_store_unavailable")?;
 
@@ -78,7 +78,7 @@ pub fn initialize_platform_store() -> Result<(), &'static str> {
 }
 
 fn load_profile() -> Result<Option<DeviceProfile>, &'static str> {
-    let record = match identity_entry()?.get_secret() {
+    let record = match protected_entry(CREDENTIAL_USER)?.get_secret() {
         Ok(bytes) => Zeroizing::new(bytes),
         Err(KeyringError::NoEntry) => return Ok(None),
         Err(_) => return Err("identity_store_unavailable"),
@@ -93,19 +93,19 @@ fn load_profile() -> Result<Option<DeviceProfile>, &'static str> {
     }))
 }
 
-fn identity_entry() -> Result<Entry, &'static str> {
+pub(crate) fn protected_entry(user: &str) -> Result<Entry, &'static str> {
     #[cfg(all(windows, not(test)))]
     let entry = Entry::new_with_modifiers(
         CREDENTIAL_SERVICE,
-        CREDENTIAL_USER,
+        user,
         &std::collections::HashMap::from([("persistence", "Local")]),
     );
 
     #[cfg(all(target_os = "android", not(test)))]
-    let entry = Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_USER);
+    let entry = Entry::new(CREDENTIAL_SERVICE, user);
 
     #[cfg(test)]
-    let entry = Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_USER);
+    let entry = Entry::new(CREDENTIAL_SERVICE, user);
 
     #[cfg(all(not(test), not(any(windows, target_os = "android"))))]
     return Err("identity_store_unsupported");

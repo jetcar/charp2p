@@ -17,6 +17,12 @@ recovery export and the final peer join remain later increments. Accepted
 invitations survive restarts: safe group metadata is indexed in SQLite while
 the signed bearer credential remains in platform-protected storage.
 
+Windows and Android register `charp2p://` as an application link. Cold-start
+and already-running link deliveries open the existing verified join preview;
+Windows forwards links to one application instance. Debug Windows builds
+register the scheme at startup. Installed release builds use the bundle's
+protocol registration.
+
 The pending-group screen can run a bounded Kademlia provider search and direct
 QUIC reachability check with the restored device identity. Release builds will
 use the versioned built-in bootstrap list. During local development, set

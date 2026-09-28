@@ -68,9 +68,27 @@ async fn search_group_peers(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     identity::initialize_platform_store().expect("platform-protected identity store is available");
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    #[cfg(windows)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .manage(IdentityService::default())
         .setup(|app| {
+            #[cfg(all(debug_assertions, windows))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link().register_all()?;
+            }
+
             let data_directory = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_directory)?;
             let pending = PendingInvitationService::open(data_directory.join("charp2p.sqlite3"))

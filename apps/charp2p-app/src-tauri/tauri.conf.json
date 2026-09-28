@@ -24,6 +24,19 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["charp2p"]
+      },
+      "mobile": [
+        {
+          "scheme": ["charp2p"],
+          "appLink": false
+        }
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

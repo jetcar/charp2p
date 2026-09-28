@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
@@ -189,6 +190,49 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    let active = true;
+    let stopListening: (() => void) | undefined;
+
+    async function openInvitation(urls: string[] | null) {
+      const input = urls?.find((url) => url.startsWith("charp2p://join/"));
+      if (!active || !input) return;
+
+      setError("");
+      setJoinMode(true);
+      setInviteInput(input);
+      setInvitationPreview(null);
+      setVerifyingInvite(true);
+      try {
+        const preview = await invoke<InvitationPreview>("preview_invitation", { input });
+        if (active) setInvitationPreview(preview);
+      } catch (reason) {
+        if (active) setError(errorMessage(reason));
+      } finally {
+        if (active) setVerifyingInvite(false);
+      }
+    }
+
+    void getCurrent().then(openInvitation).catch(() => {
+      if (active) setError("The invitation link could not be opened.");
+    });
+    void onOpenUrl((urls) => void openInvitation(urls))
+      .then((unlisten) => {
+        if (active) stopListening = unlisten;
+        else unlisten();
+      })
+      .catch(() => {
+        if (active) setError("Invitation links are unavailable on this device.");
+      });
+
+    return () => {
+      active = false;
+      stopListening?.();
+    };
+  }, []);
+
   async function createIdentity(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!deviceName.trim() || saving) return;
@@ -349,7 +393,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && pendingGroup && (
+          {step === 3 && pendingGroup && !joinMode && (
             <section className="setup-form pending-card">
               <div className="pending-icon" aria-hidden="true">⌁</div>
               <header>
@@ -398,7 +442,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && !pendingGroup && joinMode && !invitationPreview && (
+          {step === 3 && joinMode && !invitationPreview && (
             <form className="setup-form join-form" onSubmit={verifyInvitation}>
               <header>
                 <p className="eyebrow">Invitation</p>
@@ -430,7 +474,7 @@ function App() {
             </form>
           )}
 
-          {step === 3 && !pendingGroup && joinMode && invitationPreview && (
+          {step === 3 && joinMode && invitationPreview && (
             <section className="setup-form join-preview">
               <div className="join-icon" aria-hidden="true"><BrandMark decorative /></div>
               <header>

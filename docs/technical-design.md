@@ -78,8 +78,10 @@ The preferred shared link is an HTTPS App Link:
 https://join.charp2p.example/i#<base64url-invitation>
 ```
 
-Installed applications claim the verified HTTPS link. The fallback web page
-explains installation. A custom scheme may be supported for development:
+Installed applications will claim the verified HTTPS link once the release
+host, Android application association, and signing identities exist. The
+fallback web page explains installation. Windows and Android currently claim
+the custom scheme:
 
 ```text
 charp2p://join/<base64url-invitation>
@@ -109,6 +111,12 @@ or the exact HTTPS host and path above. The HTTPS form must carry the payload in
 the fragment. Query-string credentials and lookalike hosts are rejected. The UI
 may display authenticated invitation metadata after validation, but it must not
 receive or display the discovery secret.
+
+The operating system routes custom-scheme links through Tauri's maintained
+deep-link plugin. The application consumes both cold-start and already-running
+deliveries. Windows uses one application instance so a later link is forwarded
+to the active window. OS routing is not trust: every delivered string still
+passes the same bounded Rust invitation parser and signature verification.
 
 ## Discovery
 

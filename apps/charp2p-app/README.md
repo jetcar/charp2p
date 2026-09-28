@@ -29,3 +29,10 @@ use the versioned built-in bootstrap list. During local development, set
 `CHARP2P_BOOTSTRAP_NODES` to up to 16 semicolon-separated QUIC multiaddresses
 ending in `/p2p/<peer-id>`. With no configured node, the app reports that a
 bootstrap node is required.
+
+The ready screen can create and restore a first local group. Its group-root
+private key is stored through the platform keyring, while SQLite stores only
+the group name, icon, and invitation defaults. Invitation issuance and the
+initial protected membership event remain later increments. Until the groups
+list is implemented, the backend enforces one locally created group so extra
+protected roots cannot become hidden from the interface.

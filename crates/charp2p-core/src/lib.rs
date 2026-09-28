@@ -11,7 +11,7 @@ mod sync;
 
 pub use discovery::DiscoveryKey;
 pub use event::{EventError, EventId, EventKind, EventSpec, SignedEvent};
-pub use group_identity::GroupIdentity;
+pub use group_identity::{GroupIdentity, GroupIdentityError, GroupIdentitySecret};
 pub use identity::{DeviceIdentity, DeviceIdentityError, DeviceIdentitySecret};
 pub use invitation::{HistoryPolicy, Invitation, InvitationError, InvitationSpec};
 pub use libp2p_identity::{PeerId, PublicKey, SigningError};

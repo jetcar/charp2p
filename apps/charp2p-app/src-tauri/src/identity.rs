@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use charp2p_core::{DeviceIdentity, DeviceIdentitySecret};
 use keyring_core::{Entry, Error as KeyringError};
@@ -19,12 +19,15 @@ pub struct DeviceProfile {
     pub peer_id: String,
 }
 
-#[derive(Default)]
 pub struct IdentityService {
-    operations: Mutex<()>,
+    operations: Arc<Mutex<()>>,
 }
 
 impl IdentityService {
+    pub fn new(operations: Arc<Mutex<()>>) -> Self {
+        Self { operations }
+    }
+
     pub fn status(&self) -> Result<Option<DeviceProfile>, &'static str> {
         let _guard = self
             .operations
@@ -65,6 +68,12 @@ impl IdentityService {
         load_identity_record()?
             .map(|(_, identity)| identity)
             .ok_or("identity_missing")
+    }
+}
+
+impl Default for IdentityService {
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(())))
     }
 }
 

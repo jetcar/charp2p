@@ -274,6 +274,8 @@ metadata, and group members know which device signed a message.
 Each client stores:
 
 - Device identity and authorized group key material.
+- Locally owned group-root keys in platform-protected storage, with non-secret
+  display and invitation-default metadata in SQLite.
 - Verified group events.
 - Peer addresses with last-success metadata.
 - Pending invitations and synchronization state.

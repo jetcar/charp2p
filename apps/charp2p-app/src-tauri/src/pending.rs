@@ -1,6 +1,6 @@
 use std::{
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +28,7 @@ pub struct PendingGroup {
 
 trait InvitationSecretStore: Send + Sync {
     fn put(&self, group_id: PeerId, encoded: &[u8]) -> Result<(), &'static str>;
-    fn get(&self, group_id: PeerId) -> Result<Zeroizing<Vec<u8>>, &'static str>;
+    fn get_optional(&self, group_id: PeerId) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str>;
     fn remove(&self, group_id: PeerId) -> Result<(), &'static str>;
 }
 
@@ -41,11 +41,12 @@ impl InvitationSecretStore for PlatformInvitationSecretStore {
             .map_err(|_| "pending_invitation_store_unavailable")
     }
 
-    fn get(&self, group_id: PeerId) -> Result<Zeroizing<Vec<u8>>, &'static str> {
-        protected_entry(&credential_user(group_id))?
-            .get_secret()
-            .map(Zeroizing::new)
-            .map_err(|_| "pending_invitation_store_unavailable")
+    fn get_optional(&self, group_id: PeerId) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
+        match protected_entry(&credential_user(group_id))?.get_secret() {
+            Ok(encoded) => Ok(Some(Zeroizing::new(encoded))),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(_) => Err("pending_invitation_store_unavailable"),
+        }
     }
 
     fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
@@ -57,13 +58,15 @@ impl InvitationSecretStore for PlatformInvitationSecretStore {
 }
 
 pub struct PendingInvitationService {
+    operations: Arc<Mutex<()>>,
     metadata: Mutex<EventStore>,
     secrets: Box<dyn InvitationSecretStore>,
 }
 
 impl PendingInvitationService {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, &'static str> {
+    pub fn open(path: impl AsRef<Path>, operations: Arc<Mutex<()>>) -> Result<Self, &'static str> {
         Ok(Self {
+            operations,
             metadata: Mutex::new(
                 EventStore::open(path).map_err(|_| "pending_invitation_store_unavailable")?,
             ),
@@ -88,6 +91,10 @@ impl PendingInvitationService {
     }
 
     pub(crate) fn load_invitation(&self, group_id: PeerId) -> Result<Invitation, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system_clock_invalid")?
@@ -101,11 +108,11 @@ impl PendingInvitationService {
             .into_iter()
             .find(|pending| pending.group_id == group_id)
             .ok_or("pending_invitation_not_found")?;
-        let encoded = self.secrets.get(group_id)?;
-        let encoded = std::str::from_utf8(encoded.as_slice())
-            .map_err(|_| "pending_invitation_record_invalid")?;
-        let invitation = Invitation::decode(encoded, now_unix)
-            .map_err(|_| "pending_invitation_record_invalid")?;
+        let encoded = self
+            .secrets
+            .get_optional(group_id)?
+            .ok_or("pending_invitation_record_invalid")?;
+        let invitation = decode_stored_invitation(&encoded, now_unix)?;
         if !metadata_matches_invitation(&stored, &invitation) {
             return Err("pending_invitation_record_invalid");
         }
@@ -113,6 +120,10 @@ impl PendingInvitationService {
     }
 
     fn list_at(&self, now_unix: u64) -> Result<Vec<PendingGroup>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
         let metadata = self
             .metadata
             .lock()
@@ -121,11 +132,11 @@ impl PendingInvitationService {
             .map_err(|_| "pending_invitation_store_unavailable")?;
         let mut pending = Vec::with_capacity(metadata.len());
         for stored in metadata {
-            let encoded = self.secrets.get(stored.group_id)?;
-            let encoded = std::str::from_utf8(encoded.as_slice())
-                .map_err(|_| "pending_invitation_record_invalid")?;
-            let invitation =
-                Invitation::decode(encoded, 0).map_err(|_| "pending_invitation_record_invalid")?;
+            let encoded = self
+                .secrets
+                .get_optional(stored.group_id)?
+                .ok_or("pending_invitation_record_invalid")?;
+            let invitation = decode_stored_invitation(&encoded, 0)?;
             if !metadata_matches_invitation(&stored, &invitation) {
                 return Err("pending_invitation_record_invalid");
             }
@@ -144,6 +155,10 @@ impl PendingInvitationService {
     }
 
     fn accept_at(&self, input: &str, now_unix: u64) -> Result<PendingGroup, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
         let invitation = Invitation::decode_input(input, now_unix).map_err(public_error_code)?;
         let encoded = invitation.encode().map_err(public_error_code)?;
         if encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
@@ -158,14 +173,34 @@ impl PendingInvitationService {
             history_policy: invitation.history_policy(),
             reusable: invitation.is_reusable(),
         };
+        let previous = self.secrets.get_optional(metadata.group_id)?;
         self.secrets.put(metadata.group_id, encoded.as_bytes())?;
-        self.metadata
+        let stored = self
+            .metadata
             .lock()
             .map_err(|_| "pending_invitation_service_unavailable")?
-            .put_pending_invitation(&metadata)
-            .map_err(|_| "pending_invitation_store_unavailable")?;
+            .put_pending_invitation(&metadata);
+        if stored.is_err() {
+            match previous {
+                Some(previous) => self.secrets.put(metadata.group_id, previous.as_slice())?,
+                None => self.secrets.remove(metadata.group_id)?,
+            }
+            return Err("pending_invitation_store_unavailable");
+        }
         Ok(metadata.into())
     }
+}
+
+fn decode_stored_invitation(
+    encoded: &Zeroizing<Vec<u8>>,
+    now_unix: u64,
+) -> Result<Invitation, &'static str> {
+    if encoded.is_empty() || encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
+        return Err("pending_invitation_record_invalid");
+    }
+    let encoded =
+        std::str::from_utf8(encoded.as_slice()).map_err(|_| "pending_invitation_record_invalid")?;
+    Invitation::decode(encoded, now_unix).map_err(|_| "pending_invitation_record_invalid")
 }
 
 impl From<PendingInvitationMetadata> for PendingGroup {
@@ -207,7 +242,7 @@ fn metadata_matches_invitation(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use charp2p_core::{GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId};
     use charp2p_store::EventStore;
@@ -230,15 +265,18 @@ mod tests {
             Ok(())
         }
 
-        fn get(&self, group_id: PeerId) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
-            self.saved
+        fn get_optional(
+            &self,
+            group_id: PeerId,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, &'static str> {
+            Ok(self
+                .saved
                 .lock()
                 .unwrap()
                 .iter()
                 .rev()
                 .find(|(stored_group, _)| *stored_group == group_id)
-                .map(|(_, encoded)| zeroize::Zeroizing::new(encoded.clone()))
-                .ok_or("pending_invitation_store_unavailable")
+                .map(|(_, encoded)| zeroize::Zeroizing::new(encoded.clone())))
         }
 
         fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
@@ -252,6 +290,7 @@ mod tests {
 
     fn service() -> PendingInvitationService {
         PendingInvitationService {
+            operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::<MemorySecretStore>::default(),
         }
@@ -312,6 +351,25 @@ mod tests {
                 history_policy: HistoryPolicy::FromInvitation,
                 reusable: false,
             })
+            .unwrap();
+
+        assert_eq!(
+            service.list_at(NOW),
+            Err("pending_invitation_record_invalid")
+        );
+    }
+
+    #[test]
+    fn oversized_protected_invitation_is_rejected_before_decoding() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        service.accept_at(&encoded, NOW).unwrap();
+        service
+            .secrets
+            .put(
+                group_id,
+                &vec![b'A'; super::MAX_PROTECTED_INVITATION_BYTES + 1],
+            )
             .unwrap();
 
         assert_eq!(

@@ -1,8 +1,12 @@
+mod groups;
 mod identity;
 mod invitation;
 mod network;
 mod pending;
 
+use std::sync::{Arc, Mutex};
+
+use groups::{CreateGroupSpec, GroupService, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use network::{NetworkService, PeerSearchResult};
 use pending::{PendingGroup, PendingInvitationService};
@@ -44,6 +48,38 @@ fn pending_invitations(
 }
 
 #[tauri::command]
+fn local_groups(service: tauri::State<'_, GroupService>) -> Result<Vec<LocalGroup>, String> {
+    service.list().map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn create_group(
+    group_name: String,
+    icon: u8,
+    history_policy: String,
+    approval_required: bool,
+    invitation_lifetime_seconds: u64,
+    reusable_invitation: bool,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, GroupService>,
+) -> Result<LocalGroup, String> {
+    if identity_service.status().map_err(str::to_owned)?.is_none() {
+        return Err("identity_missing".to_owned());
+    }
+    group_service
+        .create(CreateGroupSpec {
+            group_name: &group_name,
+            icon,
+            history_policy: &history_policy,
+            approval_required,
+            invitation_lifetime_seconds,
+            reusable_invitation,
+        })
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn search_group_peers(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -81,7 +117,6 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_deep_link::init())
-        .manage(IdentityService::default())
         .setup(|app| {
             #[cfg(all(debug_assertions, windows))]
             {
@@ -91,10 +126,20 @@ pub fn run() {
 
             let data_directory = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_directory)?;
-            let pending = PendingInvitationService::open(data_directory.join("charp2p.sqlite3"))
-                .map_err(std::io::Error::other)?;
+            let storage_operations = Arc::new(Mutex::new(()));
+            let identity = IdentityService::new(Arc::clone(&storage_operations));
+            let pending = PendingInvitationService::open(
+                data_directory.join("charp2p.sqlite3"),
+                Arc::clone(&storage_operations),
+            )
+            .map_err(std::io::Error::other)?;
+            let groups =
+                GroupService::open(data_directory.join("charp2p.sqlite3"), storage_operations)
+                    .map_err(std::io::Error::other)?;
             let network = NetworkService::from_environment().map_err(std::io::Error::other)?;
+            app.manage(identity);
             app.manage(pending);
+            app.manage(groups);
             app.manage(network);
             Ok(())
         })
@@ -104,6 +149,8 @@ pub fn run() {
             preview_invitation,
             accept_invitation,
             pending_invitations,
+            local_groups,
+            create_group,
             search_group_peers
         ])
         .run(tauri::generate_context!())

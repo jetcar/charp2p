@@ -14,6 +14,15 @@ type InvitationPreview = {
   reusable: boolean;
 };
 type PendingGroup = InvitationPreview;
+type LocalGroup = {
+  groupId: string;
+  groupName: string;
+  icon: number;
+  historyPolicy: InvitationPreview["historyPolicy"];
+  approvalRequired: boolean;
+  invitationLifetimeSeconds: number;
+  reusableInvitation: boolean;
+};
 type PeerSearchResult = {
   status: "bootstrapRequired" | "peerReachable" | "peersFound" | "noPeers" | "unavailable";
   discoveredPeers: number;
@@ -27,6 +36,16 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_service_unavailable: "The identity service is unavailable.",
   identity_store_unavailable: "Protected device storage is unavailable.",
   identity_missing: "Create a device identity before searching for peers.",
+  group_creation_failed: "The group identity could not be created.",
+  group_already_exists: "This version supports one local group at a time.",
+  group_identity_record_invalid: "A stored group identity is damaged.",
+  group_identity_store_unavailable: "Protected group storage is unavailable.",
+  group_service_unavailable: "Groups are temporarily unavailable.",
+  group_store_unavailable: "The group could not be saved on this device.",
+  invalid_group_icon: "Choose a supported group icon.",
+  invalid_group_name: "Enter a shorter group name (up to 80 UTF-8 bytes).",
+  invalid_history_policy: "Choose a valid history policy.",
+  invalid_invitation_lifetime: "Choose a supported invitation expiry.",
   invitation_expired: "This invitation has expired.",
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
@@ -152,6 +171,15 @@ function App() {
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
+  const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
+  const [createGroupMode, setCreateGroupMode] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [groupIcon, setGroupIcon] = useState(0);
+  const [groupHistory, setGroupHistory] = useState<InvitationPreview["historyPolicy"]>("fromInvitation");
+  const [approvalRequired, setApprovalRequired] = useState(false);
+  const [invitationLifetime, setInvitationLifetime] = useState(604800);
+  const [reusableInvitation, setReusableInvitation] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -164,8 +192,9 @@ function App() {
     Promise.allSettled([
       invoke<DeviceProfile | null>("identity_status"),
       invoke<PendingGroup[]>("pending_invitations"),
+      invoke<LocalGroup[]>("local_groups"),
     ])
-      .then(([identityResult, pendingResult]) => {
+      .then(([identityResult, pendingResult, groupsResult]) => {
         if (!active) return;
         if (identityResult.status === "fulfilled" && identityResult.value) {
           const storedProfile = identityResult.value;
@@ -179,6 +208,11 @@ function App() {
           setPendingGroup(pendingResult.value[0] ?? null);
         } else {
           setError(errorMessage(pendingResult.reason));
+        }
+        if (groupsResult.status === "fulfilled") {
+          setLocalGroup(groupsResult.value[0] ?? null);
+        } else {
+          setError(errorMessage(groupsResult.reason));
         }
       })
       .finally(() => {
@@ -202,6 +236,7 @@ function App() {
 
       setError("");
       setJoinMode(true);
+      setCreateGroupMode(false);
       setInviteInput(input);
       setInvitationPreview(null);
       setVerifyingInvite(true);
@@ -305,6 +340,31 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setSearchingPeers(false);
+    }
+  }
+
+  async function createGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!groupName.trim() || creatingGroup || !isTauri()) return;
+
+    setError("");
+    setCreatingGroup(true);
+    try {
+      const created = await invoke<LocalGroup>("create_group", {
+        groupName,
+        icon: groupIcon,
+        historyPolicy: groupHistory,
+        approvalRequired,
+        invitationLifetimeSeconds: invitationLifetime,
+        reusableInvitation,
+      });
+      setLocalGroup(created);
+      setGroupName(created.groupName);
+      setCreateGroupMode(false);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCreatingGroup(false);
     }
   }
 
@@ -419,7 +479,117 @@ function App() {
             </section>
           )}
 
-          {step === 3 && !pendingGroup && !joinMode && (
+          {step === 3 && localGroup && !pendingGroup && !joinMode && !createGroupMode && (
+            <section className="setup-form group-ready-card">
+              <div className={`group-avatar icon-${localGroup.icon}`} aria-hidden="true">
+                {['●●●', '◆', '▲', '♥', '★'][localGroup.icon]}
+              </div>
+              <header>
+                <p className="eyebrow">Group created</p>
+                <h2>{localGroup.groupName}</h2>
+                <p>The owner identity is protected on this device.</p>
+              </header>
+              <dl className="preview-facts">
+                <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
+                <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Owner approval required" : "Invite grants access"}</dd></div>
+                <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
+                <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
+              </dl>
+              <p className="preview-note">Invitation creation and peer advertising are the next setup step.</p>
+              <button className="primary-button" disabled title="Invitation creation is not available yet" type="button">
+                Create invitation
+              </button>
+            </section>
+          )}
+
+          {step === 3 && createGroupMode && !joinMode && (
+            <form className="setup-form create-group-form" onSubmit={createGroup}>
+              <header>
+                <p className="eyebrow">New private group</p>
+                <h2>Create a group</h2>
+                <p>Set the local group identity and invitation defaults.</p>
+              </header>
+
+              <fieldset className="icon-picker">
+                <legend>Group icon</legend>
+                <div>
+                  {['●●●', '◆', '▲', '♥', '★'].map((icon, index) => (
+                    <button
+                      aria-label={`Group icon ${index + 1}`}
+                      aria-pressed={groupIcon === index}
+                      className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
+                      key={icon}
+                      onClick={() => setGroupIcon(index)}
+                      type="button"
+                    >{icon}</button>
+                  ))}
+                </div>
+              </fieldset>
+
+              <label htmlFor="group-name">Group name</label>
+              <input
+                autoFocus
+                id="group-name"
+                maxLength={80}
+                onChange={(event) => setGroupName(event.target.value)}
+                placeholder="Project Atlas"
+                value={groupName}
+              />
+
+              <fieldset className="choice-group">
+                <legend>History for new members</legend>
+                <div className="segmented-options">
+                  {([
+                    ["none", "None"],
+                    ["fromInvitation", "From invitation"],
+                    ["allRetained", "All retained"],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      aria-pressed={groupHistory === value}
+                      className={groupHistory === value ? "selected" : ""}
+                      key={value}
+                      onClick={() => setGroupHistory(value)}
+                      type="button"
+                    >{label}</button>
+                  ))}
+                </div>
+              </fieldset>
+
+              <fieldset className="choice-group">
+                <legend>Join mode</legend>
+                <div className="join-options">
+                  <button aria-pressed={!approvalRequired} className={!approvalRequired ? "selected" : ""} onClick={() => setApprovalRequired(false)} type="button">
+                    <strong>Invite grants access</strong><span>People can join with a valid invitation.</span>
+                  </button>
+                  <button aria-pressed={approvalRequired} className={approvalRequired ? "selected" : ""} onClick={() => setApprovalRequired(true)} type="button">
+                    <strong>Owner approval required</strong><span>Join requests must be approved.</span>
+                  </button>
+                </div>
+              </fieldset>
+
+              <div className="invitation-defaults">
+                <label htmlFor="invitation-lifetime">Invitation expires after</label>
+                <select id="invitation-lifetime" onChange={(event) => setInvitationLifetime(Number(event.target.value))} value={invitationLifetime}>
+                  <option value={86400}>1 day</option>
+                  <option value={604800}>7 days</option>
+                  <option value={1209600}>14 days</option>
+                  <option value={2592000}>30 days</option>
+                </select>
+                <label className="toggle-row">
+                  <span><strong>Reusable invitation</strong><small>Allow the link to be used multiple times.</small></span>
+                  <input checked={reusableInvitation} onChange={(event) => setReusableInvitation(event.target.checked)} type="checkbox" />
+                </label>
+              </div>
+
+              {error && <p className="form-error preview-error" role="alert">{error}</p>}
+              <button className="primary-button join-button" disabled={!groupName.trim() || creatingGroup || !isTauri()} type="submit">
+                {creatingGroup ? "Creating group…" : "Create group"}
+              </button>
+              <button className="text-button" onClick={() => { setCreateGroupMode(false); setError(""); }} type="button">Cancel</button>
+            </form>
+          )}
+
+          {step === 3 && !pendingGroup && !localGroup && !joinMode && !createGroupMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>
@@ -436,7 +606,7 @@ function App() {
               <button className="primary-button" onClick={() => setJoinMode(true)} type="button">
                 Paste invite link
               </button>
-              <button className="secondary-button" disabled title="Group creation is not available yet" type="button">
+              <button className="secondary-button" onClick={() => setCreateGroupMode(true)} type="button">
                 Create a group
               </button>
             </section>

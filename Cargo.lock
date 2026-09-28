@@ -325,6 +325,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "charp2p-sync"
+version = "0.1.0"
+dependencies = [
+ "charp2p-core",
+ "charp2p-store",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"

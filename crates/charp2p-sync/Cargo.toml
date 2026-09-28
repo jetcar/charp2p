@@ -1,0 +1,11 @@
+[package]
+name = "charp2p-sync"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+charp2p-core = { path = "../charp2p-core" }
+charp2p-store = { path = "../charp2p-store" }
+thiserror.workspace = true

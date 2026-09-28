@@ -36,6 +36,10 @@ an event response to persistence.
 Authorization remains a separate group-state check. An unauthorized request is
 rejected without revealing whether the requested group exists.
 
+After authorization, a synchronization engine builds responses from verified
+SQLite events. Incoming event responses are validated as a whole and committed
+in one transaction so sequence conflicts cannot leave a partial batch.
+
 ## Consequences
 
 - Missing sequence gaps cannot be mistaken for synchronized history.

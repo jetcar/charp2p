@@ -8,7 +8,7 @@ use std::{
 };
 
 use charp2p_core::{EventError, EventId, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
@@ -25,6 +25,15 @@ pub enum PutEventOutcome {
     Inserted,
     /// The exact event was already present.
     AlreadyPresent,
+}
+
+/// Result of transactionally adding a batch of verified events.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PutEventsOutcome {
+    /// Events persisted for the first time.
+    pub inserted: usize,
+    /// Exact events already present.
+    pub already_present: usize,
 }
 
 /// SQLite-backed storage for signed group events.
@@ -48,47 +57,26 @@ impl EventStore {
     /// Repeating the same event is idempotent. Reusing one author sequence for
     /// different content is rejected.
     pub fn put_event(&mut self, event: &SignedEvent) -> Result<PutEventOutcome, StoreError> {
-        let sequence = i64::try_from(event.author_sequence())
-            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
-        let event_id = event.id();
-        let group_id = event.group_id().to_bytes();
-        let author_id = event.author_id().to_bytes();
-        let encoded = event.encode()?;
         let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
 
-        let existing: Option<Vec<u8>> = transaction
-            .query_row(
-                "SELECT event_id FROM events
-                 WHERE group_id = ?1 AND author_id = ?2 AND author_sequence = ?3",
-                params![group_id, author_id, sequence],
-                |row| row.get(0),
-            )
-            .optional()?;
+    /// Persists a batch atomically after checking every author sequence.
+    pub fn put_events(&mut self, events: &[SignedEvent]) -> Result<PutEventsOutcome, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let mut outcome = PutEventsOutcome::default();
 
-        if let Some(existing_id) = existing {
-            if existing_id.as_slice() == event_id.as_bytes() {
-                transaction.commit()?;
-                return Ok(PutEventOutcome::AlreadyPresent);
+        for event in events {
+            match put_event_in_transaction(&transaction, event)? {
+                PutEventOutcome::Inserted => outcome.inserted += 1,
+                PutEventOutcome::AlreadyPresent => outcome.already_present += 1,
             }
-            return Err(StoreError::SequenceConflict {
-                sequence: event.author_sequence(),
-            });
         }
 
-        transaction.execute(
-            "INSERT INTO events (
-                event_id, group_id, author_id, author_sequence, encoded
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                event_id.as_bytes().as_slice(),
-                group_id,
-                author_id,
-                sequence,
-                encoded
-            ],
-        )?;
         transaction.commit()?;
-        Ok(PutEventOutcome::Inserted)
+        Ok(outcome)
     }
 
     /// Loads and re-verifies an event by its identifier.
@@ -217,6 +205,49 @@ impl EventStore {
 
         Ok(Self { connection })
     }
+}
+
+fn put_event_in_transaction(
+    transaction: &Transaction<'_>,
+    event: &SignedEvent,
+) -> Result<PutEventOutcome, StoreError> {
+    let sequence = i64::try_from(event.author_sequence())
+        .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+    let event_id = event.id();
+    let group_id = event.group_id().to_bytes();
+    let author_id = event.author_id().to_bytes();
+    let encoded = event.encode()?;
+    let existing: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT event_id FROM events
+                 WHERE group_id = ?1 AND author_id = ?2 AND author_sequence = ?3",
+            params![group_id, author_id, sequence],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(existing_id) = existing {
+        if existing_id.as_slice() == event_id.as_bytes() {
+            return Ok(PutEventOutcome::AlreadyPresent);
+        }
+        return Err(StoreError::SequenceConflict {
+            sequence: event.author_sequence(),
+        });
+    }
+
+    transaction.execute(
+        "INSERT INTO events (
+                event_id, group_id, author_id, author_sequence, encoded
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            event_id.as_bytes().as_slice(),
+            group_id,
+            author_id,
+            sequence,
+            encoded
+        ],
+    )?;
+    Ok(PutEventOutcome::Inserted)
 }
 
 /// Failures produced by local event persistence.
@@ -448,5 +479,27 @@ mod tests {
             store.get_event(stored.id()),
             Err(StoreError::CorruptIndex)
         ));
+    }
+
+    #[test]
+    fn conflicting_batch_rolls_back_every_new_event() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let first = message_event(&author, &group, 1, b"first");
+        let second = message_event(&author, &group, 2, b"second");
+        let conflict = message_event(&author, &group, 1, b"conflict");
+        store.put_event(&first).unwrap();
+
+        assert!(matches!(
+            store.put_events(&[second, conflict]),
+            Err(StoreError::SequenceConflict { sequence: 1 })
+        ));
+        assert!(
+            store
+                .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

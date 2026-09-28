@@ -3,6 +3,7 @@ members = [
     "crates/charp2p-core",
     "crates/charp2p-network",
     "crates/charp2p-store",
+    "crates/charp2p-sync",
 ]
 resolver = "2"
 

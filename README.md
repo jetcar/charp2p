@@ -10,7 +10,8 @@ compatible nodes.
 
 ## Current status
 
-The repository is in the design phase.
+The repository is implementing the shared Rust protocol core and network
+foundation from the approved product and technical designs.
 
 - [Product design](docs/product-design.md)
 - [Technical design](docs/technical-design.md)

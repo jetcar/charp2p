@@ -2,9 +2,9 @@
 
 ## Scope
 
-This document defines protocol boundaries for the MVP. It deliberately does
-not select a UI framework yet. The networking and data model should live in a
-portable core so Windows and Android implement the same protocol.
+This document defines protocol boundaries for the MVP. The networking and data
+model live in portable Rust crates so Windows and Android implement the same
+protocol. ADR-001 records the selected Tauri application shell.
 
 ## System topology
 
@@ -305,4 +305,3 @@ Before public node deployment:
 - [libp2p Kademlia DHT](https://github.com/libp2p/specs/tree/master/kad-dht)
 - [libp2p Circuit Relay v2](https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md)
 - [Messaging Layer Security, RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)
-

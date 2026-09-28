@@ -25,6 +25,12 @@ group peers without publishing group metadata.
 Keep TCP, relay, NAT traversal, and synchronization streams as later increments
 over this foundation.
 
+Expose an explicit routing-node mode that answers Kademlia queries while client
+applications remain in client mode. Client searches use a bounded list of at
+most 16 bootstrap multiaddresses and a 12-second provider-query deadline. The
+development application may read this list from `CHARP2P_BOOTSTRAP_NODES`;
+release bootstrap addresses remain a versioned built-in list.
+
 ## Consequences
 
 - Transport identity is authenticated during every QUIC connection.
@@ -32,6 +38,8 @@ over this foundation.
 - A client requires at least one reachable bootstrap address when its routing
   table is empty.
 - The node API exposes bounded lifecycle events rather than the full swarm.
+- An empty built-in list is a visible configuration state until an operated or
+  community bootstrap node is ready to ship.
 
 ## Sources
 

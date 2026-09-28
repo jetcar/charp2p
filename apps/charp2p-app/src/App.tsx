@@ -13,6 +13,10 @@ type InvitationPreview = {
   reusable: boolean;
 };
 type PendingGroup = InvitationPreview;
+type PeerSearchResult = {
+  status: "bootstrapRequired" | "peersFound" | "noPeers" | "unavailable";
+  discoveredPeers: number;
+};
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -20,10 +24,15 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_record_invalid: "The stored identity is damaged and cannot be opened.",
   identity_service_unavailable: "The identity service is unavailable.",
   identity_store_unavailable: "Protected device storage is unavailable.",
+  identity_missing: "Create a device identity before searching for peers.",
   invitation_expired: "This invitation has expired.",
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter a device name between 1 and 48 characters.",
+  network_configuration_invalid: "The peer network configuration is invalid.",
+  network_search_timed_out: "The peer search timed out. Try again.",
+  network_unavailable: "The peer network is unavailable.",
+  pending_invitation_not_found: "This pending invitation is no longer available.",
   pending_invitation_service_unavailable: "Pending invitations are temporarily unavailable.",
   pending_invitation_record_invalid: "A saved invitation is damaged and cannot be opened.",
   pending_invitation_store_unavailable: "The invitation could not be saved securely.",
@@ -54,6 +63,16 @@ function expiryDescription(expiresAtUnix: number) {
   if (hours < 48) return `Expires in ${hours} ${hours === 1 ? "hour" : "hours"}`;
   const days = Math.ceil(hours / 24);
   return `Expires in ${days} days`;
+}
+
+function peerSearchDescription(result: PeerSearchResult | null) {
+  if (!result) return "Not searched";
+  if (result.status === "bootstrapRequired") return "Bootstrap node needed";
+  if (result.status === "peersFound") {
+    return `${result.discoveredPeers} ${result.discoveredPeers === 1 ? "peer" : "peers"} found`;
+  }
+  if (result.status === "noPeers") return "No peers online";
+  return "Network unavailable";
 }
 
 function BrandMark({ decorative = false }: { decorative?: boolean }) {
@@ -126,6 +145,8 @@ function App() {
   const [verifyingInvite, setVerifyingInvite] = useState(false);
   const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
+  const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
+  const [searchingPeers, setSearchingPeers] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -219,6 +240,23 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setAcceptingInvite(false);
+    }
+  }
+
+  async function searchForPeers() {
+    if (!pendingGroup || searchingPeers || !isTauri()) return;
+
+    setError("");
+    setSearchingPeers(true);
+    try {
+      const result = await invoke<PeerSearchResult>("search_group_peers", {
+        groupId: pendingGroup.groupId,
+      });
+      setPeerSearchResult(result);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSearchingPeers(false);
     }
   }
 
@@ -317,7 +355,7 @@ function App() {
               </header>
               <div className="status-row" aria-label="Join status">
                 <span className="status-chip">✓ Verified invitation</span>
-                <span className="status-chip muted">○ Not connected</span>
+                <span className="status-chip muted">○ {searchingPeers ? "Searching…" : peerSearchDescription(peerSearchResult)}</span>
               </div>
               <dl className="preview-facts">
                 <div><dt>Invited by</dt><dd>{pendingGroup.inviterName}</dd></div>
@@ -325,7 +363,11 @@ function App() {
                 <div><dt>Invitation</dt><dd>{expiryDescription(pendingGroup.expiresAtUnix)}</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={pendingGroup.groupId}>{shortPeerId(pendingGroup.groupId)}</code></dd></div>
               </dl>
+              {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Your invitation is stored securely on this device.</p>
+              <button className="primary-button" disabled={searchingPeers || !isTauri()} onClick={searchForPeers} type="button">
+                {searchingPeers ? "Searching for peers…" : "Search for peers"}
+              </button>
             </section>
           )}
 

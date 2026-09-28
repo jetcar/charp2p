@@ -87,6 +87,31 @@ impl PendingInvitationService {
         self.list_at(now_unix)
     }
 
+    pub(crate) fn load_invitation(&self, group_id: PeerId) -> Result<Invitation, &'static str> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
+        let stored = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .pending_invitations()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|pending| pending.group_id == group_id)
+            .ok_or("pending_invitation_not_found")?;
+        let encoded = self.secrets.get(group_id)?;
+        let encoded = std::str::from_utf8(encoded.as_slice())
+            .map_err(|_| "pending_invitation_record_invalid")?;
+        let invitation = Invitation::decode(encoded, now_unix)
+            .map_err(|_| "pending_invitation_record_invalid")?;
+        if !metadata_matches_invitation(&stored, &invitation) {
+            return Err("pending_invitation_record_invalid");
+        }
+        Ok(invitation)
+    }
+
     fn list_at(&self, now_unix: u64) -> Result<Vec<PendingGroup>, &'static str> {
         let metadata = self
             .metadata

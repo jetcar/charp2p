@@ -33,10 +33,10 @@ struct Behaviour {
 }
 
 impl Behaviour {
-    fn new(identity: &Keypair) -> Self {
+    fn new(identity: &Keypair, dht_mode: kad::Mode) -> Self {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
-        dht.set_mode(Some(kad::Mode::Client));
+        dht.set_mode(Some(dht_mode));
         let sync_codec = request_response::cbor::codec::Codec::default()
             .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
             .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES);
@@ -74,10 +74,19 @@ pub struct NetworkNode {
 impl NetworkNode {
     /// Builds a node from its persistent libp2p device identity.
     pub fn new(identity: Keypair) -> Self {
+        Self::with_dht_mode(identity, kad::Mode::Client)
+    }
+
+    /// Builds a routing node that answers Kademlia queries from other peers.
+    pub fn new_routing(identity: Keypair) -> Self {
+        Self::with_dht_mode(identity, kad::Mode::Server)
+    }
+
+    fn with_dht_mode(identity: Keypair, dht_mode: kad::Mode) -> Self {
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_quic()
-            .with_behaviour(Behaviour::new)
+            .with_behaviour(|identity| Behaviour::new(identity, dht_mode))
             .expect("behaviour construction is infallible")
             .with_swarm_config(|config| {
                 config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT)
@@ -105,6 +114,12 @@ impl NetworkNode {
     /// Dials a peer multiaddress.
     pub fn dial(&mut self, address: Multiaddr) -> Result<(), NetworkError> {
         self.swarm.dial(address)?;
+        Ok(())
+    }
+
+    /// Dials a discovered peer using addresses already learned by behaviours.
+    pub fn dial_peer(&mut self, peer_id: PeerId) -> Result<(), NetworkError> {
+        self.swarm.dial(peer_id)?;
         Ok(())
     }
 

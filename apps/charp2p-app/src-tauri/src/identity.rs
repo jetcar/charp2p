@@ -56,6 +56,16 @@ impl IdentityService {
             peer_id: identity.peer_id().to_string(),
         })
     }
+
+    pub(crate) fn load_network_identity(&self) -> Result<DeviceIdentity, &'static str> {
+        let _guard = self
+            .operations
+            .lock()
+            .map_err(|_| "identity_service_unavailable")?;
+        load_identity_record()?
+            .map(|(_, identity)| identity)
+            .ok_or("identity_missing")
+    }
 }
 
 pub fn initialize_platform_store() -> Result<(), &'static str> {
@@ -78,6 +88,15 @@ pub fn initialize_platform_store() -> Result<(), &'static str> {
 }
 
 fn load_profile() -> Result<Option<DeviceProfile>, &'static str> {
+    Ok(
+        load_identity_record()?.map(|(device_name, identity)| DeviceProfile {
+            device_name,
+            peer_id: identity.peer_id().to_string(),
+        }),
+    )
+}
+
+fn load_identity_record() -> Result<Option<(String, DeviceIdentity)>, &'static str> {
     let record = match protected_entry(CREDENTIAL_USER)?.get_secret() {
         Ok(bytes) => Zeroizing::new(bytes),
         Err(KeyringError::NoEntry) => return Ok(None),
@@ -87,10 +106,7 @@ fn load_profile() -> Result<Option<DeviceProfile>, &'static str> {
     let identity =
         DeviceIdentity::from_persisted_secret(&secret).map_err(|_| "identity_record_invalid")?;
 
-    Ok(Some(DeviceProfile {
-        device_name,
-        peer_id: identity.peer_id().to_string(),
-    }))
+    Ok(Some((device_name, identity)))
 }
 
 pub(crate) fn protected_entry(user: &str) -> Result<Entry, &'static str> {

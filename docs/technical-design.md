@@ -143,6 +143,11 @@ Clients enter the network through a versioned list of built-in bootstrap
 multiaddresses. Invitations and learned routing tables provide additional
 entry points. No internet address scanning occurs.
 
+The client bounds bootstrap configuration to 16 entries and provider searches
+to 12 seconds. When no built-in or development bootstrap address is available,
+the UI reports that discovery requires a bootstrap node instead of pretending
+that the group is offline.
+
 LAN discovery may use mDNS as an additional path, never as the only discovery
 mechanism.
 

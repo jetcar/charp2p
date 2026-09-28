@@ -85,6 +85,12 @@ impl DeviceIdentity {
         self.keypair.sign(payload)
     }
 
+    /// Transfers this identity into the libp2p networking layer without
+    /// serializing or copying its private key into application storage.
+    pub fn into_network_keypair(self) -> Keypair {
+        self.keypair
+    }
+
     /// Verifies a signature from any device public key.
     pub fn verify(public_key: &PublicKey, payload: &[u8], signature: &[u8]) -> bool {
         public_key.verify(payload, signature)
@@ -132,6 +138,17 @@ mod tests {
         let identity = DeviceIdentity::generate();
 
         assert_eq!(identity.peer_id(), identity.public_key().to_peer_id());
+    }
+
+    #[test]
+    fn network_keypair_preserves_the_device_peer_id() {
+        let identity = DeviceIdentity::generate();
+        let peer_id = identity.peer_id();
+
+        assert_eq!(
+            identity.into_network_keypair().public().to_peer_id(),
+            peer_id
+        );
     }
 
     #[test]

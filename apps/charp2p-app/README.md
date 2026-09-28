@@ -16,3 +16,9 @@ are parsed and authenticated in Rust before any network access. Encrypted
 recovery export and the final peer join remain later increments. Accepted
 invitations survive restarts: safe group metadata is indexed in SQLite while
 the signed bearer credential remains in platform-protected storage.
+
+The pending-group screen can run a bounded Kademlia provider search with the
+restored device identity. Release builds will use the versioned built-in
+bootstrap list. During local development, set `CHARP2P_BOOTSTRAP_NODES` to up to
+16 semicolon-separated QUIC multiaddresses ending in `/p2p/<peer-id>`. With no
+configured node, the app reports that a bootstrap node is required.

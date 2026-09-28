@@ -19,10 +19,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 charp2p-core = { path = "../../../crates/charp2p-core" }
+charp2p-network = { path = "../../../crates/charp2p-network" }
 charp2p-store = { path = "../../../crates/charp2p-store" }
 keyring-core = "1.0.0"
+libp2p = { version = "0.57.0", default-features = false }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
 zeroize = "1.8.2"
 
 [target.'cfg(target_os = "android")'.dependencies]

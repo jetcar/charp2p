@@ -7,23 +7,16 @@ use std::{
     path::Path,
 };
 
-use charp2p_core::{EventError, EventId, PeerId, SignedEvent};
+use charp2p_core::{EventError, EventId, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+
+pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
 const SCHEMA_VERSION: i64 = 1;
 
 /// Largest event-identifier page returned for one synchronization request.
-pub const MAX_SYNC_BATCH_EVENTS: usize = 256;
-
-/// Highest gap-free event sequence stored for one group author.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorHead {
-    /// Device that authored this sequence.
-    pub author_id: PeerId,
-    /// Highest sequence for which every event from one is present.
-    pub contiguous_sequence: u64,
-}
+pub const MAX_SYNC_BATCH_EVENTS: usize = MAX_SYNC_BATCH_ITEMS;
 
 /// Result of adding an already-verified event to the local store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

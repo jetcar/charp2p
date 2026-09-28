@@ -198,6 +198,11 @@ gap-free sequence and the current membership state. They then request missing
 event identifiers in batches of at most 256, verify each envelope, and commit
 valid events transactionally to local storage.
 
+Synchronization uses three bounded request-response exchanges: author summary,
+ordered event identifiers after a sequence, and signed envelopes by identifier.
+Summaries contain at most 1,024 authors. Signed-event responses contain at most
+256 events, no event above 128 KiB, and no more than 2 MiB of event data.
+
 Requirements:
 
 - Receiving the same event repeatedly is harmless.

@@ -9,5 +9,6 @@ pnpm build
 pnpm tauri dev
 ```
 
-The current shell implements the three-step device onboarding flow. Rust core
-commands and secure identity persistence are connected in later increments.
+The current shell implements the three-step device onboarding flow. Identity
+creation and restart detection use Rust commands and platform-protected storage;
+encrypted recovery export remains a later increment.

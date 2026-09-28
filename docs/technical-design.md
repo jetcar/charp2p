@@ -51,6 +51,11 @@ system's secure random source. The peer identifier is derived from the public
 key. Private keys are stored using platform-protected storage and can be
 exported only through an explicitly encrypted backup flow.
 
+The client stores the encoded key in Windows Credential Manager or, on
+Android, an app-private preferences vault encrypted by Android Keystore. Secret
+bytes remain in Rust, are zeroized after protected-storage operations, and are
+never returned to the webview. ADR-007 records the adapter and record format.
+
 A group has a root public key. Its stable identifier is a versioned hash of
 that key:
 

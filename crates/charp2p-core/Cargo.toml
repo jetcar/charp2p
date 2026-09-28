@@ -13,3 +13,4 @@ libp2p-identity.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true

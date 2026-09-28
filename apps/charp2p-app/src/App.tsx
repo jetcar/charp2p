@@ -1,7 +1,28 @@
-import { FormEvent, useMemo, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
+type DeviceProfile = { deviceName: string; peerId: string };
+
+const ERROR_MESSAGES: Record<string, string> = {
+  identity_already_exists: "This device already has an identity.",
+  identity_creation_failed: "The device identity could not be created.",
+  identity_record_invalid: "The stored identity is damaged and cannot be opened.",
+  identity_service_unavailable: "The identity service is unavailable.",
+  identity_store_unavailable: "Protected device storage is unavailable.",
+  invalid_device_name: "Enter a device name between 1 and 48 characters.",
+};
+
+function errorMessage(error: unknown) {
+  const code = typeof error === "string" ? error : "";
+  return ERROR_MESSAGES[code] ?? "Something went wrong. Try again.";
+}
+
+function shortPeerId(peerId: string) {
+  if (peerId.length <= 18) return peerId;
+  return `${peerId.slice(0, 9)}…${peerId.slice(-8)}`;
+}
 
 function BrandMark({ decorative = false }: { decorative?: boolean }) {
   return (
@@ -63,14 +84,56 @@ function Stepper({ step }: { step: SetupStep }) {
 function App() {
   const [step, setStep] = useState<SetupStep>(1);
   const [deviceName, setDeviceName] = useState("");
+  const [profile, setProfile] = useState<DeviceProfile | null>(null);
+  const [loading, setLoading] = useState(isTauri());
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
   );
 
-  function createIdentity(event: FormEvent<HTMLFormElement>) {
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    let active = true;
+    invoke<DeviceProfile | null>("identity_status")
+      .then((storedProfile) => {
+        if (!active || !storedProfile) return;
+        setProfile(storedProfile);
+        setDeviceName(storedProfile.deviceName);
+        setStep(3);
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(errorMessage(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function createIdentity(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (deviceName.trim()) setStep(2);
+    if (!deviceName.trim() || saving) return;
+
+    setError("");
+    setSaving(true);
+    try {
+      const createdProfile = isTauri()
+        ? await invoke<DeviceProfile>("create_identity", { deviceName })
+        : { deviceName: deviceName.trim(), peerId: "12D3KooWPreviewIdentity" };
+      setProfile(createdProfile);
+      setDeviceName(createdProfile.deviceName);
+      setStep(2);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -88,7 +151,14 @@ function App() {
         <div className="setup-content">
           <Stepper step={step} />
 
-          {step === 1 && (
+          {loading && (
+            <div className="loading-state" role="status">
+              <span aria-hidden="true" />
+              Opening protected device storage…
+            </div>
+          )}
+
+          {!loading && step === 1 && (
             <form className="setup-form" onSubmit={createIdentity}>
               <header>
                 <p className="eyebrow">Welcome to CharP2P</p>
@@ -107,11 +177,13 @@ function App() {
                 value={deviceName}
               />
 
-              <button className="primary-button" disabled={!deviceName.trim()} type="submit">
+              {error && <p className="form-error" role="alert">{error}</p>}
+
+              <button className="primary-button" disabled={!deviceName.trim() || saving} type="submit">
                 <span aria-hidden="true">＋</span>
-                Create identity
+                {saving ? "Creating identity…" : "Create identity"}
               </button>
-              <button className="secondary-button" type="button">
+              <button className="secondary-button" disabled title="Encrypted backup restore is not available yet" type="button">
                 <span aria-hidden="true">↶</span>
                 Restore from backup
               </button>
@@ -127,9 +199,13 @@ function App() {
               </header>
               <div className="device-summary">
                 <BrandMark decorative />
-                <div><strong>{deviceName}</strong><span>Identity stored locally</span></div>
+                <div>
+                  <strong>{profile?.deviceName ?? deviceName}</strong>
+                  <span>Protected by this device</span>
+                  {profile && <code>{shortPeerId(profile.peerId)}</code>}
+                </div>
               </div>
-              <button className="primary-button" onClick={() => setStep(3)} type="button">
+              <button className="primary-button" disabled title="Encrypted recovery export is not available yet" type="button">
                 Create recovery copy
               </button>
               <button className="text-button" onClick={() => setStep(3)} type="button">
@@ -146,6 +222,12 @@ function App() {
                 <h2>Join your first group</h2>
                 <p>Open a CharP2P invite or paste one into the app.</p>
               </header>
+              {profile && (
+                <div className="ready-identity">
+                  <span>{profile.deviceName}</span>
+                  <code title={profile.peerId}>{shortPeerId(profile.peerId)}</code>
+                </div>
+              )}
               <button className="primary-button" type="button">Paste invite link</button>
               <button className="secondary-button" type="button">Create a group</button>
             </section>

@@ -18,9 +18,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+charp2p-core = { path = "../../../crates/charp2p-core" }
+keyring-core = "1.0.0"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+zeroize = "1.8.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1.0"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

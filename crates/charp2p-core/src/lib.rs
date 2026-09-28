@@ -12,7 +12,7 @@ mod sync;
 pub use discovery::DiscoveryKey;
 pub use event::{EventError, EventId, EventKind, EventSpec, SignedEvent};
 pub use group_identity::GroupIdentity;
-pub use identity::DeviceIdentity;
+pub use identity::{DeviceIdentity, DeviceIdentityError, DeviceIdentitySecret};
 pub use invitation::{HistoryPolicy, Invitation, InvitationError, InvitationSpec};
 pub use libp2p_identity::{PeerId, PublicKey, SigningError};
 pub use sync::{

@@ -104,6 +104,12 @@ not load third-party analytics or resources that could capture it.
 Invitation parsing is bounded and fully validated before network use. An
 invitation is a bearer credential and must be treated as sensitive.
 
+Clients accept only the raw encoded payload, the exact custom URI form above,
+or the exact HTTPS host and path above. The HTTPS form must carry the payload in
+the fragment. Query-string credentials and lookalike hosts are rejected. The UI
+may display authenticated invitation metadata after validation, but it must not
+receive or display the discovery secret.
+
 ## Discovery
 
 CharP2P uses a dedicated, open libp2p-compatible network rather than storing

@@ -9,7 +9,7 @@
 
 * { box-sizing: border-box; }
 html, body, #root { min-height: 100%; margin: 0; }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { cursor: pointer; }
 
 .onboarding-shell {
@@ -79,6 +79,9 @@ button { cursor: pointer; }
 .setup-form input { width: 100%; height: 76px; margin: 0 0 42px; padding: 0 26px; border: 2px solid #d6deea; border-radius: 14px; outline: none; color: #07113d; background: #fff; font-size: 23px; transition: border-color .2s, box-shadow .2s; }
 .setup-form input:focus { border-color: #10a89f; box-shadow: 0 0 0 4px rgba(16, 168, 159, .12); }
 .setup-form input::placeholder { color: #9ba5b9; }
+.join-form textarea { width: 100%; min-height: 132px; margin: 0 0 42px; padding: 20px 24px; resize: vertical; border: 2px solid #d6deea; border-radius: 14px; outline: none; color: #07113d; background: #fff; font-family: "Cascadia Mono", Consolas, monospace; font-size: 17px; line-height: 1.55; transition: border-color .2s, box-shadow .2s; }
+.join-form textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 4px rgba(16, 168, 159, .12); }
+.join-form textarea::placeholder { color: #9ba5b9; }
 
 .primary-button, .secondary-button { width: 100%; min-height: 76px; display: flex; align-items: center; justify-content: center; gap: 18px; border-radius: 14px; font-size: 22px; font-weight: 700; transition: transform .15s, box-shadow .2s, opacity .2s; }
 .primary-button { border: 0; color: white; background: linear-gradient(100deg, #13b7aa, #009e95); box-shadow: 0 13px 26px rgba(0, 151, 145, .18); }
@@ -107,6 +110,22 @@ button { cursor: pointer; }
 .ready-check { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 30px; border-radius: 50%; color: white; background: linear-gradient(145deg, #20c1ad, #008f88); font-size: 34px; box-shadow: 0 14px 30px rgba(0, 151, 145, .2); }
 .ready-identity { display: grid; gap: 4px; margin: -12px 0 30px; padding: 17px; border: 1px solid #dde5ec; border-radius: 14px; background: #fff; }
 .ready-identity span { font-weight: 700; }
+.join-preview { align-items: stretch; }
+.join-preview header { margin-bottom: 26px; text-align: center; }
+.join-preview header > p:last-child { font-size: 20px; }
+.join-icon { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 24px; border-radius: 20px; background: #e6faf7; }
+.join-icon .brand-mark { width: 48px; height: 48px; stroke-width: 5.5; }
+.status-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 24px; }
+.status-chip { padding: 8px 13px; border-radius: 999px; color: #087d75; background: #e2f8f4; font-size: 14px; font-weight: 700; }
+.status-chip.muted { color: #63708b; background: #edf1f5; }
+.preview-facts { display: grid; margin: 0 0 22px; border: 1px solid #dce4ec; border-radius: 16px; overflow: hidden; background: white; }
+.preview-facts div { display: grid; grid-template-columns: minmax(120px, .75fr) 1.25fr; gap: 20px; padding: 16px 20px; }
+.preview-facts div + div { border-top: 1px solid #e6ebf0; }
+.preview-facts dt { color: #6a7691; font-weight: 600; }
+.preview-facts dd { margin: 0; color: #172044; font-weight: 650; text-align: right; }
+.preview-facts code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
+.preview-note { margin: 0 0 22px; color: #68748f; font-size: 15px; text-align: center; }
+.join-button { background: linear-gradient(100deg, #ff7463, #ea584e); box-shadow: 0 13px 26px rgba(219, 77, 67, .18); }
 
 .setup-footer { width: min(100%, 900px); display: flex; justify-content: space-between; margin: auto auto 0; padding-top: 28px; border-top: 1px solid #dfe5ec; }
 .setup-footer button { padding: 8px 0; border: 0; color: #536da1; background: transparent; font-size: 16px; font-weight: 600; }
@@ -142,6 +161,9 @@ button { cursor: pointer; }
   .setup-form header > p:last-child { font-size: 18px; }
   .setup-form input, .primary-button, .secondary-button { min-height: 64px; height: 64px; font-size: 18px; }
   .setup-form input { margin-bottom: 28px; }
+  .join-form textarea { margin-bottom: 28px; }
+  .preview-facts div { grid-template-columns: 1fr; gap: 5px; }
+  .preview-facts dd { text-align: left; }
   .setup-footer { margin-top: 52px; }
 }
 

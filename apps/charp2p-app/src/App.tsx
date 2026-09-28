@@ -4,6 +4,14 @@ import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
 type DeviceProfile = { deviceName: string; peerId: string };
+type InvitationPreview = {
+  groupName: string;
+  inviterName: string;
+  groupId: string;
+  expiresAtUnix: number;
+  historyPolicy: "none" | "fromInvitation" | "allRetained";
+  reusable: boolean;
+};
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -11,7 +19,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_record_invalid: "The stored identity is damaged and cannot be opened.",
   identity_service_unavailable: "The identity service is unavailable.",
   identity_store_unavailable: "Protected device storage is unavailable.",
+  invitation_expired: "This invitation has expired.",
+  invitation_invalid: "This is not a valid CharP2P invitation.",
+  invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter a device name between 1 and 48 characters.",
+  system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
 function errorMessage(error: unknown) {
@@ -22,6 +34,21 @@ function errorMessage(error: unknown) {
 function shortPeerId(peerId: string) {
   if (peerId.length <= 18) return peerId;
   return `${peerId.slice(0, 9)}…${peerId.slice(-8)}`;
+}
+
+function historyDescription(policy: InvitationPreview["historyPolicy"]) {
+  if (policy === "none") return "Messages shared after you join";
+  if (policy === "allRetained") return "All retained history shared";
+  return "History shared from invitation";
+}
+
+function expiryDescription(expiresAtUnix: number) {
+  const remainingSeconds = expiresAtUnix - Math.floor(Date.now() / 1000);
+  if (remainingSeconds <= 0) return "Expired";
+  const hours = Math.ceil(remainingSeconds / 3600);
+  if (hours < 48) return `Expires in ${hours} ${hours === 1 ? "hour" : "hours"}`;
+  const days = Math.ceil(hours / 24);
+  return `Expires in ${days} days`;
 }
 
 function BrandMark({ decorative = false }: { decorative?: boolean }) {
@@ -88,6 +115,10 @@ function App() {
   const [loading, setLoading] = useState(isTauri());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [joinMode, setJoinMode] = useState(false);
+  const [inviteInput, setInviteInput] = useState("");
+  const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
+  const [verifyingInvite, setVerifyingInvite] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -134,6 +165,31 @@ function App() {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function verifyInvitation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!inviteInput.trim() || verifyingInvite || !isTauri()) return;
+
+    setError("");
+    setVerifyingInvite(true);
+    try {
+      const preview = await invoke<InvitationPreview>("preview_invitation", {
+        input: inviteInput,
+      });
+      setInvitationPreview(preview);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setVerifyingInvite(false);
+    }
+  }
+
+  function closeJoinFlow() {
+    setJoinMode(false);
+    setInviteInput("");
+    setInvitationPreview(null);
+    setError("");
   }
 
   return (
@@ -214,7 +270,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && (
+          {step === 3 && !joinMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>
@@ -228,8 +284,82 @@ function App() {
                   <code title={profile.peerId}>{shortPeerId(profile.peerId)}</code>
                 </div>
               )}
-              <button className="primary-button" type="button">Paste invite link</button>
-              <button className="secondary-button" type="button">Create a group</button>
+              <button className="primary-button" onClick={() => setJoinMode(true)} type="button">
+                Paste invite link
+              </button>
+              <button className="secondary-button" disabled title="Group creation is not available yet" type="button">
+                Create a group
+              </button>
+            </section>
+          )}
+
+          {step === 3 && joinMode && !invitationPreview && (
+            <form className="setup-form join-form" onSubmit={verifyInvitation}>
+              <header>
+                <p className="eyebrow">Invitation</p>
+                <h2>Join a group</h2>
+                <p>Paste an invitation to verify who created it and what it permits.</p>
+              </header>
+
+              <label htmlFor="invite-link">Invitation link</label>
+              <textarea
+                autoFocus
+                id="invite-link"
+                onChange={(event) => setInviteInput(event.target.value)}
+                placeholder="charp2p://join/…"
+                rows={4}
+                value={inviteInput}
+              />
+
+              {error && <p className="form-error" role="alert">{error}</p>}
+
+              <button
+                className="primary-button"
+                disabled={!inviteInput.trim() || verifyingInvite || !isTauri()}
+                title={isTauri() ? undefined : "Open the desktop or Android app to validate invitations"}
+                type="submit"
+              >
+                {verifyingInvite ? "Verifying invitation…" : "Verify invitation"}
+              </button>
+              <button className="text-button" onClick={closeJoinFlow} type="button">Cancel</button>
+            </form>
+          )}
+
+          {step === 3 && joinMode && invitationPreview && (
+            <section className="setup-form join-preview">
+              <div className="join-icon" aria-hidden="true"><BrandMark decorative /></div>
+              <header>
+                <p className="eyebrow">Invitation verified</p>
+                <h2>Join {invitationPreview.groupName}</h2>
+                <p>Invited by {invitationPreview.inviterName}</p>
+              </header>
+
+              <div className="status-row" aria-label="Invitation status">
+                <span className="status-chip">✓ Verified invitation</span>
+                <span className="status-chip muted">○ Connection not checked</span>
+              </div>
+
+              <dl className="preview-facts">
+                <div><dt>Messages</dt><dd>You can send messages</dd></div>
+                <div><dt>History</dt><dd>{historyDescription(invitationPreview.historyPolicy)}</dd></div>
+                <div><dt>Invitation</dt><dd>{expiryDescription(invitationPreview.expiresAtUnix)}{invitationPreview.reusable ? " · Reusable" : " · Single use"}</dd></div>
+                <div><dt>Group fingerprint</dt><dd><code title={invitationPreview.groupId}>{shortPeerId(invitationPreview.groupId)}</code></dd></div>
+              </dl>
+
+              <p className="preview-note">Your peer identity will be visible to group members.</p>
+              <button className="primary-button join-button" disabled title="Peer connection and membership exchange are not available yet" type="button">
+                Join group
+              </button>
+              <button
+                className="text-button"
+                onClick={() => {
+                  setInvitationPreview(null);
+                  setError("");
+                }}
+                type="button"
+              >
+                Use another invitation
+              </button>
             </section>
           )}
         </div>

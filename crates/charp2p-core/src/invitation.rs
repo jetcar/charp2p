@@ -1,7 +1,10 @@
+use std::borrow::Cow;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use libp2p_identity::{DecodingError, PeerId, PublicKey, SigningError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 use crate::GroupIdentity;
 
@@ -10,6 +13,7 @@ const DISCOVERY_SECRET_BYTES: usize = 32;
 const INVITATION_ID_BYTES: usize = 16;
 const MAX_NAME_BYTES: usize = 80;
 const MAX_ENCODED_BYTES: usize = 8 * 1024;
+const MAX_INPUT_BYTES: usize = MAX_ENCODED_BYTES + 256;
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v1\0";
 
 /// Controls which retained messages a newly joined member may request.
@@ -115,6 +119,25 @@ impl Invitation {
         })
     }
 
+    /// Extracts, decodes, and verifies an invitation from a pasted payload,
+    /// custom URI, or the canonical HTTPS app link.
+    pub fn decode_input(input: &str, now_unix: u64) -> Result<Self, InvitationError> {
+        let input = input.trim();
+        if input.is_empty() || input.len() > MAX_INPUT_BYTES {
+            return Err(InvitationError::InvalidSize);
+        }
+
+        let encoded = if input.starts_with("charp2p:") {
+            Cow::Owned(payload_from_custom_uri(input)?)
+        } else if input.starts_with("https:") {
+            Cow::Owned(payload_from_https_link(input)?)
+        } else {
+            Cow::Borrowed(input)
+        };
+
+        Self::decode(encoded.as_ref(), now_unix)
+    }
+
     /// Returns the group identifier derived from the group owner public key.
     pub fn group_id(&self) -> PeerId {
         self.owner_public_key.to_peer_id()
@@ -162,6 +185,9 @@ pub enum InvitationError {
     /// The payload is empty or exceeds the protocol limit.
     #[error("invitation payload has an invalid size")]
     InvalidSize,
+    /// A link does not use the supported scheme, host, path, or fragment form.
+    #[error("invitation link is invalid")]
+    InvalidLink,
     /// Base64 decoding failed.
     #[error("invitation is not valid URL-safe Base64")]
     Base64(#[from] base64::DecodeError),
@@ -189,6 +215,45 @@ pub enum InvitationError {
     /// The operating system random source failed.
     #[error("secure random source is unavailable")]
     RandomnessUnavailable,
+}
+
+fn payload_from_custom_uri(input: &str) -> Result<String, InvitationError> {
+    let url = Url::parse(input).map_err(|_| InvitationError::InvalidLink)?;
+    if url.scheme() != "charp2p"
+        || url.host_str() != Some("join")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(InvitationError::InvalidLink);
+    }
+
+    url.path()
+        .strip_prefix('/')
+        .filter(|payload| !payload.is_empty() && !payload.contains('/'))
+        .map(str::to_owned)
+        .ok_or(InvitationError::InvalidLink)
+}
+
+fn payload_from_https_link(input: &str) -> Result<String, InvitationError> {
+    let url = Url::parse(input).map_err(|_| InvitationError::InvalidLink)?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("join.charp2p.example")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != "/i"
+        || url.query().is_some()
+    {
+        return Err(InvitationError::InvalidLink);
+    }
+
+    url.fragment()
+        .filter(|payload| !payload.is_empty())
+        .map(str::to_owned)
+        .ok_or(InvitationError::InvalidLink)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -339,6 +404,64 @@ mod tests {
         assert!(matches!(
             Invitation::decode(&oversized, NOW),
             Err(InvitationError::InvalidSize)
+        ));
+    }
+
+    #[test]
+    fn supported_link_forms_decode_the_same_invitation() {
+        let owner = GroupIdentity::generate();
+        let encoded = Invitation::issue(&owner, spec(NOW + 3_600), NOW)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let inputs = [
+            encoded.clone(),
+            format!("charp2p://join/{encoded}"),
+            format!("https://join.charp2p.example/i#{encoded}"),
+        ];
+
+        for input in inputs {
+            let decoded = Invitation::decode_input(&input, NOW).unwrap();
+            assert_eq!(decoded.group_id(), owner.group_id());
+        }
+    }
+
+    #[test]
+    fn links_reject_secrets_in_queries_or_on_untrusted_hosts() {
+        let owner = GroupIdentity::generate();
+        let encoded = Invitation::issue(&owner, spec(NOW + 3_600), NOW)
+            .unwrap()
+            .encode()
+            .unwrap();
+
+        assert!(matches!(
+            Invitation::decode_input(&format!("charp2p://join/{encoded}?secret=1"), NOW),
+            Err(InvitationError::InvalidLink)
+        ));
+        assert!(matches!(
+            Invitation::decode_input(&format!("https://example.com/i#{encoded}"), NOW),
+            Err(InvitationError::InvalidLink)
+        ));
+        assert!(matches!(
+            Invitation::decode_input(
+                &format!("https://attacker@join.charp2p.example/i#{encoded}"),
+                NOW
+            ),
+            Err(InvitationError::InvalidLink)
+        ));
+        assert!(matches!(
+            Invitation::decode_input(
+                &format!("https://join.charp2p.example:444/i#{encoded}"),
+                NOW
+            ),
+            Err(InvitationError::InvalidLink)
+        ));
+        assert!(matches!(
+            Invitation::decode_input(
+                &format!("https://join.charp2p.example/i?invite={encoded}"),
+                NOW
+            ),
+            Err(InvitationError::InvalidLink)
         ));
     }
 }

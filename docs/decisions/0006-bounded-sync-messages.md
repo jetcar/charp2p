@@ -23,6 +23,11 @@ Use a versioned request-response synchronization protocol with three exchanges:
 2. Request up to 256 ordered event identifiers after an author sequence.
 3. Request canonical signed envelopes for selected identifiers.
 
+Carry these messages as CBOR over the libp2p stream protocol
+`/charp2p/sync/1.0.0`. Limit encoded requests to 64 KiB, encoded responses to
+2.125 MiB, each request to 30 seconds, and each connection to 32 concurrent
+synchronization streams.
+
 Limit summaries to 1,024 authors, identifier and event pages to 256 items, each
 encoded event to 128 KiB, and combined event payloads to 2 MiB. Reject duplicate
 authors and event IDs. Verify every event signature and group ID before exposing

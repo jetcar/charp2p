@@ -4,25 +4,32 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use charp2p_core::DiscoveryKey;
+use charp2p_core::{
+    DiscoveryKey, MAX_SYNC_RESPONSE_BYTES, SyncError, SyncRejectReason, SyncRequest, SyncResponse,
+};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
     identity::Keypair,
-    kad, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    kad, ping, request_response,
+    swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent},
 };
 use thiserror::Error;
 
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+const SYNC_PROTOCOL: &str = "/charp2p/sync/1.0.0";
+const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
+    sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
 impl Behaviour {
@@ -30,6 +37,19 @@ impl Behaviour {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
         dht.set_mode(Some(kad::Mode::Client));
+        let sync_codec = request_response::cbor::codec::Codec::default()
+            .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
+            .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES);
+        let sync = request_response::Behaviour::with_codec(
+            sync_codec,
+            [(
+                StreamProtocol::new(SYNC_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(SYNC_REQUEST_TIMEOUT)
+                .with_max_concurrent_streams(32),
+        );
 
         Self {
             ping: ping::Behaviour::new(ping::Config::new()),
@@ -38,6 +58,7 @@ impl Behaviour {
                     .with_agent_version(AGENT_VERSION.to_owned()),
             ),
             dht,
+            sync,
         }
     }
 }
@@ -46,6 +67,8 @@ impl Behaviour {
 pub struct NetworkNode {
     swarm: Swarm<Behaviour>,
     discovery_queries: HashMap<kad::QueryId, DiscoveryKey>,
+    pending_sync_responses:
+        HashMap<InboundSyncRequestId, request_response::ResponseChannel<SyncResponse>>,
 }
 
 impl NetworkNode {
@@ -64,6 +87,7 @@ impl NetworkNode {
         Self {
             swarm,
             discovery_queries: HashMap::new(),
+            pending_sync_responses: HashMap::new(),
         }
     }
 
@@ -125,6 +149,48 @@ impl NetworkNode {
             .dht
             .get_providers(record_key(key));
         self.discovery_queries.insert(query_id, key);
+    }
+
+    /// Sends a validated synchronization request to an authenticated peer.
+    pub fn send_sync_request(
+        &mut self,
+        peer_id: PeerId,
+        request: SyncRequest,
+    ) -> Result<OutboundSyncRequestId, NetworkError> {
+        request.validate()?;
+        Ok(OutboundSyncRequestId(
+            self.swarm
+                .behaviour_mut()
+                .sync
+                .send_request(&peer_id, request),
+        ))
+    }
+
+    /// Sends a validated response to a previously surfaced inbound request.
+    pub fn send_sync_response(
+        &mut self,
+        request_id: InboundSyncRequestId,
+        response: SyncResponse,
+    ) -> Result<(), NetworkError> {
+        response.validate()?;
+        let channel = self
+            .pending_sync_responses
+            .remove(&request_id)
+            .ok_or(NetworkError::UnknownSyncRequest)?;
+        self.swarm
+            .behaviour_mut()
+            .sync
+            .send_response(channel, response)
+            .map_err(|_| NetworkError::SyncResponseChannelClosed)
+    }
+
+    /// Rejects an inbound request without disclosing group state.
+    pub fn reject_sync_request(
+        &mut self,
+        request_id: InboundSyncRequestId,
+        reason: SyncRejectReason,
+    ) -> Result<(), NetworkError> {
+        self.send_sync_response(request_id, SyncResponse::Rejected { reason })
     }
 
     /// Waits for the next application-relevant network event.
@@ -207,11 +273,89 @@ impl NetworkNode {
                         };
                     }
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request_id,
+                            request,
+                            channel,
+                        },
+                    ..
+                })) => {
+                    if request.validate().is_err() {
+                        let _ = self.swarm.behaviour_mut().sync.send_response(
+                            channel,
+                            SyncResponse::Rejected {
+                                reason: SyncRejectReason::InvalidRequest,
+                            },
+                        );
+                        continue;
+                    }
+                    let request_id = InboundSyncRequestId(request_id);
+                    self.pending_sync_responses.insert(request_id, channel);
+                    return NetworkEvent::SyncRequestReceived {
+                        peer_id: peer,
+                        request_id,
+                        request,
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                })) => {
+                    let request_id = OutboundSyncRequestId(request_id);
+                    return match response.validate() {
+                        Ok(()) => NetworkEvent::SyncResponseReceived {
+                            peer_id: peer,
+                            request_id,
+                            response,
+                        },
+                        Err(_) => NetworkEvent::SyncRequestFailed {
+                            peer_id: peer,
+                            request_id,
+                            failure: SyncFailure::InvalidResponse,
+                        },
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    return NetworkEvent::SyncRequestFailed {
+                        peer_id: peer,
+                        request_id: OutboundSyncRequestId(request_id),
+                        failure: SyncFailure::from(error),
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(
+                    request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.pending_sync_responses
+                        .remove(&InboundSyncRequestId(request_id));
+                }
                 _ => {}
             }
         }
     }
 }
+
+/// Opaque identifier for an inbound synchronization request awaiting response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InboundSyncRequestId(request_response::InboundRequestId);
+
+/// Opaque identifier for an outbound synchronization request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OutboundSyncRequestId(request_response::OutboundRequestId);
 
 /// Application-facing network lifecycle events.
 #[derive(Debug, Eq, PartialEq)]
@@ -262,6 +406,62 @@ pub enum NetworkEvent {
         /// Operation that failed.
         operation: DiscoveryOperation,
     },
+    /// A validated synchronization request arrived from a connected peer.
+    SyncRequestReceived {
+        /// Authenticated transport peer.
+        peer_id: PeerId,
+        /// Token used to send the response.
+        request_id: InboundSyncRequestId,
+        /// Bounded and structurally validated request.
+        request: SyncRequest,
+    },
+    /// A validated synchronization response arrived from a connected peer.
+    SyncResponseReceived {
+        /// Authenticated transport peer.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundSyncRequestId,
+        /// Bounded response with verified event envelopes.
+        response: SyncResponse,
+    },
+    /// An outbound synchronization request failed.
+    SyncRequestFailed {
+        /// Target peer.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundSyncRequestId,
+        /// Stable failure category.
+        failure: SyncFailure,
+    },
+}
+
+/// Stable synchronization transport failure categories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncFailure {
+    /// The peer could not be dialled.
+    Dial,
+    /// The request exceeded its deadline.
+    Timeout,
+    /// The authenticated connection ended before completion.
+    ConnectionClosed,
+    /// The peer does not implement the synchronization protocol version.
+    UnsupportedProtocol,
+    /// The peer stream failed during transfer.
+    Stream,
+    /// The peer returned a response that violated protocol validation.
+    InvalidResponse,
+}
+
+impl From<request_response::OutboundFailure> for SyncFailure {
+    fn from(failure: request_response::OutboundFailure) -> Self {
+        match failure {
+            request_response::OutboundFailure::DialFailure => Self::Dial,
+            request_response::OutboundFailure::Timeout => Self::Timeout,
+            request_response::OutboundFailure::ConnectionClosed => Self::ConnectionClosed,
+            request_response::OutboundFailure::UnsupportedProtocols => Self::UnsupportedProtocol,
+            request_response::OutboundFailure::Io(_) => Self::Stream,
+        }
+    }
 }
 
 /// Rendezvous operation associated with a discovery failure.
@@ -288,6 +488,15 @@ pub enum NetworkError {
     /// The local DHT store rejected a provider record.
     #[error("failed to store the local DHT provider record")]
     ProviderStore(#[from] kad::store::Error),
+    /// A locally created synchronization message violated protocol limits.
+    #[error("invalid synchronization message")]
+    Sync(#[from] SyncError),
+    /// The inbound request token is no longer pending.
+    #[error("synchronization request is no longer awaiting a response")]
+    UnknownSyncRequest,
+    /// The peer stream closed before the response could be queued.
+    #[error("synchronization response channel is closed")]
+    SyncResponseChannelClosed,
 }
 
 fn record_key(key: DiscoveryKey) -> kad::RecordKey {
@@ -298,7 +507,7 @@ fn record_key(key: DiscoveryKey) -> kad::RecordKey {
 mod tests {
     use std::time::Duration;
 
-    use charp2p_core::{DiscoveryKey, GroupIdentity};
+    use charp2p_core::{DiscoveryKey, GroupIdentity, SyncAuthorHead, SyncRequest, SyncResponse};
     use libp2p::{Multiaddr, identity::Keypair};
     use tokio::time::timeout;
 
@@ -308,6 +517,45 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_establish_an_authenticated_quic_connection() {
+        let _ = connected_nodes().await;
+    }
+
+    #[tokio::test]
+    async fn connected_peers_exchange_validated_sync_messages() {
+        let (mut listener, mut dialer, listener_id, dialer_id) = connected_nodes().await;
+        let group_id = GroupIdentity::generate().group_id();
+        let outbound_id = dialer
+            .send_sync_request(listener_id, SyncRequest::Summary { group_id })
+            .unwrap();
+
+        let (request_peer, inbound_id, request) =
+            timeout(TEST_TIMEOUT, next_sync_request(&mut listener, &mut dialer))
+                .await
+                .expect("listener should receive the sync request");
+        assert_eq!(request_peer, dialer_id);
+        assert_eq!(request, SyncRequest::Summary { group_id });
+
+        let response = SyncResponse::Summary {
+            group_id,
+            heads: vec![SyncAuthorHead {
+                author_id: dialer_id,
+                contiguous_sequence: 4,
+            }],
+        };
+        listener
+            .send_sync_response(inbound_id, response.clone())
+            .unwrap();
+
+        let (response_peer, received_id, received) =
+            timeout(TEST_TIMEOUT, next_sync_response(&mut dialer, &mut listener))
+                .await
+                .expect("dialer should receive the sync response");
+        assert_eq!(response_peer, listener_id);
+        assert_eq!(received_id, outbound_id);
+        assert_eq!(received, response);
+    }
+
+    async fn connected_nodes() -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {
         let mut listener = NetworkNode::new(Keypair::generate_ed25519());
         let mut dialer = NetworkNode::new(Keypair::generate_ed25519());
         let listener_id = listener.peer_id();
@@ -333,6 +581,8 @@ mod tests {
 
         assert_eq!(listener_peer, dialer_id);
         assert_eq!(dialer_peer, listener_id);
+
+        (listener, dialer, listener_id, dialer_id)
     }
 
     #[tokio::test]
@@ -373,6 +623,48 @@ mod tests {
         loop {
             if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
                 return peer_id;
+            }
+        }
+    }
+
+    async fn next_sync_request(
+        receiver: &mut NetworkNode,
+        other: &mut NetworkNode,
+    ) -> (libp2p::PeerId, super::InboundSyncRequestId, SyncRequest) {
+        loop {
+            tokio::select! {
+                event = receiver.next_event() => {
+                    if let NetworkEvent::SyncRequestReceived {
+                        peer_id,
+                        request_id,
+                        request,
+                    } = event
+                    {
+                        return (peer_id, request_id, request);
+                    }
+                }
+                _ = other.next_event() => {}
+            }
+        }
+    }
+
+    async fn next_sync_response(
+        receiver: &mut NetworkNode,
+        other: &mut NetworkNode,
+    ) -> (libp2p::PeerId, super::OutboundSyncRequestId, SyncResponse) {
+        loop {
+            tokio::select! {
+                event = receiver.next_event() => {
+                    if let NetworkEvent::SyncResponseReceived {
+                        peer_id,
+                        request_id,
+                        response,
+                    } = event
+                    {
+                        return (peer_id, request_id, response);
+                    }
+                }
+                _ = other.next_event() => {}
             }
         }
     }

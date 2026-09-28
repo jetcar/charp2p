@@ -1,0 +1,64 @@
+# ADR-004: SQLite for verified local events
+
+## Status
+
+Accepted
+
+## Date
+
+2026-09-28
+
+## Context
+
+Windows and Android clients need durable, transactional storage for verified
+events. Repeated peer delivery must be idempotent, while reuse of one author
+sequence for different event content must be detected before synchronization
+state advances.
+
+Cryptographic key material has different security requirements and must remain
+in platform-protected storage rather than the event database.
+
+## Decision
+
+Use SQLite through `rusqlite` for the local verified-event index. Store each
+canonical signed envelope once by event ID and enforce a unique constraint on
+group, author, and author sequence.
+
+Re-verify envelopes when reading them from storage. Use strict SQLite tables,
+explicit schema versions, transactional writes, foreign-key enforcement, and a
+bundled SQLite build for consistent desktop and Android behavior.
+
+Keep identity and group key material outside SQLite behind future platform
+key-store adapters.
+
+## Alternatives considered
+
+### Flat event files
+
+Simple to append, but require custom indexing, crash recovery, compaction, and
+sequence-conflict handling.
+
+### Embedded key-value store
+
+Efficient for event IDs, but synchronization also needs ordered group/author
+sequence queries and transactional secondary indexes.
+
+### Store keys with events
+
+Operationally simple, but exposes long-lived private keys to ordinary database
+backup and diagnostic workflows.
+
+## Consequences
+
+- Duplicate delivery is an inexpensive no-op.
+- Sequence conflicts are durable integrity failures rather than UI-level
+  deduplication.
+- Schema changes require migrations and compatibility tests.
+- Database encryption at rest is separate from end-to-end payload protection.
+
+## Sources
+
+- https://docs.rs/rusqlite/0.40.2
+- https://www.sqlite.org/stricttables.html
+- https://www.sqlite.org/lang_transaction.html
+

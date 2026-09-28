@@ -1,0 +1,15 @@
+[package]
+name = "charp2p-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+charp2p-core = { path = "../charp2p-core" }
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

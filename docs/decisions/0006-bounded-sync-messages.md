@@ -40,6 +40,10 @@ After authorization, a synchronization engine builds responses from verified
 SQLite events. Incoming event responses are validated as a whole and committed
 in one transaction so sequence conflicts cannot leave a partial batch.
 
+A pull session processes one peer sequentially: summary, event-ID page, event
+batch, then the next page or author. It detects mismatched responses and peers
+that advertise history but fail to advance the local gap-free sequence.
+
 ## Consequences
 
 - Missing sequence gaps cannot be mistaken for synchronized history.

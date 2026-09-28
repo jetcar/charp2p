@@ -10,8 +10,8 @@ compatible nodes.
 
 ## Current status
 
-The repository is implementing the shared Rust protocol core and network
-foundation from the approved product and technical designs.
+The repository includes the shared Rust protocol and network foundation plus an
+adaptive Tauri application shell for Windows and Android.
 
 - [Product design](docs/product-design.md)
 - [Technical design](docs/technical-design.md)
@@ -22,13 +22,28 @@ foundation from the approved product and technical designs.
 
 ## Development
 
-The implementation uses a shared Rust core. Tauri application shells for
-Windows and Android will be added after the core protocol contracts are proven.
+Test the shared Rust crates:
 
 ```powershell
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+```
+
+Run the application shell:
+
+```powershell
+cd apps/charp2p-app
+pnpm install
+pnpm tauri dev
+```
+
+Initialize or run the Android target after installing Tauri's Android
+prerequisites:
+
+```powershell
+pnpm tauri android init
+pnpm tauri android dev
 ```
 
 Architecture decisions are recorded in [docs/decisions](docs/decisions).

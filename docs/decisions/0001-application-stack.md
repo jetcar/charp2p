@@ -20,10 +20,12 @@ and NAT traversal building blocks.
 
 Use a Rust workspace for shared domain, cryptographic identity, persistence,
 synchronization, and libp2p networking. Use Tauri 2 application shells with a
-TypeScript web UI for Windows and Android.
+React and TypeScript web UI built by Vite for Windows and Android.
 
 Keep the shared Rust core independent of Tauri. Tauri commands will be thin
 adapters, allowing core protocol tests to run without a WebView or mobile SDK.
+Keep the application crate in its own nested Cargo workspace so root protocol
+checks do not compile platform shell dependencies.
 
 ## Alternatives considered
 
@@ -59,4 +61,3 @@ and presentation work before the protocol is proven.
 - https://v2.tauri.app/develop/plugins/develop-mobile/
 - https://libp2p.io/guides/getting-started-rust/
 - https://docs.rs/libp2p-identity/0.3.0
-

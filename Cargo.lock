@@ -298,6 +298,7 @@ dependencies = [
 name = "charp2p-network"
 version = "0.1.0"
 dependencies = [
+ "charp2p-core",
  "futures",
  "libp2p",
  "thiserror 2.0.21",

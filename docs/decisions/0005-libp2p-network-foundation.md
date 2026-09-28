@@ -18,10 +18,12 @@ network without sending chat events through a central service.
 Use rust-libp2p 0.57 with Tokio. Start client nodes with encrypted QUIC,
 Identify, Ping, and client-mode Kademlia behaviours. Identify metadata supplies
 learned peer addresses to Kademlia. Known bootstrap addresses are configured by
-the application before starting a bootstrap query.
+the application before starting a bootstrap query. Invitation-scoped BLAKE3
+rendezvous keys use Kademlia provider records to advertise and find online
+group peers without publishing group metadata.
 
-Keep TCP, relay, NAT traversal, provider advertisement, and synchronization
-streams as later increments over this foundation.
+Keep TCP, relay, NAT traversal, and synchronization streams as later increments
+over this foundation.
 
 ## Consequences
 

@@ -107,7 +107,7 @@ application records in BitTorrent Mainline DHT.
 An online group member advertises a provider record for an opaque key:
 
 ```text
-discovery_key = multihash(
+discovery_key = BLAKE3(
   "charp2p-rendezvous-v1" || group_id || discovery_secret
 )
 ```
@@ -123,7 +123,8 @@ signature
 ```
 
 It contains no group name, membership, messages, or group encryption keys.
-Records expire quickly and online peers periodically re-advertise. Exact TTL,
+The 32-byte result is the opaque Kademlia provider-record key preimage. Records
+expire quickly and online peers periodically re-advertise. Exact TTL,
 refresh interval, record size, and per-peer quotas will be fixed through load
 testing.
 

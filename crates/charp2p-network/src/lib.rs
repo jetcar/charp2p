@@ -2,8 +2,9 @@
 
 //! Portable libp2p transport and peer-discovery foundation for CharP2P.
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
+use charp2p_core::DiscoveryKey;
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
@@ -44,6 +45,7 @@ impl Behaviour {
 /// A client-mode CharP2P node using authenticated, encrypted QUIC transport.
 pub struct NetworkNode {
     swarm: Swarm<Behaviour>,
+    discovery_queries: HashMap<kad::QueryId, DiscoveryKey>,
 }
 
 impl NetworkNode {
@@ -59,7 +61,10 @@ impl NetworkNode {
             })
             .build();
 
-        Self { swarm }
+        Self {
+            swarm,
+            discovery_queries: HashMap::new(),
+        }
     }
 
     /// Returns this node's authenticated peer identifier.
@@ -93,6 +98,35 @@ impl NetworkNode {
         Ok(())
     }
 
+    /// Advertises this online peer for an invitation-scoped rendezvous key.
+    pub fn announce_group(&mut self, key: DiscoveryKey) -> Result<(), NetworkError> {
+        let query_id = self
+            .swarm
+            .behaviour_mut()
+            .dht
+            .start_providing(record_key(key))?;
+        self.discovery_queries.insert(query_id, key);
+        Ok(())
+    }
+
+    /// Stops periodically advertising this peer for a rendezvous key.
+    pub fn stop_announcing_group(&mut self, key: DiscoveryKey) {
+        self.swarm
+            .behaviour_mut()
+            .dht
+            .stop_providing(&record_key(key));
+    }
+
+    /// Searches the DHT for peers advertising the same rendezvous key.
+    pub fn find_group_peers(&mut self, key: DiscoveryKey) {
+        let query_id = self
+            .swarm
+            .behaviour_mut()
+            .dht
+            .get_providers(record_key(key));
+        self.discovery_queries.insert(query_id, key);
+    }
+
     /// Waits for the next application-relevant network event.
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
@@ -121,6 +155,57 @@ impl NetworkNode {
                         peer_id,
                         listen_addresses: info.listen_addrs,
                     };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Dht(
+                    kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::StartProviding(result),
+                        step,
+                        ..
+                    },
+                )) => {
+                    let key = self.discovery_queries.get(&id).copied();
+                    if step.last {
+                        self.discovery_queries.remove(&id);
+                    }
+                    if let Some(key) = key {
+                        return match result {
+                            Ok(_) => NetworkEvent::GroupAnnounced { key },
+                            Err(_) => NetworkEvent::DiscoveryFailed {
+                                key,
+                                operation: DiscoveryOperation::Announcement,
+                            },
+                        };
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Dht(
+                    kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetProviders(result),
+                        step,
+                        ..
+                    },
+                )) => {
+                    let key = self.discovery_queries.get(&id).copied();
+                    if step.last {
+                        self.discovery_queries.remove(&id);
+                    }
+                    if let Some(key) = key {
+                        return match result {
+                            Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
+                                let mut providers: Vec<_> = providers.into_iter().collect();
+                                providers.sort();
+                                NetworkEvent::GroupPeersFound { key, providers }
+                            }
+                            Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
+                                NetworkEvent::GroupPeerSearchFinished { key }
+                            }
+                            Err(_) => NetworkEvent::DiscoveryFailed {
+                                key,
+                                operation: DiscoveryOperation::Search,
+                            },
+                        };
+                    }
                 }
                 _ => {}
             }
@@ -153,6 +238,39 @@ pub enum NetworkEvent {
         /// Addresses advertised by the remote Identify behaviour.
         listen_addresses: Vec<Multiaddr>,
     },
+    /// This node's provider record was published to the DHT.
+    GroupAnnounced {
+        /// Invitation-scoped rendezvous key.
+        key: DiscoveryKey,
+    },
+    /// A DHT lookup returned peers sharing the rendezvous key.
+    GroupPeersFound {
+        /// Invitation-scoped rendezvous key.
+        key: DiscoveryKey,
+        /// Newly discovered provider identities.
+        providers: Vec<PeerId>,
+    },
+    /// A provider search completed with no further records.
+    GroupPeerSearchFinished {
+        /// Invitation-scoped rendezvous key.
+        key: DiscoveryKey,
+    },
+    /// A rendezvous DHT operation timed out.
+    DiscoveryFailed {
+        /// Invitation-scoped rendezvous key.
+        key: DiscoveryKey,
+        /// Operation that failed.
+        operation: DiscoveryOperation,
+    },
+}
+
+/// Rendezvous operation associated with a discovery failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryOperation {
+    /// Publishing the local provider record.
+    Announcement,
+    /// Searching for provider records.
+    Search,
 }
 
 /// Failures while configuring or operating a network node.
@@ -167,12 +285,20 @@ pub enum NetworkError {
     /// No bootstrap peer is configured or the DHT query could not start.
     #[error("failed to start DHT bootstrap")]
     Bootstrap(#[from] kad::NoKnownPeers),
+    /// The local DHT store rejected a provider record.
+    #[error("failed to store the local DHT provider record")]
+    ProviderStore(#[from] kad::store::Error),
+}
+
+fn record_key(key: DiscoveryKey) -> kad::RecordKey {
+    kad::RecordKey::new(key.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use charp2p_core::{DiscoveryKey, GroupIdentity};
     use libp2p::{Multiaddr, identity::Keypair};
     use tokio::time::timeout;
 
@@ -207,6 +333,32 @@ mod tests {
 
         assert_eq!(listener_peer, dialer_id);
         assert_eq!(dialer_peer, listener_id);
+    }
+
+    #[tokio::test]
+    async fn announced_group_is_found_by_its_invitation_scoped_key() {
+        let mut node = NetworkNode::new(Keypair::generate_ed25519());
+        let key = DiscoveryKey::derive(GroupIdentity::generate().group_id(), &[7; 32]);
+
+        node.announce_group(key).unwrap();
+        node.find_group_peers(key);
+
+        let providers = timeout(TEST_TIMEOUT, async {
+            loop {
+                if let NetworkEvent::GroupPeersFound {
+                    key: found_key,
+                    providers,
+                } = node.next_event().await
+                {
+                    assert_eq!(found_key, key);
+                    break providers;
+                }
+            }
+        })
+        .await
+        .expect("local provider lookup should complete");
+
+        assert_eq!(providers, vec![node.peer_id()]);
     }
 
     async fn next_listen_address(node: &mut NetworkNode) -> Multiaddr {

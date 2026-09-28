@@ -2,13 +2,28 @@
 
 //! Durable local persistence for verified CharP2P protocol data.
 
-use std::path::Path;
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
 
-use charp2p_core::{EventError, EventId, SignedEvent};
+use charp2p_core::{EventError, EventId, PeerId, SignedEvent};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 1;
+
+/// Largest event-identifier page returned for one synchronization request.
+pub const MAX_SYNC_BATCH_EVENTS: usize = 256;
+
+/// Highest gap-free event sequence stored for one group author.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorHead {
+    /// Device that authored this sequence.
+    pub author_id: PeerId,
+    /// Highest sequence for which every event from one is present.
+    pub contiguous_sequence: u64,
+}
 
 /// Result of adding an already-verified event to the local store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,9 +109,88 @@ impl EventStore {
             )
             .optional()?;
 
-        encoded
+        let event = encoded
             .map(|bytes| SignedEvent::decode(&bytes).map_err(StoreError::from))
-            .transpose()
+            .transpose()?;
+        if event.as_ref().is_some_and(|event| event.id() != event_id) {
+            return Err(StoreError::CorruptIndex);
+        }
+        Ok(event)
+    }
+
+    /// Returns gap-free author heads for compact synchronization comparison.
+    pub fn synchronization_summary(&self, group_id: PeerId) -> Result<Vec<AuthorHead>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT encoded FROM events WHERE group_id = ?1")?;
+        let encoded = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut sequences: HashMap<PeerId, BTreeSet<u64>> = HashMap::new();
+
+        for bytes in encoded {
+            let event = SignedEvent::decode(&bytes?)?;
+            if event.group_id() != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            sequences
+                .entry(event.author_id())
+                .or_default()
+                .insert(event.author_sequence());
+        }
+
+        let mut summary: Vec<_> = sequences
+            .into_iter()
+            .map(|(author_id, sequences)| AuthorHead {
+                author_id,
+                contiguous_sequence: contiguous_head(&sequences),
+            })
+            .collect();
+        summary.sort_by_key(|head| head.author_id.to_bytes());
+        Ok(summary)
+    }
+
+    /// Returns an ordered, bounded page of event IDs after an author sequence.
+    pub fn event_ids_after(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventId>, StoreError> {
+        if !(1..=MAX_SYNC_BATCH_EVENTS).contains(&limit) {
+            return Err(StoreError::InvalidBatchLimit(limit));
+        }
+        let Ok(after_sequence) = i64::try_from(after_sequence) else {
+            return Ok(Vec::new());
+        };
+
+        let mut statement = self.connection.prepare(
+            "SELECT encoded FROM events
+             WHERE group_id = ?1 AND author_id = ?2 AND author_sequence > ?3
+             ORDER BY author_sequence
+             LIMIT ?4",
+        )?;
+        let encoded = statement.query_map(
+            params![
+                group_id.to_bytes(),
+                author_id.to_bytes(),
+                after_sequence,
+                limit as i64
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut event_ids = Vec::with_capacity(limit);
+
+        for bytes in encoded {
+            let event = SignedEvent::decode(&bytes?)?;
+            if event.group_id() != group_id
+                || event.author_id() != author_id
+                || event.author_sequence() <= after_sequence as u64
+            {
+                return Err(StoreError::CorruptIndex);
+            }
+            event_ids.push(event.id());
+        }
+        Ok(event_ids)
     }
 
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
@@ -153,14 +247,32 @@ pub enum StoreError {
         /// Conflicting author sequence.
         sequence: u64,
     },
+    /// A synchronization page size is zero or exceeds the protocol bound.
+    #[error("invalid synchronization batch limit {0}")]
+    InvalidBatchLimit(usize),
+    /// Stored index columns disagree with the verified signed envelope.
+    #[error("event-store index does not match its signed event")]
+    CorruptIndex,
+}
+
+fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
+    sequences
+        .iter()
+        .copied()
+        .zip(1..)
+        .take_while(|(actual, expected)| actual == expected)
+        .map(|(sequence, _)| sequence)
+        .last()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use charp2p_core::{DeviceIdentity, EventKind, EventSpec, GroupIdentity, SignedEvent};
+    use rusqlite::params;
     use tempfile::NamedTempFile;
 
-    use super::{EventStore, PutEventOutcome, StoreError};
+    use super::{AuthorHead, EventStore, MAX_SYNC_BATCH_EVENTS, PutEventOutcome, StoreError};
 
     fn message_event(
         author: &DeviceIdentity,
@@ -245,5 +357,103 @@ mod tests {
         );
 
         assert!(store.get_event(event.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn summary_reports_only_gap_free_author_sequences() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let first_author = DeviceIdentity::generate();
+        let second_author = DeviceIdentity::generate();
+        let first = message_event(&first_author, &group, 1, b"first");
+        let missing = message_event(&first_author, &group, 2, b"second");
+        let third = message_event(&first_author, &group, 3, b"third");
+        let second_author_gap = message_event(&second_author, &group, 2, b"gap");
+
+        store.put_event(&first).unwrap();
+        store.put_event(&third).unwrap();
+        store.put_event(&second_author_gap).unwrap();
+
+        let mut expected = vec![
+            AuthorHead {
+                author_id: first_author.peer_id(),
+                contiguous_sequence: 1,
+            },
+            AuthorHead {
+                author_id: second_author.peer_id(),
+                contiguous_sequence: 0,
+            },
+        ];
+        expected.sort_by_key(|head| head.author_id.to_bytes());
+        assert_eq!(
+            store.synchronization_summary(group.group_id()).unwrap(),
+            expected
+        );
+
+        store.put_event(&missing).unwrap();
+        let summary = store.synchronization_summary(group.group_id()).unwrap();
+        let first_head = summary
+            .iter()
+            .find(|head| head.author_id == first_author.peer_id())
+            .unwrap();
+        assert_eq!(first_head.contiguous_sequence, 3);
+    }
+
+    #[test]
+    fn event_id_pages_are_ordered_bounded_and_group_scoped() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let first = message_event(&author, &group, 1, b"first");
+        let second = message_event(&author, &group, 2, b"second");
+        let third = message_event(&author, &group, 3, b"third");
+        let unrelated = message_event(&author, &other_group, 4, b"unrelated");
+
+        for event in [&third, &unrelated, &first, &second] {
+            store.put_event(event).unwrap();
+        }
+
+        assert_eq!(
+            store
+                .event_ids_after(group.group_id(), author.peer_id(), 0, 2)
+                .unwrap(),
+            vec![first.id(), second.id()]
+        );
+        assert_eq!(
+            store
+                .event_ids_after(group.group_id(), author.peer_id(), 1, MAX_SYNC_BATCH_EVENTS,)
+                .unwrap(),
+            vec![second.id(), third.id()]
+        );
+        assert!(matches!(
+            store.event_ids_after(group.group_id(), author.peer_id(), 0, 0),
+            Err(StoreError::InvalidBatchLimit(0))
+        ));
+    }
+
+    #[test]
+    fn stored_event_id_is_checked_against_the_signed_envelope() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let stored = message_event(&author, &group, 1, b"stored");
+        let replacement = message_event(&author, &group, 1, b"replacement");
+        store.put_event(&stored).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE events SET encoded = ?1 WHERE event_id = ?2",
+                params![
+                    replacement.encode().unwrap(),
+                    stored.id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.get_event(stored.id()),
+            Err(StoreError::CorruptIndex)
+        ));
     }
 }

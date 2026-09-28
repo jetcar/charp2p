@@ -193,9 +193,10 @@ but cannot guarantee erasure from devices that already received it.
 
 ## Synchronization
 
-Peers first exchange a compact summary of known author sequences and membership
-state. They then request missing event identifiers in bounded batches, verify
-each envelope, and commit valid events transactionally to local storage.
+Peers first exchange a compact summary containing each author's highest
+gap-free sequence and the current membership state. They then request missing
+event identifiers in batches of at most 256, verify each envelope, and commit
+valid events transactionally to local storage.
 
 Requirements:
 

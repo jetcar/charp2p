@@ -28,6 +28,10 @@ Re-verify envelopes when reading them from storage. Use strict SQLite tables,
 explicit schema versions, transactional writes, foreign-key enforcement, and a
 bundled SQLite build for consistent desktop and Android behavior.
 
+Build synchronization summaries from each author's highest gap-free sequence.
+Expose event identifiers after a sequence in ordered pages capped at 256, and
+verify signed envelopes before their identifiers leave the store.
+
 Keep identity and group key material outside SQLite behind future platform
 key-store adapters.
 
@@ -61,4 +65,3 @@ backup and diagnostic workflows.
 - https://docs.rs/rusqlite/0.40.2
 - https://www.sqlite.org/stricttables.html
 - https://www.sqlite.org/lang_transaction.html
-

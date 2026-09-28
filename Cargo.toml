@@ -2,6 +2,7 @@
 members = [
     "crates/charp2p-core",
     "crates/charp2p-network",
+    "crates/charp2p-node",
     "crates/charp2p-store",
     "crates/charp2p-sync",
 ]
@@ -14,6 +15,7 @@ rust-version = "1.98.1"
 [workspace.dependencies]
 base64 = "0.23.1"
 blake3 = "1.8.7"
+clap = { version = "4.5.48", features = ["derive", "env"] }
 futures = "0.3.34"
 getrandom = "0.4.3"
 libp2p = { version = "0.57.0", features = ["cbor", "identify", "kad", "macros", "ping", "quic", "request-response", "tokio"] }

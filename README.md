@@ -11,7 +11,8 @@ compatible nodes.
 ## Current status
 
 The repository includes the shared Rust protocol and network foundation plus an
-adaptive Tauri application shell for Windows and Android.
+adaptive Tauri application shell for Windows and Android. It also includes a
+standalone community bootstrap and DHT routing node.
 
 - [Product design](docs/product-design.md)
 - [Technical design](docs/technical-design.md)
@@ -37,6 +38,16 @@ cd apps/charp2p-app
 pnpm install
 pnpm tauri dev
 ```
+
+Run a local routing node:
+
+```powershell
+cargo run -p charp2p-node -- --listen /ip4/0.0.0.0/udp/4001/quic-v1
+```
+
+The node prints its full bootstrap multiaddress after binding. See the
+[routing-node guide](crates/charp2p-node/README.md) for identity storage and
+client configuration.
 
 Initialize or run the Android target after installing Tauri's Android
 prerequisites:

@@ -1,0 +1,18 @@
+[package]
+name = "charp2p-node"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+charp2p-core = { path = "../charp2p-core" }
+charp2p-network = { path = "../charp2p-network" }
+clap.workspace = true
+libp2p.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

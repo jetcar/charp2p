@@ -279,6 +279,10 @@ The project node stores only bounded DHT records, relay reservations, routing
 state, and minimal security telemetry. It does not store group events or
 message payloads.
 
+The initial standalone node implements bootstrap and Kademlia routing with
+in-memory DHT state. It rejects group synchronization requests. Relay service,
+traffic quotas, metrics, and deployment packaging remain production gates.
+
 It can:
 
 - Enforce per-IP and per-peer connection and bandwidth limits.

@@ -1,0 +1,13 @@
+[package]
+name = "charp2p-mls"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openmls.workspace = true
+
+[dev-dependencies]
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true

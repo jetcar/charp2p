@@ -251,11 +251,21 @@ Transport encryption is mandatory but insufficient because relay and storage
 topologies may change. Message payloads therefore require end-to-end
 protection.
 
-The implementation must use a reviewed group-messaging construction and
-maintained cryptographic libraries. It must not invent encryption, key
-derivation, or group key rotation. The selection between an MLS-based design
-and a smaller-group sender-key construction is an explicit architecture
-decision required before protocol code begins.
+The implementation uses Messaging Layer Security (RFC 9420) through OpenMLS.
+Profile version 1 pins
+`MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`, includes the ratchet tree
+in Welcome messages, carries the profile version in an authenticated private-use
+group-context extension, and represents every authorized device as a distinct
+MLS leaf. Other suites and profile versions are rejected rather than negotiated
+through a silent downgrade. ADR-012 records the selection and initial
+prototype.
+
+Clients reject a non-profile ciphersuite from the public Welcome header before
+processing it. They validate the authenticated group-context profile marker on
+staged Welcomes before group persistence, on every staged commit before merge,
+and on restored group state before use. A rejected decrypted Welcome consumes
+its matching one-time MLS KeyPackage, so the joining client publishes a fresh
+one afterward.
 
 Whichever construction is selected must provide:
 
@@ -328,7 +338,11 @@ screenshots, or previously received history.
 
 Before protocol implementation:
 
-1. Select and prototype the group-message protection construction.
+1. ~~Select and prototype the group-message protection construction.~~ MLS via
+   OpenMLS is selected and its initial multi-member flow is covered by an
+   executable Windows prototype. Android target and device validation remains
+   part of the application integration gate because upstream builds but does
+   not test Android targets.
 2. Select the portable core and UI stack.
 3. Define canonical binary serialization and size limits.
 4. Write protocol test vectors for identities, invitations, event signatures,

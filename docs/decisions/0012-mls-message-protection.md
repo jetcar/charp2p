@@ -1,0 +1,78 @@
+# ADR-012: MLS message protection
+
+## Status
+
+Accepted
+
+## Date
+
+2026-09-28
+
+## Context
+
+CharP2P needs end-to-end protection that remains sound when peers synchronize
+through untrusted transports, members join asynchronously, and owners remove a
+member or device. A bespoke sender-key protocol would require CharP2P to define
+and audit key distribution, replay handling, epoch transitions, and recovery
+from concurrent membership changes.
+
+## Decision
+
+Use Messaging Layer Security as specified by RFC 9420 through OpenMLS 0.9. Pin
+profile version 1 to
+`MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`; clients reject other
+ciphersuites for this profile instead of silently downgrading. Carry version 1
+in an authenticated MLS group-context extension from the RFC 9420 private-use
+range and require every leaf to advertise support. Include the ratchet-tree
+extension in Welcome messages created by both original and joined members so a
+joining peer does not require a central delivery service to fetch the public
+tree.
+
+Use one wrapper to reject a mismatched ciphersuite from the public Welcome
+header before OpenMLS processes it, apply the profile join configuration, and
+validate the decrypted group context before returning unpersisted staged state.
+Validate every staged commit before merging it. Validate restored group state,
+including the ratchet-tree join configuration, before use. OpenMLS consumes a
+matching one-time KeyPackage while decrypting a Welcome; a Welcome rejected
+after decryption therefore requires the joining device to publish a fresh
+KeyPackage.
+
+Treat every authorized device as a separate MLS leaf. Bind the CharP2P device
+peer ID into its MLS Basic Credential and validate that binding against signed
+membership events before accepting the leaf. The stable CharP2P group ID stays
+the application identity; the MLS group ID and epoch are protocol state.
+
+Persist OpenMLS state with a dedicated provider before integrating it into the
+application. Keep signature private keys and exported recovery material in
+platform-protected storage. Never enable OpenMLS content or crypto debug
+features in application builds.
+
+The initial prototype fixes and authenticates the profile configuration,
+rejects mismatched state, and verifies group creation, chained asynchronous
+member admission through self-contained Welcomes, and authenticated encrypted
+application messages across distinct providers.
+
+## Consequences
+
+- Membership changes and message protection use a reviewed standard rather
+  than a CharP2P-specific cryptographic construction.
+- Removing a leaf advances the MLS epoch and excludes it from future messages;
+  previously received plaintext remains recoverable by that device.
+- Group operation ordering and fork resolution must be defined before joins
+  are connected to the append-only event graph.
+- Every application path that merges a staged commit must apply the profile
+  validator first; unit tests cover removal of the authenticated profile
+  marker.
+- Durable MLS provider storage, credential binding, state backup, and protocol
+  test vectors remain required before invitation acceptance can create a
+  membership.
+- OpenMLS builds Android targets in upstream CI but does not test them. The
+  selected provider and profile require an Android target build and device test
+  before application integration is complete.
+
+## Sources
+
+- https://www.rfc-editor.org/rfc/rfc9420
+- https://docs.rs/openmls/0.9.0/openmls/
+- https://book.openmls.tech/user_manual/create_group.html
+- https://github.com/openmls/openmls/security

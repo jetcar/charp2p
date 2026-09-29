@@ -477,9 +477,11 @@ dependencies = [
 name = "charp2p-mls"
 version = "0.1.0"
 dependencies = [
+ "charp2p-core",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

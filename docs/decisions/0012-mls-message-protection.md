@@ -38,9 +38,11 @@ after decryption therefore requires the joining device to publish a fresh
 KeyPackage.
 
 Treat every authorized device as a separate MLS leaf. Bind the CharP2P device
-peer ID into its MLS Basic Credential and validate that binding against signed
-membership events before accepting the leaf. The stable CharP2P group ID stays
-the application identity; the MLS group ID and epoch are protocol state.
+peer ID into a domain-separated, versioned MLS Basic Credential. Reject
+unscoped, malformed, oversized, and future-version credential identities.
+Validate the extracted device ID against signed membership events before
+accepting the leaf. The stable CharP2P group ID stays the application identity;
+the MLS group ID and epoch are protocol state.
 
 Persist OpenMLS state with a dedicated provider before integrating it into the
 application. Keep signature private keys and exported recovery material in
@@ -63,9 +65,12 @@ application messages across distinct providers.
 - Every application path that merges a staged commit must apply the profile
   validator first; unit tests cover removal of the authenticated profile
   marker.
-- Durable MLS provider storage, credential binding, state backup, and protocol
-  test vectors remain required before invitation acceptance can create a
-  membership.
+- Durable MLS provider storage, credential-to-membership authorization, state
+  backup, and protocol test vectors remain required before invitation
+  acceptance can create a membership.
+- Profile version 1 rejects encoded MLS messages above 128 KiB before parsing.
+  Self-contained Welcomes therefore have a size-dependent group limit; the
+  supported member count remains to be set from worst-case measurements.
 - OpenMLS builds Android targets in upstream CI but does not test them. The
   selected provider and profile require an Android target build and device test
   before application integration is complete.

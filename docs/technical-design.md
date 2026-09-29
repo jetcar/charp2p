@@ -260,6 +260,20 @@ MLS leaf. Other suites and profile versions are rejected rather than negotiated
 through a silent downgrade. ADR-012 records the selection and initial
 prototype.
 
+Each MLS Basic Credential contains a bounded, domain-separated, versioned
+encoding of the device's libp2p peer ID. Clients reject other credential types
+or malformed identities. They bound the complete MLS wire message before
+OpenMLS decoding, validate every leaf in a Welcome or restored group, and
+validate new or updated credentials before merging a commit. Application
+integration must additionally authorize each extracted device ID against the
+signed membership state before accepting the leaf.
+
+Profile version 1 rejects an encoded MLS message larger than 128 KiB. Because a
+self-contained Welcome includes the ratchet tree, this also limits the group
+size a device can join. There is no fixed member-count guarantee yet: Welcome
+size varies with the tree and credential data. Set the product group-size limit
+from measured worst-case Welcomes before the MVP accepts public invitations.
+
 Clients reject a non-profile ciphersuite from the public Welcome header before
 processing it. They validate the authenticated group-context profile marker on
 staged Welcomes before group persistence, on every staged commit before merge,

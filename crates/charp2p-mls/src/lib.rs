@@ -2,17 +2,25 @@
 
 //! The fixed MLS profile used for CharP2P group-message protection.
 
+use charp2p_core::PeerId;
 use openmls::{
     group::GroupContext,
     prelude::{
         Capabilities, Ciphersuite, CredentialType, Extension, ExtensionType, Extensions, MlsGroup,
-        MlsGroupCreateConfig, MlsGroupJoinConfig, RequiredCapabilitiesExtension, StagedCommit,
-        StagedWelcome, UnknownExtension, Welcome, WelcomeError,
+        MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn,
+        RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
+        tls_codec::Deserialize,
     },
 };
+use thiserror::Error;
 
 const PROFILE_EXTENSION_TYPE_ID: u16 = 0xF000;
 const PROFILE_EXTENSION_TYPE: ExtensionType = ExtensionType::Unknown(PROFILE_EXTENSION_TYPE_ID);
+const DEVICE_CREDENTIAL_DOMAIN: &[u8] = b"charp2p-device-credential\0";
+const DEVICE_CREDENTIAL_VERSION: u16 = 1;
+const MAX_DEVICE_PEER_ID_BYTES: usize = 128;
+/// Maximum accepted encoded MLS message size before parsing and allocation.
+pub const MAX_MLS_WIRE_BYTES: usize = 128 * 1024;
 
 /// Version of the CharP2P MLS profile carried by an authenticated private-use
 /// group-context extension.
@@ -34,15 +42,49 @@ pub enum ProfileError {
     UnsupportedProfileVersion,
     /// Local runtime configuration differs from the fixed profile.
     UnsupportedJoinConfiguration,
+    /// A group leaf does not carry a valid CharP2P device credential.
+    InvalidDeviceCredential,
 }
 
 /// Failure while checking and decrypting a profile Welcome.
 #[derive(Debug)]
 pub enum StageWelcomeError<StorageError> {
+    /// The encoded Welcome exceeds the wire bound or is malformed.
+    Wire(MlsWireError),
+    /// The encoded MLS message is valid but is not a Welcome.
+    UnexpectedMessage,
     /// The Welcome does not conform to the CharP2P profile.
     Profile(ProfileError),
     /// OpenMLS rejected the Welcome or its stored key material.
     OpenMls(WelcomeError<StorageError>),
+}
+
+/// Failure to decode a CharP2P device identity from an MLS credential.
+#[derive(Debug, Error)]
+pub enum DeviceCredentialError {
+    /// Profile version 1 accepts only MLS Basic Credentials.
+    #[error("MLS credential type is not supported")]
+    UnsupportedCredentialType,
+    /// The credential does not contain a canonical CharP2P device identity.
+    #[error("MLS device credential is malformed")]
+    InvalidIdentity,
+    /// The encoded CharP2P device-credential version is not supported.
+    #[error("MLS device credential version {0} is not supported")]
+    UnsupportedVersion(u16),
+}
+
+/// Failure to parse an encoded MLS message inside the profile wire bound.
+#[derive(Debug, Error)]
+pub enum MlsWireError {
+    /// The encoded message is empty or above the profile limit.
+    #[error("MLS message has an invalid encoded size")]
+    InvalidSize,
+    /// OpenMLS rejected the bounded wire encoding.
+    #[error("MLS message encoding is malformed")]
+    Malformed(#[source] openmls::prelude::tls_codec::Error),
+    /// Bytes remain after the one canonical MLS message.
+    #[error("MLS message has trailing data")]
+    TrailingData,
 }
 
 /// Returns the group configuration required by profile version 1.
@@ -76,6 +118,55 @@ pub fn profile_capabilities() -> Capabilities {
     )
 }
 
+/// Creates the MLS Basic Credential bound to one CharP2P device peer ID.
+pub fn device_credential(device_id: PeerId) -> openmls::prelude::BasicCredential {
+    let peer_id = device_id.to_bytes();
+    debug_assert!(peer_id.len() <= MAX_DEVICE_PEER_ID_BYTES);
+    let mut identity = Vec::with_capacity(DEVICE_CREDENTIAL_DOMAIN.len() + 2 + peer_id.len());
+    identity.extend_from_slice(DEVICE_CREDENTIAL_DOMAIN);
+    identity.extend_from_slice(&DEVICE_CREDENTIAL_VERSION.to_be_bytes());
+    identity.extend_from_slice(&peer_id);
+    openmls::prelude::BasicCredential::new(identity)
+}
+
+/// Extracts and validates the CharP2P device peer ID bound to an MLS
+/// credential.
+pub fn device_id_from_credential(
+    credential: &openmls::prelude::Credential,
+) -> Result<PeerId, DeviceCredentialError> {
+    if credential.credential_type() != CredentialType::Basic {
+        return Err(DeviceCredentialError::UnsupportedCredentialType);
+    }
+    let identity = credential.serialized_content();
+    let version_offset = DEVICE_CREDENTIAL_DOMAIN.len();
+    if identity.len() < version_offset + 3
+        || !identity.starts_with(DEVICE_CREDENTIAL_DOMAIN)
+        || identity.len() > version_offset + 2 + MAX_DEVICE_PEER_ID_BYTES
+    {
+        return Err(DeviceCredentialError::InvalidIdentity);
+    }
+    let version = u16::from_be_bytes([identity[version_offset], identity[version_offset + 1]]);
+    if version != DEVICE_CREDENTIAL_VERSION {
+        return Err(DeviceCredentialError::UnsupportedVersion(version));
+    }
+    PeerId::from_bytes(&identity[version_offset + 2..])
+        .map_err(|_| DeviceCredentialError::InvalidIdentity)
+}
+
+/// Bounds and parses exactly one MLS wire message before any attacker-sized
+/// field is allocated by OpenMLS.
+pub fn decode_profile_message(encoded: &[u8]) -> Result<MlsMessageIn, MlsWireError> {
+    if encoded.is_empty() || encoded.len() > MAX_MLS_WIRE_BYTES {
+        return Err(MlsWireError::InvalidSize);
+    }
+    let mut remaining = encoded;
+    let message = MlsMessageIn::tls_deserialize(&mut remaining).map_err(MlsWireError::Malformed)?;
+    if !remaining.is_empty() {
+        return Err(MlsWireError::TrailingData);
+    }
+    Ok(message)
+}
+
 /// Checks and decrypts a profile Welcome without persisting the resulting
 /// group.
 ///
@@ -86,22 +177,29 @@ pub fn profile_capabilities() -> Capabilities {
 /// application must publish a fresh key package after such a rejection.
 pub fn stage_profile_welcome<Provider: openmls::storage::OpenMlsProvider>(
     provider: &Provider,
-    welcome: Welcome,
+    encoded: &[u8],
 ) -> Result<
     StagedWelcome,
     StageWelcomeError<<Provider as openmls::storage::OpenMlsProvider>::StorageError>,
 > {
+    let message = decode_profile_message(encoded).map_err(StageWelcomeError::Wire)?;
+    let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+        return Err(StageWelcomeError::UnexpectedMessage);
+    };
     validate_ciphersuite(welcome.ciphersuite()).map_err(StageWelcomeError::Profile)?;
     let staged = StagedWelcome::new_from_welcome(provider, &group_join_config(), welcome, None)
         .map_err(StageWelcomeError::OpenMls)?;
     validate_group_context(staged.group_context()).map_err(StageWelcomeError::Profile)?;
+    validate_credentials(staged.members().map(|member| member.credential))
+        .map_err(StageWelcomeError::Profile)?;
     Ok(staged)
 }
 
 /// Rejects an authenticated commit that would move the group outside profile
 /// version 1. Call this before `MlsGroup::merge_staged_commit`.
 pub fn validate_staged_commit_profile(commit: &StagedCommit) -> Result<(), ProfileError> {
-    validate_group_context(commit.group_context())
+    validate_group_context(commit.group_context())?;
+    validate_credentials(commit.credentials_to_verify().cloned())
 }
 
 /// Rejects restored state that is outside profile version 1.
@@ -110,7 +208,8 @@ pub fn validate_group_profile(group: &MlsGroup) -> Result<(), ProfileError> {
     if group.configuration() != &group_join_config() {
         return Err(ProfileError::UnsupportedJoinConfiguration);
     }
-    validate_extensions(group.extensions())
+    validate_extensions(group.extensions())?;
+    validate_credentials(group.members().map(|member| member.credential))
 }
 
 fn validate_ciphersuite(ciphersuite: Ciphersuite) -> Result<(), ProfileError> {
@@ -133,6 +232,16 @@ fn validate_extensions(extensions: &Extensions<GroupContext>) -> Result<(), Prof
     }
 }
 
+fn validate_credentials(
+    credentials: impl IntoIterator<Item = openmls::prelude::Credential>,
+) -> Result<(), ProfileError> {
+    for credential in credentials {
+        device_id_from_credential(&credential)
+            .map_err(|_| ProfileError::InvalidDeviceCredential)?;
+    }
+    Ok(())
+}
+
 fn profile_extensions() -> Extensions<GroupContext> {
     Extensions::try_from(vec![
         Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
@@ -150,23 +259,31 @@ fn profile_extensions() -> Extensions<GroupContext> {
 
 #[cfg(test)]
 mod tests {
+    use charp2p_core::{DeviceIdentity, PeerId};
     use openmls::prelude::{
         BasicCredential, Ciphersuite, CredentialWithKey, Extensions, KeyPackage, MlsGroup,
-        MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider,
-        ProcessedMessageContent, ProtocolMessage, WireFormat,
-        tls_codec::{Deserialize, Serialize},
+        MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
+        WireFormat, tls_codec::Serialize,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, ProfileError, StageWelcomeError, group_create_config, profile_capabilities,
-        profile_extensions, stage_profile_welcome, validate_group_profile,
-        validate_staged_commit_profile,
+        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MlsWireError, ProfileError,
+        StageWelcomeError, decode_profile_message, device_credential, device_id_from_credential,
+        group_create_config, profile_capabilities, profile_extensions, stage_profile_welcome,
+        validate_group_profile, validate_staged_commit_profile,
     };
 
     fn credential(
-        identity: &[u8],
+        device_id: PeerId,
+        provider: &impl OpenMlsProvider,
+    ) -> (CredentialWithKey, SignatureKeyPair) {
+        credential_with_basic(device_credential(device_id), provider)
+    }
+
+    fn credential_with_basic(
+        credential: BasicCredential,
         provider: &impl OpenMlsProvider,
     ) -> (CredentialWithKey, SignatureKeyPair) {
         let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
@@ -174,7 +291,6 @@ mod tests {
         signer
             .store(provider.storage())
             .expect("test signer can be stored");
-        let credential = BasicCredential::new(identity.to_vec());
         (
             CredentialWithKey {
                 credential: credential.into(),
@@ -189,9 +305,12 @@ mod tests {
         let owner_provider = OpenMlsRustCrypto::default();
         let member_provider = OpenMlsRustCrypto::default();
         let third_provider = OpenMlsRustCrypto::default();
-        let (owner_credential, owner_signer) = credential(b"owner-device", &owner_provider);
-        let (member_credential, member_signer) = credential(b"member-device", &member_provider);
-        let (third_credential, third_signer) = credential(b"third-device", &third_provider);
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let third_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let (third_credential, third_signer) = credential(third_id, &third_provider);
         let member_key_package = KeyPackage::builder()
             .leaf_node_capabilities(profile_capabilities())
             .build(
@@ -225,6 +344,12 @@ mod tests {
                 &[member_key_package.key_package().clone()],
             )
             .expect("member can be added");
+        validate_staged_commit_profile(
+            owner_group
+                .pending_commit()
+                .expect("member addition creates a pending commit"),
+        )
+        .expect("locally created member addition matches the profile");
         owner_group
             .merge_pending_commit(&owner_provider)
             .expect("owner can advance the epoch");
@@ -232,25 +357,26 @@ mod tests {
         let welcome_bytes = welcome
             .tls_serialize_detached()
             .expect("welcome can be serialized");
-        let welcome_in = MlsMessageIn::tls_deserialize(&mut welcome_bytes.as_slice())
-            .expect("welcome can be parsed");
-        let MlsMessageBodyIn::Welcome(welcome) = welcome_in.extract() else {
-            panic!("expected an MLS Welcome");
-        };
-        let staged = stage_profile_welcome(&member_provider, welcome)
+        let staged = stage_profile_welcome(&member_provider, &welcome_bytes)
             .expect("invited member can stage the profile Welcome");
         let mut member_group = staged
             .into_group(&member_provider)
             .expect("invited member can join");
         validate_group_profile(&owner_group).expect("owner group matches the profile");
         validate_group_profile(&member_group).expect("joined group matches the profile");
+        let member_ids: Vec<_> = member_group
+            .members()
+            .map(|member| device_id_from_credential(&member.credential).unwrap())
+            .collect();
+        assert_eq!(member_ids.len(), 2);
+        assert!(member_ids.contains(&owner_id));
+        assert!(member_ids.contains(&member_id));
 
         let message = owner_group
             .create_message(&owner_provider, &owner_signer, b"protected hello")
             .expect("owner can protect an application message");
         let message_bytes = message.to_bytes().expect("message can be serialized");
-        let message_in =
-            MlsMessageIn::tls_deserialize_exact(message_bytes).expect("message can be parsed");
+        let message_in = decode_profile_message(&message_bytes).expect("message can be parsed");
         assert_eq!(message_in.wire_format(), WireFormat::PrivateMessage);
         let protocol_message: ProtocolMessage = message_in
             .try_into_protocol_message()
@@ -272,18 +398,19 @@ mod tests {
                 &[third_key_package.key_package().clone()],
             )
             .expect("a joined member can add another member");
+        validate_staged_commit_profile(
+            member_group
+                .pending_commit()
+                .expect("member addition creates a pending commit"),
+        )
+        .expect("joined member's local commit matches the profile");
         member_group
             .merge_pending_commit(&member_provider)
             .expect("joined member can advance the epoch");
         let third_welcome_bytes = third_welcome
             .tls_serialize_detached()
             .expect("third Welcome can be serialized");
-        let third_welcome_in = MlsMessageIn::tls_deserialize_exact(third_welcome_bytes)
-            .expect("third Welcome can be parsed");
-        let MlsMessageBodyIn::Welcome(third_welcome) = third_welcome_in.extract() else {
-            panic!("expected an MLS Welcome");
-        };
-        let third_staged = stage_profile_welcome(&third_provider, third_welcome)
+        let third_staged = stage_profile_welcome(&third_provider, &third_welcome_bytes)
             .expect("joined member's Welcome carries the ratchet tree");
         let mut third_group = third_staged
             .into_group(&third_provider)
@@ -308,8 +435,8 @@ mod tests {
         let processed_removal = third_group
             .process_message(
                 &third_provider,
-                MlsMessageIn::tls_deserialize_exact(
-                    profile_removal
+                decode_profile_message(
+                    &profile_removal
                         .commit()
                         .to_bytes()
                         .expect("commit can be serialized"),
@@ -334,8 +461,10 @@ mod tests {
     fn mismatched_welcome_and_restored_group_are_rejected() {
         let owner_provider = OpenMlsRustCrypto::default();
         let member_provider = OpenMlsRustCrypto::default();
-        let (owner_credential, owner_signer) = credential(b"owner-device", &owner_provider);
-        let (member_credential, member_signer) = credential(b"member-device", &member_provider);
+        let (owner_credential, owner_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &owner_provider);
+        let (member_credential, member_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &member_provider);
         let member_key_package = KeyPackage::builder()
             .leaf_node_capabilities(profile_capabilities())
             .build(
@@ -365,13 +494,8 @@ mod tests {
         let welcome_bytes = welcome
             .tls_serialize_detached()
             .expect("control Welcome can be serialized");
-        let welcome_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
-            .expect("control Welcome can be parsed");
-        let MlsMessageBodyIn::Welcome(welcome) = welcome_in.extract() else {
-            panic!("expected an MLS Welcome");
-        };
         assert!(matches!(
-            stage_profile_welcome(&member_provider, welcome),
+            stage_profile_welcome(&member_provider, &welcome_bytes),
             Err(StageWelcomeError::Profile(
                 ProfileError::UnsupportedProfileVersion
             ))
@@ -382,7 +506,8 @@ mod tests {
         );
 
         let second_provider = OpenMlsRustCrypto::default();
-        let (second_credential, second_signer) = credential(b"second-device", &second_provider);
+        let (second_credential, second_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &second_provider);
         let group_with_other_suite = MlsGroup::new(
             &second_provider,
             &second_signer,
@@ -398,7 +523,8 @@ mod tests {
         );
 
         let third_provider = OpenMlsRustCrypto::default();
-        let (third_credential, third_signer) = credential(b"third-device", &third_provider);
+        let (third_credential, third_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &third_provider);
         let group_without_tree_config = MlsGroup::new(
             &third_provider,
             &third_signer,
@@ -414,5 +540,174 @@ mod tests {
             validate_group_profile(&group_without_tree_config),
             Err(ProfileError::UnsupportedJoinConfiguration)
         );
+    }
+
+    #[test]
+    fn device_credentials_round_trip_and_reject_malformed_identity() {
+        let device_id = DeviceIdentity::generate().peer_id();
+        let credential: openmls::prelude::Credential = device_credential(device_id).into();
+        assert_eq!(device_id_from_credential(&credential).unwrap(), device_id);
+
+        let malformed: openmls::prelude::Credential =
+            BasicCredential::new(b"unscoped identity".to_vec()).into();
+        assert!(matches!(
+            device_id_from_credential(&malformed),
+            Err(DeviceCredentialError::InvalidIdentity)
+        ));
+
+        let mut future_identity = super::DEVICE_CREDENTIAL_DOMAIN.to_vec();
+        future_identity.extend_from_slice(&2_u16.to_be_bytes());
+        future_identity.extend_from_slice(&device_id.to_bytes());
+        let future: openmls::prelude::Credential = BasicCredential::new(future_identity).into();
+        assert!(matches!(
+            device_id_from_credential(&future),
+            Err(DeviceCredentialError::UnsupportedVersion(2))
+        ));
+
+        let wrong_type =
+            openmls::prelude::Credential::new(openmls::prelude::CredentialType::X509, Vec::new());
+        assert!(matches!(
+            device_id_from_credential(&wrong_type),
+            Err(DeviceCredentialError::UnsupportedCredentialType)
+        ));
+
+        let mut oversized_identity = super::DEVICE_CREDENTIAL_DOMAIN.to_vec();
+        oversized_identity.extend_from_slice(&super::DEVICE_CREDENTIAL_VERSION.to_be_bytes());
+        oversized_identity.extend_from_slice(&[0; super::MAX_DEVICE_PEER_ID_BYTES + 1]);
+        let oversized: openmls::prelude::Credential =
+            BasicCredential::new(oversized_identity).into();
+        assert!(matches!(
+            device_id_from_credential(&oversized),
+            Err(DeviceCredentialError::InvalidIdentity)
+        ));
+
+        let truncated: openmls::prelude::Credential =
+            BasicCredential::new(super::DEVICE_CREDENTIAL_DOMAIN.to_vec()).into();
+        assert!(matches!(
+            device_id_from_credential(&truncated),
+            Err(DeviceCredentialError::InvalidIdentity)
+        ));
+
+        let mut invalid_peer_id = super::DEVICE_CREDENTIAL_DOMAIN.to_vec();
+        invalid_peer_id.extend_from_slice(&super::DEVICE_CREDENTIAL_VERSION.to_be_bytes());
+        invalid_peer_id.push(0);
+        let invalid: openmls::prelude::Credential = BasicCredential::new(invalid_peer_id).into();
+        assert!(matches!(
+            device_id_from_credential(&invalid),
+            Err(DeviceCredentialError::InvalidIdentity)
+        ));
+
+        let mut trailing_identity = super::DEVICE_CREDENTIAL_DOMAIN.to_vec();
+        trailing_identity.extend_from_slice(&super::DEVICE_CREDENTIAL_VERSION.to_be_bytes());
+        trailing_identity.extend_from_slice(&device_id.to_bytes());
+        trailing_identity.push(0);
+        let trailing: openmls::prelude::Credential = BasicCredential::new(trailing_identity).into();
+        assert!(matches!(
+            device_id_from_credential(&trailing),
+            Err(DeviceCredentialError::InvalidIdentity)
+        ));
+    }
+
+    #[test]
+    fn profile_paths_reject_malformed_device_credentials() {
+        let malformed = || BasicCredential::new(b"unscoped identity".to_vec());
+
+        let restored_provider = OpenMlsRustCrypto::default();
+        let (restored_credential, restored_signer) =
+            credential_with_basic(malformed(), &restored_provider);
+        let restored_group = MlsGroup::new(
+            &restored_provider,
+            &restored_signer,
+            &group_create_config(),
+            restored_credential,
+        )
+        .expect("OpenMLS accepts the malformed profile credential");
+        assert_eq!(
+            validate_group_profile(&restored_group),
+            Err(ProfileError::InvalidDeviceCredential)
+        );
+
+        let owner_provider = OpenMlsRustCrypto::default();
+        let malformed_member_provider = OpenMlsRustCrypto::default();
+        let (owner_credential, owner_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &owner_provider);
+        let (malformed_member_credential, malformed_member_signer) =
+            credential_with_basic(malformed(), &malformed_member_provider);
+        let malformed_member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &malformed_member_provider,
+                &malformed_member_signer,
+                malformed_member_credential,
+            )
+            .expect("OpenMLS accepts the malformed member credential");
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .expect("profile group can be created");
+        let (_, malformed_welcome, _) = owner_group
+            .add_members(
+                &owner_provider,
+                &owner_signer,
+                &[malformed_member_key_package.key_package().clone()],
+            )
+            .expect("OpenMLS can stage the malformed member addition");
+        assert_eq!(
+            validate_staged_commit_profile(
+                owner_group
+                    .pending_commit()
+                    .expect("member addition creates a pending commit"),
+            ),
+            Err(ProfileError::InvalidDeviceCredential)
+        );
+        let malformed_welcome_bytes = malformed_welcome
+            .tls_serialize_detached()
+            .expect("Welcome can be serialized");
+        assert!(matches!(
+            stage_profile_welcome(&malformed_member_provider, &malformed_welcome_bytes),
+            Err(StageWelcomeError::Profile(
+                ProfileError::InvalidDeviceCredential
+            ))
+        ));
+    }
+
+    #[test]
+    fn profile_message_decoder_rejects_unbounded_and_trailing_input() {
+        assert!(matches!(
+            decode_profile_message(&[]),
+            Err(MlsWireError::InvalidSize)
+        ));
+        let provider = OpenMlsRustCrypto::default();
+        assert!(matches!(
+            stage_profile_welcome(&provider, &[]),
+            Err(StageWelcomeError::Wire(MlsWireError::InvalidSize))
+        ));
+        assert!(matches!(
+            decode_profile_message(&vec![0; MAX_MLS_WIRE_BYTES + 1]),
+            Err(MlsWireError::InvalidSize)
+        ));
+
+        let (credential, signer) = credential(DeviceIdentity::generate().peer_id(), &provider);
+        let mut group = MlsGroup::new(&provider, &signer, &group_create_config(), credential)
+            .expect("profile group can be created");
+        let encoded_message = group
+            .create_message(&provider, &signer, b"bounded")
+            .expect("message can be created")
+            .to_bytes()
+            .expect("message can be serialized");
+        assert!(matches!(
+            stage_profile_welcome(&provider, &encoded_message),
+            Err(StageWelcomeError::UnexpectedMessage)
+        ));
+        let mut encoded = encoded_message;
+        encoded.push(0);
+        assert!(matches!(
+            decode_profile_message(&encoded),
+            Err(MlsWireError::TrailingData)
+        ));
     }
 }

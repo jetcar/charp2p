@@ -6,11 +6,13 @@ mod pending;
 
 use std::sync::{Arc, Mutex};
 
-use groups::{CreateGroupSpec, GroupService, LocalGroup};
+use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use network::{NetworkService, PeerSearchResult};
 use pending::{PendingGroup, PendingInvitationService};
 use tauri::Manager;
+
+const MAX_GROUP_ID_TEXT_BYTES: usize = 256;
 
 #[tauri::command]
 fn identity_status(
@@ -35,9 +37,19 @@ fn preview_invitation(input: String) -> Result<invitation::InvitationPreview, St
 #[tauri::command]
 fn accept_invitation(
     input: String,
-    service: tauri::State<'_, PendingInvitationService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    group_service: tauri::State<'_, GroupService>,
 ) -> Result<PendingGroup, String> {
-    service.accept(&input).map_err(str::to_owned)
+    let preview = invitation::preview_invitation(&input).map_err(str::to_owned)?;
+    if group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == preview.group_id)
+    {
+        return Err("invitation_owned_locally".to_owned());
+    }
+    pending_service.accept(&input).map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -50,6 +62,30 @@ fn pending_invitations(
 #[tauri::command]
 fn local_groups(service: tauri::State<'_, GroupService>) -> Result<Vec<LocalGroup>, String> {
     service.list().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn issued_invitations(
+    service: tauri::State<'_, GroupService>,
+) -> Result<Vec<IssuedInvitation>, String> {
+    service.issued_invitations().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn create_group_invitation(
+    group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, GroupService>,
+) -> Result<IssuedInvitation, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let profile = identity_service
+        .status()
+        .map_err(str::to_owned)?
+        .ok_or_else(|| "identity_missing".to_owned())?;
+    let inviter_name = identity::invitation_device_name(&profile.device_name);
+    group_service
+        .issue_invitation(group_id, &inviter_name)
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -86,9 +122,7 @@ async fn search_group_peers(
     pending_service: tauri::State<'_, PendingInvitationService>,
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<PeerSearchResult, String> {
-    let group_id = group_id
-        .parse()
-        .map_err(|_| "pending_invitation_not_found".to_owned())?;
+    let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -99,6 +133,13 @@ async fn search_group_peers(
         .search(identity, &invitation)
         .await
         .map_err(str::to_owned)
+}
+
+fn parse_group_id(input: &str, error: &'static str) -> Result<charp2p_core::PeerId, String> {
+    if input.is_empty() || input.len() > MAX_GROUP_ID_TEXT_BYTES {
+        return Err(error.to_owned());
+    }
+    input.parse().map_err(|_| error.to_owned())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -150,9 +191,31 @@ pub fn run() {
             accept_invitation,
             pending_invitations,
             local_groups,
+            issued_invitations,
             create_group,
+            create_group_invitation,
             search_group_peers
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use charp2p_core::GroupIdentity;
+
+    use super::parse_group_id;
+
+    #[test]
+    fn webview_group_identifiers_are_bounded_before_parsing() {
+        let group_id = GroupIdentity::generate().group_id();
+        assert_eq!(
+            parse_group_id(&group_id.to_string(), "invalid").unwrap(),
+            group_id
+        );
+        assert_eq!(
+            parse_group_id(&"1".repeat(257), "invalid"),
+            Err("invalid".to_owned())
+        );
+    }
 }

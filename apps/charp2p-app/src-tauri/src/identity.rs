@@ -9,7 +9,8 @@ const CREDENTIAL_SERVICE: &str = "chat.charp2p.client";
 const CREDENTIAL_USER: &str = "device-identity-v1";
 const RECORD_VERSION: u8 = 1;
 const MAX_DEVICE_NAME_CHARS: usize = 48;
-const MAX_DEVICE_NAME_BYTES: usize = 128;
+const MAX_DEVICE_NAME_BYTES: usize = 80;
+const MAX_LEGACY_DEVICE_NAME_BYTES: usize = 128;
 const MAX_RECORD_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -153,6 +154,17 @@ fn normalize_device_name(requested: &str) -> Result<String, &'static str> {
     Ok(name.to_owned())
 }
 
+pub(crate) fn invitation_device_name(device_name: &str) -> String {
+    if device_name.len() <= MAX_DEVICE_NAME_BYTES {
+        return device_name.to_owned();
+    }
+    let mut end = MAX_DEVICE_NAME_BYTES;
+    while !device_name.is_char_boundary(end) {
+        end -= 1;
+    }
+    device_name[..end].trim_end().to_owned()
+}
+
 fn encode_record(
     device_name: &str,
     secret: &DeviceIdentitySecret,
@@ -182,7 +194,7 @@ fn decode_record(record: &[u8]) -> Result<(String, DeviceIdentitySecret), &'stat
     }
 
     let name_len = usize::from(u16::from_be_bytes([record[1], record[2]]));
-    if name_len == 0 || name_len > MAX_DEVICE_NAME_BYTES {
+    if name_len == 0 || name_len > MAX_LEGACY_DEVICE_NAME_BYTES {
         return Err("identity_record_invalid");
     }
     let secret_start = 3usize
@@ -191,14 +203,25 @@ fn decode_record(record: &[u8]) -> Result<(String, DeviceIdentitySecret), &'stat
         .ok_or("identity_record_invalid")?;
     let device_name =
         std::str::from_utf8(&record[3..secret_start]).map_err(|_| "identity_record_invalid")?;
-    let device_name = normalize_device_name(device_name).map_err(|_| "identity_record_invalid")?;
+    if device_name.is_empty()
+        || device_name.chars().count() > MAX_DEVICE_NAME_CHARS
+        || device_name.len() > MAX_LEGACY_DEVICE_NAME_BYTES
+        || device_name.trim() != device_name
+        || device_name.chars().any(char::is_control)
+    {
+        return Err("identity_record_invalid");
+    }
+    let device_name = device_name.to_owned();
     let secret = DeviceIdentitySecret::from_protected_bytes(record[secret_start..].to_vec());
     Ok((device_name, secret))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_record, encode_record, normalize_device_name, IdentityService};
+    use super::{
+        decode_record, encode_record, invitation_device_name, normalize_device_name,
+        IdentityService,
+    };
     use charp2p_core::{DeviceIdentity, DeviceIdentitySecret};
 
     #[test]
@@ -228,12 +251,37 @@ mod tests {
         assert!(normalize_device_name("").is_err());
         assert!(normalize_device_name("bad\nname").is_err());
         assert!(normalize_device_name(&"a".repeat(49)).is_err());
+        assert!(normalize_device_name(&"é".repeat(40)).is_ok());
+        assert!(normalize_device_name(&"é".repeat(41)).is_err());
     }
 
     #[test]
     fn record_size_is_bounded() {
         let secret = DeviceIdentitySecret::from_protected_bytes(vec![7; 400]);
         assert!(encode_record(&"a".repeat(128), &secret).is_err());
+    }
+
+    #[test]
+    fn legacy_multibyte_name_loads_with_a_bounded_invitation_form() {
+        let (_, secret) = DeviceIdentity::generate_persistable().unwrap();
+        let legacy_name = "é".repeat(48);
+        let mut record = zeroize::Zeroizing::new(Vec::new());
+        record.push(super::RECORD_VERSION);
+        record.extend_from_slice(&(legacy_name.len() as u16).to_be_bytes());
+        record.extend_from_slice(legacy_name.as_bytes());
+        record.extend_from_slice(secret.expose_for_protected_storage());
+
+        let (loaded, _) = decode_record(&record).unwrap();
+        assert_eq!(loaded, legacy_name);
+        let invitation_name = invitation_device_name(&loaded);
+        assert!(invitation_name.len() <= 80);
+        assert!(loaded.starts_with(&invitation_name));
+        assert_eq!(invitation_name.trim(), invitation_name);
+
+        let trailing_space_boundary = format!("{} é", "é".repeat(39));
+        let bounded = invitation_device_name(&trailing_space_boundary);
+        assert_eq!(bounded, "é".repeat(39));
+        assert!(bounded.len() <= 80);
     }
 
     #[test]

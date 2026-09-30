@@ -1,10 +1,14 @@
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use charp2p_core::{GroupIdentity, GroupIdentitySecret, HistoryPolicy, PeerId};
-use charp2p_store::{EventStore, LocalGroupMetadata};
+use charp2p_core::{
+    GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, InvitationSpec,
+    PeerId,
+};
+use charp2p_store::{EventStore, IssuedInvitationMetadata, LocalGroupMetadata};
 use keyring_core::Error as KeyringError;
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -12,9 +16,11 @@ use zeroize::Zeroizing;
 use crate::identity::protected_entry;
 
 const CREDENTIAL_PREFIX: &str = "group-identity-v1-";
+const INVITATION_CREDENTIAL_PREFIX: &str = "issued-invitation-v1-";
 const MAX_GROUP_NAME_CHARS: usize = 80;
 const MAX_GROUP_NAME_BYTES: usize = 80;
 const MAX_GROUP_SECRET_BYTES: usize = 512;
+const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
 const ALLOWED_INVITATION_LIFETIMES: [u64; 4] = [86_400, 604_800, 1_209_600, 2_592_000];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -27,6 +33,16 @@ pub struct LocalGroup {
     pub approval_required: bool,
     pub invitation_lifetime_seconds: u64,
     pub reusable_invitation: bool,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedInvitation {
+    pub invitation_id: String,
+    pub group_id: String,
+    pub link: String,
+    pub expires_at_unix: u64,
+    pub reusable: bool,
 }
 
 pub struct CreateGroupSpec<'a> {
@@ -43,7 +59,17 @@ trait GroupSecretStore: Send + Sync {
     fn get(&self, group_id: PeerId) -> Result<GroupIdentitySecret, &'static str>;
 }
 
+trait IssuedInvitationSecretStore: Send + Sync {
+    fn put(&self, invitation_id: InvitationId, encoded: &[u8]) -> Result<(), &'static str>;
+    fn get_optional(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str>;
+    fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str>;
+}
+
 struct PlatformGroupSecretStore;
+struct PlatformIssuedInvitationSecretStore;
 
 impl GroupSecretStore for PlatformGroupSecretStore {
     fn put(&self, group_id: PeerId, secret: &[u8]) -> Result<(), &'static str> {
@@ -66,10 +92,37 @@ impl GroupSecretStore for PlatformGroupSecretStore {
     }
 }
 
+impl IssuedInvitationSecretStore for PlatformIssuedInvitationSecretStore {
+    fn put(&self, invitation_id: InvitationId, encoded: &[u8]) -> Result<(), &'static str> {
+        protected_entry(&invitation_credential_user(invitation_id))?
+            .set_secret(encoded)
+            .map_err(|_| "issued_invitation_store_unavailable")
+    }
+
+    fn get_optional(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
+        match protected_entry(&invitation_credential_user(invitation_id))?.get_secret() {
+            Ok(encoded) => Ok(Some(Zeroizing::new(encoded))),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(_) => Err("issued_invitation_store_unavailable"),
+        }
+    }
+
+    fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str> {
+        match protected_entry(&invitation_credential_user(invitation_id))?.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(_) => Err("issued_invitation_store_unavailable"),
+        }
+    }
+}
+
 pub struct GroupService {
     operations: Arc<Mutex<()>>,
     metadata: Mutex<EventStore>,
     secrets: Box<dyn GroupSecretStore>,
+    invitation_secrets: Box<dyn IssuedInvitationSecretStore>,
 }
 
 impl GroupService {
@@ -78,6 +131,7 @@ impl GroupService {
             operations,
             metadata: Mutex::new(EventStore::open(path).map_err(|_| "group_store_unavailable")?),
             secrets: Box::new(PlatformGroupSecretStore),
+            invitation_secrets: Box::new(PlatformIssuedInvitationSecretStore),
         })
     }
 
@@ -174,6 +228,196 @@ impl GroupService {
         }
         Ok(groups)
     }
+
+    pub fn issue_invitation(
+        &self,
+        group_id: PeerId,
+        inviter_name: &str,
+    ) -> Result<IssuedInvitation, &'static str> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
+        self.issue_invitation_at(group_id, inviter_name, now_unix)
+    }
+
+    pub fn issued_invitations(&self) -> Result<Vec<IssuedInvitation>, &'static str> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
+        self.issued_invitations_at(now_unix)
+    }
+
+    fn issue_invitation_at(
+        &self,
+        group_id: PeerId,
+        inviter_name: &str,
+        now_unix: u64,
+    ) -> Result<IssuedInvitation, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let group = store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or("group_not_found")?;
+        for existing in store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .filter(|invitation| invitation.group_id == group_id)
+        {
+            let Some(encoded) = self
+                .invitation_secrets
+                .get_optional(existing.invitation_id)?
+            else {
+                store
+                    .remove_issued_invitation(existing.invitation_id)
+                    .map_err(|_| "group_store_unavailable")?;
+                continue;
+            };
+            let (invitation, _) = decode_issued_invitation(&encoded)?;
+            if invitation.invitation_id() != existing.invitation_id
+                || invitation.group_id() != existing.group_id
+                || invitation.expires_at_unix() != existing.expires_at_unix
+            {
+                return Err("issued_invitation_record_invalid");
+            }
+            if invitation.expires_at_unix() > now_unix {
+                return Err("invitation_already_exists");
+            }
+            self.invitation_secrets.remove(existing.invitation_id)?;
+            store
+                .remove_issued_invitation(existing.invitation_id)
+                .map_err(|_| "group_store_unavailable")?;
+        }
+        let secret = self.secrets.get(group_id)?;
+        let identity = GroupIdentity::from_persisted_secret(&secret)
+            .map_err(|_| "group_identity_record_invalid")?;
+        if identity.group_id() != group_id {
+            return Err("group_identity_record_invalid");
+        }
+        let expires_at_unix = now_unix
+            .checked_add(group.invitation_lifetime_seconds)
+            .ok_or("system_clock_invalid")?;
+        let invitation = Invitation::issue(
+            &identity,
+            InvitationSpec {
+                group_name: &group.group_name,
+                inviter_name,
+                expires_at_unix,
+                history_policy: group.history_policy,
+                reusable: group.reusable_invitation,
+            },
+            now_unix,
+        )
+        .map_err(|_| "invitation_creation_failed")?;
+        let encoded = Zeroizing::new(
+            invitation
+                .encode()
+                .map_err(|_| "invitation_creation_failed")?,
+        );
+        if encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
+            return Err("invitation_creation_failed");
+        }
+        let indexed = IssuedInvitationMetadata {
+            invitation_id: invitation.invitation_id(),
+            group_id,
+            expires_at_unix,
+        };
+        store
+            .put_issued_invitation(&indexed)
+            .map_err(|_| "group_store_unavailable")?;
+        if let Err(error) = self
+            .invitation_secrets
+            .put(indexed.invitation_id, encoded.as_bytes())
+        {
+            store
+                .remove_issued_invitation(indexed.invitation_id)
+                .map_err(|_| "group_store_unavailable")?;
+            return Err(error);
+        }
+        Ok(issued_invitation(&invitation, encoded.as_str()))
+    }
+
+    fn issued_invitations_at(&self, now_unix: u64) -> Result<Vec<IssuedInvitation>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let indexed = store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?;
+        let local_group_ids: Vec<_> = store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .map(|group| group.group_id)
+            .collect();
+        let mut invitations = Vec::with_capacity(indexed.len());
+        for indexed in indexed {
+            if !local_group_ids.contains(&indexed.group_id) {
+                self.invitation_secrets.remove(indexed.invitation_id)?;
+                store
+                    .remove_issued_invitation(indexed.invitation_id)
+                    .map_err(|_| "group_store_unavailable")?;
+                continue;
+            }
+            let group_secret = match self.secrets.get(indexed.group_id) {
+                Ok(secret) => secret,
+                Err("group_identity_missing") => {
+                    self.invitation_secrets.remove(indexed.invitation_id)?;
+                    store
+                        .remove_issued_invitation(indexed.invitation_id)
+                        .map_err(|_| "group_store_unavailable")?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let group_identity = GroupIdentity::from_persisted_secret(&group_secret)
+                .map_err(|_| "group_identity_record_invalid")?;
+            if group_identity.group_id() != indexed.group_id {
+                return Err("issued_invitation_record_invalid");
+            }
+            let Some(encoded) = self
+                .invitation_secrets
+                .get_optional(indexed.invitation_id)?
+            else {
+                store
+                    .remove_issued_invitation(indexed.invitation_id)
+                    .map_err(|_| "group_store_unavailable")?;
+                continue;
+            };
+            let (invitation, encoded) = decode_issued_invitation(&encoded)?;
+            if invitation.invitation_id() != indexed.invitation_id
+                || invitation.group_id() != indexed.group_id
+                || invitation.expires_at_unix() != indexed.expires_at_unix
+            {
+                return Err("issued_invitation_record_invalid");
+            }
+            if indexed.expires_at_unix <= now_unix {
+                self.invitation_secrets.remove(indexed.invitation_id)?;
+                store
+                    .remove_issued_invitation(indexed.invitation_id)
+                    .map_err(|_| "group_store_unavailable")?;
+                continue;
+            }
+            invitations.push(issued_invitation(&invitation, encoded));
+        }
+        Ok(invitations)
+    }
 }
 
 impl From<LocalGroupMetadata> for LocalGroup {
@@ -192,6 +436,44 @@ impl From<LocalGroupMetadata> for LocalGroup {
 
 fn credential_user(group_id: PeerId) -> String {
     format!("{CREDENTIAL_PREFIX}{group_id}")
+}
+
+fn invitation_credential_user(invitation_id: InvitationId) -> String {
+    format!(
+        "{INVITATION_CREDENTIAL_PREFIX}{}",
+        encode_identifier(invitation_id)
+    )
+}
+
+fn encode_identifier(invitation_id: InvitationId) -> String {
+    invitation_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_issued_invitation(
+    encoded: &Zeroizing<Vec<u8>>,
+) -> Result<(Invitation, &str), &'static str> {
+    if encoded.is_empty() || encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
+        return Err("issued_invitation_record_invalid");
+    }
+    let encoded =
+        std::str::from_utf8(encoded.as_slice()).map_err(|_| "issued_invitation_record_invalid")?;
+    let invitation =
+        Invitation::decode(encoded, 0).map_err(|_| "issued_invitation_record_invalid")?;
+    Ok((invitation, encoded))
+}
+
+fn issued_invitation(invitation: &Invitation, encoded: &str) -> IssuedInvitation {
+    IssuedInvitation {
+        invitation_id: encode_identifier(invitation.invitation_id()),
+        group_id: invitation.group_id().to_string(),
+        link: format!("charp2p://join/{encoded}"),
+        expires_at_unix: invitation.expires_at_unix(),
+        reusable: invitation.is_reusable(),
+    }
 }
 
 fn normalize_group_name(requested: &str) -> Result<String, &'static str> {
@@ -227,10 +509,12 @@ fn history_policy_name(policy: HistoryPolicy) -> &'static str {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use charp2p_core::{GroupIdentity, GroupIdentitySecret, HistoryPolicy, PeerId};
+    use charp2p_core::{
+        GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, PeerId,
+    };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
-    use super::{CreateGroupSpec, GroupSecretStore, GroupService};
+    use super::{CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore};
 
     #[derive(Default)]
     struct MemorySecretStore {
@@ -238,6 +522,11 @@ mod tests {
     }
 
     struct FailingSecretStore;
+
+    #[derive(Default)]
+    struct MemoryInvitationStore {
+        saved: Mutex<Vec<(InvitationId, Vec<u8>)>>,
+    }
 
     impl GroupSecretStore for FailingSecretStore {
         fn put(&self, _group_id: PeerId, _secret: &[u8]) -> Result<(), &'static str> {
@@ -267,11 +556,44 @@ mod tests {
         }
     }
 
+    impl IssuedInvitationSecretStore for MemoryInvitationStore {
+        fn put(&self, invitation_id: InvitationId, encoded: &[u8]) -> Result<(), &'static str> {
+            self.saved
+                .lock()
+                .unwrap()
+                .push((invitation_id, encoded.to_vec()));
+            Ok(())
+        }
+
+        fn get_optional(
+            &self,
+            invitation_id: InvitationId,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, &'static str> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(saved_id, _)| *saved_id == invitation_id)
+                .map(|(_, encoded)| zeroize::Zeroizing::new(encoded.clone())))
+        }
+
+        fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str> {
+            self.saved
+                .lock()
+                .unwrap()
+                .retain(|(saved_id, _)| *saved_id != invitation_id);
+            Ok(())
+        }
+    }
+
     fn service() -> GroupService {
         GroupService {
             operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::new(MemorySecretStore::default()),
+            invitation_secrets: Box::new(MemoryInvitationStore::default()),
         }
     }
 
@@ -297,6 +619,108 @@ mod tests {
         assert_eq!(
             service.create(spec("Hidden second group")).unwrap_err(),
             "group_already_exists"
+        );
+    }
+
+    #[test]
+    fn issued_invitation_restores_and_expires_from_both_stores() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+
+        let issued = service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        let decoded = Invitation::decode_input(&issued.link, NOW).unwrap();
+        assert_eq!(decoded.group_id(), group_id);
+        assert_eq!(decoded.group_name(), "Project Atlas");
+        assert_eq!(decoded.inviter_name(), "Maya's PC");
+        let restored = service.issued_invitations_at(NOW).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].invitation_id, issued.invitation_id);
+        assert_eq!(restored[0].group_id, issued.group_id);
+        assert_eq!(restored[0].expires_at_unix, issued.expires_at_unix);
+        assert_eq!(restored[0].reusable, issued.reusable);
+        assert!(Invitation::decode_input(&restored[0].link, NOW).is_ok());
+        assert!(matches!(
+            service.issue_invitation_at(group_id, "Maya's PC", NOW + 1),
+            Err("invitation_already_exists")
+        ));
+
+        assert!(service
+            .issued_invitations_at(NOW + 604_800)
+            .unwrap()
+            .is_empty());
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .issued_invitations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn issued_invitation_is_removed_when_local_group_metadata_is_missing() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .remove_local_group(group_id)
+            .unwrap();
+
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .issued_invitations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_active_invitation_fails_closed_before_replacement() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        let indexed = service
+            .metadata
+            .lock()
+            .unwrap()
+            .issued_invitations()
+            .unwrap()
+            .remove(0);
+        service
+            .invitation_secrets
+            .put(indexed.invitation_id, b"not an invitation")
+            .unwrap();
+
+        assert!(matches!(
+            service.issue_invitation_at(group_id, "Maya's PC", NOW + 1),
+            Err("issued_invitation_record_invalid")
+        ));
+        assert_eq!(
+            service
+                .metadata
+                .lock()
+                .unwrap()
+                .issued_invitations()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -343,6 +767,7 @@ mod tests {
             operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::new(FailingSecretStore),
+            invitation_secrets: Box::new(MemoryInvitationStore::default()),
         };
 
         assert_eq!(
@@ -376,6 +801,7 @@ mod tests {
             operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(metadata),
             secrets: Box::new(MemorySecretStore::default()),
+            invitation_secrets: Box::new(MemoryInvitationStore::default()),
         };
 
         assert!(service.list().unwrap().is_empty());

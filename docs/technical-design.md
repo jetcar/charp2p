@@ -303,6 +303,8 @@ Each client stores:
 - Verified group events.
 - Peer addresses with last-success metadata.
 - Pending invitations and synchronization state.
+- Issued invitation indexes; their signed bearer credentials remain in
+  platform-protected storage and are revalidated on load.
 - User preferences and local blocks.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential

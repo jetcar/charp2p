@@ -135,6 +135,8 @@ button { cursor: pointer; }
 .group-ready-card { align-items: stretch; }
 .group-ready-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child { font-size: 20px; }
+.invitation-link-box { width: 100%; min-height: 104px; margin: 0 0 18px; padding: 16px 18px; resize: none; border: 1px solid #ced9e5; border-radius: 12px; outline: none; color: #33415f; background: #f5f8fb; font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.invitation-link-box:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
 .group-avatar { width: 82px; height: 82px; display: grid; place-items: center; align-self: center; margin-bottom: 24px; border-radius: 24px; color: white; font-size: 25px; font-weight: 800; letter-spacing: -6px; }
 .icon-0 { background: linear-gradient(145deg, #17b7aa, #07897f); }
 .icon-1 { background: linear-gradient(145deg, #8b6be8, #6550bf); }

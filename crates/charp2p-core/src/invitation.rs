@@ -48,6 +48,22 @@ pub struct Invitation {
     signature: Vec<u8>,
 }
 
+/// Opaque identifier used to revoke or account for one issued invitation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InvitationId([u8; INVITATION_ID_BYTES]);
+
+impl InvitationId {
+    /// Reconstructs an identifier loaded from trusted local metadata.
+    pub fn from_bytes(bytes: [u8; INVITATION_ID_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the fixed-width identifier bytes.
+    pub fn as_bytes(&self) -> &[u8; INVITATION_ID_BYTES] {
+        &self.0
+    }
+}
+
 impl Invitation {
     /// Issues a signed invitation from a group owner identity.
     pub fn issue(
@@ -95,6 +111,17 @@ impl Invitation {
             signature: self.signature.clone(),
         };
         Ok(URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire)?))
+    }
+
+    /// Encodes the invitation as the application custom URI registered by the
+    /// Windows and Android clients.
+    pub fn custom_uri(&self) -> Result<String, InvitationError> {
+        Ok(format!("charp2p://join/{}", self.encode()?))
+    }
+
+    /// Encodes the invitation as the canonical HTTPS App Link.
+    pub fn https_link(&self) -> Result<String, InvitationError> {
+        Ok(format!("https://join.charp2p.example/i#{}", self.encode()?))
     }
 
     /// Decodes and verifies an invitation payload.
@@ -149,8 +176,8 @@ impl Invitation {
     }
 
     /// Returns the random identifier used for revocation and replay tracking.
-    pub fn invitation_id(&self) -> &[u8; INVITATION_ID_BYTES] {
-        &self.claims.invitation_id
+    pub fn invitation_id(&self) -> InvitationId {
+        InvitationId(self.claims.invitation_id)
     }
 
     /// Returns the authenticated display name of the group.
@@ -410,14 +437,11 @@ mod tests {
     #[test]
     fn supported_link_forms_decode_the_same_invitation() {
         let owner = GroupIdentity::generate();
-        let encoded = Invitation::issue(&owner, spec(NOW + 3_600), NOW)
-            .unwrap()
-            .encode()
-            .unwrap();
+        let invitation = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
         let inputs = [
-            encoded.clone(),
-            format!("charp2p://join/{encoded}"),
-            format!("https://join.charp2p.example/i#{encoded}"),
+            invitation.encode().unwrap(),
+            invitation.custom_uri().unwrap(),
+            invitation.https_link().unwrap(),
         ];
 
         for input in inputs {

@@ -23,6 +23,13 @@ type LocalGroup = {
   invitationLifetimeSeconds: number;
   reusableInvitation: boolean;
 };
+type IssuedInvitation = {
+  invitationId: string;
+  groupId: string;
+  link: string;
+  expiresAtUnix: number;
+  reusable: boolean;
+};
 type PeerSearchResult = {
   status: "bootstrapRequired" | "peerReachable" | "peersFound" | "noPeers" | "unavailable";
   discoveredPeers: number;
@@ -42,14 +49,20 @@ const ERROR_MESSAGES: Record<string, string> = {
   group_identity_store_unavailable: "Protected group storage is unavailable.",
   group_service_unavailable: "Groups are temporarily unavailable.",
   group_store_unavailable: "The group could not be saved on this device.",
+  group_not_found: "This local group is no longer available.",
+  invitation_creation_failed: "The invitation could not be created.",
+  invitation_already_exists: "This group already has an active invitation.",
+  issued_invitation_record_invalid: "A saved group invitation is damaged.",
+  issued_invitation_store_unavailable: "The invitation could not be saved securely.",
   invalid_group_icon: "Choose a supported group icon.",
   invalid_group_name: "Enter a shorter group name (up to 80 UTF-8 bytes).",
   invalid_history_policy: "Choose a valid history policy.",
   invalid_invitation_lifetime: "Choose a supported invitation expiry.",
   invitation_expired: "This invitation has expired.",
+  invitation_owned_locally: "This device already owns that group.",
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
-  invalid_device_name: "Enter a device name between 1 and 48 characters.",
+  invalid_device_name: "Enter 1–48 characters using no more than 80 UTF-8 bytes.",
   network_configuration_invalid: "The peer network configuration is invalid.",
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
@@ -172,6 +185,7 @@ function App() {
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
+  const [issuedInvitation, setIssuedInvitation] = useState<IssuedInvitation | null>(null);
   const [createGroupMode, setCreateGroupMode] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [groupIcon, setGroupIcon] = useState(0);
@@ -180,6 +194,8 @@ function App() {
   const [invitationLifetime, setInvitationLifetime] = useState(604800);
   const [reusableInvitation, setReusableInvitation] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
+  const [creatingInvitation, setCreatingInvitation] = useState(false);
+  const [invitationCopied, setInvitationCopied] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -193,8 +209,9 @@ function App() {
       invoke<DeviceProfile | null>("identity_status"),
       invoke<PendingGroup[]>("pending_invitations"),
       invoke<LocalGroup[]>("local_groups"),
+      invoke<IssuedInvitation[]>("issued_invitations"),
     ])
-      .then(([identityResult, pendingResult, groupsResult]) => {
+      .then(([identityResult, pendingResult, groupsResult, invitationsResult]) => {
         if (!active) return;
         if (identityResult.status === "fulfilled" && identityResult.value) {
           const storedProfile = identityResult.value;
@@ -214,6 +231,11 @@ function App() {
         } else {
           setError(errorMessage(groupsResult.reason));
         }
+        if (invitationsResult.status === "fulfilled") {
+          setIssuedInvitation(invitationsResult.value[0] ?? null);
+        } else {
+          setError(errorMessage(invitationsResult.reason));
+        }
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -223,6 +245,37 @@ function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!issuedInvitation) return;
+    let active = true;
+    let timer: number | undefined;
+    const scheduleExpiry = () => {
+      const remainingMs = issuedInvitation.expiresAtUnix * 1000 - Date.now();
+      if (remainingMs <= 0) {
+        const cleanup = isTauri()
+          ? invoke<IssuedInvitation[]>("issued_invitations")
+          : Promise.resolve([]);
+        void cleanup
+          .catch((reason) => {
+            if (active) setError(errorMessage(reason));
+          })
+          .finally(() => {
+            if (active) {
+              setIssuedInvitation(null);
+              setInvitationCopied(false);
+            }
+          });
+        return;
+      }
+      timer = window.setTimeout(scheduleExpiry, Math.min(remainingMs, 2_147_483_647));
+    };
+    scheduleExpiry();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [issuedInvitation]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -359,12 +412,42 @@ function App() {
         reusableInvitation,
       });
       setLocalGroup(created);
+      setIssuedInvitation(null);
       setGroupName(created.groupName);
       setCreateGroupMode(false);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setCreatingGroup(false);
+    }
+  }
+
+  async function createInvitation() {
+    if (!localGroup || creatingInvitation || !isTauri()) return;
+
+    setError("");
+    setInvitationCopied(false);
+    setCreatingInvitation(true);
+    try {
+      const invitation = await invoke<IssuedInvitation>("create_group_invitation", {
+        groupId: localGroup.groupId,
+      });
+      setIssuedInvitation(invitation);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCreatingInvitation(false);
+    }
+  }
+
+  async function copyInvitation() {
+    if (!issuedInvitation) return;
+    try {
+      await navigator.clipboard.writeText(issuedInvitation.link);
+      setInvitationCopied(true);
+      setError("");
+    } catch {
+      setError("The invitation could not be copied. Select the link and copy it manually.");
     }
   }
 
@@ -495,10 +578,34 @@ function App() {
                 <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
               </dl>
-              <p className="preview-note">Invitation creation and peer advertising are the next setup step.</p>
-              <button className="primary-button" disabled title="Invitation creation is not available yet" type="button">
-                Create invitation
-              </button>
+              {issuedInvitation && issuedInvitation.groupId === localGroup.groupId ? (
+                <>
+                  <label htmlFor="issued-invitation">Invitation link</label>
+                  <textarea
+                    className="invitation-link-box"
+                    id="issued-invitation"
+                    readOnly
+                    rows={3}
+                    value={issuedInvitation.link}
+                  />
+                  <p className="preview-note">
+                    {expiryDescription(issuedInvitation.expiresAtUnix)}
+                    {issuedInvitation.reusable ? " · Reusable" : " · Single use"}. Peer advertising is the next networking step.
+                  </p>
+                  {error && <p className="form-error preview-error" role="alert">{error}</p>}
+                  <button className="primary-button" onClick={copyInvitation} type="button">
+                    {invitationCopied ? "Invitation copied" : "Copy invitation"}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p className="preview-note">Create a signed invitation to share this group.</p>
+                  {error && <p className="form-error preview-error" role="alert">{error}</p>}
+                  <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">
+                    {creatingInvitation ? "Creating invitation…" : "Create invitation"}
+                  </button>
+                </>
+              )}
             </section>
           )}
 

@@ -8,13 +8,15 @@ use std::{
     time::Duration,
 };
 
-use charp2p_core::{EventError, EventId, HistoryPolicy, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent};
+use charp2p_core::{
+    EventError, EventId, HistoryPolicy, InvitationId, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +45,14 @@ pub struct PendingInvitationMetadata {
     pub history_policy: HistoryPolicy,
     /// Whether the invitation may authorize multiple memberships.
     pub reusable: bool,
+}
+
+/// Non-secret index for a bearer invitation issued by a locally owned group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuedInvitationMetadata {
+    pub invitation_id: InvitationId,
+    pub group_id: PeerId,
+    pub expires_at_unix: u64,
 }
 
 /// Largest event-identifier page returned for one synchronization request.
@@ -278,6 +288,66 @@ impl EventStore {
         )? != 0)
     }
 
+    /// Adds the non-secret index for a newly issued bearer invitation.
+    pub fn put_issued_invitation(
+        &mut self,
+        invitation: &IssuedInvitationMetadata,
+    ) -> Result<(), StoreError> {
+        let expires_at_unix = i64::try_from(invitation.expires_at_unix)
+            .map_err(|_| StoreError::TimestampTooLarge(invitation.expires_at_unix))?;
+        self.connection.execute(
+            "INSERT INTO issued_invitations (invitation_id, group_id, expires_at_unix)
+             VALUES (?1, ?2, ?3)",
+            params![
+                invitation.invitation_id.as_bytes().as_slice(),
+                invitation.group_id.to_bytes(),
+                expires_at_unix,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lists issued invitation indexes without exposing their bearer secrets.
+    pub fn issued_invitations(&self) -> Result<Vec<IssuedInvitationMetadata>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT invitation_id, group_id, expires_at_unix
+             FROM issued_invitations
+             ORDER BY expires_at_unix DESC, invitation_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut invitations = Vec::new();
+        for row in rows {
+            let (invitation_id, group_id, expires_at_unix) = row?;
+            let invitation_id: [u8; 16] = invitation_id
+                .try_into()
+                .map_err(|_| StoreError::CorruptIndex)?;
+            invitations.push(IssuedInvitationMetadata {
+                invitation_id: InvitationId::from_bytes(invitation_id),
+                group_id: PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?,
+                expires_at_unix: u64::try_from(expires_at_unix)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+            });
+        }
+        Ok(invitations)
+    }
+
+    /// Removes an issued invitation index after expiry or revocation.
+    pub fn remove_issued_invitation(
+        &mut self,
+        invitation_id: InvitationId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM issued_invitations WHERE invitation_id = ?1",
+            [invitation_id.as_bytes().as_slice()],
+        )? != 0)
+    }
+
     /// Persists the non-secret settings for a locally owned group.
     pub fn put_local_group(&mut self, group: &LocalGroupMetadata) -> Result<(), StoreError> {
         let lifetime = i64::try_from(group.invitation_lifetime_seconds)
@@ -394,6 +464,13 @@ impl EventStore {
                             CHECK(invitation_lifetime_seconds > 0),
                         reusable_invitation INTEGER NOT NULL
                             CHECK(reusable_invitation IN (0, 1))
+                     ) STRICT;
+
+                     CREATE TABLE issued_invitations (
+                        invitation_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(invitation_id) = 16),
+                        group_id BLOB NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -421,6 +498,13 @@ impl EventStore {
                             CHECK(invitation_lifetime_seconds > 0),
                         reusable_invitation INTEGER NOT NULL
                             CHECK(reusable_invitation IN (0, 1))
+                     ) STRICT;
+
+                     CREATE TABLE issued_invitations (
+                        invitation_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(invitation_id) = 16),
+                        group_id BLOB NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -439,6 +523,26 @@ impl EventStore {
                             CHECK(invitation_lifetime_seconds > 0),
                         reusable_invitation INTEGER NOT NULL
                             CHECK(reusable_invitation IN (0, 1))
+                     ) STRICT;
+
+                     CREATE TABLE issued_invitations (
+                        invitation_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(invitation_id) = 16),
+                        group_id BLOB NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
+                     ) STRICT;",
+                )?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            3 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "CREATE TABLE issued_invitations (
+                        invitation_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(invitation_id) = 16),
+                        group_id BLOB NOT NULL,
+                        expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -558,14 +662,15 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use charp2p_core::{
-        DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, SignedEvent,
+        DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, InvitationId,
+        SignedEvent,
     };
     use rusqlite::{Connection, params};
     use tempfile::NamedTempFile;
 
     use super::{
-        AuthorHead, EventStore, LocalGroupMetadata, MAX_SYNC_BATCH_EVENTS,
-        PendingInvitationMetadata, PutEventOutcome, StoreError,
+        AuthorHead, EventStore, IssuedInvitationMetadata, LocalGroupMetadata,
+        MAX_SYNC_BATCH_EVENTS, PendingInvitationMetadata, PutEventOutcome, StoreError,
     };
 
     fn message_event(
@@ -855,6 +960,32 @@ mod tests {
     }
 
     #[test]
+    fn issued_invitation_metadata_survives_restart_and_can_be_removed() {
+        let file = NamedTempFile::new().unwrap();
+        let invitation = IssuedInvitationMetadata {
+            invitation_id: InvitationId::from_bytes([7; 16]),
+            group_id: GroupIdentity::generate().group_id(),
+            expires_at_unix: 1_800_003_600,
+        };
+        EventStore::open(file.path())
+            .unwrap()
+            .put_issued_invitation(&invitation)
+            .unwrap();
+
+        let mut reopened = EventStore::open(file.path()).unwrap();
+        assert_eq!(
+            reopened.issued_invitations().unwrap(),
+            vec![invitation.clone()]
+        );
+        assert!(
+            reopened
+                .remove_issued_invitation(invitation.invitation_id)
+                .unwrap()
+        );
+        assert!(reopened.issued_invitations().unwrap().is_empty());
+    }
+
+    #[test]
     fn version_two_database_adds_local_groups() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -883,6 +1014,49 @@ mod tests {
 
         let store = EventStore::from_connection(connection).unwrap();
         assert!(store.local_groups().unwrap().is_empty());
+        assert!(store.issued_invitations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_three_database_adds_issued_invitations() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (
+                    event_id BLOB PRIMARY KEY NOT NULL CHECK(length(event_id) = 32),
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    encoded BLOB NOT NULL,
+                    UNIQUE(group_id, author_id, author_sequence)
+                 ) STRICT;
+                 CREATE INDEX events_by_group_author_sequence
+                    ON events(group_id, author_id, author_sequence);
+                 CREATE TABLE pending_invitations (
+                    group_id BLOB PRIMARY KEY NOT NULL,
+                    group_name TEXT NOT NULL,
+                    inviter_name TEXT NOT NULL,
+                    expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0),
+                    history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2),
+                    reusable INTEGER NOT NULL CHECK(reusable IN (0, 1))
+                 ) STRICT;
+                 CREATE TABLE local_groups (
+                    group_id BLOB PRIMARY KEY NOT NULL,
+                    group_name TEXT NOT NULL,
+                    icon INTEGER NOT NULL CHECK(icon BETWEEN 0 AND 4),
+                    history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2),
+                    approval_required INTEGER NOT NULL CHECK(approval_required IN (0, 1)),
+                    invitation_lifetime_seconds INTEGER NOT NULL
+                        CHECK(invitation_lifetime_seconds > 0),
+                    reusable_invitation INTEGER NOT NULL
+                        CHECK(reusable_invitation IN (0, 1))
+                 ) STRICT;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+
+        let store = EventStore::from_connection(connection).unwrap();
+        assert!(store.issued_invitations().unwrap().is_empty());
     }
 
     #[test]

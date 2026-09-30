@@ -189,6 +189,15 @@ Discovery and transport authentication do not grant group access. Until the
 join protocol authorizes a device, an advertiser rejects its synchronization
 requests.
 
+The join exchange carries the canonical bearer invitation and one MLS
+KeyPackage in a bounded request. An accepted owner returns one bounded MLS
+Welcome. Invitation payloads are limited to 8 KiB; KeyPackages and Welcomes are
+limited to 128 KiB. The versioned binary codec rejects outer and declared field
+sizes before allocation; secret-bearing fields and encoded buffers are
+redacted from debug output and zeroed on drop. Wire validation alone does not
+authorize the request: the owner verifies the capability and binds the MLS
+credential to the authenticated transport peer before accepting it.
+
 ## Group protocol
 
 Group state is an authenticated append-only event graph. A canonical event

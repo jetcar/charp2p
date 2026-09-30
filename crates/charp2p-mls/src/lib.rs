@@ -2,6 +2,7 @@
 
 //! The fixed MLS profile used for CharP2P group-message protection.
 
+pub use charp2p_core::MAX_JOIN_MLS_MESSAGE_BYTES as MAX_MLS_WIRE_BYTES;
 use charp2p_core::PeerId;
 use openmls::{
     group::GroupContext,
@@ -19,9 +20,6 @@ const PROFILE_EXTENSION_TYPE: ExtensionType = ExtensionType::Unknown(PROFILE_EXT
 const DEVICE_CREDENTIAL_DOMAIN: &[u8] = b"charp2p-device-credential\0";
 const DEVICE_CREDENTIAL_VERSION: u16 = 1;
 const MAX_DEVICE_PEER_ID_BYTES: usize = 128;
-/// Maximum accepted encoded MLS message size before parsing and allocation.
-pub const MAX_MLS_WIRE_BYTES: usize = 128 * 1024;
-
 /// Version of the CharP2P MLS profile carried by an authenticated private-use
 /// group-context extension.
 pub const PROFILE_VERSION: u16 = 1;

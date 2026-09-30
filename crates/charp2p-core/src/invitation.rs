@@ -12,8 +12,9 @@ const INVITATION_VERSION: u16 = 1;
 const DISCOVERY_SECRET_BYTES: usize = 32;
 const INVITATION_ID_BYTES: usize = 16;
 const MAX_NAME_BYTES: usize = 80;
-const MAX_ENCODED_BYTES: usize = 8 * 1024;
-const MAX_INPUT_BYTES: usize = MAX_ENCODED_BYTES + 256;
+/// Largest canonical encoded invitation payload accepted by the protocol.
+pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
+const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v1\0";
 
 /// Controls which retained messages a newly joined member may request.
@@ -126,7 +127,7 @@ impl Invitation {
 
     /// Decodes and verifies an invitation payload.
     pub fn decode(encoded: &str, now_unix: u64) -> Result<Self, InvitationError> {
-        if encoded.is_empty() || encoded.len() > MAX_ENCODED_BYTES {
+        if encoded.is_empty() || encoded.len() > MAX_INVITATION_ENCODED_BYTES {
             return Err(InvitationError::InvalidSize);
         }
 

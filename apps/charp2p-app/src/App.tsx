@@ -35,6 +35,14 @@ type PeerSearchResult = {
   discoveredPeers: number;
   reachablePeers: number;
 };
+type AdvertisementResult = {
+  status: "advertising" | "bootstrapRequired";
+  expiresAtUnix: number;
+};
+
+const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
+const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
+const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -53,6 +61,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_creation_failed: "The invitation could not be created.",
   invitation_already_exists: "This group already has an active invitation.",
   issued_invitation_record_invalid: "A saved group invitation is damaged.",
+  issued_invitation_not_found: "Create an invitation before advertising this group.",
   issued_invitation_store_unavailable: "The invitation could not be saved securely.",
   invalid_group_icon: "Choose a supported group icon.",
   invalid_group_name: "Enter a shorter group name (up to 80 UTF-8 bytes).",
@@ -63,6 +72,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter 1–48 characters using no more than 80 UTF-8 bytes.",
+  network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
   network_configuration_invalid: "The peer network configuration is invalid.",
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
@@ -196,6 +206,9 @@ function App() {
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
   const [invitationCopied, setInvitationCopied] = useState(false);
+  const [advertisement, setAdvertisement] = useState<AdvertisementResult | null>(null);
+  const [advertisementError, setAdvertisementError] = useState("");
+  const [advertisementRetrying, setAdvertisementRetrying] = useState(false);
   const suggestedName = useMemo(
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
@@ -257,18 +270,31 @@ function App() {
           ? invoke<IssuedInvitation[]>("issued_invitations")
           : Promise.resolve([]);
         void cleanup
-          .catch((reason) => {
-            if (active) setError(errorMessage(reason));
-          })
-          .finally(() => {
-            if (active) {
+          .then((invitations) => {
+            if (!active) return;
+            const refreshed = invitations.find(
+              (invitation) => invitation.invitationId === issuedInvitation.invitationId,
+            );
+            if (refreshed) {
+              setIssuedInvitation(refreshed);
+              timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
+            } else {
               setIssuedInvitation(null);
               setInvitationCopied(false);
+            }
+          })
+          .catch((reason) => {
+            if (active) {
+              setError(errorMessage(reason));
+              timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
             }
           });
         return;
       }
-      timer = window.setTimeout(scheduleExpiry, Math.min(remainingMs, 2_147_483_647));
+      timer = window.setTimeout(
+        scheduleExpiry,
+        Math.min(remainingMs, INVITATION_EXPIRY_CHECK_INTERVAL_MS),
+      );
     };
     scheduleExpiry();
     return () => {
@@ -276,6 +302,51 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [issuedInvitation]);
+
+  useEffect(() => {
+    if (
+      !isTauri()
+      || !localGroup
+      || !issuedInvitation
+      || issuedInvitation.groupId !== localGroup.groupId
+    ) {
+      setAdvertisement(null);
+      setAdvertisementError("");
+      setAdvertisementRetrying(false);
+      return;
+    }
+    const groupId = localGroup.groupId;
+    let active = true;
+    let timer: number | undefined;
+    setAdvertisement(null);
+    setAdvertisementError("");
+    setAdvertisementRetrying(false);
+
+    async function refreshAdvertisement() {
+      try {
+        const result = await invoke<AdvertisementResult>("advertise_group", {
+          groupId,
+        });
+        if (!active) return;
+        setAdvertisement(result);
+        setAdvertisementError("");
+        setAdvertisementRetrying(false);
+        timer = window.setTimeout(refreshAdvertisement, ADVERTISEMENT_STATUS_INTERVAL_MS);
+      } catch (reason) {
+        if (!active) return;
+        setAdvertisement(null);
+        setAdvertisementError(errorMessage(reason));
+        setAdvertisementRetrying(true);
+        timer = window.setTimeout(refreshAdvertisement, ADVERTISEMENT_RETRY_INTERVAL_MS);
+      }
+    }
+
+    void refreshAdvertisement();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [issuedInvitation, localGroup]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -590,8 +661,20 @@ function App() {
                   />
                   <p className="preview-note">
                     {expiryDescription(issuedInvitation.expiresAtUnix)}
-                    {issuedInvitation.reusable ? " · Reusable" : " · Single use"}. Peer advertising is the next networking step.
+                    {issuedInvitation.reusable ? " · Reusable" : " · Single use"}
                   </p>
+                  <div className="status-row" aria-label="Invitation network status">
+                    <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
+                      {advertisement?.status === "advertising"
+                        ? "● Advertising to peers"
+                        : advertisement?.status === "bootstrapRequired"
+                          ? "○ Bootstrap node needed"
+                          : advertisementRetrying
+                            ? "○ Advertising failed · Retrying…"
+                          : "○ Starting peer advertising…"}
+                    </span>
+                  </div>
+                  {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
                   {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" onClick={copyInvitation} type="button">
                     {invitationCopied ? "Invitation copied" : "Copy invitation"}

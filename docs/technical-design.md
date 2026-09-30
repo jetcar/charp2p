@@ -157,6 +157,14 @@ no built-in or development bootstrap address is available, the UI reports that
 discovery requires a bootstrap node instead of pretending that the group is
 offline.
 
+After loading and revalidating an issued invitation, the owner client starts
+providing its rendezvous key and keeps the libp2p swarm active until the signed
+invitation expiry. Reopening the same invitation reuses the active advertiser;
+replacing it stops the earlier task. Closing the app removes the live provider,
+while short-lived DHT records may remain until their network TTL elapses. The
+client refreshes publication every five minutes and restarts failed advertisers
+from its status poll.
+
 LAN discovery may use mDNS as an additional path, never as the only discovery
 mechanism.
 

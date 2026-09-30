@@ -4,11 +4,14 @@ mod invitation;
 mod network;
 mod pending;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
-use network::{NetworkService, PeerSearchResult};
+use network::{AdvertisementResult, NetworkService, PeerSearchResult};
 use pending::{PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
@@ -135,6 +138,34 @@ async fn search_group_peers(
         .map_err(str::to_owned)
 }
 
+#[tauri::command]
+async fn advertise_group(
+    group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, GroupService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<AdvertisementResult, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let issued = group_service.issued_invitations().map_err(str::to_owned)?;
+    let issued = issued
+        .into_iter()
+        .find(|invitation| invitation.group_id == group_id.to_string())
+        .ok_or_else(|| "issued_invitation_not_found".to_owned())?;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system_clock_invalid".to_owned())?
+        .as_secs();
+    let invitation = charp2p_core::Invitation::decode_input(&issued.link, now_unix)
+        .map_err(|_| "issued_invitation_record_invalid".to_owned())?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    network_service
+        .advertise(identity, &invitation)
+        .await
+        .map_err(str::to_owned)
+}
+
 fn parse_group_id(input: &str, error: &'static str) -> Result<charp2p_core::PeerId, String> {
     if input.is_empty() || input.len() > MAX_GROUP_ID_TEXT_BYTES {
         return Err(error.to_owned());
@@ -194,7 +225,8 @@ pub fn run() {
             issued_invitations,
             create_group,
             create_group_invitation,
-            search_group_peers
+            search_group_peers,
+            advertise_group
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

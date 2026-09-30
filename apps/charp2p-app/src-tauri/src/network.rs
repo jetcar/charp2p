@@ -1,10 +1,17 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use charp2p_core::{DeviceIdentity, DiscoveryKey, Invitation};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
-use tokio::time::timeout;
+use tokio::{
+    sync::Mutex,
+    task::JoinHandle,
+    time::{interval, interval_at, sleep, timeout, Instant, MissedTickBehavior},
+};
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
 const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
@@ -13,6 +20,8 @@ const MAX_BOOTSTRAP_ADDRESS_BYTES: usize = 512;
 const MAX_DISCOVERED_PEERS: usize = 32;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct BootstrapPeer {
@@ -28,8 +37,22 @@ pub struct PeerSearchResult {
     pub reachable_peers: usize,
 }
 
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvertisementResult {
+    pub status: &'static str,
+    pub expires_at_unix: u64,
+}
+
+struct ActiveAdvertisement {
+    key: DiscoveryKey,
+    expires_at_unix: u64,
+    task: JoinHandle<()>,
+}
+
 pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
+    advertisement: Mutex<Option<ActiveAdvertisement>>,
 }
 
 impl NetworkService {
@@ -54,7 +77,116 @@ impl NetworkService {
             }
             bootstrap_peers.push(parse_bootstrap_peer(configured_address)?);
         }
-        Ok(Self { bootstrap_peers })
+        Ok(Self {
+            bootstrap_peers,
+            advertisement: Mutex::new(None),
+        })
+    }
+
+    pub async fn advertise(
+        &self,
+        identity: DeviceIdentity,
+        invitation: &Invitation,
+    ) -> Result<AdvertisementResult, &'static str> {
+        remaining_until_expiry(invitation.expires_at_unix())?;
+        if self.bootstrap_peers.is_empty() {
+            return Ok(AdvertisementResult {
+                status: "bootstrapRequired",
+                expires_at_unix: invitation.expires_at_unix(),
+            });
+        }
+
+        let key = DiscoveryKey::from_invitation(invitation);
+        let mut active = self.advertisement.lock().await;
+        if let Some(existing) = active.as_ref() {
+            if existing.key == key
+                && existing.expires_at_unix == invitation.expires_at_unix()
+                && !existing.task.is_finished()
+            {
+                return Ok(AdvertisementResult {
+                    status: "advertising",
+                    expires_at_unix: existing.expires_at_unix,
+                });
+            }
+        }
+        if let Some(existing) = active.take() {
+            existing.task.abort();
+        }
+
+        let mut node = NetworkNode::new(identity.into_network_keypair());
+        node.listen_on(
+            "/ip4/0.0.0.0/udp/0/quic-v1"
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+        for bootstrap in &self.bootstrap_peers {
+            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+        }
+        node.bootstrap().map_err(|_| "network_unavailable")?;
+        node.announce_group(key)
+            .map_err(|_| "network_unavailable")?;
+
+        timeout(PROVIDER_SEARCH_TIMEOUT, async {
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::GroupAnnounced { key: announced } if announced == key => {
+                        return Ok(());
+                    }
+                    NetworkEvent::DiscoveryFailed {
+                        key: failed,
+                        operation: charp2p_network::DiscoveryOperation::Announcement,
+                    } if failed == key => return Err("network_unavailable"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "network_advertisement_timed_out")??;
+
+        remaining_until_expiry(invitation.expires_at_unix())?;
+
+        let expires_at_unix = invitation.expires_at_unix();
+        let task = tokio::spawn(async move {
+            let mut refresh = interval_at(
+                Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
+                ADVERTISEMENT_REFRESH_INTERVAL,
+            );
+            refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut expiry_check = interval(EXPIRY_CHECK_INTERVAL);
+            expiry_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            while let Ok(remaining) = remaining_until_expiry(expires_at_unix) {
+                tokio::select! {
+                    _ = sleep(remaining) => {}
+                    _ = expiry_check.tick() => {}
+                    _ = refresh.tick() => {
+                        if node.announce_group(key).is_err() {
+                            break;
+                        }
+                    }
+                    event = node.next_event() => {
+                        if matches!(
+                            event,
+                            NetworkEvent::DiscoveryFailed {
+                                key: failed,
+                                operation: charp2p_network::DiscoveryOperation::Announcement,
+                            } if failed == key
+                        ) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        *active = Some(ActiveAdvertisement {
+            key,
+            expires_at_unix: invitation.expires_at_unix(),
+            task,
+        });
+        Ok(AdvertisementResult {
+            status: "advertising",
+            expires_at_unix: invitation.expires_at_unix(),
+        })
     }
 
     pub async fn search(
@@ -169,6 +301,15 @@ impl NetworkService {
     }
 }
 
+fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
+    let expiry = UNIX_EPOCH
+        .checked_add(Duration::from_secs(expires_at_unix))
+        .ok_or("invitation_expired")?;
+    expiry
+        .duration_since(SystemTime::now())
+        .map_err(|_| "invitation_expired")
+}
+
 fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
     let mut address: Multiaddr = input.parse().map_err(|_| "network_configuration_invalid")?;
     let Some(Protocol::P2p(peer_id)) = address.pop() else {
@@ -182,7 +323,7 @@ fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
@@ -190,9 +331,16 @@ mod tests {
     use charp2p_network::{NetworkEvent, NetworkNode};
     use tokio::time::timeout;
 
-    use super::{parse_bootstrap_peer, NetworkService, PeerSearchResult};
+    use super::{parse_bootstrap_peer, AdvertisementResult, NetworkService, PeerSearchResult};
 
     const NOW: u64 = 1_800_000_000;
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
 
     #[test]
     fn bootstrap_address_requires_a_peer_id() {
@@ -248,6 +396,231 @@ mod tests {
                 reachable_peers: 0,
             }
         );
+    }
+
+    #[test]
+    fn advertise_reports_when_no_bootstrap_peer_is_configured() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        let result = tauri::async_runtime::block_on(
+            NetworkService::from_sources(&[], "")
+                .unwrap()
+                .advertise(DeviceIdentity::generate(), &invitation),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AdvertisementResult {
+                status: "bootstrapRequired",
+                expires_at_unix: now + 3_600,
+            }
+        );
+    }
+
+    #[test]
+    fn advertise_rejects_an_expired_invitation() {
+        let expires_at_unix = unix_now().saturating_sub(1);
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            expires_at_unix.saturating_sub(1),
+        )
+        .unwrap();
+        let result = tauri::async_runtime::block_on(
+            NetworkService::from_sources(&[], "")
+                .unwrap()
+                .advertise(DeviceIdentity::generate(), &invitation),
+        );
+
+        assert!(matches!(result, Err("invitation_expired")));
+    }
+
+    #[test]
+    fn advertised_invitation_is_discoverable_through_a_routing_node() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        let result = tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service =
+                NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
+            let (_, advertiser_secret) = DeviceIdentity::generate_persistable().unwrap();
+            let advertise = service.advertise(
+                DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
+                &invitation,
+            );
+            tokio::pin!(advertise);
+            let advertised = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+            assert_eq!(advertised.status, "advertising");
+            let first_task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should be active")
+                .task
+                .id();
+            let repeated = service
+                .advertise(
+                    DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
+                    &invitation,
+                )
+                .await
+                .unwrap();
+            let repeated_task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should remain active")
+                .task
+                .id();
+            assert_eq!(repeated.status, "advertising");
+            assert_eq!(repeated_task_id, first_task_id);
+
+            let search = service.search(DeviceIdentity::generate(), &invitation);
+            tokio::pin!(search);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut search => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("provider search should complete")
+            .unwrap()
+        });
+
+        assert_eq!(result.status, "peerReachable");
+        assert_eq!(result.discovered_peers, 1);
+        assert_eq!(result.reachable_peers, 1);
+    }
+
+    #[test]
+    fn active_advertisement_stops_at_signed_expiry() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service =
+                NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
+            let advertise = service.advertise(DeviceIdentity::generate(), &invitation);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should publish before expiry")
+            .unwrap();
+            assert!(!service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should be active")
+                .task
+                .is_finished());
+
+            timeout(Duration::from_secs(4), async {
+                loop {
+                    if service
+                        .advertisement
+                        .lock()
+                        .await
+                        .as_ref()
+                        .expect("advertisement should remain recorded")
+                        .task
+                        .is_finished()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("advertisement should stop at signed expiry");
+            assert!(unix_now() >= invitation.expires_at_unix());
+        });
     }
 
     #[test]

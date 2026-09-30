@@ -24,8 +24,10 @@ register the scheme at startup. Installed release builds use the bundle's
 protocol registration.
 
 The pending-group screen can run a bounded Kademlia provider search and direct
-QUIC reachability check with the restored device identity. Release builds will
-use the versioned built-in bootstrap list. During local development, set
+QUIC reachability check with the restored device identity. An owner with an
+active invitation advertises its opaque rendezvous key while the app is
+running, through the invitation expiry. Release builds will use the versioned
+built-in bootstrap list. During local development, set
 `CHARP2P_BOOTSTRAP_NODES` to up to 16 semicolon-separated QUIC multiaddresses
 ending in `/p2p/<peer-id>`. With no configured node, the app reports that a
 bootstrap node is required.
@@ -34,7 +36,7 @@ The ready screen can create and restore a first local group, then issue and
 copy signed custom-URI invitations. Group-root keys and issued bearer
 credentials use the platform keyring; SQLite stores their non-secret indexes
 and invitation defaults. Expired invitations are removed from both stores.
-Owner-side peer advertising, revocation events, and the initial protected
-membership event remain later increments. Until the groups list is
-implemented, the backend enforces one locally created group so extra protected
-roots cannot become hidden from the interface.
+Revocation events and the initial protected membership event remain later
+increments. Until the groups list is implemented, the backend enforces one
+locally created group so extra protected roots cannot become hidden from the
+interface.

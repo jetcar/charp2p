@@ -43,5 +43,6 @@ invitation so an older bearer credential cannot become hidden from its UI.
 - Generating a replacement does not revoke an older invitation. Revocation
   remains a signed group event and must remove the corresponding protected
   record when that event is applied.
-- Owner-side DHT advertising and the peer join handshake remain separate
-  increments.
+- Owner-side DHT advertising consumes the protected invitation after the same
+  signature and index validation. The peer join handshake remains a separate
+  increment.

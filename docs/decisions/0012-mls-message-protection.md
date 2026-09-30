@@ -51,6 +51,13 @@ leaf capabilities. Finally require the signed device credential to equal the
 peer ID authenticated by the libp2p transport. These checks validate the
 KeyPackage source but do not authorize its invitation or membership.
 
+Generate outbound KeyPackages through the same profile wrapper. Require the
+caller-supplied signing credential to name the local device, set the exact
+profile capabilities, let OpenMLS create and store the one-time private
+material, bound and encode the public package, and run it through the inbound
+validator before use. Keep the encoded package in a zeroing, non-cloneable
+buffer, then transfer that buffer directly into the bounded join request.
+
 Prepare an accepted addition as a pending OpenMLS commit and bounded Welcome;
 do not advance the owner's epoch in the preparation step. The application must
 durably publish the Commit through the signed group event graph, then explicitly

@@ -5,12 +5,12 @@
 use std::fmt;
 
 pub use charp2p_core::MAX_JOIN_MLS_MESSAGE_BYTES as MAX_MLS_WIRE_BYTES;
-use charp2p_core::PeerId;
+use charp2p_core::{Invitation, JoinError, JoinRequest, PeerId};
 use openmls::{
     group::GroupContext,
     prelude::{
-        Capabilities, Ciphersuite, CredentialType, Extension, ExtensionType, Extensions,
-        KeyPackage, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig,
+        Capabilities, Ciphersuite, CredentialType, CredentialWithKey, Extension, ExtensionType,
+        Extensions, KeyPackage, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig,
         MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
         RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
         tls_codec::{Deserialize, Serialize},
@@ -114,6 +114,60 @@ pub enum ProfileKeyPackageError {
     /// The signed device credential is not the authenticated transport peer.
     #[error("MLS KeyPackage device does not match the transport peer")]
     TransportPeerMismatch,
+}
+
+/// A one-time profile KeyPackage whose private keys are stored by the provider.
+pub struct PreparedKeyPackage {
+    device_id: PeerId,
+    encoded: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedKeyPackage {
+    /// Device identity signed into the KeyPackage leaf credential.
+    pub fn device_id(&self) -> PeerId {
+        self.device_id
+    }
+
+    /// Bounded encoded KeyPackage sent in one join request.
+    pub fn encoded(&self) -> &[u8] {
+        self.encoded.as_slice()
+    }
+
+    /// Transfers the one-time public package into a bounded join request.
+    pub fn into_join_request(mut self, invitation: &Invitation) -> Result<JoinRequest, JoinError> {
+        let encoded = std::mem::take(&mut *self.encoded);
+        JoinRequest::from_invitation(invitation, encoded)
+    }
+}
+
+impl fmt::Debug for PreparedKeyPackage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedKeyPackage")
+            .field("device_id", &self.device_id)
+            .field("encoded_bytes", &self.encoded.len())
+            .finish()
+    }
+}
+
+/// Failure while creating a one-time profile KeyPackage.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PrepareKeyPackageError {
+    /// The supplied credential is malformed or names another device.
+    #[error("MLS credential does not match the local device")]
+    InvalidDeviceCredential,
+    /// OpenMLS could not generate and store the one-time private key material.
+    #[error("MLS KeyPackage generation failed")]
+    GenerationFailed,
+    /// OpenMLS could not canonically encode the KeyPackage.
+    #[error("MLS KeyPackage encoding failed")]
+    WireEncodingFailed,
+    /// The generated KeyPackage exceeds the profile wire bound.
+    #[error("MLS KeyPackage exceeds the profile wire bound")]
+    WireSizeExceeded,
+    /// The generated KeyPackage did not pass the inbound profile validator.
+    #[error("generated MLS KeyPackage failed profile validation")]
+    SelfValidationFailed,
 }
 
 /// Bounded MLS messages produced while staging one authenticated member.
@@ -263,6 +317,40 @@ pub fn device_id_from_credential(
     }
     PeerId::from_bytes(&identity[version_offset + 2..])
         .map_err(|_| DeviceCredentialError::InvalidIdentity)
+}
+
+/// Generates and stores one-time profile KeyPackage private material.
+///
+/// `credential_with_key` must contain the public key of `signer` and a
+/// CharP2P Basic Credential for `device_id`. The returned public encoding is
+/// ready for one [`charp2p_core::JoinRequest`].
+pub fn prepare_profile_key_package<Provider: OpenMlsProvider>(
+    provider: &Provider,
+    signer: &impl Signer,
+    credential_with_key: CredentialWithKey,
+    device_id: PeerId,
+) -> Result<PreparedKeyPackage, PrepareKeyPackageError> {
+    let credential_device = device_id_from_credential(&credential_with_key.credential)
+        .map_err(|_| PrepareKeyPackageError::InvalidDeviceCredential)?;
+    if credential_device != device_id {
+        return Err(PrepareKeyPackageError::InvalidDeviceCredential);
+    }
+    let key_package = KeyPackage::builder()
+        .leaf_node_capabilities(profile_capabilities())
+        .build(CIPHERSUITE, provider, signer, credential_with_key)
+        .map_err(|_| PrepareKeyPackageError::GenerationFailed)?;
+    let encoded = Zeroizing::new(
+        key_package
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|_| PrepareKeyPackageError::WireEncodingFailed)?,
+    );
+    if encoded.is_empty() || encoded.len() > MAX_MLS_WIRE_BYTES {
+        return Err(PrepareKeyPackageError::WireSizeExceeded);
+    }
+    validate_profile_key_package(provider, encoded.as_slice(), device_id)
+        .map_err(|_| PrepareKeyPackageError::SelfValidationFailed)?;
+    Ok(PreparedKeyPackage { device_id, encoded })
 }
 
 /// Bounds and parses exactly one MLS wire message before any attacker-sized
@@ -515,7 +603,9 @@ fn profile_extensions() -> Extensions<GroupContext> {
 
 #[cfg(test)]
 mod tests {
-    use charp2p_core::{DeviceIdentity, PeerId};
+    use charp2p_core::{
+        DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId,
+    };
     use openmls::prelude::{
         BasicCredential, Ciphersuite, CredentialWithKey, Extensions, KeyPackage, MlsGroup,
         MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
@@ -526,12 +616,13 @@ mod tests {
 
     use super::{
         CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
-        MlsWireError, PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError,
-        StageWelcomeError, abort_prepared_member_admission, decode_profile_message,
-        device_credential, device_id_from_credential, group_create_config,
-        merge_prepared_member_admission, prepare_profile_member_admission, profile_capabilities,
-        profile_extensions, stage_profile_welcome, validate_group_profile,
-        validate_profile_key_package, validate_staged_commit_profile,
+        MlsWireError, PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError,
+        ProfileKeyPackageError, StageWelcomeError, abort_prepared_member_admission,
+        decode_profile_message, device_credential, device_id_from_credential, group_create_config,
+        merge_prepared_member_admission, prepare_profile_key_package,
+        prepare_profile_member_admission, profile_capabilities, profile_extensions,
+        stage_profile_welcome, validate_group_profile, validate_profile_key_package,
+        validate_staged_commit_profile,
     };
 
     fn credential(
@@ -752,6 +843,45 @@ mod tests {
         assert_eq!(
             validate_profile_key_package(&provider, &forged, member_id).unwrap_err(),
             ProfileKeyPackageError::VerificationFailed
+        );
+    }
+
+    #[test]
+    fn local_profile_key_package_is_bounded_and_self_validated() {
+        let provider = OpenMlsRustCrypto::default();
+        let device_id = DeviceIdentity::generate().peer_id();
+        let other_id = DeviceIdentity::generate().peer_id();
+        let (device_credential, signer) = credential(device_id, &provider);
+
+        let prepared =
+            prepare_profile_key_package(&provider, &signer, device_credential, device_id)
+                .expect("profile KeyPackage can be prepared");
+
+        assert_eq!(prepared.device_id(), device_id);
+        assert!(!prepared.encoded().is_empty());
+        assert!(prepared.encoded().len() <= MAX_MLS_WIRE_BYTES);
+        validate_profile_key_package(&provider, prepared.encoded(), device_id).unwrap();
+        let invitation = Invitation::issue(
+            &GroupIdentity::generate(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: 1_800_003_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            1_800_000_000,
+        )
+        .unwrap();
+        let request = prepared.into_join_request(&invitation).unwrap();
+        assert_eq!(request.group_id(), invitation.group_id());
+        assert!(!request.key_package().is_empty());
+
+        let (device_credential, signer) = credential(device_id, &provider);
+        assert_eq!(
+            prepare_profile_key_package(&provider, &signer, device_credential, other_id)
+                .unwrap_err(),
+            PrepareKeyPackageError::InvalidDeviceCredential
         );
     }
 

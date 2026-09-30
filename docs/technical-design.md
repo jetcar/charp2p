@@ -204,6 +204,10 @@ rejecting an oversized message, and zeroes temporary wire buffers on drop.
 Before use, the owner parses exactly one bounded KeyPackage, verifies it with
 OpenMLS, requires the pinned ciphersuite and exact profile capabilities, and
 requires its signed device credential to equal the authenticated libp2p peer.
+The joining device generates its one-time KeyPackage through the same profile:
+the credential must name its local peer ID, OpenMLS stores the matching private
+material, and the bounded public encoding is self-validated before being moved
+into the join request.
 An accepted addition first produces a pending, profile-validated MLS Commit and
 Welcome without advancing the owner's epoch. The owner durably publishes the
 Commit as a signed group event, explicitly merges it, and then sends the

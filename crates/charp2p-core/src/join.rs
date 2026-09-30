@@ -32,8 +32,9 @@ impl JoinRequest {
         invitation: &Invitation,
         key_package: Vec<u8>,
     ) -> Result<Self, JoinError> {
-        let encoded = invitation.encode()?;
-        Self::from_parts(invitation.group_id(), encoded, key_package)
+        let key_package = Zeroizing::new(key_package);
+        let encoded = Zeroizing::new(invitation.encode()?);
+        Self::from_zeroizing_parts(invitation.group_id(), encoded, key_package)
     }
 
     /// Encodes the versioned join request without copying its secret fields.
@@ -106,18 +107,6 @@ impl JoinRequest {
     /// Encoded MLS KeyPackage for the authenticated transport device.
     pub fn key_package(&self) -> &[u8] {
         self.key_package.as_slice()
-    }
-
-    fn from_parts(
-        group_id: PeerId,
-        invitation: String,
-        key_package: Vec<u8>,
-    ) -> Result<Self, JoinError> {
-        Self::from_zeroizing_parts(
-            group_id,
-            Zeroizing::new(invitation),
-            Zeroizing::new(key_package),
-        )
     }
 
     fn from_zeroizing_parts(

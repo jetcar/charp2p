@@ -1,4 +1,4 @@
-mod groups;
+pub mod groups;
 mod identity;
 mod invitation;
 mod network;

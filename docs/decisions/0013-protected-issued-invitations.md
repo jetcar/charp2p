@@ -34,6 +34,14 @@ fails. Return the custom application URI to the owner interface so it can be
 copied and shared. The current single-group shell permits one active issued
 invitation so an older bearer credential cannot become hidden from its UI.
 
+Before admitting a join request, the owner revalidates the presented bearer
+signature and expiry, requires its group to match the request and a locally
+protected group root, finds the invitation in the SQLite issue index, and
+compares it with the exact protected bearer record. Wire-shape validation alone
+does not authorize membership. This check proves current local issuance but does
+not consume a single-use invitation; reuse and revocation are enforced by the
+signed membership state when the member-add event is committed.
+
 ## Consequences
 
 - Issued links and discovery secrets survive application restarts without
@@ -44,5 +52,6 @@ invitation so an older bearer credential cannot become hidden from its UI.
   remains a signed group event and must remove the corresponding protected
   record when that event is applied.
 - Owner-side DHT advertising consumes the protected invitation after the same
-  signature and index validation. The peer join handshake remains a separate
-  increment.
+  signature and index validation.
+- The join handshake now has a local issuance authorization boundary. MLS
+  admission and atomic single-use consumption remain separate increments.

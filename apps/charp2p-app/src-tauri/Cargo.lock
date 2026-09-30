@@ -670,6 +670,7 @@ dependencies = [
  "libp2p",
  "serde",
  "serde_json",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-deep-link",

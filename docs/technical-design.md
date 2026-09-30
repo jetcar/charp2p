@@ -197,6 +197,12 @@ sizes before allocation; secret-bearing fields and encoded buffers are
 redacted from debug output and zeroed on drop. Wire validation alone does not
 authorize the request: the owner verifies the capability and binds the MLS
 credential to the authenticated transport peer before accepting it.
+Owner-side capability verification checks the signature and expiry, the group
+claimed by the request, ownership through the protected group root, the SQLite
+issued-invitation index, and an exact constant-time match with the protected
+bearer record. It returns only non-secret invitation metadata. This proves that
+the owner currently recognizes the bearer; single-use consumption and
+revocation still derive from signed membership state when admission commits.
 The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before

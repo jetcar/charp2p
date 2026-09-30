@@ -6,11 +6,12 @@ use std::{
 
 use charp2p_core::{
     GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, InvitationSpec,
-    PeerId,
+    JoinRequest, PeerId,
 };
 use charp2p_store::{EventStore, IssuedInvitationMetadata, LocalGroupMetadata};
 use keyring_core::Error as KeyringError;
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
@@ -43,6 +44,33 @@ pub struct IssuedInvitation {
     pub link: String,
     pub expires_at_unix: u64,
     pub reusable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorizedJoinInvitation {
+    invitation_id: InvitationId,
+    group_id: PeerId,
+    reusable: bool,
+}
+
+impl AuthorizedJoinInvitation {
+    pub fn invitation_id(self) -> InvitationId {
+        self.invitation_id
+    }
+
+    pub fn group_id(self) -> PeerId {
+        self.group_id
+    }
+
+    pub fn is_reusable(self) -> bool {
+        self.reusable
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinInvitationAuthorizationError {
+    Unauthorized,
+    Unavailable,
 }
 
 pub struct CreateGroupSpec<'a> {
@@ -247,6 +275,96 @@ impl GroupService {
             .map_err(|_| "system_clock_invalid")?
             .as_secs();
         self.issued_invitations_at(now_unix)
+    }
+
+    /// Verifies that an inbound bearer invitation is active and was issued by
+    /// this owner. This does not consume single-use invitations; consumption
+    /// requires the signed membership event that commits the new member.
+    pub fn authorize_join_request(
+        &self,
+        request: &JoinRequest,
+    ) -> Result<AuthorizedJoinInvitation, JoinInvitationAuthorizationError> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JoinInvitationAuthorizationError::Unavailable)?
+            .as_secs();
+        self.authorize_join_request_at(request, now_unix)
+    }
+
+    fn authorize_join_request_at(
+        &self,
+        request: &JoinRequest,
+        now_unix: u64,
+    ) -> Result<AuthorizedJoinInvitation, JoinInvitationAuthorizationError> {
+        use JoinInvitationAuthorizationError::{Unauthorized, Unavailable};
+
+        let invitation = Invitation::decode(request.invitation(), now_unix)
+            .map_err(|_| Unauthorized)?;
+        if invitation.group_id() != request.group_id() {
+            return Err(Unauthorized);
+        }
+
+        let _operation = self.operations.lock().map_err(|_| Unavailable)?;
+        let store = self.metadata.lock().map_err(|_| Unavailable)?;
+        let owns_group = store
+            .local_groups()
+            .map_err(|_| Unavailable)?
+            .into_iter()
+            .any(|group| group.group_id == invitation.group_id());
+        if !owns_group {
+            return Err(Unauthorized);
+        }
+
+        let group_secret = match self.secrets.get(invitation.group_id()) {
+            Ok(secret) => secret,
+            Err("group_identity_missing") => return Err(Unauthorized),
+            Err(_) => return Err(Unavailable),
+        };
+        let group_identity =
+            GroupIdentity::from_persisted_secret(&group_secret).map_err(|_| Unavailable)?;
+        if group_identity.group_id() != invitation.group_id() {
+            return Err(Unavailable);
+        }
+
+        let indexed = store
+            .issued_invitations()
+            .map_err(|_| Unavailable)?
+            .into_iter()
+            .find(|indexed| indexed.invitation_id == invitation.invitation_id())
+            .ok_or(Unauthorized)?;
+        if indexed.group_id != invitation.group_id()
+            || indexed.expires_at_unix != invitation.expires_at_unix()
+            || indexed.expires_at_unix <= now_unix
+        {
+            return Err(Unauthorized);
+        }
+
+        let encoded = self
+            .invitation_secrets
+            .get_optional(indexed.invitation_id)
+            .map_err(|_| Unavailable)?
+            .ok_or(Unauthorized)?;
+        let (stored_invitation, stored_encoded) =
+            decode_issued_invitation(&encoded).map_err(|_| Unavailable)?;
+        if stored_invitation.invitation_id() != indexed.invitation_id
+            || stored_invitation.group_id() != indexed.group_id
+            || stored_invitation.expires_at_unix() != indexed.expires_at_unix
+            || stored_invitation.is_reusable() != invitation.is_reusable()
+        {
+            return Err(Unavailable);
+        }
+        let presented = request.invitation().as_bytes();
+        if presented.len() != stored_encoded.len()
+            || !bool::from(presented.ct_eq(stored_encoded.as_bytes()))
+        {
+            return Err(Unauthorized);
+        }
+
+        Ok(AuthorizedJoinInvitation {
+            invitation_id: indexed.invitation_id,
+            group_id: indexed.group_id,
+            reusable: stored_invitation.is_reusable(),
+        })
     }
 
     fn issue_invitation_at(
@@ -510,11 +628,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use charp2p_core::{
-        GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, PeerId,
+        GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, InvitationSpec,
+        JoinRequest, PeerId,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
-    use super::{CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore};
+    use super::{
+        CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
+        JoinInvitationAuthorizationError,
+    };
 
     #[derive(Default)]
     struct MemorySecretStore {
@@ -608,6 +730,17 @@ mod tests {
         }
     }
 
+    fn join_request(link: &str, now_unix: u64) -> JoinRequest {
+        let invitation = Invitation::decode_input(link, now_unix).unwrap();
+        JoinRequest::from_invitation(&invitation, vec![1]).unwrap()
+    }
+
+    fn request_invitation_id(request: &JoinRequest, now_unix: u64) -> InvitationId {
+        Invitation::decode(request.invitation(), now_unix)
+            .unwrap()
+            .invitation_id()
+    }
+
     #[test]
     fn created_group_restores_with_the_same_protected_root() {
         let service = service();
@@ -659,6 +792,91 @@ mod tests {
             .issued_invitations()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn issued_invitation_authorizes_without_consuming_the_bearer() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+
+        let first = service.authorize_join_request_at(&request, NOW).unwrap();
+        let second = service.authorize_join_request_at(&request, NOW).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.group_id(), group_id);
+        assert_eq!(first.invitation_id(), request_invitation_id(&request, NOW));
+        assert!(!first.is_reusable());
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_or_foreign_invitation_is_not_authorized() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        assert_eq!(
+            service.authorize_join_request_at(&request, NOW + 604_800),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+
+        let foreign_identity = GroupIdentity::generate();
+        let foreign_invitation = Invitation::issue(
+            &foreign_identity,
+            InvitationSpec {
+                group_name: "Foreign",
+                inviter_name: "Another owner",
+                expires_at_unix: NOW + 600,
+                history_policy: HistoryPolicy::None,
+                reusable: true,
+            },
+            NOW,
+        )
+        .unwrap();
+        let foreign_request =
+            JoinRequest::from_invitation(&foreign_invitation, vec![1]).unwrap();
+        assert_eq!(
+            service.authorize_join_request_at(&foreign_request, NOW),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_protected_invitation_fails_closed() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        let invitation_id = request_invitation_id(&request, NOW);
+
+        service.invitation_secrets.remove(invitation_id).unwrap();
+        assert_eq!(
+            service.authorize_join_request_at(&request, NOW),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+
+        service
+            .invitation_secrets
+            .put(invitation_id, b"not an invitation")
+            .unwrap();
+        assert_eq!(
+            service.authorize_join_request_at(&request, NOW),
+            Err(JoinInvitationAuthorizationError::Unavailable)
+        );
     }
 
     #[test]

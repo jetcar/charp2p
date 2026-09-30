@@ -2,6 +2,8 @@
 
 //! The fixed MLS profile used for CharP2P group-message protection.
 
+use std::fmt;
+
 pub use charp2p_core::MAX_JOIN_MLS_MESSAGE_BYTES as MAX_MLS_WIRE_BYTES;
 use charp2p_core::PeerId;
 use openmls::{
@@ -11,10 +13,12 @@ use openmls::{
         KeyPackage, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig,
         MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
         RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
-        tls_codec::Deserialize,
+        tls_codec::{Deserialize, Serialize},
     },
 };
+use openmls_traits::signatures::Signer;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const PROFILE_EXTENSION_TYPE_ID: u16 = 0xF000;
 const PROFILE_EXTENSION_TYPE: ExtensionType = ExtensionType::Unknown(PROFILE_EXTENSION_TYPE_ID);
@@ -110,6 +114,89 @@ pub enum ProfileKeyPackageError {
     /// The signed device credential is not the authenticated transport peer.
     #[error("MLS KeyPackage device does not match the transport peer")]
     TransportPeerMismatch,
+}
+
+/// Bounded MLS messages produced while staging one authenticated member.
+pub struct PreparedMemberAdmission {
+    peer_id: PeerId,
+    commit: Zeroizing<Vec<u8>>,
+    welcome: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedMemberAdmission {
+    /// Device authenticated by both the transport and KeyPackage credential.
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Commit that existing members must authenticate and merge.
+    pub fn commit(&self) -> &[u8] {
+        self.commit.as_slice()
+    }
+
+    /// Welcome returned only to the joining device.
+    pub fn welcome(&self) -> &[u8] {
+        self.welcome.as_slice()
+    }
+}
+
+impl fmt::Debug for PreparedMemberAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMemberAdmission")
+            .field("peer_id", &self.peer_id)
+            .field("commit_bytes", &self.commit.len())
+            .field("welcome_bytes", &self.welcome.len())
+            .finish()
+    }
+}
+
+/// Failure while staging an authenticated device addition.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PrepareMemberAdmissionError {
+    /// The owner's existing group state is outside the fixed profile.
+    #[error("owner MLS group does not match the CharP2P profile")]
+    InvalidGroupProfile,
+    /// The KeyPackage is invalid or is not bound to the transport peer.
+    #[error("joining MLS KeyPackage is invalid")]
+    InvalidKeyPackage(ProfileKeyPackageError),
+    /// OpenMLS could not stage the member addition.
+    #[error("MLS member addition could not be staged")]
+    MemberAdditionFailed,
+    /// The locally generated pending commit violates the profile.
+    #[error("generated MLS member commit violates the profile")]
+    InvalidPendingCommit,
+    /// OpenMLS could not canonically encode the generated messages.
+    #[error("generated MLS member messages could not be encoded")]
+    WireEncodingFailed,
+    /// The generated commit or Welcome exceeds the profile wire bound.
+    #[error("generated MLS member messages exceed the profile wire bound")]
+    WireSizeExceeded,
+    /// A failed preparation could not clear its pending commit.
+    #[error("failed MLS member preparation could not be rolled back")]
+    RollbackFailed,
+}
+
+/// Failure while merging a previously persisted member admission commit.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MergeMemberAdmissionError {
+    /// There is no locally prepared commit to merge.
+    #[error("no MLS member admission is pending")]
+    MissingPendingCommit,
+    /// The pending commit violates the fixed profile.
+    #[error("pending MLS member admission violates the profile")]
+    InvalidPendingCommit,
+    /// OpenMLS could not durably advance the group epoch.
+    #[error("pending MLS member admission could not be merged")]
+    MergeFailed,
+}
+
+/// Failure while discarding an unpublished member admission.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AbortMemberAdmissionError {
+    /// OpenMLS could not durably clear its pending commit.
+    #[error("pending MLS member admission could not be cleared")]
+    StorageFailed,
 }
 
 /// Returns the group configuration required by profile version 1.
@@ -229,6 +316,113 @@ pub fn validate_profile_key_package<Provider: OpenMlsProvider>(
     Ok(key_package)
 }
 
+/// Stages one authenticated device addition without advancing the local epoch.
+///
+/// The caller must durably publish `commit()` to the signed group event graph
+/// before calling [`merge_prepared_member_admission`]. The `welcome()` is then
+/// returned only to the authenticated joining peer. Any validation or encoding
+/// failure after OpenMLS creates the pending commit clears that commit first.
+pub fn prepare_profile_member_admission<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    signer: &impl Signer,
+    encoded_key_package: &[u8],
+    authenticated_peer: PeerId,
+) -> Result<PreparedMemberAdmission, PrepareMemberAdmissionError> {
+    validate_group_profile(group).map_err(|_| PrepareMemberAdmissionError::InvalidGroupProfile)?;
+    let key_package =
+        validate_profile_key_package(provider, encoded_key_package, authenticated_peer)
+            .map_err(PrepareMemberAdmissionError::InvalidKeyPackage)?;
+    let (commit, welcome, _) = group
+        .add_members(provider, signer, &[key_package])
+        .map_err(|_| PrepareMemberAdmissionError::MemberAdditionFailed)?;
+
+    let pending_is_valid = group
+        .pending_commit()
+        .is_some_and(|pending| validate_staged_commit_profile(pending).is_ok());
+    if !pending_is_valid {
+        return Err(rollback_prepared_admission(
+            group,
+            provider,
+            PrepareMemberAdmissionError::InvalidPendingCommit,
+        ));
+    }
+
+    let commit = match commit.tls_serialize_detached() {
+        Ok(commit) => Zeroizing::new(commit),
+        Err(_) => {
+            return Err(rollback_prepared_admission(
+                group,
+                provider,
+                PrepareMemberAdmissionError::WireEncodingFailed,
+            ));
+        }
+    };
+    let welcome = match welcome.tls_serialize_detached() {
+        Ok(welcome) => Zeroizing::new(welcome),
+        Err(_) => {
+            return Err(rollback_prepared_admission(
+                group,
+                provider,
+                PrepareMemberAdmissionError::WireEncodingFailed,
+            ));
+        }
+    };
+    if commit.is_empty()
+        || commit.len() > MAX_MLS_WIRE_BYTES
+        || welcome.is_empty()
+        || welcome.len() > MAX_MLS_WIRE_BYTES
+    {
+        return Err(rollback_prepared_admission(
+            group,
+            provider,
+            PrepareMemberAdmissionError::WireSizeExceeded,
+        ));
+    }
+
+    Ok(PreparedMemberAdmission {
+        peer_id: authenticated_peer,
+        commit,
+        welcome,
+    })
+}
+
+/// Merges a prepared admission after its Commit is durably published.
+pub fn merge_prepared_member_admission<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+) -> Result<(), MergeMemberAdmissionError> {
+    let pending = group
+        .pending_commit()
+        .ok_or(MergeMemberAdmissionError::MissingPendingCommit)?;
+    validate_staged_commit_profile(pending)
+        .map_err(|_| MergeMemberAdmissionError::InvalidPendingCommit)?;
+    group
+        .merge_pending_commit(provider)
+        .map_err(|_| MergeMemberAdmissionError::MergeFailed)
+}
+
+/// Clears a prepared admission when its Commit cannot be durably published.
+pub fn abort_prepared_member_admission<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+) -> Result<(), AbortMemberAdmissionError> {
+    group
+        .clear_pending_commit(provider.storage())
+        .map_err(|_| AbortMemberAdmissionError::StorageFailed)
+}
+
+fn rollback_prepared_admission<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    error: PrepareMemberAdmissionError,
+) -> PrepareMemberAdmissionError {
+    match group.clear_pending_commit(provider.storage()) {
+        Ok(()) => error,
+        Err(_) => PrepareMemberAdmissionError::RollbackFailed,
+    }
+}
+
 /// Checks and decrypts a profile Welcome without persisting the resulting
 /// group.
 ///
@@ -331,11 +525,13 @@ mod tests {
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MlsWireError, ProfileError,
-        ProfileKeyPackageError, StageWelcomeError, decode_profile_message, device_credential,
-        device_id_from_credential, group_create_config, profile_capabilities, profile_extensions,
-        stage_profile_welcome, validate_group_profile, validate_profile_key_package,
-        validate_staged_commit_profile,
+        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
+        MlsWireError, PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError,
+        StageWelcomeError, abort_prepared_member_admission, decode_profile_message,
+        device_credential, device_id_from_credential, group_create_config,
+        merge_prepared_member_admission, prepare_profile_member_admission, profile_capabilities,
+        profile_extensions, stage_profile_welcome, validate_group_profile,
+        validate_profile_key_package, validate_staged_commit_profile,
     };
 
     fn credential(
@@ -621,6 +817,122 @@ mod tests {
                 .unwrap_err(),
             ProfileKeyPackageError::InvalidSize
         );
+    }
+
+    #[test]
+    fn authenticated_member_admission_is_prepared_then_explicitly_merged() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &member_provider,
+                &member_signer,
+                member_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &member_key_package,
+            member_id,
+        )
+        .unwrap();
+        assert_eq!(admission.peer_id(), member_id);
+        assert!(!admission.commit().is_empty());
+        assert!(!admission.welcome().is_empty());
+        assert!(admission.commit().len() <= MAX_MLS_WIRE_BYTES);
+        assert!(admission.welcome().len() <= MAX_MLS_WIRE_BYTES);
+        assert!(owner_group.pending_commit().is_some());
+        assert_eq!(owner_group.members().count(), 1);
+
+        let staged_member = stage_profile_welcome(&member_provider, admission.welcome()).unwrap();
+        let member_group = staged_member.into_group(&member_provider).unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        assert!(owner_group.pending_commit().is_none());
+        assert_eq!(owner_group.members().count(), 2);
+        assert_eq!(member_group.members().count(), 2);
+        assert_eq!(
+            merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap_err(),
+            MergeMemberAdmissionError::MissingPendingCommit
+        );
+    }
+
+    #[test]
+    fn rejected_member_admission_does_not_leave_a_pending_commit() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let other_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &member_provider,
+                &member_signer,
+                member_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_profile_member_admission(
+                &mut owner_group,
+                &owner_provider,
+                &owner_signer,
+                &member_key_package,
+                other_id,
+            )
+            .unwrap_err(),
+            PrepareMemberAdmissionError::InvalidKeyPackage(
+                ProfileKeyPackageError::TransportPeerMismatch
+            )
+        );
+        assert!(owner_group.pending_commit().is_none());
+        assert_eq!(owner_group.members().count(), 1);
+
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &member_key_package,
+            member_id,
+        )
+        .unwrap();
+        assert!(!admission.commit().is_empty());
+        assert!(owner_group.pending_commit().is_some());
+        abort_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        assert!(owner_group.pending_commit().is_none());
+        assert_eq!(owner_group.members().count(), 1);
     }
 
     #[test]

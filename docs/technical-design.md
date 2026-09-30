@@ -204,6 +204,12 @@ rejecting an oversized message, and zeroes temporary wire buffers on drop.
 Before use, the owner parses exactly one bounded KeyPackage, verifies it with
 OpenMLS, requires the pinned ciphersuite and exact profile capabilities, and
 requires its signed device credential to equal the authenticated libp2p peer.
+An accepted addition first produces a pending, profile-validated MLS Commit and
+Welcome without advancing the owner's epoch. The owner durably publishes the
+Commit as a signed group event, explicitly merges it, and then sends the
+Welcome. Preparation failures clear the pending commit, and event-publication
+failure explicitly aborts it. Generated wire buffers are bounded, redacted,
+and zeroed on drop.
 
 ## Group protocol
 

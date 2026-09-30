@@ -51,6 +51,15 @@ leaf capabilities. Finally require the signed device credential to equal the
 peer ID authenticated by the libp2p transport. These checks validate the
 KeyPackage source but do not authorize its invitation or membership.
 
+Prepare an accepted addition as a pending OpenMLS commit and bounded Welcome;
+do not advance the owner's epoch in the preparation step. The application must
+durably publish the Commit through the signed group event graph, then explicitly
+merge the pending commit, and only then return the Welcome. Preparation errors
+after OpenMLS stages a commit clear that pending state. If durable event
+publication fails, the application explicitly aborts the prepared admission.
+Keep the encoded Commit and Welcome in zeroing, non-cloneable buffers and redact
+their contents from debug output.
+
 Persist OpenMLS state with a dedicated provider before integrating it into the
 application. Keep signature private keys and exported recovery material in
 platform-protected storage. Never enable OpenMLS content or crypto debug

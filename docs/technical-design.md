@@ -197,6 +197,10 @@ sizes before allocation; secret-bearing fields and encoded buffers are
 redacted from debug output and zeroed on drop. Wire validation alone does not
 authorize the request: the owner verifies the capability and binds the MLS
 credential to the authenticated transport peer before accepting it.
+The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
+connection, with a 30-second request timeout and 16 concurrent streams per
+connection. The transport reads one byte beyond each outer bound before
+rejecting an oversized message, and zeroes temporary wire buffers on drop.
 
 ## Group protocol
 

@@ -37,10 +37,17 @@ the invitation signature, group, expiry, revocation and reuse state; parse the
 KeyPackage with the pinned MLS profile; and bind its credential to the
 authenticated transport peer before acceptance.
 
+Carry this codec over the authenticated libp2p request-response protocol
+`/charp2p/join/1.0.0`, with a 30-second deadline and at most 16 concurrent
+streams per connection. The transport reads at most one byte beyond each outer
+limit so an oversized message cannot be accepted as a valid prefix. Temporary
+wire buffers are zeroed on drop. Routing-only nodes reject all join requests;
+application advertisers return `busy` until the owner acceptance handler is
+active.
+
 ## Consequences
 
 - Join handlers have one shared bounded input and output codec with stable
   version, variant, and rejection codes.
 - A syntactically valid request grants no membership or synchronization access.
-- Network transport, durable MLS state, approval flow, and acceptance remain
-  separate increments.
+- Durable MLS state, approval flow, and acceptance remain separate increments.

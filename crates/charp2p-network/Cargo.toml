@@ -10,6 +10,7 @@ charp2p-core = { path = "../charp2p-core" }
 futures.workspace = true
 libp2p.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

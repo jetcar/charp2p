@@ -3,7 +3,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use charp2p_core::{DeviceIdentity, DiscoveryKey, Invitation, SyncRejectReason};
+use charp2p_core::{
+    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, SyncRejectReason,
+};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -147,6 +149,9 @@ impl NetworkService {
                         let _ =
                             node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
                     }
+                    NetworkEvent::JoinRequestReceived { request_id, .. } => {
+                        let _ = node.reject_join_request(request_id, JoinRejectReason::Busy);
+                    }
                     _ => {}
                 }
             }
@@ -184,6 +189,12 @@ impl NetworkService {
                                 let _ = node.reject_sync_request(
                                     request_id,
                                     SyncRejectReason::Unauthorized,
+                                );
+                            }
+                            NetworkEvent::JoinRequestReceived { request_id, .. } => {
+                                let _ = node.reject_join_request(
+                                    request_id,
+                                    JoinRejectReason::Busy,
                                 );
                             }
                             _ => {}

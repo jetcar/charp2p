@@ -2,10 +2,13 @@
 
 //! Portable libp2p transport and peer-discovery foundation for CharP2P.
 
+mod join_codec;
+
 use std::{collections::HashMap, time::Duration};
 
 use charp2p_core::{
-    DiscoveryKey, MAX_SYNC_RESPONSE_BYTES, SyncError, SyncRejectReason, SyncRequest, SyncResponse,
+    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError,
+    SyncRejectReason, SyncRequest, SyncResponse,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -16,11 +19,15 @@ use libp2p::{
 };
 use thiserror::Error;
 
+use crate::join_codec::JoinCodec;
+
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const SYNC_PROTOCOL: &str = "/charp2p/sync/1.0.0";
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const JOIN_PROTOCOL: &str = "/charp2p/join/1.0.0";
+const JOIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 
@@ -29,6 +36,7 @@ struct Behaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
+    join: request_response::Behaviour<JoinCodec>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
@@ -37,6 +45,16 @@ impl Behaviour {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
         dht.set_mode(Some(dht_mode));
+        let join = request_response::Behaviour::with_codec(
+            JoinCodec,
+            [(
+                StreamProtocol::new(JOIN_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(JOIN_REQUEST_TIMEOUT)
+                .with_max_concurrent_streams(16),
+        );
         let sync_codec = request_response::cbor::codec::Codec::default()
             .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
             .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES);
@@ -58,6 +76,7 @@ impl Behaviour {
                     .with_agent_version(AGENT_VERSION.to_owned()),
             ),
             dht,
+            join,
             sync,
         }
     }
@@ -69,6 +88,8 @@ pub struct NetworkNode {
     discovery_queries: HashMap<kad::QueryId, DiscoveryKey>,
     pending_sync_responses:
         HashMap<InboundSyncRequestId, request_response::ResponseChannel<SyncResponse>>,
+    pending_join_responses:
+        HashMap<InboundJoinRequestId, request_response::ResponseChannel<JoinResponse>>,
 }
 
 impl NetworkNode {
@@ -97,6 +118,7 @@ impl NetworkNode {
             swarm,
             discovery_queries: HashMap::new(),
             pending_sync_responses: HashMap::new(),
+            pending_join_responses: HashMap::new(),
         }
     }
 
@@ -179,6 +201,46 @@ impl NetworkNode {
                 .sync
                 .send_request(&peer_id, request),
         ))
+    }
+
+    /// Sends a bounded membership request to an authenticated peer.
+    pub fn send_join_request(
+        &mut self,
+        peer_id: PeerId,
+        request: JoinRequest,
+    ) -> OutboundJoinRequestId {
+        OutboundJoinRequestId(
+            self.swarm
+                .behaviour_mut()
+                .join
+                .send_request(&peer_id, request),
+        )
+    }
+
+    /// Sends a bounded membership response to a previously surfaced request.
+    pub fn send_join_response(
+        &mut self,
+        request_id: InboundJoinRequestId,
+        response: JoinResponse,
+    ) -> Result<(), NetworkError> {
+        let channel = self
+            .pending_join_responses
+            .remove(&request_id)
+            .ok_or(NetworkError::UnknownJoinRequest)?;
+        self.swarm
+            .behaviour_mut()
+            .join
+            .send_response(channel, response)
+            .map_err(|_| NetworkError::JoinResponseChannelClosed)
+    }
+
+    /// Rejects an inbound membership request without disclosing group state.
+    pub fn reject_join_request(
+        &mut self,
+        request_id: InboundJoinRequestId,
+        reason: JoinRejectReason,
+    ) -> Result<(), NetworkError> {
+        self.send_join_response(request_id, JoinResponse::rejected(reason))
     }
 
     /// Sends a validated response to a previously surfaced inbound request.
@@ -288,6 +350,59 @@ impl NetworkNode {
                         };
                     }
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Join(request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request_id,
+                            request,
+                            channel,
+                        },
+                    ..
+                })) => {
+                    let request_id = InboundJoinRequestId(request_id);
+                    self.pending_join_responses.insert(request_id, channel);
+                    return NetworkEvent::JoinRequestReceived {
+                        peer_id: peer,
+                        request_id,
+                        request,
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Join(request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                })) => {
+                    return NetworkEvent::JoinResponseReceived {
+                        peer_id: peer,
+                        request_id: OutboundJoinRequestId(request_id),
+                        response,
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Join(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    return NetworkEvent::JoinRequestFailed {
+                        peer_id: peer,
+                        request_id: OutboundJoinRequestId(request_id),
+                        failure: JoinFailure::from(error),
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Join(
+                    request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.pending_join_responses
+                        .remove(&InboundJoinRequestId(request_id));
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
                     peer,
                     message:
@@ -372,8 +487,16 @@ pub struct InboundSyncRequestId(request_response::InboundRequestId);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OutboundSyncRequestId(request_response::OutboundRequestId);
 
+/// Opaque identifier for an inbound membership request awaiting response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InboundJoinRequestId(request_response::InboundRequestId);
+
+/// Opaque identifier for an outbound membership request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OutboundJoinRequestId(request_response::OutboundRequestId);
+
 /// Application-facing network lifecycle events.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum NetworkEvent {
     /// The local node started listening.
     Listening {
@@ -421,6 +544,33 @@ pub enum NetworkEvent {
         /// Operation that failed.
         operation: DiscoveryOperation,
     },
+    /// A bounded membership request arrived from an authenticated peer.
+    JoinRequestReceived {
+        /// Authenticated transport peer that must match the MLS credential.
+        peer_id: PeerId,
+        /// Token used to send the response.
+        request_id: InboundJoinRequestId,
+        /// Structurally validated invitation and MLS KeyPackage.
+        request: JoinRequest,
+    },
+    /// A bounded membership response arrived from an authenticated peer.
+    JoinResponseReceived {
+        /// Authenticated transport peer that processed the request.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundJoinRequestId,
+        /// MLS Welcome or privacy-preserving rejection.
+        response: JoinResponse,
+    },
+    /// An outbound membership request failed.
+    JoinRequestFailed {
+        /// Target peer.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundJoinRequestId,
+        /// Stable failure category.
+        failure: JoinFailure,
+    },
     /// A validated synchronization request arrived from a connected peer.
     SyncRequestReceived {
         /// Authenticated transport peer.
@@ -448,6 +598,33 @@ pub enum NetworkEvent {
         /// Stable failure category.
         failure: SyncFailure,
     },
+}
+
+/// Stable membership transport failure categories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinFailure {
+    /// The peer could not be dialled.
+    Dial,
+    /// The request exceeded its deadline.
+    Timeout,
+    /// The authenticated connection ended before completion.
+    ConnectionClosed,
+    /// The peer does not implement the membership protocol version.
+    UnsupportedProtocol,
+    /// The peer stream failed or returned an invalid bounded message.
+    Stream,
+}
+
+impl From<request_response::OutboundFailure> for JoinFailure {
+    fn from(failure: request_response::OutboundFailure) -> Self {
+        match failure {
+            request_response::OutboundFailure::DialFailure => Self::Dial,
+            request_response::OutboundFailure::Timeout => Self::Timeout,
+            request_response::OutboundFailure::ConnectionClosed => Self::ConnectionClosed,
+            request_response::OutboundFailure::UnsupportedProtocols => Self::UnsupportedProtocol,
+            request_response::OutboundFailure::Io(_) => Self::Stream,
+        }
+    }
 }
 
 /// Stable synchronization transport failure categories.
@@ -512,6 +689,12 @@ pub enum NetworkError {
     /// The peer stream closed before the response could be queued.
     #[error("synchronization response channel is closed")]
     SyncResponseChannelClosed,
+    /// The inbound membership request token is no longer pending.
+    #[error("membership request is no longer awaiting a response")]
+    UnknownJoinRequest,
+    /// The peer stream closed before the membership response could be queued.
+    #[error("membership response channel is closed")]
+    JoinResponseChannelClosed,
 }
 
 fn record_key(key: DiscoveryKey) -> kad::RecordKey {
@@ -522,13 +705,17 @@ fn record_key(key: DiscoveryKey) -> kad::RecordKey {
 mod tests {
     use std::time::Duration;
 
-    use charp2p_core::{DiscoveryKey, GroupIdentity, SyncAuthorHead, SyncRequest, SyncResponse};
+    use charp2p_core::{
+        DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
+        JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
+    };
     use libp2p::{Multiaddr, identity::Keypair};
     use tokio::time::timeout;
 
     use super::{NetworkEvent, NetworkNode};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const NOW: u64 = 1_800_000_000;
 
     #[tokio::test]
     async fn two_nodes_establish_an_authenticated_quic_connection() {
@@ -568,6 +755,48 @@ mod tests {
         assert_eq!(response_peer, listener_id);
         assert_eq!(received_id, outbound_id);
         assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn connected_peers_exchange_bounded_join_messages() {
+        let (mut listener, mut dialer, listener_id, dialer_id) = connected_nodes().await;
+        let invitation = Invitation::issue(
+            &GroupIdentity::generate(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap();
+        let outbound_id = dialer.send_join_request(
+            listener_id,
+            JoinRequest::from_invitation(&invitation, vec![1, 2, 3]).unwrap(),
+        );
+
+        let (request_peer, inbound_id, request) =
+            timeout(TEST_TIMEOUT, next_join_request(&mut listener, &mut dialer))
+                .await
+                .expect("listener should receive the join request");
+        assert_eq!(request_peer, dialer_id);
+        assert_eq!(request.group_id(), invitation.group_id());
+        assert_eq!(request.invitation(), invitation.encode().unwrap());
+        assert_eq!(request.key_package(), &[1, 2, 3]);
+
+        listener
+            .send_join_response(inbound_id, JoinResponse::accepted(vec![4, 5, 6]).unwrap())
+            .unwrap();
+
+        let (response_peer, received_id, response) =
+            timeout(TEST_TIMEOUT, next_join_response(&mut dialer, &mut listener))
+                .await
+                .expect("dialer should receive the join response");
+        assert_eq!(response_peer, listener_id);
+        assert_eq!(received_id, outbound_id);
+        assert_eq!(response.welcome(), Some([4, 5, 6].as_slice()));
     }
 
     async fn connected_nodes() -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {
@@ -671,6 +900,48 @@ mod tests {
             tokio::select! {
                 event = receiver.next_event() => {
                     if let NetworkEvent::SyncResponseReceived {
+                        peer_id,
+                        request_id,
+                        response,
+                    } = event
+                    {
+                        return (peer_id, request_id, response);
+                    }
+                }
+                _ = other.next_event() => {}
+            }
+        }
+    }
+
+    async fn next_join_request(
+        receiver: &mut NetworkNode,
+        other: &mut NetworkNode,
+    ) -> (libp2p::PeerId, super::InboundJoinRequestId, JoinRequest) {
+        loop {
+            tokio::select! {
+                event = receiver.next_event() => {
+                    if let NetworkEvent::JoinRequestReceived {
+                        peer_id,
+                        request_id,
+                        request,
+                    } = event
+                    {
+                        return (peer_id, request_id, request);
+                    }
+                }
+                _ = other.next_event() => {}
+            }
+        }
+    }
+
+    async fn next_join_response(
+        receiver: &mut NetworkNode,
+        other: &mut NetworkNode,
+    ) -> (libp2p::PeerId, super::OutboundJoinRequestId, JoinResponse) {
+        loop {
+            tokio::select! {
+                event = receiver.next_event() => {
+                    if let NetworkEvent::JoinResponseReceived {
                         peer_id,
                         request_id,
                         response,

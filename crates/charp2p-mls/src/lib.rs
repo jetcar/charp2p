@@ -7,8 +7,9 @@ use charp2p_core::PeerId;
 use openmls::{
     group::GroupContext,
     prelude::{
-        Capabilities, Ciphersuite, CredentialType, Extension, ExtensionType, Extensions, MlsGroup,
-        MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn,
+        Capabilities, Ciphersuite, CredentialType, Extension, ExtensionType, Extensions,
+        KeyPackage, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig,
+        MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
         RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
         tls_codec::Deserialize,
     },
@@ -83,6 +84,32 @@ pub enum MlsWireError {
     /// Bytes remain after the one canonical MLS message.
     #[error("MLS message has trailing data")]
     TrailingData,
+}
+
+/// Failure while authenticating an inbound profile KeyPackage.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProfileKeyPackageError {
+    /// The encoded KeyPackage is empty or above the profile wire bound.
+    #[error("MLS KeyPackage has an invalid encoded size")]
+    InvalidSize,
+    /// The bounded bytes are not exactly one canonical KeyPackage.
+    #[error("MLS KeyPackage encoding is malformed")]
+    Malformed,
+    /// OpenMLS rejected the KeyPackage signature, lifetime, or structure.
+    #[error("MLS KeyPackage verification failed")]
+    VerificationFailed,
+    /// The KeyPackage uses a ciphersuite outside profile version 1.
+    #[error("MLS KeyPackage ciphersuite is unsupported")]
+    UnsupportedCiphersuite,
+    /// The leaf does not advertise the exact profile version 1 capabilities.
+    #[error("MLS KeyPackage capabilities are unsupported")]
+    UnsupportedCapabilities,
+    /// The leaf does not carry a valid CharP2P device credential.
+    #[error("MLS KeyPackage device credential is invalid")]
+    InvalidDeviceCredential,
+    /// The signed device credential is not the authenticated transport peer.
+    #[error("MLS KeyPackage device does not match the transport peer")]
+    TransportPeerMismatch,
 }
 
 /// Returns the group configuration required by profile version 1.
@@ -163,6 +190,43 @@ pub fn decode_profile_message(encoded: &[u8]) -> Result<MlsMessageIn, MlsWireErr
         return Err(MlsWireError::TrailingData);
     }
     Ok(message)
+}
+
+/// Bounds and verifies one profile KeyPackage for an authenticated transport
+/// peer.
+///
+/// The returned package is safe to pass to `MlsGroup::add_members`. This does
+/// not authorize the peer to join a group; the caller must separately validate
+/// its invitation and membership policy.
+pub fn validate_profile_key_package<Provider: OpenMlsProvider>(
+    provider: &Provider,
+    encoded: &[u8],
+    authenticated_peer: PeerId,
+) -> Result<KeyPackage, ProfileKeyPackageError> {
+    if encoded.is_empty() || encoded.len() > MAX_MLS_WIRE_BYTES {
+        return Err(ProfileKeyPackageError::InvalidSize);
+    }
+    let mut remaining = encoded;
+    let key_package = KeyPackageIn::tls_deserialize(&mut remaining)
+        .map_err(|_| ProfileKeyPackageError::Malformed)?;
+    if !remaining.is_empty() {
+        return Err(ProfileKeyPackageError::Malformed);
+    }
+    let key_package = key_package
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .map_err(|_| ProfileKeyPackageError::VerificationFailed)?;
+    if key_package.ciphersuite() != CIPHERSUITE {
+        return Err(ProfileKeyPackageError::UnsupportedCiphersuite);
+    }
+    if key_package.leaf_node().capabilities() != &profile_capabilities() {
+        return Err(ProfileKeyPackageError::UnsupportedCapabilities);
+    }
+    let credential_peer = device_id_from_credential(key_package.leaf_node().credential())
+        .map_err(|_| ProfileKeyPackageError::InvalidDeviceCredential)?;
+    if credential_peer != authenticated_peer {
+        return Err(ProfileKeyPackageError::TransportPeerMismatch);
+    }
+    Ok(key_package)
 }
 
 /// Checks and decrypts a profile Welcome without persisting the resulting
@@ -268,9 +332,10 @@ mod tests {
 
     use super::{
         CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MlsWireError, ProfileError,
-        StageWelcomeError, decode_profile_message, device_credential, device_id_from_credential,
-        group_create_config, profile_capabilities, profile_extensions, stage_profile_welcome,
-        validate_group_profile, validate_staged_commit_profile,
+        ProfileKeyPackageError, StageWelcomeError, decode_profile_message, device_credential,
+        device_id_from_credential, group_create_config, profile_capabilities, profile_extensions,
+        stage_profile_welcome, validate_group_profile, validate_profile_key_package,
+        validate_staged_commit_profile,
     };
 
     fn credential(
@@ -452,6 +517,109 @@ mod tests {
         assert_eq!(
             validate_staged_commit_profile(&staged_removal),
             Err(ProfileError::UnsupportedProfileVersion)
+        );
+    }
+
+    #[test]
+    fn profile_key_package_is_bound_to_the_authenticated_transport_peer() {
+        let provider = OpenMlsRustCrypto::default();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let other_id = DeviceIdentity::generate().peer_id();
+        let (member_credential, member_signer) = credential(member_id, &provider);
+        let member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(CIPHERSUITE, &provider, &member_signer, member_credential)
+            .unwrap();
+        let encoded = member_key_package
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+
+        let validated = validate_profile_key_package(&provider, &encoded, member_id).unwrap();
+        assert_eq!(
+            device_id_from_credential(validated.leaf_node().credential()).unwrap(),
+            member_id
+        );
+        assert_eq!(
+            validate_profile_key_package(&provider, &encoded, other_id).unwrap_err(),
+            ProfileKeyPackageError::TransportPeerMismatch
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            validate_profile_key_package(&provider, &trailing, member_id).unwrap_err(),
+            ProfileKeyPackageError::Malformed
+        );
+        let mut forged = encoded;
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            validate_profile_key_package(&provider, &forged, member_id).unwrap_err(),
+            ProfileKeyPackageError::VerificationFailed
+        );
+    }
+
+    #[test]
+    fn profile_key_package_rejects_unsupported_capabilities_and_credentials() {
+        let provider = OpenMlsRustCrypto::default();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (member_credential, member_signer) = credential(member_id, &provider);
+        let default_capabilities = KeyPackage::builder()
+            .build(CIPHERSUITE, &provider, &member_signer, member_credential)
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            validate_profile_key_package(&provider, &default_capabilities, member_id).unwrap_err(),
+            ProfileKeyPackageError::UnsupportedCapabilities
+        );
+
+        let malformed = BasicCredential::new(b"unscoped identity".to_vec());
+        let (malformed_credential, malformed_signer) = credential_with_basic(malformed, &provider);
+        let malformed_credential_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &provider,
+                &malformed_signer,
+                malformed_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            validate_profile_key_package(&provider, &malformed_credential_package, member_id)
+                .unwrap_err(),
+            ProfileKeyPackageError::InvalidDeviceCredential
+        );
+
+        let (other_suite_credential, other_suite_signer) = credential(member_id, &provider);
+        let other_suite_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+                &provider,
+                &other_suite_signer,
+                other_suite_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            validate_profile_key_package(&provider, &other_suite_package, member_id).unwrap_err(),
+            ProfileKeyPackageError::UnsupportedCiphersuite
+        );
+        assert_eq!(
+            validate_profile_key_package(&provider, &[], member_id).unwrap_err(),
+            ProfileKeyPackageError::InvalidSize
+        );
+        assert_eq!(
+            validate_profile_key_package(&provider, &vec![0; MAX_MLS_WIRE_BYTES + 1], member_id)
+                .unwrap_err(),
+            ProfileKeyPackageError::InvalidSize
         );
     }
 

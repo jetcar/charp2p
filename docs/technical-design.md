@@ -201,6 +201,9 @@ The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before
 rejecting an oversized message, and zeroes temporary wire buffers on drop.
+Before use, the owner parses exactly one bounded KeyPackage, verifies it with
+OpenMLS, requires the pinned ciphersuite and exact profile capabilities, and
+requires its signed device credential to equal the authenticated libp2p peer.
 
 ## Group protocol
 

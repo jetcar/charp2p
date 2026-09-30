@@ -44,6 +44,13 @@ Validate the extracted device ID against signed membership events before
 accepting the leaf. The stable CharP2P group ID stays the application identity;
 the MLS group ID and epoch are protocol state.
 
+Before an owner stages a member addition, bound the encoded KeyPackage to 128
+KiB, parse exactly one value, and require OpenMLS signature, structure, and
+lifetime validation. Require the pinned ciphersuite and exact profile version 1
+leaf capabilities. Finally require the signed device credential to equal the
+peer ID authenticated by the libp2p transport. These checks validate the
+KeyPackage source but do not authorize its invitation or membership.
+
 Persist OpenMLS state with a dedicated provider before integrating it into the
 application. Keep signature private keys and exported recovery material in
 platform-protected storage. Never enable OpenMLS content or crypto debug
@@ -65,9 +72,9 @@ application messages across distinct providers.
 - Every application path that merges a staged commit must apply the profile
   validator first; unit tests cover removal of the authenticated profile
   marker.
-- Durable MLS provider storage, credential-to-membership authorization, state
-  backup, and protocol test vectors remain required before invitation
-  acceptance can create a membership.
+- Durable MLS provider storage, signed membership authorization, state backup,
+  and protocol test vectors remain required before invitation acceptance can
+  create a membership.
 - Profile version 1 rejects encoded MLS messages above 128 KiB before parsing.
   Self-contained Welcomes therefore have a size-dependent group limit; the
   supported member count remains to be set from worst-case measurements.

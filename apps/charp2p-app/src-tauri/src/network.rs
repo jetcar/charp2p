@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use charp2p_core::{DeviceIdentity, DiscoveryKey, Invitation};
+use charp2p_core::{DeviceIdentity, DiscoveryKey, Invitation, SyncRejectReason};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -48,6 +48,12 @@ struct ActiveAdvertisement {
     key: DiscoveryKey,
     expires_at_unix: u64,
     task: JoinHandle<()>,
+}
+
+impl Drop for ActiveAdvertisement {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 pub struct NetworkService {
@@ -137,6 +143,10 @@ impl NetworkService {
                         key: failed,
                         operation: charp2p_network::DiscoveryOperation::Announcement,
                     } if failed == key => return Err("network_unavailable"),
+                    NetworkEvent::SyncRequestReceived { request_id, .. } => {
+                        let _ =
+                            node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
+                    }
                     _ => {}
                 }
             }
@@ -165,14 +175,18 @@ impl NetworkService {
                         }
                     }
                     event = node.next_event() => {
-                        if matches!(
-                            event,
+                        match event {
                             NetworkEvent::DiscoveryFailed {
                                 key: failed,
                                 operation: charp2p_network::DiscoveryOperation::Announcement,
-                            } if failed == key
-                        ) {
-                            break;
+                            } if failed == key => break,
+                            NetworkEvent::SyncRequestReceived { request_id, .. } => {
+                                let _ = node.reject_sync_request(
+                                    request_id,
+                                    SyncRejectReason::Unauthorized,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -327,6 +341,7 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
+        SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_network::{NetworkEvent, NetworkNode};
     use tokio::time::timeout;
@@ -620,6 +635,119 @@ mod tests {
             .await
             .expect("advertisement should stop at signed expiry");
             assert!(unix_now() >= invitation.expires_at_unix());
+        });
+    }
+
+    #[test]
+    fn advertisement_rejects_unauthorized_sync_requests() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let bootstrap = format!("{address}/p2p/{routing_id}");
+            let service = NetworkService::from_sources(&[], &bootstrap).unwrap();
+            let owner = DeviceIdentity::generate();
+            let owner_id = owner.peer_id();
+            {
+                let advertise = service.advertise(owner, &invitation);
+                tokio::pin!(advertise);
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut advertise => break result,
+                            _ = routing.next_event() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("advertisement should complete")
+                .unwrap();
+            }
+
+            let mut requester = NetworkNode::new(DeviceIdentity::generate().into_network_keypair());
+            requester
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            requester.add_bootstrap_peer(routing_id, address);
+            requester.bootstrap().unwrap();
+            requester.find_group_peers(DiscoveryKey::from_invitation(&invitation));
+
+            let response = timeout(Duration::from_secs(10), async {
+                let mut request_sent = false;
+                loop {
+                    tokio::select! {
+                        event = requester.next_event() => match event {
+                            NetworkEvent::GroupPeersFound { providers, .. }
+                                if providers.contains(&owner_id) && !request_sent =>
+                            {
+                                requester
+                                    .send_sync_request(
+                                        owner_id,
+                                        SyncRequest::Summary {
+                                            group_id: invitation.group_id(),
+                                        },
+                                    )
+                                    .unwrap();
+                                request_sent = true;
+                            }
+                            NetworkEvent::SyncResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } if peer_id == owner_id => break response,
+                            _ => {}
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("unauthorized sync request should receive a response");
+
+            assert_eq!(
+                response,
+                SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                }
+            );
+            let advertiser_task = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should remain active")
+                .task
+                .abort_handle();
+            drop(service);
+            timeout(Duration::from_secs(1), async {
+                while !advertiser_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropping the service should stop its advertiser");
         });
     }
 

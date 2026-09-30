@@ -185,6 +185,9 @@ payloads.
 A provider record means a peer recently advertised the invitation rendezvous
 key. The UI reports a peer as reachable only after an authenticated QUIC
 connection succeeds; stale provider records remain a separate status.
+Discovery and transport authentication do not grant group access. Until the
+join protocol authorizes a device, an advertiser rejects its synchronization
+requests.
 
 ## Group protocol
 

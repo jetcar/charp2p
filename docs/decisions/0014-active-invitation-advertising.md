@@ -27,7 +27,9 @@ before replacing it with another advertisement.
 Require a configured bootstrap peer before starting. Report
 `bootstrapRequired` to the interface when none is available. Treat successful
 Kademlia provider publication as the point at which the interface may report
-the invitation as advertising.
+the invitation as advertising. Reject synchronization requests received by the
+advertiser until a later join protocol has authenticated and authorized the
+requesting device.
 
 ## Consequences
 
@@ -39,3 +41,4 @@ the invitation as advertising.
 - The advertiser rechecks signed wall-clock expiry every second, bounding
   clock-correction detection delay to one second.
 - Join authorization and invitation revocation remain separate protocol work.
+- Discovery alone grants no event synchronization access.

@@ -7,10 +7,9 @@ use std::{
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, SyncRejectReason,
 };
-use charp2p_mls::{ProfileKeyPackageError, validate_profile_key_package};
+use charp2p_mls::{ProfileKeyPackageError, ProfileProvider, validate_profile_key_package};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
-use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde::Serialize;
 use tokio::{
     sync::Mutex,
@@ -386,7 +385,7 @@ fn join_reject_reason(
         JoinRequestAuthorization::Unauthorized => JoinRejectReason::Unauthorized,
         JoinRequestAuthorization::Unavailable => JoinRejectReason::Busy,
         JoinRequestAuthorization::Authorized => match validate_profile_key_package(
-            &OpenMlsRustCrypto::default(),
+            &ProfileProvider::default(),
             request.key_package(),
             authenticated_peer,
         ) {
@@ -439,14 +438,13 @@ mod tests {
         JoinRejectReason, JoinRequest, PeerId, SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
-        CIPHERSUITE, device_credential, prepare_profile_key_package,
+        CIPHERSUITE, ProfileProvider, device_credential, prepare_profile_key_package,
     };
     use charp2p_network::{NetworkEvent, NetworkNode};
     use openmls::prelude::{
         CredentialWithKey, KeyPackage, OpenMlsProvider, tls_codec::Serialize,
     };
     use openmls_basic_credential::SignatureKeyPair;
-    use openmls_rust_crypto::OpenMlsRustCrypto;
     use tokio::time::timeout;
 
     use super::{
@@ -472,7 +470,7 @@ mod tests {
     }
 
     fn profile_join_request(device_id: PeerId) -> JoinRequest {
-        let provider = OpenMlsRustCrypto::default();
+        let provider = ProfileProvider::default();
         let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
         signer.store(provider.storage()).unwrap();
         let credential = CredentialWithKey {
@@ -485,7 +483,7 @@ mod tests {
     }
 
     fn unsupported_profile_join_request(device_id: PeerId) -> JoinRequest {
-        let provider = OpenMlsRustCrypto::default();
+        let provider = ProfileProvider::default();
         let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
         signer.store(provider.storage()).unwrap();
         let credential = CredentialWithKey {

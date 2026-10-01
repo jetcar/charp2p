@@ -2,7 +2,7 @@
 
 //! The fixed MLS profile used for CharP2P group-message protection.
 
-use std::fmt;
+use std::{collections::HashMap, fmt, sync::RwLock};
 
 pub use charp2p_core::MAX_JOIN_MLS_MESSAGE_BYTES as MAX_MLS_WIRE_BYTES;
 use charp2p_core::{Invitation, JoinError, JoinRequest, PeerId};
@@ -16,6 +16,8 @@ use openmls::{
         tls_codec::{Deserialize, Serialize},
     },
 };
+use openmls_memory_storage::MemoryStorage;
+use openmls_rust_crypto::RustCrypto;
 use openmls_traits::signatures::Signer;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -25,6 +27,11 @@ const PROFILE_EXTENSION_TYPE: ExtensionType = ExtensionType::Unknown(PROFILE_EXT
 const DEVICE_CREDENTIAL_DOMAIN: &[u8] = b"charp2p-device-credential\0";
 const DEVICE_CREDENTIAL_VERSION: u16 = 1;
 const MAX_DEVICE_PEER_ID_BYTES: usize = 128;
+const PROVIDER_SNAPSHOT_VERSION: u16 = 1;
+const MAX_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROVIDER_SNAPSHOT_RECORDS: usize = 4_096;
+const MAX_PROVIDER_SNAPSHOT_KEY_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_SNAPSHOT_VALUE_BYTES: usize = 2 * 1024 * 1024;
 /// Version of the CharP2P MLS profile carried by an authenticated private-use
 /// group-context extension.
 pub const PROFILE_VERSION: u16 = 1;
@@ -35,6 +42,189 @@ pub const PROFILE_VERSION: u16 = 1;
 /// construction. A future profile version can add another suite explicitly.
 pub const CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+
+/// Profile provider whose secret-bearing storage can be snapshotted for
+/// application-managed encrypted persistence.
+#[derive(Default)]
+pub struct ProfileProvider {
+    crypto: RustCrypto,
+    storage: MemoryStorage,
+}
+
+impl ProfileProvider {
+    /// Restores one bounded, versioned provider snapshot.
+    pub fn from_snapshot(encoded: &[u8]) -> Result<Self, ProfileProviderSnapshotError> {
+        if encoded.len() < 6 || encoded.len() > MAX_PROVIDER_SNAPSHOT_BYTES {
+            return Err(ProfileProviderSnapshotError::InvalidSize);
+        }
+        let mut decoder = SnapshotDecoder::new(encoded);
+        let version = decoder.u16()?;
+        if version != PROVIDER_SNAPSHOT_VERSION {
+            return Err(ProfileProviderSnapshotError::UnsupportedVersion(version));
+        }
+        let record_count = usize::try_from(decoder.u32()?)
+            .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?;
+        if record_count > MAX_PROVIDER_SNAPSHOT_RECORDS {
+            return Err(ProfileProviderSnapshotError::InvalidSize);
+        }
+        let mut values = HashMap::with_capacity(record_count);
+        for _ in 0..record_count {
+            let key_length = usize::try_from(decoder.u32()?)
+                .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?;
+            let value_length = usize::try_from(decoder.u32()?)
+                .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?;
+            if key_length == 0
+                || key_length > MAX_PROVIDER_SNAPSHOT_KEY_BYTES
+                || value_length > MAX_PROVIDER_SNAPSHOT_VALUE_BYTES
+            {
+                return Err(ProfileProviderSnapshotError::InvalidSize);
+            }
+            let key = decoder.bytes(key_length)?.to_vec();
+            let value = decoder.bytes(value_length)?.to_vec();
+            if values.insert(key, value).is_some() {
+                return Err(ProfileProviderSnapshotError::DuplicateKey);
+            }
+        }
+        decoder.finish()?;
+        Ok(Self {
+            crypto: RustCrypto::default(),
+            storage: MemoryStorage {
+                values: RwLock::new(values),
+            },
+        })
+    }
+
+    /// Serializes all provider records into a bounded zeroizing snapshot.
+    /// The snapshot contains MLS secrets and must be encrypted before storage.
+    pub fn snapshot(&self) -> Result<Zeroizing<Vec<u8>>, ProfileProviderSnapshotError> {
+        let values = self
+            .storage
+            .values
+            .read()
+            .map_err(|_| ProfileProviderSnapshotError::StorageUnavailable)?;
+        if values.len() > MAX_PROVIDER_SNAPSHOT_RECORDS {
+            return Err(ProfileProviderSnapshotError::InvalidSize);
+        }
+        let mut records: Vec<_> = values.iter().collect();
+        records.sort_unstable_by_key(|(key, _)| *key);
+        let mut encoded_length = 6usize;
+        for (key, value) in &records {
+            if key.is_empty()
+                || key.len() > MAX_PROVIDER_SNAPSHOT_KEY_BYTES
+                || value.len() > MAX_PROVIDER_SNAPSHOT_VALUE_BYTES
+            {
+                return Err(ProfileProviderSnapshotError::InvalidSize);
+            }
+            encoded_length = encoded_length
+                .checked_add(8)
+                .and_then(|length| length.checked_add(key.len()))
+                .and_then(|length| length.checked_add(value.len()))
+                .ok_or(ProfileProviderSnapshotError::InvalidSize)?;
+            if encoded_length > MAX_PROVIDER_SNAPSHOT_BYTES {
+                return Err(ProfileProviderSnapshotError::InvalidSize);
+            }
+        }
+        let mut encoded = Zeroizing::new(Vec::with_capacity(encoded_length));
+        encoded.extend_from_slice(&PROVIDER_SNAPSHOT_VERSION.to_be_bytes());
+        encoded.extend_from_slice(
+            &u32::try_from(records.len())
+                .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?
+                .to_be_bytes(),
+        );
+        for (key, value) in records {
+            encoded.extend_from_slice(
+                &u32::try_from(key.len())
+                    .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(
+                &u32::try_from(value.len())
+                    .map_err(|_| ProfileProviderSnapshotError::InvalidSize)?
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(key);
+            encoded.extend_from_slice(value);
+        }
+        debug_assert_eq!(encoded.len(), encoded_length);
+        Ok(encoded)
+    }
+}
+
+impl OpenMlsProvider for ProfileProvider {
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
+    type StorageProvider = MemoryStorage;
+
+    fn storage(&self) -> &Self::StorageProvider {
+        &self.storage
+    }
+
+    fn crypto(&self) -> &Self::CryptoProvider {
+        &self.crypto
+    }
+
+    fn rand(&self) -> &Self::RandProvider {
+        &self.crypto
+    }
+}
+
+/// Failure while encoding or restoring a profile-provider snapshot.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProfileProviderSnapshotError {
+    #[error("MLS provider snapshot has an invalid size")]
+    InvalidSize,
+    #[error("MLS provider snapshot version {0} is unsupported")]
+    UnsupportedVersion(u16),
+    #[error("MLS provider snapshot is malformed")]
+    Malformed,
+    #[error("MLS provider snapshot contains a duplicate key")]
+    DuplicateKey,
+    #[error("MLS provider storage is unavailable")]
+    StorageUnavailable,
+}
+
+struct SnapshotDecoder<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> SnapshotDecoder<'a> {
+    fn new(encoded: &'a [u8]) -> Self {
+        Self { remaining: encoded }
+    }
+
+    fn u16(&mut self) -> Result<u16, ProfileProviderSnapshotError> {
+        let bytes: [u8; 2] = self
+            .bytes(2)?
+            .try_into()
+            .map_err(|_| ProfileProviderSnapshotError::Malformed)?;
+        Ok(u16::from_be_bytes(bytes))
+    }
+
+    fn u32(&mut self) -> Result<u32, ProfileProviderSnapshotError> {
+        let bytes: [u8; 4] = self
+            .bytes(4)?
+            .try_into()
+            .map_err(|_| ProfileProviderSnapshotError::Malformed)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn bytes(&mut self, length: usize) -> Result<&'a [u8], ProfileProviderSnapshotError> {
+        if self.remaining.len() < length {
+            return Err(ProfileProviderSnapshotError::Malformed);
+        }
+        let (value, remaining) = self.remaining.split_at(length);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn finish(self) -> Result<(), ProfileProviderSnapshotError> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(ProfileProviderSnapshotError::Malformed)
+        }
+    }
+}
 
 /// A mismatch between received MLS state and the CharP2P profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,12 +807,12 @@ mod tests {
     use super::{
         CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
         MlsWireError, PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError,
-        ProfileKeyPackageError, StageWelcomeError, abort_prepared_member_admission,
-        decode_profile_message, device_credential, device_id_from_credential, group_create_config,
-        merge_prepared_member_admission, prepare_profile_key_package,
-        prepare_profile_member_admission, profile_capabilities, profile_extensions,
-        stage_profile_welcome, validate_group_profile, validate_profile_key_package,
-        validate_staged_commit_profile,
+        ProfileKeyPackageError, ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
+        abort_prepared_member_admission, decode_profile_message, device_credential,
+        device_id_from_credential, group_create_config, merge_prepared_member_admission,
+        prepare_profile_key_package, prepare_profile_member_admission, profile_capabilities,
+        profile_extensions, stage_profile_welcome, validate_group_profile,
+        validate_profile_key_package, validate_staged_commit_profile,
     };
 
     fn credential(
@@ -648,6 +838,81 @@ mod tests {
             },
             signer,
         )
+    }
+
+    #[test]
+    fn provider_snapshot_restores_key_package_and_group_state() {
+        let owner_provider = ProfileProvider::default();
+        let member_provider = ProfileProvider::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let member_key_package = prepare_profile_key_package(
+            &member_provider,
+            &member_signer,
+            member_credential,
+            member_id,
+        )
+        .unwrap();
+        let pending_snapshot = member_provider.snapshot().unwrap();
+        assert_eq!(
+            pending_snapshot.as_slice(),
+            member_provider.snapshot().unwrap().as_slice()
+        );
+        let restored_member = ProfileProvider::from_snapshot(&pending_snapshot).unwrap();
+
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            member_key_package.encoded(),
+            member_id,
+        )
+        .unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+
+        let staged = stage_profile_welcome(&restored_member, admission.welcome()).unwrap();
+        let member_group = staged.into_group(&restored_member).unwrap();
+        validate_group_profile(&member_group).unwrap();
+        let group_id = member_group.group_id().clone();
+        drop(member_group);
+
+        let joined_snapshot = restored_member.snapshot().unwrap();
+        let restored_joined = ProfileProvider::from_snapshot(&joined_snapshot).unwrap();
+        let loaded = MlsGroup::load(restored_joined.storage(), &group_id)
+            .unwrap()
+            .expect("joined group is present in the restored snapshot");
+        validate_group_profile(&loaded).unwrap();
+        let member_ids: Vec<_> = loaded
+            .members()
+            .map(|member| device_id_from_credential(&member.credential).unwrap())
+            .collect();
+        assert!(member_ids.contains(&owner_id));
+        assert!(member_ids.contains(&member_id));
+    }
+
+    #[test]
+    fn provider_snapshot_rejects_unbounded_or_malformed_data() {
+        assert!(matches!(
+            ProfileProvider::from_snapshot(&[]),
+            Err(ProfileProviderSnapshotError::InvalidSize)
+        ));
+        assert!(matches!(
+            ProfileProvider::from_snapshot(&[0, 2, 0, 0, 0, 0]),
+            Err(ProfileProviderSnapshotError::UnsupportedVersion(2))
+        ));
+        assert!(matches!(
+            ProfileProvider::from_snapshot(&[0, 1, 0, 0, 0, 1]),
+            Err(ProfileProviderSnapshotError::Malformed)
+        ));
     }
 
     #[test]

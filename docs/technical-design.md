@@ -331,6 +331,12 @@ and on restored group state before use. A rejected decrypted Welcome consumes
 its matching one-time MLS KeyPackage, so the joining client publishes a fresh
 one afterward.
 
+The shared MLS provider exports a deterministic, versioned snapshot containing
+its group state and one-time private material. The decoder bounds the snapshot,
+record count, keys, and values before restoring them. Snapshot bytes are secret
+and zeroed after use; the application must encrypt and authenticate them with a
+platform-protected wrapping key and replace the encrypted record atomically.
+
 Whichever construction is selected must provide:
 
 - Authentication of the sending device.

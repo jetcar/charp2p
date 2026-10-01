@@ -67,10 +67,12 @@ publication fails, the application explicitly aborts the prepared admission.
 Keep the encoded Commit and Welcome in zeroing, non-cloneable buffers and redact
 their contents from debug output.
 
-Persist OpenMLS state with a dedicated provider before integrating it into the
-application. Keep signature private keys and exported recovery material in
-platform-protected storage. Never enable OpenMLS content or crypto debug
-features in application builds.
+Use the shared profile provider's bounded, versioned snapshots as the boundary
+for application persistence. Encrypt and authenticate each complete snapshot
+before writing it outside memory, keep its wrapping key in platform-protected
+storage, and replace it atomically. Keep signature private keys and exported
+recovery material protected. Never enable OpenMLS content or crypto debug
+features in application builds. ADR-016 defines the snapshot format and limits.
 
 The initial prototype fixes and authenticates the profile configuration,
 rejects mismatched state, and verifies group creation, chained asynchronous
@@ -88,9 +90,9 @@ application messages across distinct providers.
 - Every application path that merges a staged commit must apply the profile
   validator first; unit tests cover removal of the authenticated profile
   marker.
-- Durable MLS provider storage, signed membership authorization, state backup,
-  and protocol test vectors remain required before invitation acceptance can
-  create a membership.
+- Encrypted atomic storage for provider snapshots, signed membership
+  authorization, state backup, and protocol test vectors remain required before
+  invitation acceptance can create a membership.
 - Profile version 1 rejects encoded MLS messages above 128 KiB before parsing.
   Self-contained Welcomes therefore have a size-dependent group limit; the
   supported member count remains to be set from worst-case measurements.

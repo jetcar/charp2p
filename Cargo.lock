@@ -480,6 +480,7 @@ dependencies = [
  "charp2p-core",
  "openmls",
  "openmls_basic_credential",
+ "openmls_memory_storage",
  "openmls_rust_crypto",
  "openmls_traits",
  "thiserror 2.0.21",

@@ -771,7 +771,6 @@ dependencies = [
  "libp2p",
  "openmls",
  "openmls_basic_credential",
- "openmls_rust_crypto",
  "openmls_traits",
  "serde",
  "serde_json",
@@ -806,6 +805,8 @@ version = "0.1.0"
 dependencies = [
  "charp2p-core",
  "openmls",
+ "openmls_memory_storage",
+ "openmls_rust_crypto",
  "openmls_traits",
  "thiserror 2.0.21",
  "zeroize",

@@ -8,10 +8,11 @@ publish = false
 [dependencies]
 charp2p-core = { path = "../charp2p-core" }
 openmls.workspace = true
+openmls_memory_storage = "0.6.0"
+openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 openmls_basic_credential.workspace = true
-openmls_rust_crypto.workspace = true

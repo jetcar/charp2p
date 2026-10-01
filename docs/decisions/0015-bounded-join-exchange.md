@@ -42,7 +42,10 @@ Carry this codec over the authenticated libp2p request-response protocol
 streams per connection. The transport reads at most one byte beyond each outer
 limit so an oversized message cannot be accepted as a valid prefix. Temporary
 wire buffers are zeroed on drop. Routing-only nodes reject all join requests;
-application advertisers return `busy` until the owner acceptance handler is
+application advertisers validate inbound bearers against the owner's protected
+issued-invitation state. Unknown, expired, or forged credentials receive the
+same `unauthorized` response. Recognized credentials and temporary protected
+storage failures receive `busy` until the durable MLS acceptance handler is
 active.
 
 ## Consequences
@@ -50,4 +53,5 @@ active.
 - Join handlers have one shared bounded input and output codec with stable
   version, variant, and rejection codes.
 - A syntactically valid request grants no membership or synchronization access.
+- Owner advertisers reject unrecognized bearer credentials before MLS parsing.
 - Durable MLS state, approval flow, and acceptance remain separate increments.

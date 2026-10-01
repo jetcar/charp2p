@@ -41,7 +41,7 @@ fn preview_invitation(input: String) -> Result<invitation::InvitationPreview, St
 fn accept_invitation(
     input: String,
     pending_service: tauri::State<'_, PendingInvitationService>,
-    group_service: tauri::State<'_, GroupService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<PendingGroup, String> {
     let preview = invitation::preview_invitation(&input).map_err(str::to_owned)?;
     if group_service
@@ -63,13 +63,13 @@ fn pending_invitations(
 }
 
 #[tauri::command]
-fn local_groups(service: tauri::State<'_, GroupService>) -> Result<Vec<LocalGroup>, String> {
+fn local_groups(service: tauri::State<'_, Arc<GroupService>>) -> Result<Vec<LocalGroup>, String> {
     service.list().map_err(str::to_owned)
 }
 
 #[tauri::command]
 fn issued_invitations(
-    service: tauri::State<'_, GroupService>,
+    service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<Vec<IssuedInvitation>, String> {
     service.issued_invitations().map_err(str::to_owned)
 }
@@ -78,7 +78,7 @@ fn issued_invitations(
 fn create_group_invitation(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
-    group_service: tauri::State<'_, GroupService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<IssuedInvitation, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let profile = identity_service
@@ -101,7 +101,7 @@ fn create_group(
     invitation_lifetime_seconds: u64,
     reusable_invitation: bool,
     identity_service: tauri::State<'_, IdentityService>,
-    group_service: tauri::State<'_, GroupService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<LocalGroup, String> {
     if identity_service.status().map_err(str::to_owned)?.is_none() {
         return Err("identity_missing".to_owned());
@@ -142,7 +142,7 @@ async fn search_group_peers(
 async fn advertise_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
-    group_service: tauri::State<'_, GroupService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<AdvertisementResult, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
@@ -205,10 +205,12 @@ pub fn run() {
                 Arc::clone(&storage_operations),
             )
             .map_err(std::io::Error::other)?;
-            let groups =
+            let groups = Arc::new(
                 GroupService::open(data_directory.join("charp2p.sqlite3"), storage_operations)
-                    .map_err(std::io::Error::other)?;
-            let network = NetworkService::from_environment().map_err(std::io::Error::other)?;
+                    .map_err(std::io::Error::other)?,
+            );
+            let network = NetworkService::from_environment(groups.clone())
+                .map_err(std::io::Error::other)?;
             app.manage(identity);
             app.manage(pending);
             app.manage(groups);

@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeSet,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use charp2p_core::{
-    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, SyncRejectReason,
+    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, SyncRejectReason,
 };
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
@@ -24,6 +25,17 @@ const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JoinRequestAuthorization {
+    Authorized,
+    Unauthorized,
+    Unavailable,
+}
+
+pub(crate) trait JoinRequestAuthorizer: Send + Sync {
+    fn authorize_join_request(&self, request: &JoinRequest) -> JoinRequestAuthorization;
+}
 
 #[derive(Clone)]
 struct BootstrapPeer {
@@ -61,15 +73,35 @@ impl Drop for ActiveAdvertisement {
 pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
+    join_authorizer: Arc<dyn JoinRequestAuthorizer>,
 }
 
 impl NetworkService {
-    pub fn from_environment() -> Result<Self, &'static str> {
+    pub fn from_environment(
+        join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+    ) -> Result<Self, &'static str> {
         let environment = std::env::var(BOOTSTRAP_ENVIRONMENT_VARIABLE).unwrap_or_default();
-        Self::from_sources(BUILT_IN_BOOTSTRAP_ADDRESSES, &environment)
+        Self::from_sources_with_authorizer(
+            BUILT_IN_BOOTSTRAP_ADDRESSES,
+            &environment,
+            join_authorizer,
+        )
     }
 
+    #[cfg(test)]
     fn from_sources(built_in: &[&str], environment: &str) -> Result<Self, &'static str> {
+        Self::from_sources_with_authorizer(
+            built_in,
+            environment,
+            Arc::new(UnavailableJoinRequestAuthorizer),
+        )
+    }
+
+    fn from_sources_with_authorizer(
+        built_in: &[&str],
+        environment: &str,
+        join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+    ) -> Result<Self, &'static str> {
         let configured = built_in.iter().copied().chain(
             environment
                 .split(';')
@@ -88,6 +120,7 @@ impl NetworkService {
         Ok(Self {
             bootstrap_peers,
             advertisement: Mutex::new(None),
+            join_authorizer,
         })
     }
 
@@ -149,8 +182,15 @@ impl NetworkService {
                         let _ =
                             node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
                     }
-                    NetworkEvent::JoinRequestReceived { request_id, .. } => {
-                        let _ = node.reject_join_request(request_id, JoinRejectReason::Busy);
+                    NetworkEvent::JoinRequestReceived {
+                        request_id,
+                        request,
+                        ..
+                    } => {
+                        let reason = join_reject_reason(
+                            self.join_authorizer.authorize_join_request(&request),
+                        );
+                        let _ = node.reject_join_request(request_id, reason);
                     }
                     _ => {}
                 }
@@ -162,6 +202,7 @@ impl NetworkService {
         remaining_until_expiry(invitation.expires_at_unix())?;
 
         let expires_at_unix = invitation.expires_at_unix();
+        let join_authorizer = Arc::clone(&self.join_authorizer);
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
                 Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
@@ -191,11 +232,15 @@ impl NetworkService {
                                     SyncRejectReason::Unauthorized,
                                 );
                             }
-                            NetworkEvent::JoinRequestReceived { request_id, .. } => {
-                                let _ = node.reject_join_request(
-                                    request_id,
-                                    JoinRejectReason::Busy,
+                            NetworkEvent::JoinRequestReceived {
+                                request_id,
+                                request,
+                                ..
+                            } => {
+                                let reason = join_reject_reason(
+                                    join_authorizer.authorize_join_request(&request),
                                 );
+                                let _ = node.reject_join_request(request_id, reason);
                             }
                             _ => {}
                         }
@@ -326,6 +371,25 @@ impl NetworkService {
     }
 }
 
+fn join_reject_reason(authorization: JoinRequestAuthorization) -> JoinRejectReason {
+    match authorization {
+        JoinRequestAuthorization::Unauthorized => JoinRejectReason::Unauthorized,
+        JoinRequestAuthorization::Authorized | JoinRequestAuthorization::Unavailable => {
+            JoinRejectReason::Busy
+        }
+    }
+}
+
+#[cfg(test)]
+struct UnavailableJoinRequestAuthorizer;
+
+#[cfg(test)]
+impl JoinRequestAuthorizer for UnavailableJoinRequestAuthorizer {
+    fn authorize_join_request(&self, _request: &JoinRequest) -> JoinRequestAuthorization {
+        JoinRequestAuthorization::Unavailable
+    }
+}
+
 fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
     let expiry = UNIX_EPOCH
         .checked_add(Duration::from_secs(expires_at_unix))
@@ -348,24 +412,51 @@ fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        SyncRejectReason, SyncRequest, SyncResponse,
+        JoinRejectReason, JoinRequest, SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_network::{NetworkEvent, NetworkNode};
     use tokio::time::timeout;
 
-    use super::{parse_bootstrap_peer, AdvertisementResult, NetworkService, PeerSearchResult};
+    use super::{
+        join_reject_reason, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
+        JoinRequestAuthorizer, NetworkService, PeerSearchResult,
+    };
 
     const NOW: u64 = 1_800_000_000;
+
+    struct StaticJoinRequestAuthorizer(JoinRequestAuthorization);
+
+    impl JoinRequestAuthorizer for StaticJoinRequestAuthorizer {
+        fn authorize_join_request(&self, _request: &JoinRequest) -> JoinRequestAuthorization {
+            self.0
+        }
+    }
 
     fn unix_now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[test]
+    fn join_authorization_uses_stable_public_rejections() {
+        assert_eq!(
+            join_reject_reason(JoinRequestAuthorization::Authorized),
+            JoinRejectReason::Busy
+        );
+        assert_eq!(
+            join_reject_reason(JoinRequestAuthorization::Unauthorized),
+            JoinRejectReason::Unauthorized
+        );
+        assert_eq!(
+            join_reject_reason(JoinRequestAuthorization::Unavailable),
+            JoinRejectReason::Busy
+        );
     }
 
     #[test]
@@ -650,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_rejects_unauthorized_sync_requests() {
+    fn advertisement_rejects_unauthorized_requests() {
         let now = unix_now();
         let group = GroupIdentity::generate();
         let invitation = Invitation::issue(
@@ -678,7 +769,14 @@ mod tests {
                 }
             };
             let bootstrap = format!("{address}/p2p/{routing_id}");
-            let service = NetworkService::from_sources(&[], &bootstrap).unwrap();
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstrap,
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Unauthorized,
+                )),
+            )
+            .unwrap();
             let owner = DeviceIdentity::generate();
             let owner_id = owner.peer_id();
             {
@@ -742,6 +840,37 @@ mod tests {
                 SyncResponse::Rejected {
                     reason: SyncRejectReason::Unauthorized,
                 }
+            );
+
+            requester
+                .send_join_request(
+                    owner_id,
+                    JoinRequest::from_invitation(&invitation, vec![1]).unwrap(),
+                );
+            let join_response = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = requester.next_event() => {
+                            if let NetworkEvent::JoinResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } = event
+                            {
+                                if peer_id == owner_id {
+                                    break response;
+                                }
+                            }
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("unauthorized join request should receive a response");
+            assert_eq!(
+                join_response.rejection(),
+                Some(JoinRejectReason::Unauthorized)
             );
             let advertiser_task = service
                 .advertisement

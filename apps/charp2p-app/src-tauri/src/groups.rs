@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
+use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
 const CREDENTIAL_PREFIX: &str = "group-identity-v1-";
 const INVITATION_CREDENTIAL_PREFIX: &str = "issued-invitation-v1-";
@@ -538,6 +539,20 @@ impl GroupService {
     }
 }
 
+impl JoinRequestAuthorizer for GroupService {
+    fn authorize_join_request(&self, request: &JoinRequest) -> JoinRequestAuthorization {
+        match GroupService::authorize_join_request(self, request) {
+            Ok(_) => JoinRequestAuthorization::Authorized,
+            Err(JoinInvitationAuthorizationError::Unauthorized) => {
+                JoinRequestAuthorization::Unauthorized
+            }
+            Err(JoinInvitationAuthorizationError::Unavailable) => {
+                JoinRequestAuthorization::Unavailable
+            }
+        }
+    }
+}
+
 impl From<LocalGroupMetadata> for LocalGroup {
     fn from(metadata: LocalGroupMetadata) -> Self {
         Self {
@@ -637,6 +652,7 @@ mod tests {
         CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
         JoinInvitationAuthorizationError,
     };
+    use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
     #[derive(Default)]
     struct MemorySecretStore {
@@ -812,6 +828,10 @@ mod tests {
         assert_eq!(first.group_id(), group_id);
         assert_eq!(first.invitation_id(), request_invitation_id(&request, NOW));
         assert!(!first.is_reusable());
+        assert_eq!(
+            JoinRequestAuthorizer::authorize_join_request(&service, &request),
+            JoinRequestAuthorization::Authorized
+        );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
     }
 

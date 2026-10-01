@@ -44,14 +44,18 @@ limit so an oversized message cannot be accepted as a valid prefix. Temporary
 wire buffers are zeroed on drop. Routing-only nodes reject all join requests;
 application advertisers validate inbound bearers against the owner's protected
 issued-invitation state. Unknown, expired, or forged credentials receive the
-same `unauthorized` response. Recognized credentials and temporary protected
-storage failures receive `busy` until the durable MLS acceptance handler is
-active.
+same `unauthorized` response. After bearer authorization, advertisers parse and
+verify the bounded MLS KeyPackage, require the pinned profile, and bind its
+signed credential to the authenticated transport peer. Profile mismatches
+receive `unsupported profile`; invalid credentials receive `unauthorized`.
+Recognized, profile-valid requests and temporary protected storage failures
+receive `busy` until the durable MLS acceptance handler is active.
 
 ## Consequences
 
 - Join handlers have one shared bounded input and output codec with stable
   version, variant, and rejection codes.
 - A syntactically valid request grants no membership or synchronization access.
-- Owner advertisers reject unrecognized bearer credentials before MLS parsing.
+- Owner advertisers reject unrecognized bearer credentials before MLS parsing,
+  then authenticate the KeyPackage before durable admission work.
 - Durable MLS state, approval flow, and acceptance remain separate increments.

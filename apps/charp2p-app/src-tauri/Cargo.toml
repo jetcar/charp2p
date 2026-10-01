@@ -19,10 +19,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 charp2p-core = { path = "../../../crates/charp2p-core" }
+charp2p-mls = { path = "../../../crates/charp2p-mls" }
 charp2p-network = { path = "../../../crates/charp2p-network" }
 charp2p-store = { path = "../../../crates/charp2p-store" }
 keyring-core = "1.0.0"
 libp2p = { version = "0.57.0", default-features = false }
+openmls_rust_crypto = "0.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6.1"
@@ -37,6 +39,11 @@ android-native-keyring-store = "1.0.0"
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 windows-native-keyring-store = "1.1.0"
+
+[dev-dependencies]
+openmls = "0.9.0"
+openmls_basic_credential = "0.6.0"
+openmls_traits = "0.6.0"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

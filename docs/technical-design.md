@@ -214,6 +214,9 @@ rejecting an oversized message, and zeroes temporary wire buffers on drop.
 Before use, the owner parses exactly one bounded KeyPackage, verifies it with
 OpenMLS, requires the pinned ciphersuite and exact profile capabilities, and
 requires its signed device credential to equal the authenticated libp2p peer.
+This validation now runs in the active advertiser after bearer authorization;
+malformed or peer-mismatched credentials are rejected as unauthorized and
+profile mismatches use the stable unsupported-profile response.
 The joining device generates its one-time KeyPackage through the same profile:
 the credential must name its local peer ID, OpenMLS stores the matching private
 material, and the bounded public encoding is self-validated before being moved

@@ -37,7 +37,9 @@ copy signed custom-URI invitations. Group-root keys and issued bearer
 credentials use the platform keyring; SQLite stores their non-secret indexes
 and invitation defaults. Expired invitations are removed from both stores.
 Inbound join requests are checked against this protected issuance state before
-MLS processing. Revocation events and the initial protected membership event
-remain later increments. Until the groups list is implemented, the backend
-enforces one locally created group so extra protected roots cannot become
-hidden from the interface.
+MLS processing. The advertiser then verifies the bounded MLS KeyPackage,
+requires the pinned profile, and binds its signed device credential to the
+authenticated connection. Revocation events and the initial protected
+membership event remain later increments. Until the groups list is implemented,
+the backend enforces one locally created group so extra protected roots cannot
+become hidden from the interface.

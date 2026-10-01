@@ -7,8 +7,10 @@ use std::{
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, SyncRejectReason,
 };
+use charp2p_mls::{ProfileKeyPackageError, validate_profile_key_package};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
+use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde::Serialize;
 use tokio::{
     sync::Mutex,
@@ -183,12 +185,14 @@ impl NetworkService {
                             node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
                     }
                     NetworkEvent::JoinRequestReceived {
+                        peer_id,
                         request_id,
                         request,
-                        ..
                     } => {
                         let reason = join_reject_reason(
                             self.join_authorizer.authorize_join_request(&request),
+                            &request,
+                            peer_id,
                         );
                         let _ = node.reject_join_request(request_id, reason);
                     }
@@ -233,12 +237,14 @@ impl NetworkService {
                                 );
                             }
                             NetworkEvent::JoinRequestReceived {
+                                peer_id,
                                 request_id,
                                 request,
-                                ..
                             } => {
                                 let reason = join_reject_reason(
                                     join_authorizer.authorize_join_request(&request),
+                                    &request,
+                                    peer_id,
                                 );
                                 let _ = node.reject_join_request(request_id, reason);
                             }
@@ -371,12 +377,26 @@ impl NetworkService {
     }
 }
 
-fn join_reject_reason(authorization: JoinRequestAuthorization) -> JoinRejectReason {
+fn join_reject_reason(
+    authorization: JoinRequestAuthorization,
+    request: &JoinRequest,
+    authenticated_peer: PeerId,
+) -> JoinRejectReason {
     match authorization {
         JoinRequestAuthorization::Unauthorized => JoinRejectReason::Unauthorized,
-        JoinRequestAuthorization::Authorized | JoinRequestAuthorization::Unavailable => {
-            JoinRejectReason::Busy
-        }
+        JoinRequestAuthorization::Unavailable => JoinRejectReason::Busy,
+        JoinRequestAuthorization::Authorized => match validate_profile_key_package(
+            &OpenMlsRustCrypto::default(),
+            request.key_package(),
+            authenticated_peer,
+        ) {
+            Ok(_) => JoinRejectReason::Busy,
+            Err(
+                ProfileKeyPackageError::UnsupportedCiphersuite
+                | ProfileKeyPackageError::UnsupportedCapabilities,
+            ) => JoinRejectReason::UnsupportedProfile,
+            Err(_) => JoinRejectReason::Unauthorized,
+        },
     }
 }
 
@@ -416,9 +436,17 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        JoinRejectReason, JoinRequest, SyncRejectReason, SyncRequest, SyncResponse,
+        JoinRejectReason, JoinRequest, PeerId, SyncRejectReason, SyncRequest, SyncResponse,
+    };
+    use charp2p_mls::{
+        CIPHERSUITE, device_credential, prepare_profile_key_package,
     };
     use charp2p_network::{NetworkEvent, NetworkNode};
+    use openmls::prelude::{
+        CredentialWithKey, KeyPackage, OpenMlsProvider, tls_codec::Serialize,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
     use tokio::time::timeout;
 
     use super::{
@@ -443,19 +471,85 @@ mod tests {
             .as_secs()
     }
 
+    fn profile_join_request(device_id: PeerId) -> JoinRequest {
+        let provider = OpenMlsRustCrypto::default();
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+        signer.store(provider.storage()).unwrap();
+        let credential = CredentialWithKey {
+            credential: device_credential(device_id).into(),
+            signature_key: signer.public().into(),
+        };
+        let prepared =
+            prepare_profile_key_package(&provider, &signer, credential, device_id).unwrap();
+        prepared.into_join_request(&join_invitation()).unwrap()
+    }
+
+    fn unsupported_profile_join_request(device_id: PeerId) -> JoinRequest {
+        let provider = OpenMlsRustCrypto::default();
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+        signer.store(provider.storage()).unwrap();
+        let credential = CredentialWithKey {
+            credential: device_credential(device_id).into(),
+            signature_key: signer.public().into(),
+        };
+        let key_package = KeyPackage::builder()
+            .build(CIPHERSUITE, &provider, &signer, credential)
+            .unwrap();
+        let encoded = key_package
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        JoinRequest::from_invitation(&join_invitation(), encoded).unwrap()
+    }
+
+    fn join_invitation() -> Invitation {
+        let group = GroupIdentity::generate();
+        Invitation::issue(
+            &group,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn join_authorization_uses_stable_public_rejections() {
+        let peer_id = DeviceIdentity::generate().peer_id();
+        let request = profile_join_request(peer_id);
         assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Authorized),
+            join_reject_reason(JoinRequestAuthorization::Authorized, &request, peer_id),
             JoinRejectReason::Busy
         );
         assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Unauthorized),
+            join_reject_reason(JoinRequestAuthorization::Unauthorized, &request, peer_id),
             JoinRejectReason::Unauthorized
         );
         assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Unavailable),
+            join_reject_reason(JoinRequestAuthorization::Unavailable, &request, peer_id),
             JoinRejectReason::Busy
+        );
+        assert_eq!(
+            join_reject_reason(
+                JoinRequestAuthorization::Authorized,
+                &request,
+                DeviceIdentity::generate().peer_id(),
+            ),
+            JoinRejectReason::Unauthorized
+        );
+        let unsupported = unsupported_profile_join_request(peer_id);
+        assert_eq!(
+            join_reject_reason(
+                JoinRequestAuthorization::Authorized,
+                &unsupported,
+                peer_id,
+            ),
+            JoinRejectReason::UnsupportedProfile
         );
     }
 

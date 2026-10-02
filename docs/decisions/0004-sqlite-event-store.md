@@ -35,7 +35,9 @@ verify signed envelopes before their identifiers leave the store.
 Keep plaintext identity and group key material outside SQLite. SQLite may hold
 one bounded, atomically replaced MLS provider ciphertext; its authenticated
 encryption key remains in platform-protected storage and the store never
-interprets the encrypted bytes.
+interprets the encrypted bytes. When a signed event advances MLS state, insert
+the event and replace the resulting provider ciphertext in one SQLite
+transaction so neither state can become durable alone.
 
 ## Alternatives considered
 
@@ -63,6 +65,8 @@ backup and diagnostic workflows.
 - Database encryption at rest is separate from end-to-end payload protection.
 - MLS provider ciphertext replacement is atomic and preserves the previous
   record when a new value fails local size validation.
+- An event that advances MLS state and its resulting encrypted provider
+  snapshot commit or roll back together.
 
 ## Sources
 

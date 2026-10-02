@@ -40,6 +40,8 @@ the maximum snapshot plus encryption-envelope overhead. The storage layer
 atomically replaces this opaque record and never receives plaintext provider
 state. Each application provider mutation snapshots the preceding state, then
 restores it if the operation, encryption, or durable replacement fails.
+Mutations represented by signed group events persist that event and the
+resulting encrypted snapshot in one SQLite transaction.
 
 ## Consequences
 

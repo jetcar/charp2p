@@ -294,6 +294,10 @@ Requirements:
 
 SQLite is the expected local event index, with protected payloads and key
 material separated so keys can use platform secure storage.
+An event that changes MLS state and the resulting encrypted provider snapshot
+are committed in one SQLite transaction. A failed snapshot replacement rolls
+back the event, preventing the event graph and the local MLS epoch from
+diverging across a crash or storage failure.
 
 ## Message protection
 

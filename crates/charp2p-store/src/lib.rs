@@ -122,6 +122,21 @@ impl EventStore {
         Ok(outcome)
     }
 
+    /// Atomically persists one verified event and the MLS provider state that
+    /// results from applying it.
+    pub fn put_event_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        validate_encrypted_mls_provider_snapshot(encrypted)?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Loads and re-verifies an event by its identifier.
     pub fn get_event(&self, event_id: EventId) -> Result<Option<SignedEvent>, StoreError> {
         let encoded: Option<Vec<u8>> = self
@@ -430,9 +445,7 @@ impl EventStore {
         &mut self,
         encrypted: &[u8],
     ) -> Result<(), StoreError> {
-        if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
-            return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
-        }
+        validate_encrypted_mls_provider_snapshot(encrypted)?;
         self.connection.execute(
             "INSERT INTO mls_provider_snapshot (singleton, encrypted)
              VALUES (1, ?1)
@@ -628,6 +641,26 @@ impl EventStore {
 
         Ok(Self { connection })
     }
+}
+
+fn validate_encrypted_mls_provider_snapshot(encrypted: &[u8]) -> Result<(), StoreError> {
+    if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
+        return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
+    }
+    Ok(())
+}
+
+fn put_encrypted_mls_provider_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    encrypted: &[u8],
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO mls_provider_snapshot (singleton, encrypted)
+         VALUES (1, ?1)
+         ON CONFLICT(singleton) DO UPDATE SET encrypted = excluded.encrypted",
+        [encrypted],
+    )?;
+    Ok(())
 }
 
 fn history_policy_code(policy: HistoryPolicy) -> i64 {
@@ -1094,6 +1127,69 @@ mod tests {
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"replacement ciphertext"
+        );
+    }
+
+    #[test]
+    fn event_and_resulting_mls_snapshot_commit_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        let event = message_event(
+            &DeviceIdentity::generate(),
+            &GroupIdentity::generate(),
+            1,
+            b"protected membership change",
+        );
+
+        assert_eq!(
+            store
+                .put_event_and_encrypted_mls_provider_snapshot(
+                    &event,
+                    b"resulting authenticated snapshot",
+                )
+                .unwrap(),
+            PutEventOutcome::Inserted
+        );
+        assert!(store.get_event(event.id()).unwrap().is_some());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"resulting authenticated snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_write_failure_rolls_back_the_event() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_encrypted_mls_provider_snapshot(b"preceding authenticated snapshot")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_mls_snapshot_update
+                 BEFORE UPDATE ON mls_provider_snapshot
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected snapshot failure');
+                 END;",
+            )
+            .unwrap();
+        let event = message_event(
+            &DeviceIdentity::generate(),
+            &GroupIdentity::generate(),
+            1,
+            b"protected membership change",
+        );
+
+        assert!(matches!(
+            store.put_event_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"resulting authenticated snapshot",
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert!(store.get_event(event.id()).unwrap().is_none());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"preceding authenticated snapshot"
         );
     }
 

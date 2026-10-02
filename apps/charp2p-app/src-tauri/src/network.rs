@@ -5,9 +5,10 @@ use std::{
 };
 
 use charp2p_core::{
-    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, SyncRejectReason,
+    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, JoinResponse,
+    SyncRejectReason,
 };
-use charp2p_mls::{ProfileKeyPackageError, ProfileProvider, validate_profile_key_package};
+use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{NetworkEvent, NetworkNode};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -16,6 +17,8 @@ use tokio::{
     task::JoinHandle,
     time::{interval, interval_at, sleep, timeout, Instant, MissedTickBehavior},
 };
+
+use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
 const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
@@ -36,6 +39,34 @@ pub(crate) enum JoinRequestAuthorization {
 
 pub(crate) trait JoinRequestAuthorizer: Send + Sync {
     fn authorize_join_request(&self, request: &JoinRequest) -> JoinRequestAuthorization;
+}
+
+trait MemberAdmissionService: Send + Sync {
+    fn admit_member(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+    ) -> Result<JoinResponse, MemberAdmissionError>;
+}
+
+impl MemberAdmissionService for MlsProviderService {
+    fn admit_member(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        MlsProviderService::admit_member(
+            self,
+            group_id,
+            owner_identity,
+            authenticated_peer,
+            encoded_key_package,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -75,17 +106,20 @@ pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+    member_admission: Arc<dyn MemberAdmissionService>,
 }
 
 impl NetworkService {
     pub fn from_environment(
         join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+        member_admission: Arc<MlsProviderService>,
     ) -> Result<Self, &'static str> {
         let environment = std::env::var(BOOTSTRAP_ENVIRONMENT_VARIABLE).unwrap_or_default();
         Self::from_sources_with_authorizer(
             BUILT_IN_BOOTSTRAP_ADDRESSES,
             &environment,
             join_authorizer,
+            member_admission,
         )
     }
 
@@ -95,6 +129,7 @@ impl NetworkService {
             built_in,
             environment,
             Arc::new(UnavailableJoinRequestAuthorizer),
+            Arc::new(UnavailableMemberAdmissionService),
         )
     }
 
@@ -102,6 +137,7 @@ impl NetworkService {
         built_in: &[&str],
         environment: &str,
         join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+        member_admission: Arc<dyn MemberAdmissionService>,
     ) -> Result<Self, &'static str> {
         let configured = built_in.iter().copied().chain(
             environment
@@ -122,15 +158,19 @@ impl NetworkService {
             bootstrap_peers,
             advertisement: Mutex::new(None),
             join_authorizer,
+            member_admission,
         })
     }
 
     pub async fn advertise(
         &self,
-        identity: DeviceIdentity,
+        network_identity: DeviceIdentity,
+        owner_identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<AdvertisementResult, &'static str> {
-        if identity.peer_id() != invitation.inviter_device_id() {
+        if network_identity.peer_id() != invitation.inviter_device_id()
+            || owner_identity.peer_id() != network_identity.peer_id()
+        {
             return Err("invitation_inviter_mismatch");
         }
         remaining_until_expiry(invitation.expires_at_unix())?;
@@ -158,7 +198,7 @@ impl NetworkService {
             existing.task.abort();
         }
 
-        let mut node = NetworkNode::new(identity.into_network_keypair());
+        let mut node = NetworkNode::new(network_identity.into_network_keypair());
         node.listen_on(
             "/ip4/0.0.0.0/udp/0/quic-v1"
                 .parse()
@@ -191,12 +231,14 @@ impl NetworkService {
                         request_id,
                         request,
                     } => {
-                        let reason = join_reject_reason(
+                        let response = join_response(
                             self.join_authorizer.authorize_join_request(&request),
+                            self.member_admission.as_ref(),
+                            &owner_identity,
                             &request,
                             peer_id,
                         );
-                        let _ = node.reject_join_request(request_id, reason);
+                        let _ = node.send_join_response(request_id, response);
                     }
                     _ => {}
                 }
@@ -209,6 +251,7 @@ impl NetworkService {
 
         let expires_at_unix = invitation.expires_at_unix();
         let join_authorizer = Arc::clone(&self.join_authorizer);
+        let member_admission = Arc::clone(&self.member_admission);
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
                 Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
@@ -243,12 +286,14 @@ impl NetworkService {
                                 request_id,
                                 request,
                             } => {
-                                let reason = join_reject_reason(
+                                let response = join_response(
                                     join_authorizer.authorize_join_request(&request),
+                                    member_admission.as_ref(),
+                                    &owner_identity,
                                     &request,
                                     peer_id,
                                 );
-                                let _ = node.reject_join_request(request_id, reason);
+                                let _ = node.send_join_response(request_id, response);
                             }
                             _ => {}
                         }
@@ -380,25 +425,45 @@ impl NetworkService {
     }
 }
 
-fn join_reject_reason(
+fn join_response(
     authorization: JoinRequestAuthorization,
+    member_admission: &dyn MemberAdmissionService,
+    owner_identity: &DeviceIdentity,
     request: &JoinRequest,
     authenticated_peer: PeerId,
-) -> JoinRejectReason {
+) -> JoinResponse {
     match authorization {
-        JoinRequestAuthorization::Unauthorized => JoinRejectReason::Unauthorized,
-        JoinRequestAuthorization::Unavailable => JoinRejectReason::Busy,
+        JoinRequestAuthorization::Unauthorized => {
+            JoinResponse::rejected(JoinRejectReason::Unauthorized)
+        }
+        JoinRequestAuthorization::Unavailable => JoinResponse::rejected(JoinRejectReason::Busy),
         JoinRequestAuthorization::Authorized => match validate_profile_key_package(
             &ProfileProvider::default(),
             request.key_package(),
             authenticated_peer,
         ) {
-            Ok(_) => JoinRejectReason::Busy,
+            Ok(_) => match member_admission.admit_member(
+                request.group_id(),
+                owner_identity,
+                authenticated_peer,
+                request.key_package(),
+            ) {
+                Ok(response) => response,
+                Err(MemberAdmissionError::Unauthorized) => {
+                    JoinResponse::rejected(JoinRejectReason::Unauthorized)
+                }
+                Err(MemberAdmissionError::UnsupportedProfile) => {
+                    JoinResponse::rejected(JoinRejectReason::UnsupportedProfile)
+                }
+                Err(MemberAdmissionError::Unavailable) => {
+                    JoinResponse::rejected(JoinRejectReason::Busy)
+                }
+            },
             Err(
                 ProfileKeyPackageError::UnsupportedCiphersuite
                 | ProfileKeyPackageError::UnsupportedCapabilities,
-            ) => JoinRejectReason::UnsupportedProfile,
-            Err(_) => JoinRejectReason::Unauthorized,
+            ) => JoinResponse::rejected(JoinRejectReason::UnsupportedProfile),
+            Err(_) => JoinResponse::rejected(JoinRejectReason::Unauthorized),
         },
     }
 }
@@ -410,6 +475,22 @@ struct UnavailableJoinRequestAuthorizer;
 impl JoinRequestAuthorizer for UnavailableJoinRequestAuthorizer {
     fn authorize_join_request(&self, _request: &JoinRequest) -> JoinRequestAuthorization {
         JoinRequestAuthorization::Unavailable
+    }
+}
+
+#[cfg(test)]
+struct UnavailableMemberAdmissionService;
+
+#[cfg(test)]
+impl MemberAdmissionService for UnavailableMemberAdmissionService {
+    fn admit_member(
+        &self,
+        _group_id: PeerId,
+        _owner_identity: &DeviceIdentity,
+        _authenticated_peer: PeerId,
+        _encoded_key_package: &[u8],
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        Err(MemberAdmissionError::Unavailable)
     }
 }
 
@@ -435,26 +516,30 @@ fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        JoinRejectReason, JoinRequest, PeerId, SyncRejectReason, SyncRequest, SyncResponse,
+        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncRejectReason, SyncRequest,
+        SyncResponse,
     };
     use charp2p_mls::{
-        CIPHERSUITE, ProfileProvider, device_credential, prepare_profile_key_package,
+        device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
     };
     use charp2p_network::{NetworkEvent, NetworkNode};
-    use openmls::prelude::{
-        CredentialWithKey, KeyPackage, OpenMlsProvider, tls_codec::Serialize,
-    };
+    use openmls::prelude::{tls_codec::Serialize, CredentialWithKey, KeyPackage, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
     use tokio::time::timeout;
 
     use super::{
-        join_reject_reason, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
-        JoinRequestAuthorizer, NetworkService, PeerSearchResult,
+        join_response, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
+        JoinRequestAuthorizer, MemberAdmissionService, NetworkService, PeerSearchResult,
+        UnavailableMemberAdmissionService,
     };
+    use crate::mls_storage::MemberAdmissionError;
 
     const NOW: u64 = 1_800_000_000;
 
@@ -466,11 +551,33 @@ mod tests {
         }
     }
 
+    struct AcceptingMemberAdmissionService;
+
+    impl MemberAdmissionService for AcceptingMemberAdmissionService {
+        fn admit_member(
+            &self,
+            _group_id: PeerId,
+            _owner_identity: &DeviceIdentity,
+            _authenticated_peer: PeerId,
+            _encoded_key_package: &[u8],
+        ) -> Result<JoinResponse, MemberAdmissionError> {
+            JoinResponse::accepted(vec![4, 5, 6]).map_err(|_| MemberAdmissionError::Unavailable)
+        }
+    }
+
     fn unix_now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    fn identity_pair() -> (DeviceIdentity, DeviceIdentity) {
+        let (_, secret) = DeviceIdentity::generate_persistable().unwrap();
+        (
+            DeviceIdentity::from_persisted_secret(&secret).unwrap(),
+            DeviceIdentity::from_persisted_secret(&secret).unwrap(),
+        )
     }
 
     fn profile_join_request(device_id: PeerId) -> JoinRequest {
@@ -497,10 +604,7 @@ mod tests {
         let key_package = KeyPackage::builder()
             .build(CIPHERSUITE, &provider, &signer, credential)
             .unwrap();
-        let encoded = key_package
-            .key_package()
-            .tls_serialize_detached()
-            .unwrap();
+        let encoded = key_package.key_package().tls_serialize_detached().unwrap();
         JoinRequest::from_invitation(&join_invitation(), encoded).unwrap()
     }
 
@@ -524,36 +628,74 @@ mod tests {
     #[test]
     fn join_authorization_uses_stable_public_rejections() {
         let peer_id = DeviceIdentity::generate().peer_id();
+        let owner = DeviceIdentity::generate();
+        let admission = UnavailableMemberAdmissionService;
         let request = profile_join_request(peer_id);
         assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Authorized, &request, peer_id),
-            JoinRejectReason::Busy
-        );
-        assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Unauthorized, &request, peer_id),
-            JoinRejectReason::Unauthorized
-        );
-        assert_eq!(
-            join_reject_reason(JoinRequestAuthorization::Unavailable, &request, peer_id),
-            JoinRejectReason::Busy
-        );
-        assert_eq!(
-            join_reject_reason(
+            join_response(
                 JoinRequestAuthorization::Authorized,
+                &admission,
+                &owner,
+                &request,
+                peer_id,
+            )
+            .rejection(),
+            Some(JoinRejectReason::Busy)
+        );
+        assert_eq!(
+            join_response(
+                JoinRequestAuthorization::Unauthorized,
+                &admission,
+                &owner,
+                &request,
+                peer_id,
+            )
+            .rejection(),
+            Some(JoinRejectReason::Unauthorized)
+        );
+        assert_eq!(
+            join_response(
+                JoinRequestAuthorization::Unavailable,
+                &admission,
+                &owner,
+                &request,
+                peer_id,
+            )
+            .rejection(),
+            Some(JoinRejectReason::Busy)
+        );
+        assert_eq!(
+            join_response(
+                JoinRequestAuthorization::Authorized,
+                &admission,
+                &owner,
                 &request,
                 DeviceIdentity::generate().peer_id(),
-            ),
-            JoinRejectReason::Unauthorized
+            )
+            .rejection(),
+            Some(JoinRejectReason::Unauthorized)
         );
         let unsupported = unsupported_profile_join_request(peer_id);
         assert_eq!(
-            join_reject_reason(
+            join_response(
                 JoinRequestAuthorization::Authorized,
+                &admission,
+                &owner,
                 &unsupported,
                 peer_id,
-            ),
-            JoinRejectReason::UnsupportedProfile
+            )
+            .rejection(),
+            Some(JoinRejectReason::UnsupportedProfile)
         );
+
+        let accepted = join_response(
+            JoinRequestAuthorization::Authorized,
+            &AcceptingMemberAdmissionService,
+            &owner,
+            &request,
+            peer_id,
+        );
+        assert_eq!(accepted.welcome(), Some([4, 5, 6].as_slice()));
     }
 
     #[test]
@@ -617,7 +759,7 @@ mod tests {
     fn advertise_reports_when_no_bootstrap_peer_is_configured() {
         let now = unix_now();
         let group = GroupIdentity::generate();
-        let owner = DeviceIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
         let invitation = Invitation::issue(
             &group,
             owner.peer_id(),
@@ -632,9 +774,11 @@ mod tests {
         )
         .unwrap();
         let result = tauri::async_runtime::block_on(
-            NetworkService::from_sources(&[], "")
-                .unwrap()
-                .advertise(owner, &invitation),
+            NetworkService::from_sources(&[], "").unwrap().advertise(
+                owner,
+                owner_signer,
+                &invitation,
+            ),
         )
         .unwrap();
 
@@ -665,9 +809,11 @@ mod tests {
         .unwrap();
 
         let result = tauri::async_runtime::block_on(
-            NetworkService::from_sources(&[], "")
-                .unwrap()
-                .advertise(DeviceIdentity::generate(), &invitation),
+            NetworkService::from_sources(&[], "").unwrap().advertise(
+                DeviceIdentity::generate(),
+                DeviceIdentity::generate(),
+                &invitation,
+            ),
         );
 
         assert!(matches!(result, Err("invitation_inviter_mismatch")));
@@ -677,7 +823,7 @@ mod tests {
     fn advertise_rejects_an_expired_invitation() {
         let expires_at_unix = unix_now().saturating_sub(1);
         let group = GroupIdentity::generate();
-        let owner = DeviceIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
         let invitation = Invitation::issue(
             &group,
             owner.peer_id(),
@@ -692,9 +838,11 @@ mod tests {
         )
         .unwrap();
         let result = tauri::async_runtime::block_on(
-            NetworkService::from_sources(&[], "")
-                .unwrap()
-                .advertise(owner, &invitation),
+            NetworkService::from_sources(&[], "").unwrap().advertise(
+                owner,
+                owner_signer,
+                &invitation,
+            ),
         );
 
         assert!(matches!(result, Err("invitation_expired")));
@@ -737,6 +885,7 @@ mod tests {
                 NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
             let advertise = service.advertise(
                 DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
+                DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
                 &invitation,
             );
             tokio::pin!(advertise);
@@ -762,6 +911,7 @@ mod tests {
                 .id();
             let repeated = service
                 .advertise(
+                    DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
                     DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
                     &invitation,
                 )
@@ -802,7 +952,7 @@ mod tests {
     fn active_advertisement_stops_at_signed_expiry() {
         let now = unix_now();
         let group = GroupIdentity::generate();
-        let owner = DeviceIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
         let invitation = Invitation::issue(
             &group,
             owner.peer_id(),
@@ -830,7 +980,7 @@ mod tests {
             };
             let service =
                 NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
-            let advertise = service.advertise(owner, &invitation);
+            let advertise = service.advertise(owner, owner_signer, &invitation);
             tokio::pin!(advertise);
             timeout(Duration::from_secs(2), async {
                 loop {
@@ -878,7 +1028,7 @@ mod tests {
     fn advertisement_rejects_unauthorized_requests() {
         let now = unix_now();
         let group = GroupIdentity::generate();
-        let owner = DeviceIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
         let owner_id = owner.peer_id();
         let invitation = Invitation::issue(
             &group,
@@ -912,10 +1062,11 @@ mod tests {
                 Arc::new(StaticJoinRequestAuthorizer(
                     JoinRequestAuthorization::Unauthorized,
                 )),
+                Arc::new(UnavailableMemberAdmissionService),
             )
             .unwrap();
             {
-                let advertise = service.advertise(owner, &invitation);
+                let advertise = service.advertise(owner, owner_signer, &invitation);
                 tokio::pin!(advertise);
                 timeout(Duration::from_secs(10), async {
                     loop {
@@ -977,11 +1128,10 @@ mod tests {
                 }
             );
 
-            requester
-                .send_join_request(
-                    owner_id,
-                    JoinRequest::from_invitation(&invitation, vec![1]).unwrap(),
-                );
+            requester.send_join_request(
+                owner_id,
+                JoinRequest::from_invitation(&invitation, vec![1]).unwrap(),
+            );
             let join_response = timeout(Duration::from_secs(10), async {
                 loop {
                     tokio::select! {

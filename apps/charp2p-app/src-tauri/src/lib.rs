@@ -105,7 +105,7 @@ fn create_group(
     reusable_invitation: bool,
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
-    mls_service: tauri::State<'_, MlsProviderService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<LocalGroup, String> {
     let profile = identity_service
         .status()
@@ -174,8 +174,11 @@ async fn advertise_group(
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
+    let owner_identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
     network_service
-        .advertise(identity, &invitation)
+        .advertise(identity, owner_identity, &invitation)
         .await
         .map_err(str::to_owned)
 }
@@ -224,8 +227,10 @@ pub fn run() {
                 GroupService::open(&database_path, Arc::clone(&storage_operations))
                     .map_err(std::io::Error::other)?,
             );
-            let mls = MlsProviderService::open(&database_path, storage_operations)
-                .map_err(std::io::Error::other)?;
+            let mls = Arc::new(
+                MlsProviderService::open(&database_path, storage_operations)
+                    .map_err(std::io::Error::other)?,
+            );
             let local_groups = groups.list().map_err(std::io::Error::other)?;
             if !local_groups.is_empty() {
                 let profile = identity
@@ -245,7 +250,7 @@ pub fn run() {
                         .map_err(std::io::Error::other)?;
                 }
             }
-            let network = NetworkService::from_environment(groups.clone())
+            let network = NetworkService::from_environment(groups.clone(), mls.clone())
                 .map_err(std::io::Error::other)?;
             app.manage(identity);
             app.manage(pending);

@@ -1,16 +1,20 @@
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
 };
-use charp2p_core::PeerId;
+use charp2p_core::{
+    DeviceIdentity, EventId, EventKind, EventSpec, JoinResponse, PeerId, SignedEvent,
+};
 use charp2p_mls::{
-    CIPHERSUITE, ProfileProvider, device_credential, device_id_from_credential,
-    group_create_config, validate_group_profile,
+    device_credential, device_id_from_credential, group_create_config,
+    merge_prepared_member_admission, prepare_profile_member_admission, validate_group_profile,
+    PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
 };
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
 use keyring_core::Error as KeyringError;
@@ -68,6 +72,13 @@ pub(crate) struct MlsProviderService {
     wrapping_keys: Box<dyn WrappingKeyStore>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemberAdmissionError {
+    Unauthorized,
+    UnsupportedProfile,
+    Unavailable,
+}
+
 impl MlsProviderService {
     pub(crate) fn open(
         path: impl AsRef<Path>,
@@ -122,6 +133,117 @@ impl MlsProviderService {
             })
     }
 
+    /// Adds one transport-authenticated device, publishes the resulting MLS
+    /// Commit as a signed event, and persists the advanced MLS state in the
+    /// same SQLite transaction before returning its Welcome.
+    pub(crate) fn admit_member(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or(MemberAdmissionError::Unavailable)?;
+        self.admit_member_at(
+            group_id,
+            owner_identity,
+            authenticated_peer,
+            encoded_key_package,
+            created_at_unix_ms,
+        )
+    }
+
+    fn admit_member_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+        created_at_unix_ms: u64,
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let result = (|| {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
+            let mut group = MlsGroup::load(provider.storage(), &mls_group_id)
+                .map_err(|_| MemberAdmissionError::Unavailable)?
+                .ok_or(MemberAdmissionError::Unavailable)?;
+            validate_owner_group(&group, group_id, owner_identity.peer_id())
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let own_signature_key = group
+                .own_leaf_node()
+                .ok_or(MemberAdmissionError::Unavailable)?
+                .signature_key();
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                own_signature_key.as_slice(),
+                CIPHERSUITE.signature_algorithm(),
+            )
+            .ok_or(MemberAdmissionError::Unavailable)?;
+            let (author_sequence, causal_parents) =
+                next_event_position(&store, group_id, owner_identity.peer_id())?;
+            let admission = prepare_profile_member_admission(
+                &mut group,
+                &*provider,
+                &signer,
+                encoded_key_package,
+                authenticated_peer,
+            )
+            .map_err(map_preparation_error)?;
+            let response = JoinResponse::accepted(admission.welcome().to_vec())
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let event = SignedEvent::create(
+                owner_identity,
+                EventSpec {
+                    group_id,
+                    author_sequence,
+                    causal_parents: &causal_parents,
+                    created_at_unix_ms,
+                    kind: EventKind::MemberAdded,
+                    protected_payload: admission.commit(),
+                },
+            )
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+            merge_prepared_member_admission(&mut group, &*provider)
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let key = self
+                .load_or_create_wrapping_key()
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let encrypted =
+                encrypt_snapshot(&snapshot, &key).map_err(|_| MemberAdmissionError::Unavailable)?;
+            store
+                .put_event_and_encrypted_mls_provider_snapshot(&event, &encrypted)
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            Ok(response)
+        })();
+
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+        }
+        result
+    }
+
     #[cfg(test)]
     fn read<T>(&self, operation: impl FnOnce(&ProfileProvider) -> T) -> Result<T, &'static str> {
         let _operation = self
@@ -141,14 +263,12 @@ impl MlsProviderService {
         &self,
         operation: impl FnOnce(&mut ProfileProvider) -> Result<T, E>,
     ) -> Result<T, MlsProviderMutationError<E>> {
-        let _operation = self
-            .operations
-            .lock()
-            .map_err(|_| MlsProviderMutationError::Unavailable("mls_provider_service_unavailable"))?;
-        let mut provider = self
-            .provider
-            .lock()
-            .map_err(|_| MlsProviderMutationError::Unavailable("mls_provider_service_unavailable"))?;
+        let _operation = self.operations.lock().map_err(|_| {
+            MlsProviderMutationError::Unavailable("mls_provider_service_unavailable")
+        })?;
+        let mut provider = self.provider.lock().map_err(|_| {
+            MlsProviderMutationError::Unavailable("mls_provider_service_unavailable")
+        })?;
         let previous = provider
             .snapshot()
             .map_err(|_| MlsProviderMutationError::Unavailable("mls_provider_snapshot_invalid"))?;
@@ -212,6 +332,45 @@ impl MlsProviderService {
     }
 }
 
+fn next_event_position(
+    store: &EventStore,
+    group_id: PeerId,
+    author_id: PeerId,
+) -> Result<(u64, Vec<EventId>), MemberAdmissionError> {
+    let current_sequence = store
+        .synchronization_summary(group_id)
+        .map_err(|_| MemberAdmissionError::Unavailable)?
+        .into_iter()
+        .find(|head| head.author_id == author_id)
+        .map_or(0, |head| head.contiguous_sequence);
+    let author_sequence = current_sequence
+        .checked_add(1)
+        .ok_or(MemberAdmissionError::Unavailable)?;
+    let causal_parents = if current_sequence == 0 {
+        Vec::new()
+    } else {
+        let parent = store
+            .event_ids_after(group_id, author_id, current_sequence - 1, 1)
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+            .into_iter()
+            .next()
+            .ok_or(MemberAdmissionError::Unavailable)?;
+        vec![parent]
+    };
+    Ok((author_sequence, causal_parents))
+}
+
+fn map_preparation_error(error: PrepareMemberAdmissionError) -> MemberAdmissionError {
+    match error {
+        PrepareMemberAdmissionError::InvalidKeyPackage(
+            ProfileKeyPackageError::UnsupportedCiphersuite
+            | ProfileKeyPackageError::UnsupportedCapabilities,
+        ) => MemberAdmissionError::UnsupportedProfile,
+        PrepareMemberAdmissionError::InvalidKeyPackage(_) => MemberAdmissionError::Unauthorized,
+        _ => MemberAdmissionError::Unavailable,
+    }
+}
+
 fn initialize_owner_group(
     provider: &mut ProfileProvider,
     group_id: PeerId,
@@ -254,11 +413,9 @@ fn validate_owner_group(
     if group.group_id().as_slice() != group_id.to_bytes() {
         return Err("mls_group_identity_invalid");
     }
-    let own_leaf = group
-        .own_leaf_node()
-        .ok_or("mls_group_owner_missing")?;
-    let stored_device = device_id_from_credential(own_leaf.credential())
-        .map_err(|_| "mls_group_owner_invalid")?;
+    let own_leaf = group.own_leaf_node().ok_or("mls_group_owner_missing")?;
+    let stored_device =
+        device_id_from_credential(own_leaf.credential()).map_err(|_| "mls_group_owner_invalid")?;
     if stored_device != device_id {
         return Err("mls_group_owner_mismatch");
     }
@@ -276,9 +433,8 @@ fn restore_provider<E>(
     provider: &mut ProfileProvider,
     snapshot: &[u8],
 ) -> Result<(), MlsProviderMutationError<E>> {
-    *provider = ProfileProvider::from_snapshot(snapshot).map_err(|_| {
-        MlsProviderMutationError::Unavailable("mls_provider_snapshot_invalid")
-    })?;
+    *provider = ProfileProvider::from_snapshot(snapshot)
+        .map_err(|_| MlsProviderMutationError::Unavailable("mls_provider_snapshot_invalid"))?;
     Ok(())
 }
 
@@ -340,16 +496,19 @@ fn decrypt_snapshot(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use charp2p_core::{DeviceIdentity, GroupIdentity};
-    use charp2p_mls::{CIPHERSUITE, device_credential, prepare_profile_key_package};
-    use openmls::prelude::{CredentialWithKey, OpenMlsProvider};
+    use charp2p_core::{DeviceIdentity, EventKind, GroupIdentity};
+    use charp2p_mls::{
+        device_credential, device_id_from_credential, prepare_profile_key_package,
+        stage_profile_welcome, ProfileProvider, CIPHERSUITE,
+    };
+    use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
     use tempfile::tempdir;
     use zeroize::Zeroizing;
 
     use super::{
-        MlsProviderMutationError, MlsProviderService, WRAPPING_KEY_BYTES, WrappingKeyStore,
-        decrypt_snapshot, encrypt_snapshot,
+        decrypt_snapshot, encrypt_snapshot, MemberAdmissionError, MlsProviderMutationError,
+        MlsProviderService, WrappingKeyStore, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::EventStore;
 
@@ -370,10 +529,7 @@ mod tests {
         }
 
         fn put(&self, key: &[u8; WRAPPING_KEY_BYTES]) -> Result<(), &'static str> {
-            *self
-                .key
-                .lock()
-                .map_err(|_| "test_key_store_unavailable")? = Some(*key);
+            *self.key.lock().map_err(|_| "test_key_store_unavailable")? = Some(*key);
             Ok(())
         }
     }
@@ -387,6 +543,21 @@ mod tests {
             signature_key: signer.public().into(),
         };
         prepare_profile_key_package(provider, &signer, credential, device_id).unwrap();
+    }
+
+    fn member_key_package(
+        member_id: charp2p_core::PeerId,
+    ) -> (ProfileProvider, charp2p_mls::PreparedKeyPackage) {
+        let provider = ProfileProvider::default();
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+        signer.store(provider.storage()).unwrap();
+        let credential = CredentialWithKey {
+            credential: device_credential(member_id).into(),
+            signature_key: signer.public().into(),
+        };
+        let key_package =
+            prepare_profile_key_package(&provider, &signer, credential, member_id).unwrap();
+        (provider, key_package)
     }
 
     #[test]
@@ -426,7 +597,134 @@ mod tests {
             Box::new(key_store),
         )
         .unwrap();
-        restored.initialize_owner_group(group_id, device_id).unwrap();
+        restored
+            .initialize_owner_group(group_id, device_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn member_admission_persists_the_event_and_advanced_group_atomically() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (member_provider, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+
+        let response = service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
+            .unwrap();
+        let staged = stage_profile_welcome(&member_provider, response.welcome().unwrap()).unwrap();
+        let joined = staged.into_group(&member_provider).unwrap();
+        assert_eq!(joined.group_id().as_slice(), group_id.to_bytes());
+
+        let second_member_id = DeviceIdentity::generate().peer_id();
+        let (second_member_provider, second_key_package) = member_key_package(second_member_id);
+        let second_response = service
+            .admit_member_at(
+                group_id,
+                &owner,
+                second_member_id,
+                second_key_package.encoded(),
+                43,
+            )
+            .unwrap();
+        let second_staged =
+            stage_profile_welcome(&second_member_provider, second_response.welcome().unwrap())
+                .unwrap();
+        second_staged.into_group(&second_member_provider).unwrap();
+
+        let store = EventStore::open(&path).unwrap();
+        let event_ids = store
+            .event_ids_after(group_id, owner.peer_id(), 0, 2)
+            .unwrap();
+        let first = store.get_event(event_ids[0]).unwrap().unwrap();
+        let second = store.get_event(event_ids[1]).unwrap().unwrap();
+        assert_eq!(first.kind(), EventKind::MemberAdded);
+        assert_eq!(first.author_sequence(), 1);
+        assert_eq!(first.created_at_unix_ms(), 42);
+        assert_eq!(second.kind(), EventKind::MemberAdded);
+        assert_eq!(second.author_sequence(), 2);
+        assert_eq!(second.causal_parents(), &[first.id()]);
+        assert_eq!(second.created_at_unix_ms(), 43);
+        drop(store);
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        let members = restored
+            .read(|provider| {
+                MlsGroup::load(
+                    provider.storage(),
+                    &GroupId::from_slice(&group_id.to_bytes()),
+                )
+                .unwrap()
+                .unwrap()
+                .members()
+                .map(|member| device_id_from_credential(&member.credential).unwrap())
+                .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(members.contains(&owner.peer_id()));
+        assert!(members.contains(&member_id));
+        assert!(members.contains(&second_member_id));
+    }
+
+    #[test]
+    fn rejected_member_admission_restores_provider_and_writes_no_event() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        let before = service
+            .read(|provider| provider.snapshot().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            service.admit_member_at(
+                group_id,
+                &owner,
+                DeviceIdentity::generate().peer_id(),
+                &[1],
+                42,
+            ),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
+        assert_eq!(
+            service
+                .read(|provider| provider.snapshot().unwrap())
+                .unwrap()
+                .as_slice(),
+            before.as_slice()
+        );
+        assert!(EventStore::open(&path)
+            .unwrap()
+            .event_ids_after(group_id, owner.peer_id(), 0, 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -442,7 +740,9 @@ mod tests {
         )
         .unwrap();
         service.initialize_owner_group(group_id, device_id).unwrap();
-        let before = service.read(|provider| provider.snapshot().unwrap()).unwrap();
+        let before = service
+            .read(|provider| provider.snapshot().unwrap())
+            .unwrap();
 
         assert_eq!(
             service.initialize_owner_group(group_id, DeviceIdentity::generate().peer_id()),
@@ -475,7 +775,9 @@ mod tests {
                 Ok::<_, ()>(())
             })
             .unwrap();
-        let expected = service.read(|provider| provider.snapshot().unwrap()).unwrap();
+        let expected = service
+            .read(|provider| provider.snapshot().unwrap())
+            .unwrap();
         drop(service);
 
         let encrypted = EventStore::open(&path)
@@ -573,7 +875,9 @@ mod tests {
             Box::new(MemoryWrappingKeyStore::default()),
         )
         .unwrap();
-        let before = service.read(|provider| provider.snapshot().unwrap()).unwrap();
+        let before = service
+            .read(|provider| provider.snapshot().unwrap())
+            .unwrap();
 
         let result = service.mutate(|provider| {
             add_key_package(provider);
@@ -590,12 +894,10 @@ mod tests {
                 .as_slice(),
             before.as_slice()
         );
-        assert!(
-            EventStore::open(&path)
-                .unwrap()
-                .encrypted_mls_provider_snapshot()
-                .unwrap()
-                .is_none()
-        );
+        assert!(EventStore::open(&path)
+            .unwrap()
+            .encrypted_mls_provider_snapshot()
+            .unwrap()
+            .is_none());
     }
 }

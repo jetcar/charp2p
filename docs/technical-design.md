@@ -210,10 +210,10 @@ issued-invitation index, and an exact constant-time match with the protected
 bearer record. It returns only non-secret invitation metadata. This proves that
 the owner currently recognizes the bearer; single-use consumption and
 revocation still derive from signed membership state when admission commits.
-While durable admission is not connected, an owner returns `unauthorized` for
-unrecognized bearers and `busy` for recognized bearers or temporary local
-authorization failures. These public categories do not reveal which local
-record was missing or unavailable.
+An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
+with a valid profile proceeds through durable admission and receives a Welcome;
+temporary authorization, MLS, or storage failures return `busy`. These public
+categories do not reveal which local record was missing or unavailable.
 The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before

@@ -7,9 +7,15 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use charp2p_mls::ProfileProvider;
+use charp2p_core::PeerId;
+use charp2p_mls::{
+    CIPHERSUITE, ProfileProvider, device_credential, device_id_from_credential,
+    group_create_config, validate_group_profile,
+};
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
 use keyring_core::Error as KeyringError;
+use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
+use openmls_basic_credential::SignatureKeyPair;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
@@ -55,7 +61,7 @@ impl WrappingKeyStore for PlatformWrappingKeyStore {
 }
 
 /// Owns the in-memory OpenMLS provider and its encrypted durable snapshot.
-pub struct MlsProviderService {
+pub(crate) struct MlsProviderService {
     operations: Arc<Mutex<()>>,
     store: Mutex<EventStore>,
     provider: Mutex<ProfileProvider>,
@@ -63,7 +69,10 @@ pub struct MlsProviderService {
 }
 
 impl MlsProviderService {
-    pub fn open(path: impl AsRef<Path>, operations: Arc<Mutex<()>>) -> Result<Self, &'static str> {
+    pub(crate) fn open(
+        path: impl AsRef<Path>,
+        operations: Arc<Mutex<()>>,
+    ) -> Result<Self, &'static str> {
         Self::open_with_key_store(path, operations, Box::new(PlatformWrappingKeyStore))
     }
 
@@ -99,8 +108,22 @@ impl MlsProviderService {
         })
     }
 
+    /// Creates or verifies the owner's MLS group using the stable CharP2P
+    /// group identifier as the MLS group identifier.
+    pub(crate) fn initialize_owner_group(
+        &self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<(), &'static str> {
+        self.mutate(|provider| initialize_owner_group(provider, group_id, device_id))
+            .map_err(|error| match error {
+                MlsProviderMutationError::Operation(error)
+                | MlsProviderMutationError::Unavailable(error) => error,
+            })
+    }
+
     #[cfg(test)]
-    pub fn read<T>(&self, operation: impl FnOnce(&ProfileProvider) -> T) -> Result<T, &'static str> {
+    fn read<T>(&self, operation: impl FnOnce(&ProfileProvider) -> T) -> Result<T, &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -114,7 +137,7 @@ impl MlsProviderService {
 
     /// Runs one provider mutation and persists its encrypted snapshot. A failed
     /// operation or durable write restores the preceding in-memory state.
-    pub fn mutate<T, E>(
+    fn mutate<T, E>(
         &self,
         operation: impl FnOnce(&mut ProfileProvider) -> Result<T, E>,
     ) -> Result<T, MlsProviderMutationError<E>> {
@@ -189,9 +212,62 @@ impl MlsProviderService {
     }
 }
 
+fn initialize_owner_group(
+    provider: &mut ProfileProvider,
+    group_id: PeerId,
+    device_id: PeerId,
+) -> Result<(), &'static str> {
+    let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
+    if let Some(group) = MlsGroup::load(provider.storage(), &mls_group_id)
+        .map_err(|_| "mls_group_storage_unavailable")?
+    {
+        validate_owner_group(&group, group_id, device_id)?;
+        return Ok(());
+    }
+
+    let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+        .map_err(|_| "mls_group_creation_failed")?;
+    signer
+        .store(provider.storage())
+        .map_err(|_| "mls_group_storage_unavailable")?;
+    let credential = CredentialWithKey {
+        credential: device_credential(device_id).into(),
+        signature_key: signer.public().into(),
+    };
+    let group = MlsGroup::new_with_group_id(
+        provider,
+        &signer,
+        &group_create_config(),
+        mls_group_id,
+        credential,
+    )
+    .map_err(|_| "mls_group_creation_failed")?;
+    validate_owner_group(&group, group_id, device_id)
+}
+
+fn validate_owner_group(
+    group: &MlsGroup,
+    group_id: PeerId,
+    device_id: PeerId,
+) -> Result<(), &'static str> {
+    validate_group_profile(group).map_err(|_| "mls_group_profile_invalid")?;
+    if group.group_id().as_slice() != group_id.to_bytes() {
+        return Err("mls_group_identity_invalid");
+    }
+    let own_leaf = group
+        .own_leaf_node()
+        .ok_or("mls_group_owner_missing")?;
+    let stored_device = device_id_from_credential(own_leaf.credential())
+        .map_err(|_| "mls_group_owner_invalid")?;
+    if stored_device != device_id {
+        return Err("mls_group_owner_mismatch");
+    }
+    Ok(())
+}
+
 /// Result of a provider operation that may fail before durable replacement.
 #[derive(Debug)]
-pub enum MlsProviderMutationError<E> {
+enum MlsProviderMutationError<E> {
     Operation(E),
     Unavailable(&'static str),
 }
@@ -264,7 +340,7 @@ fn decrypt_snapshot(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use charp2p_core::DeviceIdentity;
+    use charp2p_core::{DeviceIdentity, GroupIdentity};
     use charp2p_mls::{CIPHERSUITE, device_credential, prepare_profile_key_package};
     use openmls::prelude::{CredentialWithKey, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
@@ -323,6 +399,61 @@ mod tests {
         assert_eq!(
             decrypt_snapshot(&first, &key).unwrap().as_slice(),
             b"provider state"
+        );
+    }
+
+    #[test]
+    fn owner_group_is_idempotent_and_survives_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_id = GroupIdentity::generate().group_id();
+        let device_id = DeviceIdentity::generate().peer_id();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+
+        service.initialize_owner_group(group_id, device_id).unwrap();
+        service.initialize_owner_group(group_id, device_id).unwrap();
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        restored.initialize_owner_group(group_id, device_id).unwrap();
+    }
+
+    #[test]
+    fn restored_owner_group_rejects_a_different_device() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_id = GroupIdentity::generate().group_id();
+        let device_id = DeviceIdentity::generate().peer_id();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        service.initialize_owner_group(group_id, device_id).unwrap();
+        let before = service.read(|provider| provider.snapshot().unwrap()).unwrap();
+
+        assert_eq!(
+            service.initialize_owner_group(group_id, DeviceIdentity::generate().peer_id()),
+            Err("mls_group_owner_mismatch")
+        );
+        assert_eq!(
+            service
+                .read(|provider| provider.snapshot().unwrap())
+                .unwrap()
+                .as_slice(),
+            before.as_slice()
         );
     }
 

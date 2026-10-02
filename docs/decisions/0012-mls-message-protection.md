@@ -42,7 +42,10 @@ peer ID into a domain-separated, versioned MLS Basic Credential. Reject
 unscoped, malformed, oversized, and future-version credential identities.
 Validate the extracted device ID against signed membership events before
 accepting the leaf. The stable CharP2P group ID stays the application identity;
-the MLS group ID and epoch are protocol state.
+its canonical bytes are also the MLS group ID so persisted state can be loaded
+without a separate secret mapping. The MLS epoch remains protocol state. Group
+creation initializes the owner's leaf with the creating device credential and
+fails closed if restored state names a different owner device.
 
 Before an owner stages a member addition, bound the encoded KeyPackage to 128
 KiB, parse exactly one value, and require OpenMLS signature, structure, and

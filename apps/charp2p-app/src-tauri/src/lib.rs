@@ -1,7 +1,7 @@
 pub mod groups;
 mod identity;
 mod invitation;
-pub mod mls_storage;
+mod mls_storage;
 mod network;
 mod pending;
 
@@ -104,11 +104,14 @@ fn create_group(
     reusable_invitation: bool,
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, MlsProviderService>,
 ) -> Result<LocalGroup, String> {
-    if identity_service.status().map_err(str::to_owned)?.is_none() {
-        return Err("identity_missing".to_owned());
-    }
-    group_service
+    let profile = identity_service
+        .status()
+        .map_err(str::to_owned)?
+        .ok_or_else(|| "identity_missing".to_owned())?;
+    let device_id = parse_group_id(&profile.peer_id, "identity_record_invalid")?;
+    let group = group_service
         .create(CreateGroupSpec {
             group_name: &group_name,
             icon,
@@ -117,7 +120,15 @@ fn create_group(
             invitation_lifetime_seconds,
             reusable_invitation,
         })
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    let group_id = parse_group_id(&group.group_id, "group_creation_failed")?;
+    if let Err(error) = mls_service.initialize_owner_group(group_id, device_id) {
+        group_service
+            .rollback_created_group(group_id)
+            .map_err(|_| "group_creation_rollback_failed".to_owned())?;
+        return Err(error.to_owned());
+    }
+    Ok(group)
 }
 
 #[tauri::command]
@@ -214,6 +225,25 @@ pub fn run() {
             );
             let mls = MlsProviderService::open(&database_path, storage_operations)
                 .map_err(std::io::Error::other)?;
+            let local_groups = groups.list().map_err(std::io::Error::other)?;
+            if !local_groups.is_empty() {
+                let profile = identity
+                    .status()
+                    .map_err(std::io::Error::other)?
+                    .ok_or_else(|| std::io::Error::other("identity_missing"))?;
+                let device_id = profile
+                    .peer_id
+                    .parse()
+                    .map_err(|_| std::io::Error::other("identity_record_invalid"))?;
+                for group in &local_groups {
+                    let group_id = group
+                        .group_id
+                        .parse()
+                        .map_err(|_| std::io::Error::other("group_identity_record_invalid"))?;
+                    mls.initialize_owner_group(group_id, device_id)
+                        .map_err(std::io::Error::other)?;
+                }
+            }
             let network = NetworkService::from_environment(groups.clone())
                 .map_err(std::io::Error::other)?;
             app.manage(identity);

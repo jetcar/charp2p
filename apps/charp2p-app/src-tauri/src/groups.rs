@@ -86,6 +86,7 @@ pub struct CreateGroupSpec<'a> {
 trait GroupSecretStore: Send + Sync {
     fn put(&self, group_id: PeerId, secret: &[u8]) -> Result<(), &'static str>;
     fn get(&self, group_id: PeerId) -> Result<GroupIdentitySecret, &'static str>;
+    fn remove(&self, group_id: PeerId) -> Result<(), &'static str>;
 }
 
 trait IssuedInvitationSecretStore: Send + Sync {
@@ -118,6 +119,13 @@ impl GroupSecretStore for PlatformGroupSecretStore {
             return Err("group_identity_record_invalid");
         }
         Ok(GroupIdentitySecret::from_protected_zeroizing(encoded))
+    }
+
+    fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
+        match protected_entry(&credential_user(group_id))?.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(_) => Err("group_identity_store_unavailable"),
+        }
     }
 }
 
@@ -217,6 +225,38 @@ impl GroupService {
             return Err(error);
         }
         Ok(metadata.into())
+    }
+
+    pub(crate) fn rollback_created_group(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        if !store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .iter()
+            .any(|group| group.group_id == group_id)
+        {
+            return Err("group_not_found");
+        }
+        if store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?
+            .iter()
+            .any(|invitation| invitation.group_id == group_id)
+        {
+            return Err("group_creation_rollback_unsafe");
+        }
+        self.secrets.remove(group_id)?;
+        store
+            .remove_local_group(group_id)
+            .map(|_| ())
+            .map_err(|_| "group_store_unavailable")
     }
 
     pub fn list(&self) -> Result<Vec<LocalGroup>, &'static str> {
@@ -674,6 +714,10 @@ mod tests {
         fn get(&self, _group_id: PeerId) -> Result<GroupIdentitySecret, &'static str> {
             Err("group_identity_missing")
         }
+
+        fn remove(&self, _group_id: PeerId) -> Result<(), &'static str> {
+            Ok(())
+        }
     }
 
     impl GroupSecretStore for MemorySecretStore {
@@ -691,6 +735,14 @@ mod tests {
                 .find(|(saved_id, _)| *saved_id == group_id)
                 .map(|(_, secret)| GroupIdentitySecret::from_protected_bytes(secret.clone()))
                 .ok_or("group_identity_missing")
+        }
+
+        fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
+            self.saved
+                .lock()
+                .unwrap()
+                .retain(|(saved_id, _)| *saved_id != group_id);
+            Ok(())
         }
     }
 
@@ -769,6 +821,21 @@ mod tests {
             service.create(spec("Hidden second group")).unwrap_err(),
             "group_already_exists"
         );
+    }
+
+    #[test]
+    fn failed_follow_up_can_remove_a_new_group_and_its_root() {
+        let service = service();
+        let created = service.create(spec("Launch room")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+
+        service.rollback_created_group(group_id).unwrap();
+
+        assert!(service.list().unwrap().is_empty());
+        assert!(matches!(
+            service.secrets.get(group_id),
+            Err("group_identity_missing")
+        ));
     }
 
     #[test]

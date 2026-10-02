@@ -310,6 +310,13 @@ MLS leaf. Other suites and profile versions are rejected rather than negotiated
 through a silent downgrade. ADR-012 records the selection and initial
 prototype.
 
+Local group creation also creates the initial MLS group and owner leaf. The
+canonical CharP2P group-ID bytes are used as the MLS group ID, and the owner's
+MLS credential is bound to the creating device peer ID. Existing local groups
+are reconciled at startup for migration; restored state with another owner
+credential fails closed. If initial MLS persistence fails, the new local group
+metadata and protected group root are removed before the create command fails.
+
 Each MLS Basic Credential contains a bounded, domain-separated, versioned
 encoding of the device's libp2p peer ID. Clients reject other credential types
 or malformed identities. They bound the complete MLS wire message before

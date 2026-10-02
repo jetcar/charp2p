@@ -35,7 +35,10 @@ bootstrap node is required.
 The ready screen can create and restore a first local group, then issue and
 copy signed custom-URI invitations. Group-root keys and issued bearer
 credentials use the platform keyring; SQLite stores their non-secret indexes
-and invitation defaults. Expired invitations are removed from both stores.
+and invitation defaults. Group creation also initializes the owner's durable
+MLS group and rolls the local group back if that secure setup fails. Existing
+local groups are reconciled with MLS state at startup. Expired invitations are
+removed from both stores.
 Inbound join requests are checked against this protected issuance state before
 MLS processing. The advertiser then verifies the bounded MLS KeyPackage,
 requires the pinned profile, and binds its signed device credential to the

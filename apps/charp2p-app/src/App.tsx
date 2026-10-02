@@ -15,6 +15,7 @@ type InvitationPreview = {
   reusable: boolean;
 };
 type PendingGroup = InvitationPreview;
+type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable">;
 type LocalGroup = {
   groupId: string;
   groupName: string;
@@ -55,6 +56,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   group_creation_failed: "The group identity could not be created.",
   group_creation_rollback_failed: "Group setup failed and could not be safely rolled back.",
   group_already_exists: "This version supports one local group at a time.",
+  group_already_joined: "This device already belongs to that group.",
   group_identity_record_invalid: "A stored group identity is damaged.",
   group_identity_store_unavailable: "Protected group storage is unavailable.",
   group_service_unavailable: "Groups are temporarily unavailable.",
@@ -76,21 +78,34 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter 1–48 characters using no more than 80 UTF-8 bytes.",
   network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
+  network_bootstrap_required: "Configure a bootstrap node before joining.",
   network_configuration_invalid: "The peer network configuration is invalid.",
+  network_join_failed: "The secure join exchange failed. Try again.",
+  network_join_timed_out: "The group owner did not answer in time. Try again.",
+  network_peer_not_found: "The invited group owner is not online yet.",
+  network_peer_unreachable: "The invited group owner could not be reached.",
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
   mls_group_creation_failed: "Secure group setup failed.",
+  mls_group_already_joined: "This device already belongs to that group.",
   mls_group_storage_unavailable: "Secure group storage is unavailable.",
   mls_provider_encryption_failed: "Secure group state could not be encrypted.",
   mls_provider_service_unavailable: "Secure group state is temporarily unavailable.",
   mls_provider_snapshot_invalid: "Stored secure group state is damaged.",
   mls_provider_store_unavailable: "Secure group state could not be saved.",
+  mls_pending_join_invalid: "The saved secure join state is damaged.",
+  mls_pending_join_missing: "The saved secure join state is missing.",
+  mls_welcome_group_mismatch: "The response belongs to a different group.",
+  mls_welcome_invalid: "The group owner returned an invalid secure response.",
   mls_wrapping_key_store_unavailable: "Protected secure-group storage is unavailable.",
   pending_invitation_not_found: "This pending invitation is no longer available.",
   pending_invitation_service_unavailable: "Pending invitations are temporarily unavailable.",
   pending_invitation_record_invalid: "A saved invitation is damaged and cannot be opened.",
   pending_invitation_store_unavailable: "The invitation could not be saved securely.",
   pending_invitation_too_large: "This invitation is too large for protected device storage.",
+  join_busy: "The group owner is busy. Try again shortly.",
+  join_unauthorized: "The group owner did not accept this invitation.",
+  join_unsupported_profile: "The group uses an unsupported security profile.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -201,7 +216,9 @@ function App() {
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
   const [verifyingInvite, setVerifyingInvite] = useState(false);
   const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
+  const [joinedGroup, setJoinedGroup] = useState<JoinedGroup | null>(null);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
+  const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
@@ -231,10 +248,11 @@ function App() {
     Promise.allSettled([
       invoke<DeviceProfile | null>("identity_status"),
       invoke<PendingGroup[]>("pending_invitations"),
+      invoke<JoinedGroup[]>("joined_groups"),
       invoke<LocalGroup[]>("local_groups"),
       invoke<IssuedInvitation[]>("issued_invitations"),
     ])
-      .then(([identityResult, pendingResult, groupsResult, invitationsResult]) => {
+      .then(([identityResult, pendingResult, joinedResult, groupsResult, invitationsResult]) => {
         if (!active) return;
         if (identityResult.status === "fulfilled" && identityResult.value) {
           const storedProfile = identityResult.value;
@@ -248,6 +266,11 @@ function App() {
           setPendingGroup(pendingResult.value[0] ?? null);
         } else {
           setError(errorMessage(pendingResult.reason));
+        }
+        if (joinedResult.status === "fulfilled") {
+          setJoinedGroup(joinedResult.value[0] ?? null);
+        } else {
+          setError(errorMessage(joinedResult.reason));
         }
         if (groupsResult.status === "fulfilled") {
           setLocalGroup(groupsResult.value[0] ?? null);
@@ -450,6 +473,8 @@ function App() {
         input: inviteInput,
       });
       setPendingGroup(accepted);
+      setJoinedGroup(null);
+      setPeerSearchResult(null);
       setInvitationPreview(null);
       setInviteInput("");
       setJoinMode(false);
@@ -474,6 +499,25 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setSearchingPeers(false);
+    }
+  }
+
+  async function joinPendingGroup() {
+    if (!pendingGroup || joiningGroup || !isTauri()) return;
+
+    setError("");
+    setJoiningGroup(true);
+    try {
+      const joined = await invoke<JoinedGroup>("join_group", {
+        groupId: pendingGroup.groupId,
+      });
+      setJoinedGroup(joined);
+      setPendingGroup(null);
+      setPeerSearchResult(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setJoiningGroup(false);
     }
   }
 
@@ -617,7 +661,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && pendingGroup && !joinMode && (
+          {step === 3 && pendingGroup && !joinMode && !joinedGroup && (
             <section className="setup-form pending-card">
               <div className="pending-icon" aria-hidden="true">⌁</div>
               <header>
@@ -637,14 +681,38 @@ function App() {
                 <div><dt>Inviter device</dt><dd><code title={pendingGroup.inviterDeviceId}>{shortPeerId(pendingGroup.inviterDeviceId)}</code></dd></div>
               </dl>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
-              <p className="preview-note">Your invitation is stored securely on this device.</p>
-              <button className="primary-button" disabled={searchingPeers || !isTauri()} onClick={searchForPeers} type="button">
-                {searchingPeers ? "Searching for peers…" : "Search for peers"}
+              <p className="preview-note">Your invitation is stored securely until the invited owner is online.</p>
+              <button className="primary-button join-button" disabled={joiningGroup || searchingPeers || !isTauri()} onClick={joinPendingGroup} type="button">
+                {joiningGroup ? "Joining securely…" : "Connect and join"}
+              </button>
+              <button className="secondary-button" disabled={joiningGroup || searchingPeers || !isTauri()} onClick={searchForPeers} type="button">
+                {searchingPeers ? "Checking availability…" : "Check peer availability"}
               </button>
             </section>
           )}
 
-          {step === 3 && localGroup && !pendingGroup && !joinMode && !createGroupMode && (
+          {step === 3 && joinedGroup && !pendingGroup && !joinMode && !createGroupMode && (
+            <section className="setup-form joined-card">
+              <div className="ready-check" aria-hidden="true">✓</div>
+              <header>
+                <p className="eyebrow">Joined securely</p>
+                <h2>{joinedGroup.groupName}</h2>
+                <p>Your membership is protected on this device.</p>
+              </header>
+              <div className="status-row" aria-label="Group status">
+                <span className="status-chip">✓ Secure membership ready</span>
+              </div>
+              <dl className="preview-facts">
+                <div><dt>Invited by</dt><dd>{joinedGroup.inviterName}</dd></div>
+                <div><dt>History</dt><dd>{historyDescription(joinedGroup.historyPolicy)}</dd></div>
+                <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
+                <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
+              </dl>
+              <p className="preview-note">The group will synchronize whenever another member is online.</p>
+            </section>
+          )}
+
+          {step === 3 && localGroup && !pendingGroup && !joinedGroup && !joinMode && !createGroupMode && (
             <section className="setup-form group-ready-card">
               <div className={`group-avatar icon-${localGroup.icon}`} aria-hidden="true">
                 {['●●●', '◆', '▲', '♥', '★'][localGroup.icon]}
@@ -790,7 +858,7 @@ function App() {
             </form>
           )}
 
-          {step === 3 && !pendingGroup && !localGroup && !joinMode && !createGroupMode && (
+          {step === 3 && !pendingGroup && !joinedGroup && !localGroup && !joinMode && !createGroupMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>

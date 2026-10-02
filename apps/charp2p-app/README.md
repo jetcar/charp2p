@@ -59,5 +59,6 @@ authenticated QUIC, validates the returned Welcome, and atomically replaces
 the pending private material with joined MLS group state. Authenticated display
 metadata is then promoted from pending to joined storage, the bearer invitation
 is deleted, and an interrupted post-join cleanup can resume without repeating
-the network exchange. The pending-group UI still needs to expose this final
-join action.
+the network exchange. The pending-group screen exposes the secure join action,
+shows availability separately, and restores the completed joined-group card
+after restart.

@@ -5,7 +5,7 @@ use std::{
 };
 
 use charp2p_core::{HistoryPolicy, Invitation, PeerId};
-use charp2p_store::{EventStore, PendingInvitationMetadata};
+use charp2p_store::{EventStore, JoinedGroupMetadata, PendingInvitationMetadata};
 use keyring_core::Error as KeyringError;
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -25,6 +25,16 @@ pub struct PendingGroup {
     pub expires_at_unix: u64,
     pub history_policy: &'static str,
     pub reusable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinedGroup {
+    pub group_name: String,
+    pub inviter_name: String,
+    pub inviter_device_id: String,
+    pub group_id: String,
+    pub history_policy: &'static str,
 }
 
 trait InvitationSecretStore: Send + Sync {
@@ -89,6 +99,68 @@ impl PendingInvitationService {
             .map_err(|_| "system_clock_invalid")?
             .as_secs();
         self.list_at(now_unix)
+    }
+
+    pub fn joined(&self) -> Result<Vec<JoinedGroup>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let groups = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?;
+        for group in &groups {
+            self.secrets.remove(group.group_id)?;
+        }
+        Ok(groups.into_iter().map(JoinedGroup::from_metadata).collect())
+    }
+
+    pub(crate) fn complete_join(&self, group_id: PeerId) -> Result<JoinedGroup, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let mut metadata = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        if let Some(joined) = metadata
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|joined| joined.group_id == group_id)
+        {
+            self.secrets.remove(group_id)?;
+            return Ok(JoinedGroup::from_metadata(joined));
+        }
+        let stored = metadata
+            .pending_invitations()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|pending| pending.group_id == group_id)
+            .ok_or("pending_invitation_not_found")?;
+        let encoded = self
+            .secrets
+            .get_optional(group_id)?
+            .ok_or("pending_invitation_record_invalid")?;
+        let invitation = decode_stored_invitation(&encoded, 0)?;
+        if !metadata_matches_invitation(&stored, &invitation) {
+            return Err("pending_invitation_record_invalid");
+        }
+        metadata
+            .promote_pending_invitation_to_joined_group(group_id, invitation.inviter_device_id())
+            .map_err(|_| "pending_invitation_store_unavailable")?;
+        let joined = metadata
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|joined| joined.group_id == group_id)
+            .ok_or("pending_invitation_store_unavailable")?;
+        self.secrets.remove(group_id)?;
+        Ok(JoinedGroup::from_metadata(joined))
     }
 
     pub(crate) fn load_invitation(&self, group_id: PeerId) -> Result<Invitation, &'static str> {
@@ -177,6 +249,17 @@ impl PendingInvitationService {
             history_policy: invitation.history_policy(),
             reusable: invitation.is_reusable(),
         };
+        if self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .iter()
+            .any(|joined| joined.group_id == metadata.group_id)
+        {
+            return Err("group_already_joined");
+        }
         let previous = self.secrets.get_optional(metadata.group_id)?;
         self.secrets.put(metadata.group_id, encoded.as_bytes())?;
         let stored = self
@@ -220,6 +303,18 @@ impl PendingGroup {
             expires_at_unix: metadata.expires_at_unix,
             history_policy: history_policy_name(metadata.history_policy),
             reusable: metadata.reusable,
+        }
+    }
+}
+
+impl JoinedGroup {
+    fn from_metadata(metadata: JoinedGroupMetadata) -> Self {
+        Self {
+            group_name: metadata.group_name,
+            inviter_name: metadata.inviter_name,
+            inviter_device_id: metadata.inviter_device_id.to_string(),
+            group_id: metadata.group_id.to_string(),
+            history_policy: history_policy_name(metadata.history_policy),
         }
     }
 }
@@ -335,6 +430,26 @@ mod tests {
         assert_eq!(accepted.group_name, "Design Crew");
         assert_eq!(accepted.group_id, group_id.to_string());
         assert_eq!(service.list_at(NOW).unwrap(), vec![accepted]);
+    }
+
+    #[test]
+    fn completed_join_moves_safe_metadata_and_removes_the_bearer() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        let pending = service.accept_at(&encoded, NOW).unwrap();
+
+        let joined = service.complete_join(group_id).unwrap();
+        assert_eq!(joined.group_id, pending.group_id);
+        assert_eq!(joined.group_name, pending.group_name);
+        assert_eq!(joined.inviter_device_id, pending.inviter_device_id);
+        assert!(service.list_at(NOW).unwrap().is_empty());
+        assert_eq!(service.joined().unwrap(), vec![joined.clone()]);
+        assert_eq!(service.complete_join(group_id).unwrap(), joined);
+        assert!(service.secrets.get_optional(group_id).unwrap().is_none());
+        assert_eq!(
+            service.accept_at(&encoded, NOW),
+            Err("group_already_joined")
+        );
     }
 
     #[test]

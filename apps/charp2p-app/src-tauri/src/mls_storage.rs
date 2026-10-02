@@ -135,6 +135,23 @@ impl MlsProviderService {
             })
     }
 
+    pub(crate) fn has_group(&self, group_id: PeerId) -> Result<bool, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map(|group| group.is_some())
+        .map_err(|_| "mls_group_storage_unavailable")
+    }
+
     /// Adds one transport-authenticated device, publishes the resulting MLS
     /// Commit as a signed event, and persists the advanced MLS state in the
     /// same SQLite transaction before returning its Welcome.

@@ -13,8 +13,8 @@ use std::{
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::MlsProviderService;
-use network::{AdvertisementResult, JoinGroupResult, NetworkService, PeerSearchResult};
-use pending::{PendingGroup, PendingInvitationService};
+use network::{AdvertisementResult, NetworkService, PeerSearchResult};
+use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
 const MAX_GROUP_ID_TEXT_BYTES: usize = 256;
@@ -62,6 +62,13 @@ fn pending_invitations(
     service: tauri::State<'_, PendingInvitationService>,
 ) -> Result<Vec<PendingGroup>, String> {
     service.list().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn joined_groups(
+    service: tauri::State<'_, PendingInvitationService>,
+) -> Result<Vec<JoinedGroup>, String> {
+    service.joined().map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -158,17 +165,23 @@ async fn join_group(
     identity_service: tauri::State<'_, IdentityService>,
     pending_service: tauri::State<'_, PendingInvitationService>,
     network_service: tauri::State<'_, NetworkService>,
-) -> Result<JoinGroupResult, String> {
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<JoinedGroup, String> {
     let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
-    let identity = identity_service
-        .load_network_identity()
-        .map_err(str::to_owned)?;
-    let invitation = pending_service
-        .load_invitation(group_id)
-        .map_err(str::to_owned)?;
-    network_service
-        .join(identity, &invitation)
-        .await
+    if !mls_service.has_group(group_id).map_err(str::to_owned)? {
+        let identity = identity_service
+            .load_network_identity()
+            .map_err(str::to_owned)?;
+        let invitation = pending_service
+            .load_invitation(group_id)
+            .map_err(str::to_owned)?;
+        network_service
+            .join(identity, &invitation)
+            .await
+            .map_err(str::to_owned)?;
+    }
+    pending_service
+        .complete_join(group_id)
         .map_err(str::to_owned)
 }
 
@@ -285,6 +298,7 @@ pub fn run() {
             preview_invitation,
             accept_invitation,
             pending_invitations,
+            joined_groups,
             local_groups,
             issued_invitations,
             create_group,

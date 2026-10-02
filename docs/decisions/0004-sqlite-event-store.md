@@ -45,6 +45,12 @@ matching private material is atomic. Completing the join atomically removes the
 public KeyPackage record and replaces the provider snapshot with the joined
 group state.
 
+After MLS completion, atomically move authenticated non-secret invitation
+metadata from the pending-invitation table into a joined-group table. Delete
+the protected bearer credential after that durable transition. If protected
+storage cleanup fails, a later completion or joined-group load retries it
+without repeating the MLS exchange.
+
 ## Alternatives considered
 
 ### Flat event files
@@ -75,6 +81,8 @@ backup and diagnostic workflows.
   snapshot commit or roll back together.
 - Pending join KeyPackages cannot become durable without their matching private
   material, and completed joins cannot lose one side of the state transition.
+- Joined groups survive invitation expiry and restart without retaining the
+  bearer credential as their display record.
 
 ## Sources
 

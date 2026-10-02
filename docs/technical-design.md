@@ -391,11 +391,16 @@ Each client stores:
   in platform-protected storage.
 - One bounded public MLS KeyPackage for each pending join, transactionally
   paired with the provider snapshot that contains its private material.
+- Non-secret display metadata for joined groups, promoted atomically from the
+  pending invitation after MLS completion.
 - User preferences and local blocks.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential
 is stored separately in platform-protected storage and is revalidated against
-the indexed metadata whenever the pending join is loaded.
+the indexed metadata whenever the pending join is loaded. After a successful
+join, SQLite atomically promotes the authenticated display metadata and removes
+the pending record; protected-storage bearer deletion is retried idempotently
+if cleanup is interrupted.
 
 Secrets must be excluded from diagnostics, notifications, URLs sent to web
 servers, and routine logs.

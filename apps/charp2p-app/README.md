@@ -56,5 +56,8 @@ roots cannot become hidden from the interface.
 The joining client now prepares and reuses one durable MLS KeyPackage, finds
 the invitation's pinned owner through the DHT, exchanges the join request over
 authenticated QUIC, validates the returned Welcome, and atomically replaces
-the pending private material with joined MLS group state. The pending-group UI
-still needs to expose this final join action and transition into a joined group.
+the pending private material with joined MLS group state. Authenticated display
+metadata is then promoted from pending to joined storage, the bearer invitation
+is deleted, and an interrupted post-join cleanup can resume without repeating
+the network exchange. The pending-group UI still needs to expose this final
+join action.

@@ -9,15 +9,15 @@ use std::{
 };
 
 use charp2p_core::{
-    EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
-    MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
+    EventError, EventId, HistoryPolicy, InvitationId, PeerId, SignedEvent,
+    MAX_JOIN_MLS_MESSAGE_BYTES, MAX_SYNC_BATCH_ITEMS,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -49,6 +49,16 @@ pub struct PendingInvitationMetadata {
     pub history_policy: HistoryPolicy,
     /// Whether the invitation may authorize multiple memberships.
     pub reusable: bool,
+}
+
+/// Non-secret display metadata for a group joined by this device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JoinedGroupMetadata {
+    pub group_id: PeerId,
+    pub group_name: String,
+    pub inviter_name: String,
+    pub inviter_device_id: PeerId,
+    pub history_policy: HistoryPolicy,
 }
 
 /// Non-secret index for a bearer invitation issued by a locally owned group.
@@ -305,6 +315,80 @@ impl EventStore {
             "DELETE FROM pending_invitations WHERE group_id = ?1",
             [group_id.to_bytes()],
         )? != 0)
+    }
+
+    /// Atomically turns a pending invitation into durable joined-group display
+    /// metadata without retaining the bearer credential in SQLite.
+    pub fn promote_pending_invitation_to_joined_group(
+        &mut self,
+        group_id: PeerId,
+        inviter_device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let pending = pending_invitation_in_transaction(&transaction, group_id)?;
+        let Some(pending) = pending else {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM joined_groups WHERE group_id = ?1)",
+                [group_id.to_bytes()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            transaction.commit()?;
+            return Ok(exists);
+        };
+        transaction.execute(
+            "INSERT INTO joined_groups (
+                group_id, group_name, inviter_name, inviter_device_id, history_policy
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(group_id) DO UPDATE SET
+                group_name = excluded.group_name,
+                inviter_name = excluded.inviter_name,
+                inviter_device_id = excluded.inviter_device_id,
+                history_policy = excluded.history_policy",
+            params![
+                pending.group_id.to_bytes(),
+                pending.group_name,
+                pending.inviter_name,
+                inviter_device_id.to_bytes(),
+                history_policy_code(pending.history_policy),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_invitations WHERE group_id = ?1",
+            [group_id.to_bytes()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Lists durable metadata for groups joined by this device.
+    pub fn joined_groups(&self) -> Result<Vec<JoinedGroupMetadata>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, group_name, inviter_name, inviter_device_id, history_policy
+             FROM joined_groups
+             ORDER BY group_name, group_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (group_id, group_name, inviter_name, inviter_device_id, history_policy) = row?;
+            groups.push(JoinedGroupMetadata {
+                group_id: PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?,
+                group_name,
+                inviter_name,
+                inviter_device_id: PeerId::from_bytes(&inviter_device_id)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                history_policy: history_policy_from_code(history_policy)?,
+            });
+        }
+        Ok(groups)
     }
 
     /// Adds the non-secret index for a newly issued bearer invitation.
@@ -602,7 +686,7 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
             1 => {
@@ -648,7 +732,7 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
             2 => {
@@ -685,7 +769,7 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
             3 => {
@@ -710,7 +794,7 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
             4 => {
@@ -728,7 +812,7 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
             5 => {
@@ -740,11 +824,27 @@ impl EventStore {
                             CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
+            6 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
+        }
+
+        if version <= 6 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE joined_groups (
+                    group_id BLOB PRIMARY KEY NOT NULL,
+                    group_name TEXT NOT NULL,
+                    inviter_name TEXT NOT NULL,
+                    inviter_device_id BLOB NOT NULL,
+                    history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
         }
 
         Ok(Self { connection })
@@ -776,6 +876,45 @@ fn put_encrypted_mls_provider_snapshot_in_transaction(
         [encrypted],
     )?;
     Ok(())
+}
+
+fn pending_invitation_in_transaction(
+    transaction: &Transaction<'_>,
+    group_id: PeerId,
+) -> Result<Option<PendingInvitationMetadata>, StoreError> {
+    let row = transaction
+        .query_row(
+            "SELECT group_id, group_name, inviter_name, expires_at_unix,
+                    history_policy, reusable
+             FROM pending_invitations WHERE group_id = ?1",
+            [group_id.to_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(stored_group_id, group_name, inviter_name, expires_at_unix, history_policy, reusable)| {
+            Ok(PendingInvitationMetadata {
+                group_id: PeerId::from_bytes(&stored_group_id)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                group_name,
+                inviter_name,
+                expires_at_unix: u64::try_from(expires_at_unix)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                history_policy: history_policy_from_code(history_policy)?,
+                reusable,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn history_policy_code(policy: HistoryPolicy) -> i64 {
@@ -891,15 +1030,15 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 mod tests {
     use charp2p_core::{
         DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, InvitationId,
-        MAX_JOIN_MLS_MESSAGE_BYTES, SignedEvent,
+        SignedEvent, MAX_JOIN_MLS_MESSAGE_BYTES,
     };
-    use rusqlite::{Connection, params};
+    use rusqlite::{params, Connection};
     use tempfile::NamedTempFile;
 
     use super::{
-        AuthorHead, EventStore, IssuedInvitationMetadata, LocalGroupMetadata,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
         PendingInvitationMetadata, PutEventOutcome, StoreError,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
     };
 
     fn message_event(
@@ -1099,12 +1238,10 @@ mod tests {
             store.put_events(&[second, conflict]),
             Err(StoreError::SequenceConflict { sequence: 1 })
         ));
-        assert!(
-            store
-                .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1130,11 +1267,9 @@ mod tests {
             reopened.pending_invitations().unwrap(),
             vec![pending.clone()]
         );
-        assert!(
-            reopened
-                .remove_pending_invitation(group.group_id())
-                .unwrap()
-        );
+        assert!(reopened
+            .remove_pending_invitation(group.group_id())
+            .unwrap());
         assert!(reopened.pending_invitations().unwrap().is_empty());
     }
 
@@ -1159,6 +1294,75 @@ mod tests {
         store.put_pending_invitation(&pending).unwrap();
 
         assert_eq!(store.pending_invitations().unwrap(), vec![pending]);
+    }
+
+    #[test]
+    fn pending_invitation_promotes_atomically_to_joined_group_metadata() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let pending = PendingInvitationMetadata {
+            group_id,
+            group_name: "Design Crew".to_owned(),
+            inviter_name: "Maya".to_owned(),
+            expires_at_unix: 1_800_003_600,
+            history_policy: HistoryPolicy::FromInvitation,
+            reusable: false,
+        };
+        store.put_pending_invitation(&pending).unwrap();
+
+        assert!(store
+            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+            .unwrap());
+        assert!(store.pending_invitations().unwrap().is_empty());
+        assert_eq!(
+            store.joined_groups().unwrap(),
+            vec![JoinedGroupMetadata {
+                group_id,
+                group_name: "Design Crew".to_owned(),
+                inviter_name: "Maya".to_owned(),
+                inviter_device_id,
+                history_policy: HistoryPolicy::FromInvitation,
+            }]
+        );
+        assert!(store
+            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn joined_group_write_failure_keeps_the_pending_invitation() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let pending = PendingInvitationMetadata {
+            group_id,
+            group_name: "Design Crew".to_owned(),
+            inviter_name: "Maya".to_owned(),
+            expires_at_unix: 1_800_003_600,
+            history_policy: HistoryPolicy::None,
+            reusable: false,
+        };
+        store.put_pending_invitation(&pending).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_joined_group
+                 BEFORE INSERT ON joined_groups
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected joined-group failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.promote_pending_invitation_to_joined_group(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert_eq!(store.pending_invitations().unwrap(), vec![pending]);
+        assert!(store.joined_groups().unwrap().is_empty());
     }
 
     #[test]
@@ -1206,11 +1410,9 @@ mod tests {
             reopened.issued_invitations().unwrap(),
             vec![invitation.clone()]
         );
-        assert!(
-            reopened
-                .remove_issued_invitation(invitation.invitation_id)
-                .unwrap()
-        );
+        assert!(reopened
+            .remove_issued_invitation(invitation.invitation_id)
+            .unwrap());
         assert!(reopened.issued_invitations().unwrap().is_empty());
     }
 
@@ -1252,12 +1454,10 @@ mod tests {
     fn pending_mls_join_and_provider_snapshot_follow_one_atomic_lifecycle() {
         let mut store = EventStore::in_memory().unwrap();
         let group_id = GroupIdentity::generate().group_id();
-        assert!(
-            store
-                .pending_mls_join_key_package(group_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .pending_mls_join_key_package(group_id)
+            .unwrap()
+            .is_none());
 
         store
             .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
@@ -1278,32 +1478,26 @@ mod tests {
             b"provider with private key package"
         );
 
-        assert!(
-            store
-                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
-                    group_id,
-                    b"provider with joined group",
-                )
-                .unwrap()
-        );
-        assert!(
-            store
-                .pending_mls_join_key_package(group_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                group_id,
+                b"provider with joined group",
+            )
+            .unwrap());
+        assert!(store
+            .pending_mls_join_key_package(group_id)
+            .unwrap()
+            .is_none());
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"provider with joined group"
         );
-        assert!(
-            !store
-                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
-                    group_id,
-                    b"must not replace provider without a pending join",
-                )
-                .unwrap()
-        );
+        assert!(!store
+            .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                group_id,
+                b"must not replace provider without a pending join",
+            )
+            .unwrap());
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"provider with joined group"
@@ -1470,6 +1664,42 @@ mod tests {
                 .unwrap(),
             b"public key package"
         );
+    }
+
+    #[test]
+    fn version_six_database_adds_joined_groups() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE pending_invitations (
+                    group_id BLOB PRIMARY KEY NOT NULL,
+                    group_name TEXT NOT NULL,
+                    inviter_name TEXT NOT NULL,
+                    expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0),
+                    history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2),
+                    reusable INTEGER NOT NULL CHECK(reusable IN (0, 1))
+                 ) STRICT;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+
+        let mut store = EventStore::from_connection(connection).unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        store
+            .put_pending_invitation(&PendingInvitationMetadata {
+                group_id,
+                group_name: "Design Crew".to_owned(),
+                inviter_name: "Maya".to_owned(),
+                expires_at_unix: 1_800_003_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            })
+            .unwrap();
+        assert!(store
+            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+            .unwrap());
+        assert_eq!(store.joined_groups().unwrap().len(), 1);
     }
 
     #[test]

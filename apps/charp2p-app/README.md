@@ -39,7 +39,9 @@ and invitation defaults. Expired invitations are removed from both stores.
 Inbound join requests are checked against this protected issuance state before
 MLS processing. The advertiser then verifies the bounded MLS KeyPackage,
 requires the pinned profile, and binds its signed device credential to the
-authenticated connection. Revocation events and the initial protected
+authenticated connection. MLS group state and one-time private material survive
+restarts in an authenticated encrypted SQLite snapshot whose wrapping key stays
+in the platform keyring. Revocation events and the initial protected
 membership event remain later increments. Until the groups list is implemented,
 the backend enforces one locally created group so extra protected roots cannot
 become hidden from the interface.

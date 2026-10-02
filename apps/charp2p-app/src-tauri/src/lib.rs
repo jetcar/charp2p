@@ -1,6 +1,7 @@
 pub mod groups;
 mod identity;
 mod invitation;
+pub mod mls_storage;
 mod network;
 mod pending;
 
@@ -11,6 +12,7 @@ use std::{
 
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
+use mls_storage::MlsProviderService;
 use network::{AdvertisementResult, NetworkService, PeerSearchResult};
 use pending::{PendingGroup, PendingInvitationService};
 use tauri::Manager;
@@ -205,15 +207,19 @@ pub fn run() {
                 Arc::clone(&storage_operations),
             )
             .map_err(std::io::Error::other)?;
+            let database_path = data_directory.join("charp2p.sqlite3");
             let groups = Arc::new(
-                GroupService::open(data_directory.join("charp2p.sqlite3"), storage_operations)
+                GroupService::open(&database_path, Arc::clone(&storage_operations))
                     .map_err(std::io::Error::other)?,
             );
+            let mls = MlsProviderService::open(&database_path, storage_operations)
+                .map_err(std::io::Error::other)?;
             let network = NetworkService::from_environment(groups.clone())
                 .map_err(std::io::Error::other)?;
             app.manage(identity);
             app.manage(pending);
             app.manage(groups);
+            app.manage(mls);
             app.manage(network);
             Ok(())
         })

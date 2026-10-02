@@ -334,8 +334,11 @@ one afterward.
 The shared MLS provider exports a deterministic, versioned snapshot containing
 its group state and one-time private material. The decoder bounds the snapshot,
 record count, keys, and values before restoring them. Snapshot bytes are secret
-and zeroed after use; the application must encrypt and authenticate them with a
-platform-protected wrapping key and replace the encrypted record atomically.
+and zeroed after use. The application encrypts them with XChaCha20-Poly1305, a
+fresh random nonce, fixed domain-separated associated data, and a random 256-bit
+wrapping key kept in platform-protected storage. It atomically replaces the
+encrypted record and restores the preceding in-memory provider if a mutation or
+durable write fails. Missing keys, tampering, and invalid envelopes fail closed.
 
 Whichever construction is selected must provide:
 

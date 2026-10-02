@@ -28,20 +28,22 @@ and return exported bytes in zeroizing memory.
 
 The snapshot contains MLS private keys and epoch secrets. It is an interchange
 boundary for application persistence, not a safe at-rest format. The client
-must encrypt and authenticate the complete snapshot with an established AEAD,
-keep the wrapping key in platform-protected storage, and replace snapshots
-atomically. No snapshot bytes may enter logs, diagnostics, or ordinary backups
-without that protection.
+encrypts and authenticates the complete snapshot with XChaCha20-Poly1305, a
+fresh random 192-bit nonce, fixed domain-separated associated data, and a
+versioned envelope. Its random 256-bit wrapping key stays in platform-protected
+storage. Missing keys, invalid envelopes, and failed authentication stop startup
+instead of discarding or replacing the stored state. No snapshot bytes enter
+logs, diagnostics, or ordinary backups without that protection.
 
 SQLite schema version 5 reserves one singleton ciphertext record, bounded to
 the maximum snapshot plus encryption-envelope overhead. The storage layer
 atomically replaces this opaque record and never receives plaintext provider
-state.
+state. Each application provider mutation snapshots the preceding state, then
+restores it if the operation, encryption, or durable replacement fails.
 
 ## Consequences
 
 - Pending one-time KeyPackages and joined MLS groups can survive provider
   reconstruction without changing the pinned cryptographic profile.
 - Local corruption is rejected before unbounded provider records are restored.
-- Application integration still requires authenticated encryption, atomic
-  replacement, rollback handling, and Android device validation.
+- Android device validation remains required.

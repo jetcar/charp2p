@@ -32,8 +32,10 @@ Build synchronization summaries from each author's highest gap-free sequence.
 Expose event identifiers after a sequence in ordered pages capped at 256, and
 verify signed envelopes before their identifiers leave the store.
 
-Keep identity and group key material outside SQLite behind future platform
-key-store adapters.
+Keep plaintext identity and group key material outside SQLite. SQLite may hold
+one bounded, atomically replaced MLS provider ciphertext; its authenticated
+encryption key remains in platform-protected storage and the store never
+interprets the encrypted bytes.
 
 ## Alternatives considered
 
@@ -59,6 +61,8 @@ backup and diagnostic workflows.
   deduplication.
 - Schema changes require migrations and compatibility tests.
 - Database encryption at rest is separate from end-to-end payload protection.
+- MLS provider ciphertext replacement is atomic and preserves the previous
+  record when a new value fails local size validation.
 
 ## Sources
 

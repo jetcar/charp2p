@@ -33,6 +33,11 @@ keep the wrapping key in platform-protected storage, and replace snapshots
 atomically. No snapshot bytes may enter logs, diagnostics, or ordinary backups
 without that protection.
 
+SQLite schema version 5 reserves one singleton ciphertext record, bounded to
+the maximum snapshot plus encryption-envelope overhead. The storage layer
+atomically replaces this opaque record and never receives plaintext provider
+state.
+
 ## Consequences
 
 - Pending one-time KeyPackages and joined MLS groups can survive provider

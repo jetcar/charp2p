@@ -16,7 +16,10 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+/// Largest authenticated ciphertext accepted for one MLS provider snapshot.
+pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,6 +425,41 @@ impl EventStore {
         )? != 0)
     }
 
+    /// Atomically replaces the encrypted MLS provider snapshot.
+    pub fn put_encrypted_mls_provider_snapshot(
+        &mut self,
+        encrypted: &[u8],
+    ) -> Result<(), StoreError> {
+        if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
+            return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
+        }
+        self.connection.execute(
+            "INSERT INTO mls_provider_snapshot (singleton, encrypted)
+             VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET encrypted = excluded.encrypted",
+            [encrypted],
+        )?;
+        Ok(())
+    }
+
+    /// Loads the encrypted MLS provider snapshot without interpreting secrets.
+    pub fn encrypted_mls_provider_snapshot(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let encrypted: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT encrypted FROM mls_provider_snapshot WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if encrypted.as_ref().is_some_and(|encrypted| {
+            encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES
+        }) {
+            return Err(StoreError::CorruptIndex);
+        }
+        Ok(encrypted)
+    }
+
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -471,6 +509,12 @@ impl EventStore {
                             CHECK(length(invitation_id) = 16),
                         group_id BLOB NOT NULL,
                         expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
+                     ) STRICT;
+
+                     CREATE TABLE mls_provider_snapshot (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        encrypted BLOB NOT NULL
+                            CHECK(length(encrypted) BETWEEN 1 AND 8388736)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -505,6 +549,12 @@ impl EventStore {
                             CHECK(length(invitation_id) = 16),
                         group_id BLOB NOT NULL,
                         expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
+                     ) STRICT;
+
+                     CREATE TABLE mls_provider_snapshot (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        encrypted BLOB NOT NULL
+                            CHECK(length(encrypted) BETWEEN 1 AND 8388736)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -530,6 +580,12 @@ impl EventStore {
                             CHECK(length(invitation_id) = 16),
                         group_id BLOB NOT NULL,
                         expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
+                     ) STRICT;
+
+                     CREATE TABLE mls_provider_snapshot (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        encrypted BLOB NOT NULL
+                            CHECK(length(encrypted) BETWEEN 1 AND 8388736)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -543,6 +599,24 @@ impl EventStore {
                             CHECK(length(invitation_id) = 16),
                         group_id BLOB NOT NULL,
                         expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > 0)
+                     ) STRICT;
+
+                     CREATE TABLE mls_provider_snapshot (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        encrypted BLOB NOT NULL
+                            CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;",
+                )?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            4 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "CREATE TABLE mls_provider_snapshot (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        encrypted BLOB NOT NULL
+                            CHECK(length(encrypted) BETWEEN 1 AND 8388736)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -643,6 +717,9 @@ pub enum StoreError {
     /// A synchronization page size is zero or exceeds the protocol bound.
     #[error("invalid synchronization batch limit {0}")]
     InvalidBatchLimit(usize),
+    /// The encrypted MLS provider snapshot is empty or above the local bound.
+    #[error("invalid encrypted MLS provider snapshot size {0}")]
+    InvalidMlsProviderSnapshotSize(usize),
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -670,7 +747,8 @@ mod tests {
 
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, LocalGroupMetadata,
-        MAX_SYNC_BATCH_EVENTS, PendingInvitationMetadata, PutEventOutcome, StoreError,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        PendingInvitationMetadata, PutEventOutcome, StoreError,
     };
 
     fn message_event(
@@ -983,6 +1061,58 @@ mod tests {
                 .unwrap()
         );
         assert!(reopened.issued_invitations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn encrypted_mls_provider_snapshot_is_bounded_and_atomically_replaced() {
+        let mut store = EventStore::in_memory().unwrap();
+        assert!(store.encrypted_mls_provider_snapshot().unwrap().is_none());
+
+        store
+            .put_encrypted_mls_provider_snapshot(b"first authenticated ciphertext")
+            .unwrap();
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"first authenticated ciphertext"
+        );
+
+        store
+            .put_encrypted_mls_provider_snapshot(b"replacement ciphertext")
+            .unwrap();
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"replacement ciphertext"
+        );
+        assert!(matches!(
+            store.put_encrypted_mls_provider_snapshot(&vec![
+                0;
+                MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES
+                    + 1
+            ]),
+            Err(StoreError::InvalidMlsProviderSnapshotSize(_))
+        ));
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"replacement ciphertext"
+        );
+    }
+
+    #[test]
+    fn version_four_database_adds_mls_provider_snapshot() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 4;")
+            .unwrap();
+
+        let mut store = EventStore::from_connection(connection).unwrap();
+        assert!(store.encrypted_mls_provider_snapshot().unwrap().is_none());
+        store
+            .put_encrypted_mls_provider_snapshot(b"authenticated ciphertext")
+            .unwrap();
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"authenticated ciphertext"
+        );
     }
 
     #[test]

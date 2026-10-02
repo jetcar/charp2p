@@ -8,6 +8,7 @@ type DeviceProfile = { deviceName: string; peerId: string };
 type InvitationPreview = {
   groupName: string;
   inviterName: string;
+  inviterDeviceId: string;
   groupId: string;
   expiresAtUnix: number;
   historyPolicy: "none" | "fromInvitation" | "allRetained";
@@ -71,6 +72,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_expired: "This invitation has expired.",
   invitation_owned_locally: "This device already owns that group.",
   invitation_invalid: "This is not a valid CharP2P invitation.",
+  invitation_inviter_mismatch: "This device is not authorized to answer that invitation.",
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter 1–48 characters using no more than 80 UTF-8 bytes.",
   network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
@@ -632,6 +634,7 @@ function App() {
                 <div><dt>History</dt><dd>{historyDescription(pendingGroup.historyPolicy)}</dd></div>
                 <div><dt>Invitation</dt><dd>{expiryDescription(pendingGroup.expiresAtUnix)}</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={pendingGroup.groupId}>{shortPeerId(pendingGroup.groupId)}</code></dd></div>
+                <div><dt>Inviter device</dt><dd><code title={pendingGroup.inviterDeviceId}>{shortPeerId(pendingGroup.inviterDeviceId)}</code></dd></div>
               </dl>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Your invitation is stored securely on this device.</p>
@@ -861,6 +864,7 @@ function App() {
                 <div><dt>History</dt><dd>{historyDescription(invitationPreview.historyPolicy)}</dd></div>
                 <div><dt>Invitation</dt><dd>{expiryDescription(invitationPreview.expiresAtUnix)}{invitationPreview.reusable ? " · Reusable" : " · Single use"}</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={invitationPreview.groupId}>{shortPeerId(invitationPreview.groupId)}</code></dd></div>
+                <div><dt>Inviter device</dt><dd><code title={invitationPreview.inviterDeviceId}>{shortPeerId(invitationPreview.inviterDeviceId)}</code></dd></div>
               </dl>
 
               <p className="preview-note">Your peer identity will be visible to group members.</p>

@@ -395,13 +395,14 @@ mod tests {
         JoinError, JoinRejectReason, JoinRequest, JoinResponse, MAX_JOIN_MLS_MESSAGE_BYTES,
         MAX_JOIN_REQUEST_WIRE_BYTES,
     };
-    use crate::{GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
+    use crate::{DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
 
     const NOW: u64 = 1_800_000_000;
 
     fn invitation() -> Invitation {
         Invitation::issue(
             &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

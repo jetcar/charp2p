@@ -90,7 +90,7 @@ mod tests {
 
     use super::JoinCodec;
     use charp2p_core::{
-        GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
+        DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
         MAX_JOIN_REQUEST_WIRE_BYTES,
     };
 
@@ -100,6 +100,7 @@ mod tests {
     async fn codec_round_trips_a_join_request() {
         let invitation = Invitation::issue(
             &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

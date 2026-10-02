@@ -92,6 +92,7 @@ The encoded invitation contains:
 ```text
 protocol version
 group ID and group root public key
+root-authorized inviter device peer ID
 random discovery secret
 signed invitation capability
 human-readable preview metadata authenticated by the capability
@@ -156,6 +157,12 @@ The client bounds bootstrap configuration to 16 entries, provider searches to
 no built-in or development bootstrap address is available, the UI reports that
 discovery requires a bootstrap node instead of pretending that the group is
 offline.
+
+Invitation version 2 binds one inviter device peer ID under the group-root
+signature. Search results from other provider peer IDs are ignored, and an
+advertiser refuses to publish an invitation bound to another local identity.
+This turns the authenticated libp2p connection into the first root-authorized
+connection instead of trusting whichever peer knows the rendezvous secret.
 
 After loading and revalidating an issued invitation, the owner client starts
 providing its rendezvous key and keeps the libp2p swarm active until the signed

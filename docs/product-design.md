@@ -98,7 +98,7 @@ the operating system permits background work.
 ### 4. Join preview
 
 - Group name and identifier fingerprint.
-- Inviter fingerprint.
+- Root-authorized inviter-device fingerprint.
 - Expiration and requested permissions.
 - Reachability status.
 - Join or Cancel.
@@ -178,4 +178,3 @@ nodes.
 - Whether Android contributes DHT routing while foregrounded or always acts as
   a light client.
 - Accessibility, localization, and minimum supported OS versions.
-

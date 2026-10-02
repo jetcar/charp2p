@@ -20,6 +20,7 @@ const CREDENTIAL_PREFIX: &str = "pending-invitation-v1-";
 pub struct PendingGroup {
     pub group_name: String,
     pub inviter_name: String,
+    pub inviter_device_id: String,
     pub group_id: String,
     pub expires_at_unix: u64,
     pub history_policy: &'static str,
@@ -149,7 +150,10 @@ impl PendingInvitationService {
                     .map_err(|_| "pending_invitation_store_unavailable")?;
                 continue;
             }
-            pending.push(stored.into());
+            pending.push(PendingGroup::from_metadata(
+                stored,
+                invitation.inviter_device_id(),
+            ));
         }
         Ok(pending)
     }
@@ -187,7 +191,10 @@ impl PendingInvitationService {
             }
             return Err("pending_invitation_store_unavailable");
         }
-        Ok(metadata.into())
+        Ok(PendingGroup::from_metadata(
+            metadata,
+            invitation.inviter_device_id(),
+        ))
     }
 }
 
@@ -203,11 +210,12 @@ fn decode_stored_invitation(
     Invitation::decode(encoded, now_unix).map_err(|_| "pending_invitation_record_invalid")
 }
 
-impl From<PendingInvitationMetadata> for PendingGroup {
-    fn from(metadata: PendingInvitationMetadata) -> Self {
+impl PendingGroup {
+    fn from_metadata(metadata: PendingInvitationMetadata, inviter_device_id: PeerId) -> Self {
         Self {
             group_name: metadata.group_name,
             inviter_name: metadata.inviter_name,
+            inviter_device_id: inviter_device_id.to_string(),
             group_id: metadata.group_id.to_string(),
             expires_at_unix: metadata.expires_at_unix,
             history_policy: history_policy_name(metadata.history_policy),
@@ -244,7 +252,9 @@ fn metadata_matches_invitation(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use charp2p_core::{GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId};
+    use charp2p_core::{
+        DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId,
+    };
     use charp2p_store::EventStore;
 
     use super::{InvitationSecretStore, PendingInvitationService};
@@ -300,6 +310,7 @@ mod tests {
         let owner = GroupIdentity::generate();
         let encoded = Invitation::issue(
             &owner,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

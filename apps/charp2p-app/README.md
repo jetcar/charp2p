@@ -15,7 +15,9 @@ storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted
 recovery export and the final peer join remain later increments. Accepted
 invitations survive restarts: safe group metadata is indexed in SQLite while
-the signed bearer credential remains in platform-protected storage.
+the signed bearer credential remains in platform-protected storage. Invitation
+version 2 also pins the root-authorized inviter device; discovery ignores
+providers with another authenticated peer identity.
 
 Windows and Android register `charp2p://` as an application link. Cold-start
 and already-running link deliveries open the existing verified join preview;

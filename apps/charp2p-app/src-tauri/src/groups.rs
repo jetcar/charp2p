@@ -301,13 +301,14 @@ impl GroupService {
     pub fn issue_invitation(
         &self,
         group_id: PeerId,
+        inviter_device_id: PeerId,
         inviter_name: &str,
     ) -> Result<IssuedInvitation, &'static str> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system_clock_invalid")?
             .as_secs();
-        self.issue_invitation_at(group_id, inviter_name, now_unix)
+        self.issue_invitation_at(group_id, inviter_device_id, inviter_name, now_unix)
     }
 
     pub fn issued_invitations(&self) -> Result<Vec<IssuedInvitation>, &'static str> {
@@ -411,6 +412,7 @@ impl GroupService {
     fn issue_invitation_at(
         &self,
         group_id: PeerId,
+        inviter_device_id: PeerId,
         inviter_name: &str,
         now_unix: u64,
     ) -> Result<IssuedInvitation, &'static str> {
@@ -469,6 +471,7 @@ impl GroupService {
             .ok_or("system_clock_invalid")?;
         let invitation = Invitation::issue(
             &identity,
+            inviter_device_id,
             InvitationSpec {
                 group_name: &group.group_name,
                 inviter_name,
@@ -683,8 +686,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use charp2p_core::{
-        GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, InvitationSpec,
-        JoinRequest, PeerId,
+        DeviceIdentity, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation,
+        InvitationId, InvitationSpec, JoinRequest, PeerId,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
@@ -846,7 +849,7 @@ mod tests {
         let group_id = created.group_id.parse().unwrap();
 
         let issued = service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         let decoded = Invitation::decode_input(&issued.link, NOW).unwrap();
         assert_eq!(decoded.group_id(), group_id);
@@ -860,7 +863,7 @@ mod tests {
         assert_eq!(restored[0].reusable, issued.reusable);
         assert!(Invitation::decode_input(&restored[0].link, NOW).is_ok());
         assert!(matches!(
-            service.issue_invitation_at(group_id, "Maya's PC", NOW + 1),
+            service.issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW + 1),
             Err("invitation_already_exists")
         ));
 
@@ -884,7 +887,7 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         let request = join_request(&issued.link, NOW);
 
@@ -909,7 +912,7 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         let request = join_request(&issued.link, NOW);
         assert_eq!(
@@ -920,6 +923,7 @@ mod tests {
         let foreign_identity = GroupIdentity::generate();
         let foreign_invitation = Invitation::issue(
             &foreign_identity,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Foreign",
                 inviter_name: "Another owner",
@@ -945,7 +949,7 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         let request = join_request(&issued.link, NOW);
         let invitation_id = request_invitation_id(&request, NOW);
@@ -973,7 +977,7 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         service
             .metadata
@@ -999,7 +1003,7 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         service
-            .issue_invitation_at(group_id, "Maya's PC", NOW)
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         let indexed = service
             .metadata
@@ -1014,7 +1018,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            service.issue_invitation_at(group_id, "Maya's PC", NOW + 1),
+            service.issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW + 1),
             Err("issued_invitation_record_invalid")
         ));
         assert_eq!(

@@ -8,6 +8,7 @@ use serde::Serialize;
 pub struct InvitationPreview {
     pub group_name: String,
     pub inviter_name: String,
+    pub inviter_device_id: String,
     pub group_id: String,
     pub expires_at_unix: u64,
     pub history_policy: &'static str,
@@ -33,6 +34,7 @@ fn preview_invitation_at(input: &str, now_unix: u64) -> Result<InvitationPreview
     Ok(InvitationPreview {
         group_name: invitation.group_name().to_owned(),
         inviter_name: invitation.inviter_name().to_owned(),
+        inviter_device_id: invitation.inviter_device_id().to_string(),
         group_id: invitation.group_id().to_string(),
         expires_at_unix: invitation.expires_at_unix(),
         history_policy,
@@ -51,15 +53,19 @@ pub(crate) fn public_error_code(error: InvitationError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::preview_invitation_at;
-    use charp2p_core::{GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
+    use charp2p_core::{
+        DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
+    };
 
     const NOW: u64 = 1_800_000_000;
 
     #[test]
     fn preview_exposes_authenticated_metadata_without_the_discovery_secret() {
         let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
         let encoded = Invitation::issue(
             &owner,
+            inviter_device_id,
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -76,6 +82,7 @@ mod tests {
         let preview = preview_invitation_at(&format!("charp2p://join/{encoded}"), NOW).unwrap();
         assert_eq!(preview.group_name, "Design Crew");
         assert_eq!(preview.inviter_name, "Maya");
+        assert_eq!(preview.inviter_device_id, inviter_device_id.to_string());
         assert_eq!(preview.group_id, owner.group_id().to_string());
         assert_eq!(preview.history_policy, "fromInvitation");
         assert!(!preview.reusable);
@@ -86,6 +93,7 @@ mod tests {
         let owner = GroupIdentity::generate();
         let encoded = Invitation::issue(
             &owner,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

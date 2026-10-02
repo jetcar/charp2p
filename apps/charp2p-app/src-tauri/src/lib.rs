@@ -88,8 +88,9 @@ fn create_group_invitation(
         .map_err(str::to_owned)?
         .ok_or_else(|| "identity_missing".to_owned())?;
     let inviter_name = identity::invitation_device_name(&profile.device_name);
+    let inviter_device_id = parse_group_id(&profile.peer_id, "identity_record_invalid")?;
     group_service
-        .issue_invitation(group_id, &inviter_name)
+        .issue_invitation(group_id, inviter_device_id, &inviter_name)
         .map_err(str::to_owned)
 }
 

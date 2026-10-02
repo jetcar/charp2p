@@ -8,14 +8,15 @@ use url::Url;
 
 use crate::GroupIdentity;
 
-const INVITATION_VERSION: u16 = 1;
+const INVITATION_VERSION: u16 = 2;
 const DISCOVERY_SECRET_BYTES: usize = 32;
 const INVITATION_ID_BYTES: usize = 16;
+const MAX_INVITER_DEVICE_ID_BYTES: usize = 128;
 const MAX_NAME_BYTES: usize = 80;
 /// Largest canonical encoded invitation payload accepted by the protocol.
 pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
 const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
-const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v1\0";
+const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v2\0";
 
 /// Controls which retained messages a newly joined member may request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,11 +70,14 @@ impl Invitation {
     /// Issues a signed invitation from a group owner identity.
     pub fn issue(
         owner: &GroupIdentity,
+        inviter_device_id: PeerId,
         spec: InvitationSpec<'_>,
         now_unix: u64,
     ) -> Result<Self, InvitationError> {
         validate_name("group name", spec.group_name)?;
         validate_name("inviter name", spec.inviter_name)?;
+        let inviter_device_id = inviter_device_id.to_bytes();
+        validate_inviter_device_id(&inviter_device_id)?;
         if spec.expires_at_unix <= now_unix {
             return Err(InvitationError::Expired);
         }
@@ -88,6 +92,7 @@ impl Invitation {
         let claims = InvitationClaims {
             version: INVITATION_VERSION,
             owner_public_key: owner_public_key.encode_protobuf(),
+            inviter_device_id,
             discovery_secret,
             invitation_id,
             group_name: spec.group_name.to_owned(),
@@ -191,6 +196,12 @@ impl Invitation {
         &self.claims.inviter_name
     }
 
+    /// Returns the root-authorized device expected to answer this invitation.
+    pub fn inviter_device_id(&self) -> PeerId {
+        PeerId::from_bytes(&self.claims.inviter_device_id)
+            .expect("validated during invitation construction")
+    }
+
     /// Returns the invitation expiry as a Unix timestamp.
     pub fn expires_at_unix(&self) -> u64 {
         self.claims.expires_at_unix
@@ -225,6 +236,9 @@ pub enum InvitationError {
     /// The embedded owner public key is malformed.
     #[error("invitation owner public key is invalid")]
     PublicKey(#[from] DecodingError),
+    /// The root-authorized inviter device identifier is malformed.
+    #[error("invitation device identifier is invalid")]
+    InvalidInviterDevice,
     /// Signing failed.
     #[error("invitation could not be signed")]
     Signing(#[from] SigningError),
@@ -288,6 +302,7 @@ fn payload_from_https_link(input: &str) -> Result<String, InvitationError> {
 struct InvitationClaims {
     version: u16,
     owner_public_key: Vec<u8>,
+    inviter_device_id: Vec<u8>,
     discovery_secret: [u8; DISCOVERY_SECRET_BYTES],
     invitation_id: [u8; INVITATION_ID_BYTES],
     group_name: String,
@@ -317,8 +332,19 @@ fn validate_claims(claims: &InvitationClaims, now_unix: u64) -> Result<(), Invit
     }
     validate_name("group name", &claims.group_name)?;
     validate_name("inviter name", &claims.inviter_name)?;
+    validate_inviter_device_id(&claims.inviter_device_id)?;
     if claims.expires_at_unix <= now_unix {
         return Err(InvitationError::Expired);
+    }
+    Ok(())
+}
+
+fn validate_inviter_device_id(encoded: &[u8]) -> Result<(), InvitationError> {
+    if encoded.is_empty()
+        || encoded.len() > MAX_INVITER_DEVICE_ID_BYTES
+        || PeerId::from_bytes(encoded).is_err()
+    {
+        return Err(InvitationError::InvalidInviterDevice);
     }
     Ok(())
 }
@@ -338,8 +364,11 @@ fn validate_name(field: &'static str, value: &str) -> Result<(), InvitationError
 mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    use super::{HistoryPolicy, Invitation, InvitationError, InvitationSpec, SignedInvitation};
-    use crate::GroupIdentity;
+    use super::{
+        HistoryPolicy, Invitation, InvitationError, InvitationSpec, SignedInvitation,
+        signing_payload,
+    };
+    use crate::{DeviceIdentity, GroupIdentity};
 
     const NOW: u64 = 1_800_000_000;
 
@@ -356,13 +385,16 @@ mod tests {
     #[test]
     fn issued_invitation_round_trips_and_preserves_authenticated_fields() {
         let owner = GroupIdentity::generate();
-        let invitation = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let invitation =
+            Invitation::issue(&owner, inviter_device_id, spec(NOW + 3_600), NOW).unwrap();
         let encoded = invitation.encode().unwrap();
         let decoded = Invitation::decode(&encoded, NOW + 60).unwrap();
 
         assert_eq!(decoded.group_id(), owner.group_id());
         assert_eq!(decoded.group_name(), "Design Crew");
         assert_eq!(decoded.inviter_name(), "Maya");
+        assert_eq!(decoded.inviter_device_id(), inviter_device_id);
         assert_eq!(decoded.expires_at_unix(), NOW + 3_600);
         assert_eq!(decoded.history_policy(), HistoryPolicy::FromInvitation);
         assert!(!decoded.is_reusable());
@@ -373,7 +405,13 @@ mod tests {
     #[test]
     fn changing_an_authenticated_field_invalidates_the_signature() {
         let owner = GroupIdentity::generate();
-        let invitation = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
         let bytes = URL_SAFE_NO_PAD
             .decode(invitation.encode().unwrap())
             .unwrap();
@@ -388,15 +426,68 @@ mod tests {
     }
 
     #[test]
+    fn changing_the_inviter_device_invalidates_the_root_signature() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(invitation.encode().unwrap())
+            .unwrap();
+        let mut wire: SignedInvitation = postcard::from_bytes(&bytes).unwrap();
+        wire.claims.inviter_device_id = DeviceIdentity::generate().peer_id().to_bytes();
+        let tampered = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
+
+        assert!(matches!(
+            Invitation::decode(&tampered, NOW),
+            Err(InvitationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn malformed_inviter_device_is_rejected_before_signature_verification() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(invitation.encode().unwrap())
+            .unwrap();
+        let mut wire: SignedInvitation = postcard::from_bytes(&bytes).unwrap();
+        wire.claims.inviter_device_id = vec![0; 129];
+        wire.signature = owner.sign(&signing_payload(&wire.claims).unwrap()).unwrap();
+        let malformed = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
+
+        assert!(matches!(
+            Invitation::decode(&malformed, NOW),
+            Err(InvitationError::InvalidInviterDevice)
+        ));
+    }
+
+    #[test]
     fn expired_invitation_is_rejected_on_issue_and_decode() {
         let owner = GroupIdentity::generate();
 
         assert!(matches!(
-            Invitation::issue(&owner, spec(NOW), NOW),
+            Invitation::issue(&owner, DeviceIdentity::generate().peer_id(), spec(NOW), NOW),
             Err(InvitationError::Expired)
         ));
 
-        let invitation = Invitation::issue(&owner, spec(NOW + 1), NOW).unwrap();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 1),
+            NOW,
+        )
+        .unwrap();
         assert!(matches!(
             Invitation::decode(&invitation.encode().unwrap(), NOW + 1),
             Err(InvitationError::Expired)
@@ -410,7 +501,7 @@ mod tests {
         invalid.group_name = " Design Crew";
 
         assert!(matches!(
-            Invitation::issue(&owner, invalid, NOW),
+            Invitation::issue(&owner, DeviceIdentity::generate().peer_id(), invalid, NOW),
             Err(InvitationError::InvalidField("group name"))
         ));
     }
@@ -418,8 +509,20 @@ mod tests {
     #[test]
     fn invitations_get_distinct_secrets_and_identifiers() {
         let owner = GroupIdentity::generate();
-        let first = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
-        let second = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
+        let first = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
+        let second = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
 
         assert_ne!(first.discovery_secret(), second.discovery_secret());
         assert_ne!(first.invitation_id(), second.invitation_id());
@@ -438,7 +541,13 @@ mod tests {
     #[test]
     fn supported_link_forms_decode_the_same_invitation() {
         let owner = GroupIdentity::generate();
-        let invitation = Invitation::issue(&owner, spec(NOW + 3_600), NOW).unwrap();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
         let inputs = [
             invitation.encode().unwrap(),
             invitation.custom_uri().unwrap(),
@@ -454,10 +563,15 @@ mod tests {
     #[test]
     fn links_reject_secrets_in_queries_or_on_untrusted_hosts() {
         let owner = GroupIdentity::generate();
-        let encoded = Invitation::issue(&owner, spec(NOW + 3_600), NOW)
-            .unwrap()
-            .encode()
-            .unwrap();
+        let encoded = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
 
         assert!(matches!(
             Invitation::decode_input(&format!("charp2p://join/{encoded}?secret=1"), NOW),

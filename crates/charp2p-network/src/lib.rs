@@ -762,6 +762,7 @@ mod tests {
         let (mut listener, mut dialer, listener_id, dialer_id) = connected_nodes().await;
         let invitation = Invitation::issue(
             &GroupIdentity::generate(),
+            listener_id,
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

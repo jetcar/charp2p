@@ -130,6 +130,9 @@ impl NetworkService {
         identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<AdvertisementResult, &'static str> {
+        if identity.peer_id() != invitation.inviter_device_id() {
+            return Err("invitation_inviter_mismatch");
+        }
         remaining_until_expiry(invitation.expires_at_unix())?;
         if self.bootstrap_peers.is_empty() {
             return Ok(AdvertisementResult {
@@ -278,6 +281,7 @@ impl NetworkService {
         }
 
         let key = DiscoveryKey::from_invitation(invitation);
+        let expected_inviter = invitation.inviter_device_id();
         let mut node = NetworkNode::new(identity.into_network_keypair());
         node.listen_on(
             "/ip4/0.0.0.0/udp/0/quic-v1"
@@ -304,7 +308,7 @@ impl NetworkService {
                         providers,
                     } if found_key == key => {
                         for provider in providers.into_iter().take(MAX_DISCOVERED_PEERS) {
-                            if provider != node.peer_id() {
+                            if provider == expected_inviter && provider != node.peer_id() {
                                 discovered.insert(provider);
                             }
                         }
@@ -504,6 +508,7 @@ mod tests {
         let group = GroupIdentity::generate();
         Invitation::issue(
             &group,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -580,6 +585,7 @@ mod tests {
         let group = GroupIdentity::generate();
         let invitation = Invitation::issue(
             &group,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -611,8 +617,10 @@ mod tests {
     fn advertise_reports_when_no_bootstrap_peer_is_configured() {
         let now = unix_now();
         let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
         let invitation = Invitation::issue(
             &group,
+            owner.peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -626,7 +634,7 @@ mod tests {
         let result = tauri::async_runtime::block_on(
             NetworkService::from_sources(&[], "")
                 .unwrap()
-                .advertise(DeviceIdentity::generate(), &invitation),
+                .advertise(owner, &invitation),
         )
         .unwrap();
 
@@ -640,11 +648,39 @@ mod tests {
     }
 
     #[test]
+    fn advertise_rejects_a_device_not_authorized_by_the_invitation() {
+        let now = unix_now();
+        let invitation = Invitation::issue(
+            &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+
+        let result = tauri::async_runtime::block_on(
+            NetworkService::from_sources(&[], "")
+                .unwrap()
+                .advertise(DeviceIdentity::generate(), &invitation),
+        );
+
+        assert!(matches!(result, Err("invitation_inviter_mismatch")));
+    }
+
+    #[test]
     fn advertise_rejects_an_expired_invitation() {
         let expires_at_unix = unix_now().saturating_sub(1);
         let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
         let invitation = Invitation::issue(
             &group,
+            owner.peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -658,7 +694,7 @@ mod tests {
         let result = tauri::async_runtime::block_on(
             NetworkService::from_sources(&[], "")
                 .unwrap()
-                .advertise(DeviceIdentity::generate(), &invitation),
+                .advertise(owner, &invitation),
         );
 
         assert!(matches!(result, Err("invitation_expired")));
@@ -668,8 +704,13 @@ mod tests {
     fn advertised_invitation_is_discoverable_through_a_routing_node() {
         let now = unix_now();
         let group = GroupIdentity::generate();
+        let (_, advertiser_secret) = DeviceIdentity::generate_persistable().unwrap();
+        let advertiser_id = DeviceIdentity::from_persisted_secret(&advertiser_secret)
+            .unwrap()
+            .peer_id();
         let invitation = Invitation::issue(
             &group,
+            advertiser_id,
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -694,7 +735,6 @@ mod tests {
             };
             let service =
                 NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
-            let (_, advertiser_secret) = DeviceIdentity::generate_persistable().unwrap();
             let advertise = service.advertise(
                 DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
                 &invitation,
@@ -762,8 +802,10 @@ mod tests {
     fn active_advertisement_stops_at_signed_expiry() {
         let now = unix_now();
         let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
         let invitation = Invitation::issue(
             &group,
+            owner.peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -788,7 +830,7 @@ mod tests {
             };
             let service =
                 NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
-            let advertise = service.advertise(DeviceIdentity::generate(), &invitation);
+            let advertise = service.advertise(owner, &invitation);
             tokio::pin!(advertise);
             timeout(Duration::from_secs(2), async {
                 loop {
@@ -836,8 +878,11 @@ mod tests {
     fn advertisement_rejects_unauthorized_requests() {
         let now = unix_now();
         let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let owner_id = owner.peer_id();
         let invitation = Invitation::issue(
             &group,
+            owner_id,
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -869,8 +914,6 @@ mod tests {
                 )),
             )
             .unwrap();
-            let owner = DeviceIdentity::generate();
-            let owner_id = owner.peer_id();
             {
                 let advertise = service.advertise(owner, &invitation);
                 tokio::pin!(advertise);
@@ -986,8 +1029,63 @@ mod tests {
     #[test]
     fn search_finds_a_provider_through_a_routing_node() {
         let group = GroupIdentity::generate();
+        let routing_identity = DeviceIdentity::generate();
+        let expected_inviter = routing_identity.peer_id();
         let invitation = Invitation::issue(
             &group,
+            expected_inviter,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap();
+        let result = tauri::async_runtime::block_on(async {
+            let mut routing = NetworkNode::new_routing(routing_identity.into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            routing
+                .announce_group(DiscoveryKey::from_invitation(&invitation))
+                .unwrap();
+            let service =
+                NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
+            let search = service.search(DeviceIdentity::generate(), &invitation);
+            tokio::pin!(search);
+
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut search => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("provider search should complete")
+            .unwrap()
+        });
+
+        assert_eq!(result.status, "peerReachable");
+        assert_eq!(result.discovered_peers, 1);
+        assert_eq!(result.reachable_peers, 1);
+    }
+
+    #[test]
+    fn search_ignores_a_provider_not_authorized_by_the_invitation() {
+        let invitation = Invitation::issue(
+            &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -1031,8 +1129,8 @@ mod tests {
             .unwrap()
         });
 
-        assert_eq!(result.status, "peerReachable");
-        assert_eq!(result.discovered_peers, 1);
-        assert_eq!(result.reachable_peers, 1);
+        assert_eq!(result.status, "noPeers");
+        assert_eq!(result.discovered_peers, 0);
+        assert_eq!(result.reachable_peers, 0);
     }
 }

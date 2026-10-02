@@ -1128,6 +1128,7 @@ mod tests {
         validate_profile_key_package(&provider, prepared.encoded(), device_id).unwrap();
         let invitation = Invitation::issue(
             &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

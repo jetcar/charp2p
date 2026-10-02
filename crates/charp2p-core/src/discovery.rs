@@ -31,7 +31,7 @@ impl DiscoveryKey {
 
 #[cfg(test)]
 mod tests {
-    use crate::{GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
+    use crate::{DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
 
     use super::DiscoveryKey;
 
@@ -42,6 +42,7 @@ mod tests {
         let owner = GroupIdentity::generate();
         let invitation = Invitation::issue(
             &owner,
+            DeviceIdentity::generate().peer_id(),
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",

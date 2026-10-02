@@ -9,11 +9,13 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use charp2p_core::{
-    DeviceIdentity, EventId, EventKind, EventSpec, JoinResponse, PeerId, SignedEvent,
+    DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
+    SignedEvent,
 };
 use charp2p_mls::{
     device_credential, device_id_from_credential, group_create_config,
-    merge_prepared_member_admission, prepare_profile_member_admission, validate_group_profile,
+    merge_prepared_member_admission, prepare_profile_key_package, prepare_profile_member_admission,
+    stage_profile_welcome, validate_group_profile, validate_profile_key_package,
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
 };
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
@@ -240,6 +242,143 @@ impl MlsProviderService {
         if result.is_err() {
             *provider = ProfileProvider::from_snapshot(&previous)
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
+        }
+        result
+    }
+
+    /// Creates or reuses the durable one-time KeyPackage for a pending join.
+    pub(crate) fn prepare_join_request(
+        &self,
+        device_id: PeerId,
+        invitation: &Invitation,
+    ) -> Result<JoinRequest, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let group_id = invitation.group_id();
+        let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
+        if MlsGroup::load(provider.storage(), &mls_group_id)
+            .map_err(|_| "mls_group_storage_unavailable")?
+            .is_some()
+        {
+            return Err("mls_group_already_joined");
+        }
+        if let Some(encoded) = store
+            .pending_mls_join_key_package(group_id)
+            .map_err(|_| "mls_provider_store_unavailable")?
+        {
+            validate_profile_key_package(&*provider, &encoded, device_id)
+                .map_err(|_| "mls_pending_join_invalid")?;
+            return JoinRequest::from_invitation(invitation, encoded)
+                .map_err(|_| "mls_pending_join_invalid");
+        }
+
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+                .map_err(|_| "mls_key_package_creation_failed")?;
+            signer
+                .store(provider.storage())
+                .map_err(|_| "mls_group_storage_unavailable")?;
+            let credential = CredentialWithKey {
+                credential: device_credential(device_id).into(),
+                signature_key: signer.public().into(),
+            };
+            let key_package =
+                prepare_profile_key_package(&*provider, &signer, credential, device_id)
+                    .map_err(|_| "mls_key_package_creation_failed")?;
+            let encoded = key_package.encoded().to_vec();
+            let request = key_package
+                .into_join_request(invitation)
+                .map_err(|_| "mls_key_package_creation_failed")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            store
+                .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+                    group_id, &encoded, &encrypted,
+                )
+                .map_err(|_| "mls_provider_store_unavailable")?;
+            Ok(request)
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
+    }
+
+    /// Validates and persists the Welcome for a pending join, then removes the
+    /// retained public KeyPackage in the same transaction as the new provider
+    /// state.
+    pub(crate) fn complete_join(
+        &self,
+        group_id: PeerId,
+        encoded_welcome: &[u8],
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        if store
+            .pending_mls_join_key_package(group_id)
+            .map_err(|_| "mls_provider_store_unavailable")?
+            .is_none()
+        {
+            return Err("mls_pending_join_missing");
+        }
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let staged = stage_profile_welcome(&*provider, encoded_welcome)
+                .map_err(|_| "mls_welcome_invalid")?;
+            let group = staged
+                .into_group(&*provider)
+                .map_err(|_| "mls_welcome_invalid")?;
+            validate_group_profile(&group).map_err(|_| "mls_welcome_invalid")?;
+            if group.group_id().as_slice() != group_id.to_bytes() {
+                return Err("mls_welcome_group_mismatch");
+            }
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            if !store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id, &encrypted,
+                )
+                .map_err(|_| "mls_provider_store_unavailable")?
+            {
+                return Err("mls_pending_join_missing");
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
         }
         result
     }
@@ -496,10 +635,13 @@ fn decrypt_snapshot(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use charp2p_core::{DeviceIdentity, EventKind, GroupIdentity};
+    use charp2p_core::{
+        DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
+    };
     use charp2p_mls::{
-        device_credential, device_id_from_credential, prepare_profile_key_package,
-        stage_profile_welcome, ProfileProvider, CIPHERSUITE,
+        device_credential, device_id_from_credential, group_create_config,
+        merge_prepared_member_admission, prepare_profile_key_package,
+        prepare_profile_member_admission, stage_profile_welcome, ProfileProvider, CIPHERSUITE,
     };
     use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
@@ -560,6 +702,22 @@ mod tests {
         (provider, key_package)
     }
 
+    fn invitation(group: &GroupIdentity) -> Invitation {
+        Invitation::issue(
+            group,
+            DeviceIdentity::generate().peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: 1_800_003_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            1_800_000_000,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn encryption_uses_a_fresh_nonce_and_authenticates_round_trips() {
         let key = [7; WRAPPING_KEY_BYTES];
@@ -600,6 +758,137 @@ mod tests {
         restored
             .initialize_owner_group(group_id, device_id)
             .unwrap();
+    }
+
+    #[test]
+    fn pending_join_request_reuses_its_durable_key_package_after_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let invitation = invitation(&GroupIdentity::generate());
+        let device_id = DeviceIdentity::generate().peer_id();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+
+        let first = service
+            .prepare_join_request(device_id, &invitation)
+            .unwrap();
+        let repeated = service
+            .prepare_join_request(device_id, &invitation)
+            .unwrap();
+        assert_eq!(first.key_package(), repeated.key_package());
+        assert_eq!(first.invitation(), repeated.invitation());
+        assert_eq!(
+            EventStore::open(&path)
+                .unwrap()
+                .pending_mls_join_key_package(invitation.group_id())
+                .unwrap()
+                .unwrap(),
+            first.key_package()
+        );
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        let after_restart = restored
+            .prepare_join_request(device_id, &invitation)
+            .unwrap();
+        assert_eq!(first.key_package(), after_restart.key_package());
+    }
+
+    #[test]
+    fn welcome_completion_restores_failures_then_persists_the_joined_group() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let joiner_id = DeviceIdentity::generate().peer_id();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        let request = service
+            .prepare_join_request(joiner_id, &invitation)
+            .unwrap();
+
+        let owner_provider = ProfileProvider::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let owner_signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+        owner_signer.store(owner_provider.storage()).unwrap();
+        let owner_credential = CredentialWithKey {
+            credential: device_credential(owner_id).into(),
+            signature_key: owner_signer.public().into(),
+        };
+        let mut owner_group = MlsGroup::new_with_group_id(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            GroupId::from_slice(&group_id.to_bytes()),
+            owner_credential,
+        )
+        .unwrap();
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            request.key_package(),
+            joiner_id,
+        )
+        .unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+
+        assert_eq!(
+            service.complete_join(group_id, &[1]),
+            Err("mls_welcome_invalid")
+        );
+        assert!(EventStore::open(&path)
+            .unwrap()
+            .pending_mls_join_key_package(group_id)
+            .unwrap()
+            .is_some());
+        service
+            .complete_join(group_id, admission.welcome())
+            .unwrap();
+        assert!(EventStore::open(&path)
+            .unwrap()
+            .pending_mls_join_key_package(group_id)
+            .unwrap()
+            .is_none());
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        let members = restored
+            .read(|provider| {
+                MlsGroup::load(
+                    provider.storage(),
+                    &GroupId::from_slice(&group_id.to_bytes()),
+                )
+                .unwrap()
+                .unwrap()
+                .members()
+                .map(|member| device_id_from_credential(&member.credential).unwrap())
+                .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(members.contains(&owner_id));
+        assert!(members.contains(&joiner_id));
     }
 
     #[test]

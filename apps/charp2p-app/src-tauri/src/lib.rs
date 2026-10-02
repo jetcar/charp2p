@@ -13,7 +13,7 @@ use std::{
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::MlsProviderService;
-use network::{AdvertisementResult, NetworkService, PeerSearchResult};
+use network::{AdvertisementResult, JoinGroupResult, NetworkService, PeerSearchResult};
 use pending::{PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
@@ -153,6 +153,26 @@ async fn search_group_peers(
 }
 
 #[tauri::command]
+async fn join_group(
+    group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<JoinGroupResult, String> {
+    let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    let invitation = pending_service
+        .load_invitation(group_id)
+        .map_err(str::to_owned)?;
+    network_service
+        .join(identity, &invitation)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn advertise_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -270,6 +290,7 @@ pub fn run() {
             create_group,
             create_group_invitation,
             search_group_peers,
+            join_group,
             advertise_group
         ])
         .run(tauri::generate_context!())

@@ -227,7 +227,12 @@ profile mismatches use the stable unsupported-profile response.
 The joining device generates its one-time KeyPackage through the same profile:
 the credential must name its local peer ID, OpenMLS stores the matching private
 material, and the bounded public encoding is self-validated before being moved
-into the join request.
+into the join request. The public KeyPackage and encrypted provider snapshot
+containing its private material are committed together and reused after a
+restart. After receiving a Welcome from the invitation's pinned owner, the
+client stages and validates the joined group, then atomically removes the
+pending KeyPackage and persists the joined provider state. A rejected or
+invalid Welcome leaves the pending join usable for a later retry.
 An accepted addition first produces a pending, profile-validated MLS Commit and
 Welcome without advancing the owner's epoch. The owner durably publishes the
 Commit as a signed group event, explicitly merges it, and then sends the

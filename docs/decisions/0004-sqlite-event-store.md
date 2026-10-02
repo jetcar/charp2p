@@ -39,6 +39,12 @@ interprets the encrypted bytes. When a signed event advances MLS state, insert
 the event and replace the resulting provider ciphertext in one SQLite
 transaction so neither state can become durable alone.
 
+SQLite also indexes one bounded public MLS KeyPackage per pending group join.
+Creating that record and storing the encrypted provider snapshot containing its
+matching private material is atomic. Completing the join atomically removes the
+public KeyPackage record and replaces the provider snapshot with the joined
+group state.
+
 ## Alternatives considered
 
 ### Flat event files
@@ -67,6 +73,8 @@ backup and diagnostic workflows.
   record when a new value fails local size validation.
 - An event that advances MLS state and its resulting encrypted provider
   snapshot commit or roll back together.
+- Pending join KeyPackages cannot become durable without their matching private
+  material, and completed joins cannot lose one side of the state transition.
 
 ## Sources
 

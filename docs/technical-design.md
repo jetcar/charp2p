@@ -384,6 +384,8 @@ Each client stores:
   platform-protected storage and are revalidated on load.
 - One bounded encrypted MLS provider snapshot in SQLite; its wrapping key stays
   in platform-protected storage.
+- One bounded public MLS KeyPackage for each pending join, transactionally
+  paired with the provider snapshot that contains its private material.
 - User preferences and local blocks.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential

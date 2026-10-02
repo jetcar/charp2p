@@ -35,13 +35,15 @@ storage. Missing keys, invalid envelopes, and failed authentication stop startup
 instead of discarding or replacing the stored state. No snapshot bytes enter
 logs, diagnostics, or ordinary backups without that protection.
 
-SQLite schema version 5 reserves one singleton ciphertext record, bounded to
+SQLite schema version 6 reserves one singleton ciphertext record, bounded to
 the maximum snapshot plus encryption-envelope overhead. The storage layer
 atomically replaces this opaque record and never receives plaintext provider
 state. Each application provider mutation snapshots the preceding state, then
 restores it if the operation, encryption, or durable replacement fails.
 Mutations represented by signed group events persist that event and the
-resulting encrypted snapshot in one SQLite transaction.
+resulting encrypted snapshot in one SQLite transaction. A pending join stores
+its bounded public KeyPackage alongside the snapshot containing the matching
+private material; creation and completion of that pair are transactional.
 
 ## Consequences
 

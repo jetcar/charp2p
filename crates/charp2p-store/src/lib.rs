@@ -9,14 +9,15 @@ use std::{
 };
 
 use charp2p_core::{
-    EventError, EventId, HistoryPolicy, InvitationId, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
+    EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
+    MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -473,6 +474,71 @@ impl EventStore {
         Ok(encrypted)
     }
 
+    /// Loads the public one-time KeyPackage retained for a pending join.
+    pub fn pending_mls_join_key_package(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT key_package FROM pending_mls_joins WHERE group_id = ?1",
+                [group_id.to_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.is_empty() || encoded.len() > MAX_JOIN_MLS_MESSAGE_BYTES)
+        {
+            return Err(StoreError::CorruptIndex);
+        }
+        Ok(encoded)
+    }
+
+    /// Atomically retains one public KeyPackage and the provider state holding
+    /// its matching private material.
+    pub fn put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        group_id: PeerId,
+        key_package: &[u8],
+        encrypted: &[u8],
+    ) -> Result<(), StoreError> {
+        validate_mls_key_package(key_package)?;
+        validate_encrypted_mls_provider_snapshot(encrypted)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO pending_mls_joins (group_id, key_package)
+             VALUES (?1, ?2)
+             ON CONFLICT(group_id) DO UPDATE SET key_package = excluded.key_package",
+            params![group_id.to_bytes(), key_package],
+        )?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically removes a completed pending join and stores the provider
+    /// state containing the joined MLS group.
+    pub fn remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+        &mut self,
+        group_id: PeerId,
+        encrypted: &[u8],
+    ) -> Result<bool, StoreError> {
+        validate_encrypted_mls_provider_snapshot(encrypted)?;
+        let transaction = self.connection.transaction()?;
+        let removed = transaction.execute(
+            "DELETE FROM pending_mls_joins WHERE group_id = ?1",
+            [group_id.to_bytes()],
+        )? != 0;
+        if !removed {
+            return Ok(false);
+        }
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -528,6 +594,12 @@ impl EventStore {
                         singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
                         encrypted BLOB NOT NULL
                             CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;
+
+                     CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -568,6 +640,12 @@ impl EventStore {
                         singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
                         encrypted BLOB NOT NULL
                             CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;
+
+                     CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -599,6 +677,12 @@ impl EventStore {
                         singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
                         encrypted BLOB NOT NULL
                             CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;
+
+                     CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -618,6 +702,12 @@ impl EventStore {
                         singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
                         encrypted BLOB NOT NULL
                             CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;
+
+                     CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -630,6 +720,24 @@ impl EventStore {
                         singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
                         encrypted BLOB NOT NULL
                             CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                     ) STRICT;
+
+                     CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
+                     ) STRICT;",
+                )?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            5 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "CREATE TABLE pending_mls_joins (
+                        group_id BLOB PRIMARY KEY NOT NULL,
+                        key_package BLOB NOT NULL
+                            CHECK(length(key_package) BETWEEN 1 AND 131072)
                      ) STRICT;",
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -646,6 +754,13 @@ impl EventStore {
 fn validate_encrypted_mls_provider_snapshot(encrypted: &[u8]) -> Result<(), StoreError> {
     if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
         return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
+    }
+    Ok(())
+}
+
+fn validate_mls_key_package(encoded: &[u8]) -> Result<(), StoreError> {
+    if encoded.is_empty() || encoded.len() > MAX_JOIN_MLS_MESSAGE_BYTES {
+        return Err(StoreError::InvalidMlsKeyPackageSize(encoded.len()));
     }
     Ok(())
 }
@@ -753,6 +868,9 @@ pub enum StoreError {
     /// The encrypted MLS provider snapshot is empty or above the local bound.
     #[error("invalid encrypted MLS provider snapshot size {0}")]
     InvalidMlsProviderSnapshotSize(usize),
+    /// A pending join KeyPackage is empty or above the protocol bound.
+    #[error("invalid pending MLS KeyPackage size {0}")]
+    InvalidMlsKeyPackageSize(usize),
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -773,7 +891,7 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 mod tests {
     use charp2p_core::{
         DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, InvitationId,
-        SignedEvent,
+        MAX_JOIN_MLS_MESSAGE_BYTES, SignedEvent,
     };
     use rusqlite::{Connection, params};
     use tempfile::NamedTempFile;
@@ -1131,6 +1249,118 @@ mod tests {
     }
 
     #[test]
+    fn pending_mls_join_and_provider_snapshot_follow_one_atomic_lifecycle() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        assert!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+                group_id,
+                b"public key package",
+                b"provider with private key package",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .unwrap(),
+            b"public key package"
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"provider with private key package"
+        );
+
+        assert!(
+            store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id,
+                    b"provider with joined group",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"provider with joined group"
+        );
+        assert!(
+            !store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id,
+                    b"must not replace provider without a pending join",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"provider with joined group"
+        );
+        assert!(matches!(
+            store.put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+                group_id,
+                &vec![0; MAX_JOIN_MLS_MESSAGE_BYTES + 1],
+                b"valid snapshot",
+            ),
+            Err(StoreError::InvalidMlsKeyPackageSize(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_failure_rolls_back_pending_mls_join_changes() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        store
+            .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+                group_id,
+                b"public key package",
+                b"preceding provider snapshot",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_pending_join_snapshot_update
+                 BEFORE UPDATE ON mls_provider_snapshot
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected snapshot failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                group_id,
+                b"provider with joined group",
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert_eq!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .unwrap(),
+            b"public key package"
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"preceding provider snapshot"
+        );
+    }
+
+    #[test]
     fn event_and_resulting_mls_snapshot_commit_together() {
         let mut store = EventStore::in_memory().unwrap();
         let event = message_event(
@@ -1208,6 +1438,37 @@ mod tests {
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"authenticated ciphertext"
+        );
+    }
+
+    #[test]
+    fn version_five_database_adds_pending_mls_joins() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE mls_provider_snapshot (
+                    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                    encrypted BLOB NOT NULL CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                 ) STRICT;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+
+        let mut store = EventStore::from_connection(connection).unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        store
+            .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
+                group_id,
+                b"public key package",
+                b"authenticated provider ciphertext",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .unwrap(),
+            b"public key package"
         );
     }
 

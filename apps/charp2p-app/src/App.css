@@ -138,6 +138,8 @@ button { cursor: pointer; }
 .message-composer { display: grid; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #f5f8fb; }
 .message-composer textarea { width: 100%; min-height: 96px; margin: 10px 0 0; padding: 14px 16px; resize: vertical; border: 1px solid #cad5e2; border-radius: 11px; outline: none; color: #172044; background: white; line-height: 1.5; }
 .message-composer textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
+.message-size { margin: 7px 2px 0; color: #68748f; font-size: 12px; text-align: right; }
+.message-size.over-limit { color: #a43143; font-weight: 700; }
 .message-composer .secondary-button { min-height: 58px; margin-top: 12px; font-size: 18px; }
 .message-receipt { margin: 14px 0 0; color: #087d75; font-size: 14px; font-weight: 700; text-align: center; }
 .message-timeline { display: grid; gap: 12px; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #fff; }

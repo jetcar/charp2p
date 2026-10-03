@@ -62,6 +62,7 @@ const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
+const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -269,6 +270,10 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
+  const outgoingMessageBytes = useMemo(
+    () => new TextEncoder().encode(outgoingMessage).length,
+    [outgoingMessage],
+  );
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -646,7 +651,14 @@ function App() {
 
   async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!localGroup || !outgoingMessage.trim() || sendingMessage || !isTauri()) return;
+    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    if (
+      !groupId
+      || !outgoingMessage.trim()
+      || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES
+      || sendingMessage
+      || !isTauri()
+    ) return;
 
     setError("");
     setCreatedMessage(null);
@@ -654,7 +666,7 @@ function App() {
     const text = outgoingMessage;
     try {
       const created = await invoke<CreatedMessage>("send_group_message", {
-        groupId: localGroup.groupId,
+        groupId,
         message: text,
       });
       setCreatedMessage(created);
@@ -874,7 +886,10 @@ function App() {
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
                   {groupMessages.map((message) => (
-                    <article className="message-bubble" key={message.eventId}>
+                    <article
+                      className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
+                      key={message.eventId}
+                    >
                       <p>{message.text}</p>
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {message.authorId === profile?.peerId ? "You" : joinedGroup.inviterName}
@@ -884,6 +899,36 @@ function App() {
                   ))}
                 </section>
               )}
+              <form className="message-composer" onSubmit={sendGroupMessage}>
+                <label htmlFor="joined-outgoing-message">Protected message</label>
+                <textarea
+                  aria-describedby="joined-message-size"
+                  id="joined-outgoing-message"
+                  maxLength={16384}
+                  onChange={(event) => setOutgoingMessage(event.target.value)}
+                  placeholder="Write a message for the group"
+                  rows={3}
+                  value={outgoingMessage}
+                />
+                <p
+                  className={`message-size ${outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES ? "over-limit" : ""}`}
+                  id="joined-message-size"
+                >
+                  {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
+                </p>
+                <button
+                  className="secondary-button"
+                  disabled={!outgoingMessage.trim() || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES || sendingMessage || !isTauri()}
+                  type="submit"
+                >
+                  {sendingMessage ? "Protecting message…" : "Save encrypted message"}
+                </button>
+                {createdMessage && (
+                  <p className="message-receipt" role="status">
+                    ✓ Encrypted event {createdMessage.authorSequence} saved securely.
+                  </p>
+                )}
+              </form>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>
               <button className="secondary-button" disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
@@ -911,6 +956,7 @@ function App() {
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 <label htmlFor="outgoing-message">Protected message</label>
                 <textarea
+                  aria-describedby="owner-message-size"
                   id="outgoing-message"
                   maxLength={16384}
                   onChange={(event) => setOutgoingMessage(event.target.value)}
@@ -918,9 +964,15 @@ function App() {
                   rows={3}
                   value={outgoingMessage}
                 />
+                <p
+                  className={`message-size ${outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES ? "over-limit" : ""}`}
+                  id="owner-message-size"
+                >
+                  {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
+                </p>
                 <button
                   className="secondary-button"
-                  disabled={!outgoingMessage.trim() || sendingMessage || !isTauri()}
+                  disabled={!outgoingMessage.trim() || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES || sendingMessage || !isTauri()}
                   type="submit"
                 >
                   {sendingMessage ? "Protecting message…" : "Save encrypted message"}

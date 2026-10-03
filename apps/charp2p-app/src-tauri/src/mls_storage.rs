@@ -1530,6 +1530,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn joined_member_can_create_a_protected_local_message() {
+        let directory = tempdir().unwrap();
+        let owner_path = directory.path().join("owner.sqlite3");
+        let member_path = directory.path().join("member.sqlite3");
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = MlsProviderService::open_with_key_store(
+            &owner_path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        owner_service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        let member_service = MlsProviderService::open_with_key_store(
+            &member_path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        let request = member_service
+            .prepare_join_request(member.peer_id(), &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                member.peer_id(),
+                request.key_package(),
+                41,
+            )
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+
+        let event = member_service
+            .create_message_at(group_id, &member, "Hello from member", 42)
+            .unwrap();
+        assert_eq!(
+            member_service.messages(group_id).unwrap()[0].text,
+            "Hello from member"
+        );
+        assert_eq!(
+            owner_service
+                .read(|provider| {
+                    let mut owner_group = MlsGroup::load(
+                        provider.storage(),
+                        &GroupId::from_slice(&group_id.to_bytes()),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    decrypt_application_message(&mut owner_group, provider, &event)
+                })
+                .unwrap(),
+            b"Hello from member"
+        );
+    }
+
     fn decrypt_application_message(
         group: &mut MlsGroup,
         provider: &ProfileProvider,

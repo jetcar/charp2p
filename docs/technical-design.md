@@ -394,6 +394,12 @@ commit in one SQLite transaction. Any protection, encryption, or storage
 failure restores the preceding in-memory provider so a ratchet generation is
 never advanced without its event.
 
+Both owners and joined members can create this protected local event. The
+current network path pulls events from the pinned owner; upload of a joined
+member's new event to that owner remains a later synchronization increment. The
+interface therefore reports local encrypted persistence without claiming peer
+delivery.
+
 Each device keeps readable message text as one bounded local display copy
 protected with XChaCha20-Poly1305 under the platform-protected provider wrapping
 key. A fresh nonce, a separate local-message domain, and the signed event ID as

@@ -53,6 +53,11 @@ protected membership event remain later increments. Until the groups list is
 implemented, the backend enforces one locally created group so extra protected
 roots cannot become hidden from the interface.
 
+The local owner screen can create bounded text messages as MLS private
+application messages and persist each signed `MessageCreated` event atomically
+with sender ratchet state. Delivery receipts and a durable decrypted timeline
+remain later increments.
+
 While an owner advertises an active invitation, authenticated devices already
 present in its MLS group can request bounded synchronization summaries, event
 identifier pages, and signed events. Devices outside that MLS membership get

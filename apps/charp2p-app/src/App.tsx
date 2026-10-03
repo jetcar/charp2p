@@ -47,6 +47,14 @@ type SynchronizeGroupResult = {
   synchronizedEvents: number;
 };
 
+type CreatedMessage = {
+  eventId: string;
+  groupId: string;
+  authorId: string;
+  authorSequence: number;
+  createdAtUnixMs: number;
+};
+
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
@@ -92,6 +100,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
   mls_group_creation_failed: "Secure group setup failed.",
+  mls_group_author_mismatch: "This device is not the authorized sender for that group.",
   mls_group_already_joined: "This device already belongs to that group.",
   mls_joined_group_missing: "Stored secure membership for this group is missing.",
   mls_group_storage_unavailable: "Secure group storage is unavailable.",
@@ -104,6 +113,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   mls_welcome_group_mismatch: "The response belongs to a different group.",
   mls_welcome_invalid: "The group owner returned an invalid secure response.",
   mls_wrapping_key_store_unavailable: "Protected secure-group storage is unavailable.",
+  mls_message_creation_failed: "The message could not be protected for this group.",
+  message_creation_failed: "The message could not be signed.",
+  message_invalid: "Enter a message up to 16 KiB.",
+  message_store_unavailable: "The encrypted message could not be saved.",
   pending_invitation_not_found: "This pending invitation is no longer available.",
   pending_invitation_service_unavailable: "Pending invitations are temporarily unavailable.",
   pending_invitation_record_invalid: "A saved invitation is damaged and cannot be opened.",
@@ -237,6 +250,9 @@ function App() {
   const [synchronizingGroup, setSynchronizingGroup] = useState(false);
   const [synchronizationResult, setSynchronizationResult] =
     useState<SynchronizeGroupResult | null>(null);
+  const [outgoingMessage, setOutgoingMessage] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -560,6 +576,27 @@ function App() {
     }
   }
 
+  async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!localGroup || !outgoingMessage.trim() || sendingMessage || !isTauri()) return;
+
+    setError("");
+    setCreatedMessage(null);
+    setSendingMessage(true);
+    try {
+      const created = await invoke<CreatedMessage>("send_group_message", {
+        groupId: localGroup.groupId,
+        message: outgoingMessage,
+      });
+      setCreatedMessage(created);
+      setOutgoingMessage("");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSendingMessage(false);
+    }
+  }
+
   async function createGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!groupName.trim() || creatingGroup || !isTauri()) return;
@@ -778,6 +815,29 @@ function App() {
                 <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
               </dl>
+              <form className="message-composer" onSubmit={sendGroupMessage}>
+                <label htmlFor="outgoing-message">Protected message</label>
+                <textarea
+                  id="outgoing-message"
+                  maxLength={16384}
+                  onChange={(event) => setOutgoingMessage(event.target.value)}
+                  placeholder="Write a message for the group"
+                  rows={3}
+                  value={outgoingMessage}
+                />
+                <button
+                  className="secondary-button"
+                  disabled={!outgoingMessage.trim() || sendingMessage || !isTauri()}
+                  type="submit"
+                >
+                  {sendingMessage ? "Protecting message…" : "Save encrypted message"}
+                </button>
+                {createdMessage && (
+                  <p className="message-receipt" role="status">
+                    ✓ Encrypted event {createdMessage.authorSequence} saved securely.
+                  </p>
+                )}
+              </form>
               {issuedInvitation && issuedInvitation.groupId === localGroup.groupId ? (
                 <>
                   <label htmlFor="issued-invitation">Invitation link</label>

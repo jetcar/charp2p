@@ -135,6 +135,11 @@ button { cursor: pointer; }
 .group-ready-card, .joined-card { align-items: stretch; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }
+.message-composer { display: grid; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #f5f8fb; }
+.message-composer textarea { width: 100%; min-height: 96px; margin: 10px 0 0; padding: 14px 16px; resize: vertical; border: 1px solid #cad5e2; border-radius: 11px; outline: none; color: #172044; background: white; line-height: 1.5; }
+.message-composer textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
+.message-composer .secondary-button { min-height: 58px; margin-top: 12px; font-size: 18px; }
+.message-receipt { margin: 14px 0 0; color: #087d75; font-size: 14px; font-weight: 700; text-align: center; }
 .invitation-link-box { width: 100%; min-height: 104px; margin: 0 0 18px; padding: 16px 18px; resize: none; border: 1px solid #ced9e5; border-radius: 12px; outline: none; color: #33415f; background: #f5f8fb; font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .invitation-link-box:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
 .group-avatar { width: 82px; height: 82px; display: grid; place-items: center; align-self: center; margin-bottom: 24px; border-radius: 24px; color: white; font-size: 25px; font-weight: 800; letter-spacing: -6px; }

@@ -406,7 +406,9 @@ synchronization. The interface reports received and newly accepted shared
 event counts; an accepted upload means the owner persisted the event for later
 fan-out, not that every member is currently online. Active group screens poll
 their encrypted local timeline every two seconds so messages materialized by a
-background synchronization stream appear without reopening the group.
+background synchronization stream appear without reopening the group. Each
+timeline read returns at most the latest 256 messages in display order and a
+flag indicating whether older locally retained messages exist.
 
 Each device keeps readable message text as one bounded local display copy
 protected with XChaCha20-Poly1305 under the platform-protected provider wrapping

@@ -57,6 +57,7 @@ type CreatedMessage = {
 };
 
 type StoredMessage = Omit<CreatedMessage, "authorSequence"> & { text: string };
+type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
@@ -284,6 +285,7 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
+  const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
     [outgoingMessage],
@@ -477,6 +479,7 @@ function App() {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
     if (!isTauri() || !groupId) {
       setGroupMessages([]);
+      setHasEarlierMessages(false);
       return;
     }
 
@@ -486,8 +489,11 @@ function App() {
 
     async function refreshMessages() {
       try {
-        const messages = await invoke<StoredMessage[]>("group_messages", { groupId });
-        if (active) setGroupMessages(messages);
+        const page = await invoke<StoredMessagePage>("group_messages", { groupId });
+        if (active) {
+          setGroupMessages(page.messages);
+          setHasEarlierMessages(page.hasEarlier);
+        }
       } catch (reason) {
         if (active && firstLoad) setError(errorMessage(reason));
       } finally {
@@ -660,8 +666,9 @@ function App() {
         groupId,
       });
       setSynchronizationResult(result);
-      const messages = await invoke<StoredMessage[]>("group_messages", { groupId });
-      setGroupMessages(messages);
+      const page = await invoke<StoredMessagePage>("group_messages", { groupId });
+      setGroupMessages(page.messages);
+      setHasEarlierMessages(page.hasEarlier);
     } catch (reason) {
       if (reportErrors) setError(errorMessage(reason));
     } finally {
@@ -926,6 +933,9 @@ function App() {
                       </time>
                     </article>
                   ))}
+                  {hasEarlierMessages && (
+                    <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
+                  )}
                 </section>
               )}
               <form className="message-composer" onSubmit={sendGroupMessage}>
@@ -1026,6 +1036,9 @@ function App() {
                       </time>
                     </article>
                   ))}
+                  {hasEarlierMessages && (
+                    <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
+                  )}
                 </section>
               )}
               {issuedInvitation && issuedInvitation.groupId === localGroup.groupId ? (

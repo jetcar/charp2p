@@ -107,6 +107,13 @@ pub(crate) struct StoredMessage {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredMessagePage {
+    pub messages: Vec<StoredMessage>,
+    pub has_earlier: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemberAdmissionError {
     Unauthorized,
@@ -206,7 +213,7 @@ impl MlsProviderService {
         })
     }
 
-    pub(crate) fn messages(&self, group_id: PeerId) -> Result<Vec<StoredMessage>, &'static str> {
+    pub(crate) fn messages(&self, group_id: PeerId) -> Result<StoredMessagePage, &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -215,17 +222,21 @@ impl MlsProviderService {
             .store
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
-        let encrypted = store
+        let encrypted_page = store
             .encrypted_messages(group_id)
             .map_err(|_| "message_list_unavailable")?;
-        if encrypted.is_empty() {
-            return Ok(Vec::new());
+        if encrypted_page.messages.is_empty() {
+            return Ok(StoredMessagePage {
+                messages: Vec::new(),
+                has_earlier: false,
+            });
         }
         let key = self
             .wrapping_keys
             .get_optional()?
             .ok_or("mls_wrapping_key_missing")?;
-        encrypted
+        let messages = encrypted_page
+            .messages
             .into_iter()
             .map(|message| {
                 let plaintext =
@@ -244,7 +255,11 @@ impl MlsProviderService {
                     text,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(StoredMessagePage {
+            messages,
+            has_earlier: encrypted_page.has_earlier,
+        })
     }
 
     fn create_message_at(
@@ -1597,14 +1612,16 @@ mod tests {
             b"After restart"
         );
         let messages = restored.messages(group_id).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].text, "Protected hello");
-        assert_eq!(messages[0].author_id, owner.peer_id().to_string());
-        assert_eq!(messages[1].text, "After restart");
+        assert_eq!(messages.messages.len(), 2);
+        assert!(!messages.has_earlier);
+        assert_eq!(messages.messages[0].text, "Protected hello");
+        assert_eq!(messages.messages[0].author_id, owner.peer_id().to_string());
+        assert_eq!(messages.messages[1].text, "After restart");
         let stored = EventStore::open(path).unwrap();
         assert!(stored
             .encrypted_messages(group_id)
             .unwrap()
+            .messages
             .iter()
             .all(|message| !message
                 .encrypted_body
@@ -1664,7 +1681,7 @@ mod tests {
             .create_message_at(group_id, &member, "Hello from member", 42)
             .unwrap();
         assert_eq!(
-            member_service.messages(group_id).unwrap()[0].text,
+            member_service.messages(group_id).unwrap().messages[0].text,
             "Hello from member"
         );
         assert_eq!(
@@ -1732,7 +1749,7 @@ mod tests {
             }
         );
         assert_eq!(
-            owner_service.messages(group_id).unwrap()[0].text,
+            owner_service.messages(group_id).unwrap().messages[0].text,
             "Hello from member"
         );
         assert_eq!(
@@ -1861,6 +1878,7 @@ mod tests {
             member_service
                 .messages(group_id)
                 .unwrap()
+                .messages
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),

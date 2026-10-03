@@ -682,6 +682,9 @@ function App() {
         },
       ]);
       setOutgoingMessage("");
+      if (joinedGroup?.groupId === groupId) {
+        void performJoinedGroupSynchronization(groupId, false);
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -922,11 +925,11 @@ function App() {
                   disabled={!outgoingMessage.trim() || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES || sendingMessage || !isTauri()}
                   type="submit"
                 >
-                  {sendingMessage ? "Protecting message…" : "Save encrypted message"}
+                  {sendingMessage ? "Protecting message…" : "Protect and send"}
                 </button>
                 {createdMessage && (
                   <p className="message-receipt" role="status">
-                    ✓ Encrypted event {createdMessage.authorSequence} saved securely.
+                    ✓ Encrypted event {createdMessage.authorSequence} saved. It will sync when the owner is reachable.
                   </p>
                 )}
               </form>

@@ -1,6 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
@@ -58,6 +58,8 @@ type CreatedMessage = {
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
+const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
+const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -250,6 +252,7 @@ function App() {
   const [synchronizingGroup, setSynchronizingGroup] = useState(false);
   const [synchronizationResult, setSynchronizationResult] =
     useState<SynchronizeGroupResult | null>(null);
+  const synchronizationInFlight = useRef(false);
   const [outgoingMessage, setOutgoingMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
@@ -418,6 +421,27 @@ function App() {
   }, [issuedInvitation, localGroup]);
 
   useEffect(() => {
+    if (!isTauri() || !joinedGroup) return;
+
+    const groupId = joinedGroup.groupId;
+    let active = true;
+    let timer: number | undefined;
+
+    async function synchronizePeriodically() {
+      await performJoinedGroupSynchronization(groupId, false);
+      if (active) {
+        timer = window.setTimeout(synchronizePeriodically, JOINED_GROUP_SYNC_INTERVAL_MS);
+      }
+    }
+
+    timer = window.setTimeout(synchronizePeriodically, JOINED_GROUP_SYNC_START_DELAY_MS);
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [joinedGroup]);
+
+  useEffect(() => {
     if (!isTauri()) return;
 
     let active = true;
@@ -558,22 +582,31 @@ function App() {
     }
   }
 
-  async function synchronizeJoinedGroup() {
-    if (!joinedGroup || synchronizingGroup || !isTauri()) return;
+  async function performJoinedGroupSynchronization(groupId: string, reportErrors: boolean) {
+    if (synchronizationInFlight.current || !isTauri()) return;
 
-    setError("");
-    setSynchronizationResult(null);
+    synchronizationInFlight.current = true;
+    if (reportErrors) {
+      setError("");
+      setSynchronizationResult(null);
+    }
     setSynchronizingGroup(true);
     try {
       const result = await invoke<SynchronizeGroupResult>("synchronize_group", {
-        groupId: joinedGroup.groupId,
+        groupId,
       });
       setSynchronizationResult(result);
     } catch (reason) {
-      setError(errorMessage(reason));
+      if (reportErrors) setError(errorMessage(reason));
     } finally {
+      synchronizationInFlight.current = false;
       setSynchronizingGroup(false);
     }
+  }
+
+  async function synchronizeJoinedGroup() {
+    if (!joinedGroup) return;
+    await performJoinedGroupSynchronization(joinedGroup.groupId, true);
   }
 
   async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {

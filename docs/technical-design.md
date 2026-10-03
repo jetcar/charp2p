@@ -213,6 +213,11 @@ the group screen: it loads the protected derived discovery key, rediscovers the
 invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
 pull. While the joined-group screen is loaded, the client performs an initial
 automatic pull and retries once per minute. Manual retry remains available.
+After each verified batch commits, the client authenticates and decrypts any
+new MLS application messages it can read, binds the MLS sender credential to
+the signed event author, and adds event-bound encrypted local display copies.
+Messages from epochs before the device joined remain stored as signed opaque
+events and are not shown when their MLS ciphertext cannot be decrypted.
 
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
@@ -389,12 +394,13 @@ commit in one SQLite transaction. Any protection, encryption, or storage
 failure restores the preceding in-memory provider so a ratchet generation is
 never advanced without its event.
 
-The sender also keeps one bounded local display copy protected with
-XChaCha20-Poly1305 under the platform-protected provider wrapping key. A fresh
-nonce, a separate local-message domain, and the signed event ID as associated
-data bind that copy to its event. The local copy, signed event, and advanced MLS
-snapshot commit atomically. The owner timeline decrypts these records only when
-loading them for display.
+Each device keeps readable message text as one bounded local display copy
+protected with XChaCha20-Poly1305 under the platform-protected provider wrapping
+key. A fresh nonce, a separate local-message domain, and the signed event ID as
+associated data bind that copy to its event. The sender commits the local copy,
+signed event, and advanced MLS snapshot atomically. A receiver first commits the
+verified event batch, then atomically commits each decrypted local copy with the
+advanced receiver snapshot. Timelines decrypt these records only for display.
 
 Whichever construction is selected must provide:
 

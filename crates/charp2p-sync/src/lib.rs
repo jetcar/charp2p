@@ -216,6 +216,11 @@ impl PullSession {
         matches!(self.phase, PullPhase::Complete)
     }
 
+    /// Returns the group scope fixed when this pull session started.
+    pub fn group_id(&self) -> PeerId {
+        self.group_id
+    }
+
     fn next_author_request(
         &mut self,
         store: &EventStore,

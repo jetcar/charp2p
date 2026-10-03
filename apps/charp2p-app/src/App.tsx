@@ -121,6 +121,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_creation_failed: "The message could not be signed.",
   message_encryption_failed: "The local message copy could not be protected.",
   message_invalid: "Enter a message up to 16 KiB.",
+  message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",
   message_store_unavailable: "The encrypted message could not be saved.",
   pending_invitation_not_found: "This pending invitation is no longer available.",
@@ -267,7 +268,7 @@ function App() {
   const [outgoingMessage, setOutgoingMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
-  const [localMessages, setLocalMessages] = useState<StoredMessage[]>([]);
+  const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -454,15 +455,16 @@ function App() {
   }, [joinedGroup]);
 
   useEffect(() => {
-    if (!isTauri() || !localGroup) {
-      setLocalMessages([]);
+    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    if (!isTauri() || !groupId) {
+      setGroupMessages([]);
       return;
     }
 
     let active = true;
-    invoke<StoredMessage[]>("group_messages", { groupId: localGroup.groupId })
+    invoke<StoredMessage[]>("group_messages", { groupId })
       .then((messages) => {
-        if (active) setLocalMessages(messages);
+        if (active) setGroupMessages(messages);
       })
       .catch((reason) => {
         if (active) setError(errorMessage(reason));
@@ -470,7 +472,7 @@ function App() {
     return () => {
       active = false;
     };
-  }, [localGroup]);
+  }, [joinedGroup, localGroup]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -627,6 +629,8 @@ function App() {
         groupId,
       });
       setSynchronizationResult(result);
+      const messages = await invoke<StoredMessage[]>("group_messages", { groupId });
+      setGroupMessages(messages);
     } catch (reason) {
       if (reportErrors) setError(errorMessage(reason));
     } finally {
@@ -654,7 +658,7 @@ function App() {
         message: text,
       });
       setCreatedMessage(created);
-      setLocalMessages((messages) => [
+      setGroupMessages((messages) => [
         ...messages,
         {
           eventId: created.eventId,
@@ -866,6 +870,20 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
               </dl>
+              {groupMessages.length > 0 && (
+                <section className="message-timeline" aria-label="Messages saved on this device">
+                  <h3>Messages</h3>
+                  {groupMessages.map((message) => (
+                    <article className="message-bubble" key={message.eventId}>
+                      <p>{message.text}</p>
+                      <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
+                        {message.authorId === profile?.peerId ? "You" : joinedGroup.inviterName}
+                        {" · "}{messageTime(message.createdAtUnixMs)}
+                      </time>
+                    </article>
+                  ))}
+                </section>
+              )}
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>
               <button className="secondary-button" disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
@@ -913,10 +931,10 @@ function App() {
                   </p>
                 )}
               </form>
-              {localMessages.length > 0 && (
+              {groupMessages.length > 0 && (
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
-                  {localMessages.map((message) => (
+                  {groupMessages.map((message) => (
                     <article className="message-bubble own-message" key={message.eventId}>
                       <p>{message.text}</p>
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>

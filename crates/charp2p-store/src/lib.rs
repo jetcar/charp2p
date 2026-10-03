@@ -243,6 +243,41 @@ impl EventStore {
         Ok(messages)
     }
 
+    /// Returns at most `limit` verified message events that do not yet have a
+    /// local materialized body. Events are ordered by author and sequence so
+    /// each sender ratchet advances consistently.
+    pub fn unmaterialized_message_events(
+        &self,
+        group_id: PeerId,
+        limit: usize,
+    ) -> Result<Vec<SignedEvent>, StoreError> {
+        if !(1..=MAX_SYNC_BATCH_EVENTS).contains(&limit) {
+            return Err(StoreError::InvalidBatchLimit(limit));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT e.encoded
+             FROM events e
+             LEFT JOIN materialized_messages m ON m.event_id = e.event_id
+             WHERE e.group_id = ?1 AND m.event_id IS NULL
+             ORDER BY e.author_id, e.author_sequence",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut events = Vec::with_capacity(limit);
+        for encoded in rows {
+            let event = SignedEvent::decode(&encoded?)?;
+            if event.group_id() != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            if event.kind() == charp2p_core::EventKind::MessageCreated {
+                events.push(event);
+                if events.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(events)
+    }
+
     /// Loads and re-verifies an event by its identifier.
     pub fn get_event(&self, event_id: EventId) -> Result<Option<SignedEvent>, StoreError> {
         let encoded: Option<Vec<u8>> = self
@@ -1754,6 +1789,14 @@ mod tests {
         let author = DeviceIdentity::generate();
         let group = GroupIdentity::generate();
         let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store.put_event(&event).unwrap();
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 1)
+                .unwrap()[0]
+                .id(),
+            event.id()
+        );
 
         assert_eq!(
             store
@@ -1763,7 +1806,7 @@ mod tests {
                     b"encrypted local message",
                 )
                 .unwrap(),
-            PutEventOutcome::Inserted
+            PutEventOutcome::AlreadyPresent
         );
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
@@ -1779,6 +1822,10 @@ mod tests {
                 encrypted_body: b"encrypted local message".to_vec(),
             }]
         );
+        assert!(store
+            .unmaterialized_message_events(group.group_id(), 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

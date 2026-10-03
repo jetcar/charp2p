@@ -82,7 +82,10 @@ bounded XChaCha20-Poly1305 envelope. Use the platform-protected provider
 wrapping key, a fresh nonce, a distinct application-message domain, and the
 signed event ID as associated data. Commit this local envelope atomically with
 the signed MLS ciphertext event and the advanced provider snapshot. A failure
-in any of the three writes rolls back all of them.
+in any of the three sender writes rolls back all of them. On receipt, first
+commit the verified signed event, then authenticate the MLS sender credential
+against the event author and atomically store the decrypted local envelope with
+the advanced receiver snapshot. An unreadable earlier epoch remains opaque.
 
 The initial prototype fixes and authenticates the profile configuration,
 rejects mismatched state, and verifies group creation, chained asynchronous

@@ -13,7 +13,7 @@ use charp2p_core::{
     SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{
-    device_credential, device_id_from_credential, group_create_config,
+    decode_profile_message, device_credential, device_id_from_credential, group_create_config,
     merge_prepared_member_admission, prepare_profile_key_package, prepare_profile_member_admission,
     stage_profile_welcome, validate_group_profile, validate_profile_key_package,
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
@@ -24,7 +24,10 @@ use charp2p_store::{
 };
 use charp2p_sync::{build_authorized_response, PullSession, SessionProgress, SynchronizationError};
 use keyring_core::Error as KeyringError;
-use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
+use openmls::prelude::{
+    CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
+    ProtocolMessage,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use serde::Serialize as SerdeSerialize;
 use zeroize::Zeroizing;
@@ -211,7 +214,7 @@ impl MlsProviderService {
             .map_err(|_| "mls_provider_service_unavailable")?;
         let encrypted = store
             .encrypted_messages(group_id)
-            .map_err(|_| "message_store_unavailable")?;
+            .map_err(|_| "message_list_unavailable")?;
         if encrypted.is_empty() {
             return Ok(Vec::new());
         }
@@ -388,13 +391,114 @@ impl MlsProviderService {
             .operations
             .lock()
             .map_err(|_| "synchronization_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "synchronization_unavailable")?;
         let mut store = self
             .store
             .lock()
             .map_err(|_| "synchronization_unavailable")?;
-        session
+        let progress = session
             .handle_response(&mut store, response)
-            .map_err(|_| "synchronization_failed")
+            .map_err(|_| "synchronization_failed")?;
+        self.materialize_pending_messages(&mut provider, &mut store, session.group_id())?;
+        Ok(progress)
+    }
+
+    fn materialize_pending_messages(
+        &self,
+        provider: &mut ProfileProvider,
+        store: &mut EventStore,
+        group_id: PeerId,
+    ) -> Result<(), &'static str> {
+        loop {
+            let events = store
+                .unmaterialized_message_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+                .map_err(|_| "message_store_unavailable")?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            let mut materialized = 0usize;
+            for event in events {
+                let previous = provider
+                    .snapshot()
+                    .map_err(|_| "mls_provider_snapshot_invalid")?;
+                match self.materialize_message(provider, store, group_id, &event) {
+                    Ok(()) => materialized += 1,
+                    Err(MaterializeMessageError::Unreadable) => {
+                        *provider = ProfileProvider::from_snapshot(&previous)
+                            .map_err(|_| "mls_provider_snapshot_invalid")?;
+                    }
+                    Err(MaterializeMessageError::Unavailable(error)) => {
+                        *provider = ProfileProvider::from_snapshot(&previous)
+                            .map_err(|_| "mls_provider_snapshot_invalid")?;
+                        return Err(error);
+                    }
+                }
+            }
+            if materialized == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    fn materialize_message(
+        &self,
+        provider: &mut ProfileProvider,
+        store: &mut EventStore,
+        group_id: PeerId,
+        event: &SignedEvent,
+    ) -> Result<(), MaterializeMessageError> {
+        let mut group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map_err(|_| MaterializeMessageError::Unavailable("mls_group_storage_unavailable"))?
+        .ok_or(MaterializeMessageError::Unavailable(
+            "mls_joined_group_missing",
+        ))?;
+        validate_group_profile(&group).map_err(|_| MaterializeMessageError::Unreadable)?;
+        let message = decode_profile_message(event.protected_payload())
+            .map_err(|_| MaterializeMessageError::Unreadable)?;
+        let protocol: ProtocolMessage = message
+            .try_into_protocol_message()
+            .map_err(|_| MaterializeMessageError::Unreadable)?;
+        let processed = group
+            .process_message(&*provider, protocol)
+            .map_err(|_| MaterializeMessageError::Unreadable)?;
+        let sender = device_id_from_credential(processed.credential())
+            .map_err(|_| MaterializeMessageError::Unreadable)?;
+        if sender != event.author_id() {
+            return Err(MaterializeMessageError::Unreadable);
+        }
+        let ProcessedMessageContent::ApplicationMessage(application) = processed.into_content()
+        else {
+            return Err(MaterializeMessageError::Unreadable);
+        };
+        let plaintext = Zeroizing::new(application.into_bytes());
+        let text = std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
+        if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
+            return Err(MaterializeMessageError::Unreadable);
+        }
+        let snapshot = provider
+            .snapshot()
+            .map_err(|_| MaterializeMessageError::Unavailable("mls_provider_snapshot_invalid"))?;
+        let key = self
+            .load_or_create_wrapping_key()
+            .map_err(MaterializeMessageError::Unavailable)?;
+        let encrypted_snapshot = encrypt_snapshot(&snapshot, &key)
+            .map_err(MaterializeMessageError::Unavailable)?;
+        let encrypted_body = encrypt_local_message(&plaintext, &key, event.id().as_bytes())
+            .map_err(MaterializeMessageError::Unavailable)?;
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                event,
+                &encrypted_snapshot,
+                &encrypted_body,
+            )
+            .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
+        Ok(())
     }
 
     /// Adds one transport-authenticated device, publishes the resulting MLS
@@ -837,6 +941,11 @@ fn validate_owner_group(
 #[derive(Debug)]
 enum MlsProviderMutationError<E> {
     Operation(E),
+    Unavailable(&'static str),
+}
+
+enum MaterializeMessageError {
+    Unreadable,
     Unavailable(&'static str),
 }
 
@@ -1479,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn joined_member_pulls_and_persists_the_admission_event() {
+    fn joined_member_materializes_only_messages_from_readable_epochs() {
         let directory = tempdir().unwrap();
         let owner_path = directory.path().join("owner.sqlite3");
         let member_path = directory.path().join("member.sqlite3");
@@ -1497,6 +1606,9 @@ mod tests {
         owner_service
             .initialize_owner_group(group_id, owner.peer_id())
             .unwrap();
+        owner_service
+            .create_message_at(group_id, &owner, "Before join", 41)
+            .unwrap();
         let member_service = MlsProviderService::open_with_key_store(
             &member_path,
             Arc::new(Mutex::new(())),
@@ -1511,6 +1623,9 @@ mod tests {
             .unwrap();
         member_service
             .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        owner_service
+            .create_message_at(group_id, &owner, "After join", 43)
             .unwrap();
 
         let (mut session, mut request) = PullSession::start(group_id);
@@ -1527,14 +1642,23 @@ mod tests {
             request = progress.next_request.unwrap();
         }
 
-        assert_eq!(inserted, 1);
+        assert_eq!(inserted, 3);
+        assert_eq!(
+            member_service
+                .messages(group_id)
+                .unwrap()
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["After join"]
+        );
         let store = EventStore::open(member_path).unwrap();
         let event_ids = store
-            .event_ids_after(group_id, owner.peer_id(), 0, 1)
+            .event_ids_after(group_id, owner.peer_id(), 0, 3)
             .unwrap();
-        assert_eq!(event_ids.len(), 1);
+        assert_eq!(event_ids.len(), 3);
         assert_eq!(
-            store.get_event(event_ids[0]).unwrap().unwrap().kind(),
+            store.get_event(event_ids[1]).unwrap().unwrap().kind(),
             EventKind::MemberAdded
         );
     }

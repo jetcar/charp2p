@@ -13,9 +13,9 @@ The current shell implements device onboarding and a local invitation preview.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted
-recovery export and the received-message timeline remain later increments.
-Accepted invitations survive restarts: safe group metadata is indexed in SQLite while
-the signed bearer credential remains in platform-protected storage. Invitation
+recovery export and member-originated sending remain later increments.
+Accepted invitations survive restarts: safe group metadata is indexed in SQLite
+while the signed bearer credential remains in platform-protected storage. Invitation
 version 2 also pins the root-authorized inviter device; discovery ignores
 providers with another authenticated peer identity.
 
@@ -79,4 +79,7 @@ shows availability separately, and restores the completed joined-group card
 after restart. The joined-group card can use that protected key to rediscover
 the pinned owner and retry a bounded authorized synchronization without keeping
 the bearer invitation. It synchronizes once after loading, continues once per
-minute while the app runs, and keeps manual retry available.
+minute while the app runs, and keeps manual retry available. Readable MLS
+application messages are authenticated against their signed event authors,
+stored as event-bound encrypted local copies, and shown in the joined-group
+timeline. Messages from epochs before this device joined remain opaque.

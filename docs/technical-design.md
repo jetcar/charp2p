@@ -408,6 +408,8 @@ Each client stores:
   paired with the provider snapshot that contains its private material.
 - Non-secret display metadata for joined groups, promoted atomically from the
   pending invitation after MLS completion.
+- One opaque derived discovery key per joined group in platform-protected
+  storage. It supports later peer lookup but carries no join authorization.
 - User preferences and local blocks.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential
@@ -416,6 +418,10 @@ the indexed metadata whenever the pending join is loaded. After a successful
 join, SQLite atomically promotes the authenticated display metadata and removes
 the pending record; protected-storage bearer deletion is retried idempotently
 if cleanup is interrupted.
+
+The client first saves the invitation's derived discovery key under a separate
+versioned protected-storage entry, then promotes the metadata, then deletes the
+bearer. A failed metadata promotion restores the earlier discovery-key record.
 
 Secrets must be excluded from diagnostics, notifications, URLs sent to web
 servers, and routine logs.

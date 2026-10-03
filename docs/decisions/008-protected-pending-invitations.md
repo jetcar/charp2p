@@ -27,12 +27,21 @@ invitation and compare every SQLite metadata field with its authenticated
 claims. Fail closed on a missing, damaged, or mismatched record. Remove expired
 pending invitations from both stores after successful verification.
 
+Before a completed join deletes the bearer invitation, derive its opaque
+32-byte DHT discovery key and store that key under a separate versioned
+credential-store entry. Persist this key before promoting the SQLite record so
+an interrupted write cannot create a newly joined group without its future
+rendezvous key. The derived key locates providers but cannot authorize group
+membership or another join.
+
 ## Consequences
 
 - The discovery secret does not enter SQLite or the JavaScript runtime.
 - Editable metadata cannot change what the UI displays without detection.
 - Saving one newer invitation for the same group replaces the previous pending
   capability and metadata.
+- Completed members retain the minimum protected rendezvous material needed to
+  rediscover peers without retaining the join capability.
 - Larger future invitation formats need another protected-storage strategy.
 - Writes span two storage systems and cannot use one atomic transaction; a
   failed metadata write may leave an unreachable credential record.

@@ -9,6 +9,11 @@ const DISCOVERY_KEY_DOMAIN: &[u8] = b"charp2p-rendezvous-v1\0";
 pub struct DiscoveryKey([u8; 32]);
 
 impl DiscoveryKey {
+    /// Restores a previously derived rendezvous key from protected storage.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Derives the rendezvous key carried implicitly by a verified invitation.
     pub fn from_invitation(invitation: &Invitation) -> Self {
         Self::derive(invitation.group_id(), invitation.discovery_secret())
@@ -75,5 +80,12 @@ mod tests {
             DiscoveryKey::derive(first_group.group_id(), &first_secret),
             DiscoveryKey::derive(first_group.group_id(), &second_secret)
         );
+    }
+
+    #[test]
+    fn derived_key_round_trips_through_protected_bytes() {
+        let key = DiscoveryKey::derive(GroupIdentity::generate().group_id(), &[7; 32]);
+
+        assert_eq!(DiscoveryKey::from_bytes(*key.as_bytes()), key);
     }
 }

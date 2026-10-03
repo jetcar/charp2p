@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use charp2p_core::{HistoryPolicy, Invitation, PeerId};
+use charp2p_core::{DiscoveryKey, HistoryPolicy, Invitation, PeerId};
 use charp2p_store::{EventStore, JoinedGroupMetadata, PendingInvitationMetadata};
 use keyring_core::Error as KeyringError;
 use serde::Serialize;
@@ -14,6 +14,7 @@ use crate::{identity::protected_entry, invitation::public_error_code};
 
 const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
 const CREDENTIAL_PREFIX: &str = "pending-invitation-v1-";
+const DISCOVERY_CREDENTIAL_PREFIX: &str = "joined-discovery-v1-";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +44,15 @@ trait InvitationSecretStore: Send + Sync {
     fn remove(&self, group_id: PeerId) -> Result<(), &'static str>;
 }
 
+trait JoinedDiscoveryStore: Send + Sync {
+    fn put(&self, group_id: PeerId, key: &DiscoveryKey) -> Result<(), &'static str>;
+    fn get_optional(&self, group_id: PeerId) -> Result<Option<DiscoveryKey>, &'static str>;
+    fn remove(&self, group_id: PeerId) -> Result<(), &'static str>;
+}
+
 struct PlatformInvitationSecretStore;
+
+struct PlatformJoinedDiscoveryStore;
 
 impl InvitationSecretStore for PlatformInvitationSecretStore {
     fn put(&self, group_id: PeerId, encoded: &[u8]) -> Result<(), &'static str> {
@@ -68,10 +77,39 @@ impl InvitationSecretStore for PlatformInvitationSecretStore {
     }
 }
 
+impl JoinedDiscoveryStore for PlatformJoinedDiscoveryStore {
+    fn put(&self, group_id: PeerId, key: &DiscoveryKey) -> Result<(), &'static str> {
+        protected_entry(&discovery_credential_user(group_id))?
+            .set_secret(key.as_bytes())
+            .map_err(|_| "joined_discovery_store_unavailable")
+    }
+
+    fn get_optional(&self, group_id: PeerId) -> Result<Option<DiscoveryKey>, &'static str> {
+        let bytes = match protected_entry(&discovery_credential_user(group_id))?.get_secret() {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(KeyringError::NoEntry) => return Ok(None),
+            Err(_) => return Err("joined_discovery_store_unavailable"),
+        };
+        let bytes: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "joined_discovery_record_invalid")?;
+        Ok(Some(DiscoveryKey::from_bytes(bytes)))
+    }
+
+    fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
+        match protected_entry(&discovery_credential_user(group_id))?.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(_) => Err("joined_discovery_store_unavailable"),
+        }
+    }
+}
+
 pub struct PendingInvitationService {
     operations: Arc<Mutex<()>>,
     metadata: Mutex<EventStore>,
     secrets: Box<dyn InvitationSecretStore>,
+    discovery: Box<dyn JoinedDiscoveryStore>,
 }
 
 impl PendingInvitationService {
@@ -82,6 +120,7 @@ impl PendingInvitationService {
                 EventStore::open(path).map_err(|_| "pending_invitation_store_unavailable")?,
             ),
             secrets: Box::new(PlatformInvitationSecretStore),
+            discovery: Box::new(PlatformJoinedDiscoveryStore),
         })
     }
 
@@ -113,6 +152,16 @@ impl PendingInvitationService {
             .joined_groups()
             .map_err(|_| "pending_invitation_store_unavailable")?;
         for group in &groups {
+            if self.discovery.get_optional(group.group_id)?.is_none() {
+                if let Some(encoded) = self.secrets.get_optional(group.group_id)? {
+                    let invitation = decode_stored_invitation(&encoded, 0)?;
+                    if !joined_metadata_matches_invitation(group, &invitation) {
+                        return Err("pending_invitation_record_invalid");
+                    }
+                    self.discovery
+                        .put(group.group_id, &DiscoveryKey::from_invitation(&invitation))?;
+                }
+            }
             self.secrets.remove(group.group_id)?;
         }
         Ok(groups.into_iter().map(JoinedGroup::from_metadata).collect())
@@ -133,6 +182,16 @@ impl PendingInvitationService {
             .into_iter()
             .find(|joined| joined.group_id == group_id)
         {
+            if self.discovery.get_optional(group_id)?.is_none() {
+                if let Some(encoded) = self.secrets.get_optional(group_id)? {
+                    let invitation = decode_stored_invitation(&encoded, 0)?;
+                    if invitation.group_id() != group_id {
+                        return Err("pending_invitation_record_invalid");
+                    }
+                    self.discovery
+                        .put(group_id, &DiscoveryKey::from_invitation(&invitation))?;
+                }
+            }
             self.secrets.remove(group_id)?;
             return Ok(JoinedGroup::from_metadata(joined));
         }
@@ -150,9 +209,19 @@ impl PendingInvitationService {
         if !metadata_matches_invitation(&stored, &invitation) {
             return Err("pending_invitation_record_invalid");
         }
-        metadata
+        let previous_discovery = self.discovery.get_optional(group_id)?;
+        self.discovery
+            .put(group_id, &DiscoveryKey::from_invitation(&invitation))?;
+        if metadata
             .promote_pending_invitation_to_joined_group(group_id, invitation.inviter_device_id())
-            .map_err(|_| "pending_invitation_store_unavailable")?;
+            .is_err()
+        {
+            match previous_discovery {
+                Some(previous) => self.discovery.put(group_id, &previous)?,
+                None => self.discovery.remove(group_id)?,
+            }
+            return Err("pending_invitation_store_unavailable");
+        }
         let joined = metadata
             .joined_groups()
             .map_err(|_| "pending_invitation_store_unavailable")?
@@ -323,6 +392,10 @@ fn credential_user(group_id: PeerId) -> String {
     format!("{CREDENTIAL_PREFIX}{group_id}")
 }
 
+fn discovery_credential_user(group_id: PeerId) -> String {
+    format!("{DISCOVERY_CREDENTIAL_PREFIX}{group_id}")
+}
+
 fn history_policy_name(policy: HistoryPolicy) -> &'static str {
     match policy {
         HistoryPolicy::None => "none",
@@ -343,6 +416,17 @@ fn metadata_matches_invitation(
         && metadata.reusable == invitation.is_reusable()
 }
 
+fn joined_metadata_matches_invitation(
+    metadata: &JoinedGroupMetadata,
+    invitation: &Invitation,
+) -> bool {
+    metadata.group_id == invitation.group_id()
+        && metadata.group_name == invitation.group_name()
+        && metadata.inviter_name == invitation.inviter_name()
+        && metadata.inviter_device_id == invitation.inviter_device_id()
+        && metadata.history_policy == invitation.history_policy()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -352,7 +436,7 @@ mod tests {
     };
     use charp2p_store::EventStore;
 
-    use super::{InvitationSecretStore, PendingInvitationService};
+    use super::{InvitationSecretStore, JoinedDiscoveryStore, PendingInvitationService};
 
     const NOW: u64 = 1_800_000_000;
 
@@ -393,11 +477,50 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MemoryDiscoveryStore {
+        saved: Mutex<Vec<(PeerId, charp2p_core::DiscoveryKey)>>,
+    }
+
+    impl JoinedDiscoveryStore for MemoryDiscoveryStore {
+        fn put(
+            &self,
+            group_id: PeerId,
+            key: &charp2p_core::DiscoveryKey,
+        ) -> Result<(), &'static str> {
+            self.saved.lock().unwrap().push((group_id, *key));
+            Ok(())
+        }
+
+        fn get_optional(
+            &self,
+            group_id: PeerId,
+        ) -> Result<Option<charp2p_core::DiscoveryKey>, &'static str> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(stored_group, _)| *stored_group == group_id)
+                .map(|(_, key)| *key))
+        }
+
+        fn remove(&self, group_id: PeerId) -> Result<(), &'static str> {
+            self.saved
+                .lock()
+                .unwrap()
+                .retain(|(stored_group, _)| *stored_group != group_id);
+            Ok(())
+        }
+    }
+
     fn service() -> PendingInvitationService {
         PendingInvitationService {
             operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::<MemorySecretStore>::default(),
+            discovery: Box::<MemoryDiscoveryStore>::default(),
         }
     }
 
@@ -436,6 +559,9 @@ mod tests {
     fn completed_join_moves_safe_metadata_and_removes_the_bearer() {
         let service = service();
         let (encoded, group_id) = invitation();
+        let expected_key = charp2p_core::DiscoveryKey::from_invitation(
+            &Invitation::decode(&encoded, NOW).unwrap(),
+        );
         let pending = service.accept_at(&encoded, NOW).unwrap();
 
         let joined = service.complete_join(group_id).unwrap();
@@ -447,9 +573,36 @@ mod tests {
         assert_eq!(service.complete_join(group_id).unwrap(), joined);
         assert!(service.secrets.get_optional(group_id).unwrap().is_none());
         assert_eq!(
+            service.discovery.get_optional(group_id),
+            Ok(Some(expected_key))
+        );
+        assert_eq!(
             service.accept_at(&encoded, NOW),
             Err("group_already_joined")
         );
+    }
+
+    #[test]
+    fn joined_listing_recovers_discovery_before_interrupted_bearer_cleanup() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        let invitation = Invitation::decode(&encoded, NOW).unwrap();
+        let expected_key = charp2p_core::DiscoveryKey::from_invitation(&invitation);
+        service.accept_at(&encoded, NOW).unwrap();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .promote_pending_invitation_to_joined_group(group_id, invitation.inviter_device_id())
+            .unwrap();
+
+        assert_eq!(service.discovery.get_optional(group_id), Ok(None));
+        assert_eq!(service.joined().unwrap().len(), 1);
+        assert_eq!(
+            service.discovery.get_optional(group_id),
+            Ok(Some(expected_key))
+        );
+        assert!(service.secrets.get_optional(group_id).unwrap().is_none());
     }
 
     #[test]

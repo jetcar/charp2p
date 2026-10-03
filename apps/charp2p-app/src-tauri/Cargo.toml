@@ -22,6 +22,7 @@ charp2p-core = { path = "../../../crates/charp2p-core" }
 charp2p-mls = { path = "../../../crates/charp2p-mls" }
 charp2p-network = { path = "../../../crates/charp2p-network" }
 charp2p-store = { path = "../../../crates/charp2p-store" }
+charp2p-sync = { path = "../../../crates/charp2p-sync" }
 chacha20poly1305 = "0.10.1"
 getrandom = "0.4.3"
 keyring-core = "1.0.0"

@@ -196,6 +196,13 @@ Discovery and transport authentication do not grant group access. Until the
 join protocol authorizes a device, an advertiser rejects its synchronization
 requests.
 
+After durable admission, the same advertiser checks the authenticated libp2p
+peer against the current MLS group membership before serving synchronization.
+Authorized peers receive bounded summaries, event-ID pages, and signed event
+envelopes from the local event store. Non-members receive only `unauthorized`;
+invalid requests are rejected by the network codec before application access,
+and temporary MLS or storage failures return `busy`.
+
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
 Welcome. Invitation payloads are limited to 8 KiB; KeyPackages and Welcomes are

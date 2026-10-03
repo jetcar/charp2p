@@ -10,7 +10,7 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
-    SignedEvent,
+    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{
     device_credential, device_id_from_credential, group_create_config,
@@ -19,6 +19,7 @@ use charp2p_mls::{
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
 };
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
+use charp2p_sync::{build_authorized_response, SynchronizationError};
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
 use openmls_basic_credential::SignatureKeyPair;
@@ -150,6 +151,50 @@ impl MlsProviderService {
         )
         .map(|group| group.is_some())
         .map_err(|_| "mls_group_storage_unavailable")
+    }
+
+    pub(crate) fn answer_sync_request(
+        &self,
+        authenticated_peer: PeerId,
+        request: &SyncRequest,
+    ) -> SyncResponse {
+        let Ok(_operation) = self.operations.lock() else {
+            return SyncResponse::Rejected {
+                reason: SyncRejectReason::Busy,
+            };
+        };
+        let Ok(provider) = self.provider.lock() else {
+            return SyncResponse::Rejected {
+                reason: SyncRejectReason::Busy,
+            };
+        };
+        let group_id = sync_request_group_id(request);
+        let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
+        let Ok(Some(group)) = MlsGroup::load(provider.storage(), &mls_group_id) else {
+            return SyncResponse::Rejected {
+                reason: SyncRejectReason::Unauthorized,
+            };
+        };
+        let authorized = group.members().any(|member| {
+            device_id_from_credential(&member.credential)
+                .is_ok_and(|device_id| device_id == authenticated_peer)
+        });
+        if !authorized {
+            return SyncResponse::Rejected {
+                reason: SyncRejectReason::Unauthorized,
+            };
+        }
+        let Ok(store) = self.store.lock() else {
+            return SyncResponse::Rejected {
+                reason: SyncRejectReason::Busy,
+            };
+        };
+        build_authorized_response(&store, request).unwrap_or_else(|error| SyncResponse::Rejected {
+            reason: match error {
+                SynchronizationError::Protocol(_) => SyncRejectReason::InvalidRequest,
+                _ => SyncRejectReason::Busy,
+            },
+        })
     }
 
     /// Adds one transport-authenticated device, publishes the resulting MLS
@@ -594,6 +639,14 @@ fn restore_provider<E>(
     Ok(())
 }
 
+fn sync_request_group_id(request: &SyncRequest) -> PeerId {
+    match request {
+        SyncRequest::Summary { group_id }
+        | SyncRequest::EventIds { group_id, .. }
+        | SyncRequest::Events { group_id, .. } => *group_id,
+    }
+}
+
 fn encrypt_snapshot(
     snapshot: &[u8],
     key: &[u8; WRAPPING_KEY_BYTES],
@@ -654,6 +707,7 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
+        SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         device_credential, device_id_from_credential, group_create_config,
@@ -988,6 +1042,48 @@ mod tests {
         assert!(members.contains(&owner.peer_id()));
         assert!(members.contains(&member_id));
         assert!(members.contains(&second_member_id));
+    }
+
+    #[test]
+    fn synchronization_is_served_only_to_an_mls_group_member() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (_, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
+            .unwrap();
+
+        let request = SyncRequest::Summary { group_id };
+        let response = service.answer_sync_request(member_id, &request);
+        let SyncResponse::Summary {
+            group_id: response_group,
+            heads,
+        } = response
+        else {
+            panic!("member should receive a synchronization summary");
+        };
+        assert_eq!(response_group, group_id);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].author_id, owner.peer_id());
+        assert_eq!(heads[0].contiguous_sequence, 1);
+        assert_eq!(
+            service.answer_sync_request(DeviceIdentity::generate().peer_id(), &request),
+            SyncResponse::Rejected {
+                reason: SyncRejectReason::Unauthorized,
+            }
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, JoinResponse,
-    SyncRejectReason,
+    SyncRequest, SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{NetworkEvent, NetworkNode};
@@ -62,6 +62,14 @@ trait PendingJoinService: Send + Sync {
     fn complete_join(&self, group_id: PeerId, encoded_welcome: &[u8]) -> Result<(), &'static str>;
 }
 
+trait SynchronizationService: Send + Sync {
+    fn answer_sync_request(
+        &self,
+        authenticated_peer: PeerId,
+        request: &SyncRequest,
+    ) -> SyncResponse;
+}
+
 impl MemberAdmissionService for MlsProviderService {
     fn admit_member(
         &self,
@@ -91,6 +99,16 @@ impl PendingJoinService for MlsProviderService {
 
     fn complete_join(&self, group_id: PeerId, encoded_welcome: &[u8]) -> Result<(), &'static str> {
         MlsProviderService::complete_join(self, group_id, encoded_welcome)
+    }
+}
+
+impl SynchronizationService for MlsProviderService {
+    fn answer_sync_request(
+        &self,
+        authenticated_peer: PeerId,
+        request: &SyncRequest,
+    ) -> SyncResponse {
+        MlsProviderService::answer_sync_request(self, authenticated_peer, request)
     }
 }
 
@@ -140,6 +158,7 @@ pub struct NetworkService {
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
+    synchronization: Arc<dyn SynchronizationService>,
 }
 
 impl NetworkService {
@@ -153,6 +172,7 @@ impl NetworkService {
             &environment,
             join_authorizer,
             member_admission.clone(),
+            member_admission.clone(),
             member_admission,
         )
     }
@@ -165,6 +185,7 @@ impl NetworkService {
             Arc::new(UnavailableJoinRequestAuthorizer),
             Arc::new(UnavailableMemberAdmissionService),
             Arc::new(UnavailablePendingJoinService),
+            Arc::new(UnavailableSynchronizationService),
         )
     }
 
@@ -174,6 +195,7 @@ impl NetworkService {
         join_authorizer: Arc<dyn JoinRequestAuthorizer>,
         member_admission: Arc<dyn MemberAdmissionService>,
         pending_join: Arc<dyn PendingJoinService>,
+        synchronization: Arc<dyn SynchronizationService>,
     ) -> Result<Self, &'static str> {
         let configured = built_in.iter().copied().chain(
             environment
@@ -196,6 +218,7 @@ impl NetworkService {
             join_authorizer,
             member_admission,
             pending_join,
+            synchronization,
         })
     }
 
@@ -259,9 +282,13 @@ impl NetworkService {
                         key: failed,
                         operation: charp2p_network::DiscoveryOperation::Announcement,
                     } if failed == key => return Err("network_unavailable"),
-                    NetworkEvent::SyncRequestReceived { request_id, .. } => {
-                        let _ =
-                            node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
+                    NetworkEvent::SyncRequestReceived {
+                        peer_id,
+                        request_id,
+                        request,
+                    } => {
+                        let response = self.synchronization.answer_sync_request(peer_id, &request);
+                        let _ = node.send_sync_response(request_id, response);
                     }
                     NetworkEvent::JoinRequestReceived {
                         peer_id,
@@ -289,6 +316,7 @@ impl NetworkService {
         let expires_at_unix = invitation.expires_at_unix();
         let join_authorizer = Arc::clone(&self.join_authorizer);
         let member_admission = Arc::clone(&self.member_admission);
+        let synchronization = Arc::clone(&self.synchronization);
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
                 Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
@@ -312,11 +340,14 @@ impl NetworkService {
                                 key: failed,
                                 operation: charp2p_network::DiscoveryOperation::Announcement,
                             } if failed == key => break,
-                            NetworkEvent::SyncRequestReceived { request_id, .. } => {
-                                let _ = node.reject_sync_request(
-                                    request_id,
-                                    SyncRejectReason::Unauthorized,
-                                );
+                            NetworkEvent::SyncRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } => {
+                                let response = synchronization
+                                    .answer_sync_request(peer_id, &request);
+                                let _ = node.send_sync_response(request_id, response);
                             }
                             NetworkEvent::JoinRequestReceived {
                                 peer_id,
@@ -667,6 +698,22 @@ impl PendingJoinService for UnavailablePendingJoinService {
     }
 }
 
+#[cfg(test)]
+struct UnavailableSynchronizationService;
+
+#[cfg(test)]
+impl SynchronizationService for UnavailableSynchronizationService {
+    fn answer_sync_request(
+        &self,
+        _authenticated_peer: PeerId,
+        _request: &SyncRequest,
+    ) -> SyncResponse {
+        SyncResponse::Rejected {
+            reason: charp2p_core::SyncRejectReason::Unauthorized,
+        }
+    }
+}
+
 fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
     let expiry = UNIX_EPOCH
         .checked_add(Duration::from_secs(expires_at_unix))
@@ -713,8 +760,9 @@ mod tests {
     use super::{
         join_response, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
         JoinRequestAuthorizer, MemberAdmissionService, NetworkService, PeerSearchResult,
-        PendingJoinService, UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
-        UnavailablePendingJoinService,
+        PendingJoinService, SynchronizationService, UnavailableJoinRequestAuthorizer,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService,
+        UnavailableSynchronizationService,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -739,6 +787,35 @@ mod tests {
             _encoded_key_package: &[u8],
         ) -> Result<JoinResponse, MemberAdmissionError> {
             JoinResponse::accepted(vec![4, 5, 6]).map_err(|_| MemberAdmissionError::Unavailable)
+        }
+    }
+
+    struct MemberSynchronizationService {
+        expected_peer: PeerId,
+        group_id: PeerId,
+    }
+
+    impl SynchronizationService for MemberSynchronizationService {
+        fn answer_sync_request(
+            &self,
+            authenticated_peer: PeerId,
+            request: &SyncRequest,
+        ) -> SyncResponse {
+            if authenticated_peer == self.expected_peer
+                && matches!(
+                    request,
+                    SyncRequest::Summary { group_id } if *group_id == self.group_id
+                )
+            {
+                SyncResponse::Summary {
+                    group_id: self.group_id,
+                    heads: Vec::new(),
+                }
+            } else {
+                SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                }
+            }
         }
     }
 
@@ -1036,6 +1113,7 @@ mod tests {
                 )),
                 Arc::new(AcceptingMemberAdmissionService),
                 Arc::new(UnavailablePendingJoinService),
+                Arc::new(UnavailableSynchronizationService),
             )
             .unwrap();
             let advertise = owner_service.advertise(owner, owner_signer, &invitation);
@@ -1059,6 +1137,7 @@ mod tests {
                 Arc::new(UnavailableJoinRequestAuthorizer),
                 Arc::new(UnavailableMemberAdmissionService),
                 pending_join.clone(),
+                Arc::new(UnavailableSynchronizationService),
             )
             .unwrap();
             let join = joiner_service.join(DeviceIdentity::generate(), &invitation);
@@ -1351,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_rejects_unauthorized_requests() {
+    fn advertisement_serves_member_sync_but_rejects_unauthorized_join() {
         let now = unix_now();
         let group = GroupIdentity::generate();
         let (owner, owner_signer) = identity_pair();
@@ -1370,6 +1449,8 @@ mod tests {
         )
         .unwrap();
         tauri::async_runtime::block_on(async {
+            let requester_identity = DeviceIdentity::generate();
+            let requester_id = requester_identity.peer_id();
             let mut routing =
                 NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
             let routing_id = routing.peer_id();
@@ -1390,6 +1471,10 @@ mod tests {
                 )),
                 Arc::new(UnavailableMemberAdmissionService),
                 Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: requester_id,
+                    group_id: invitation.group_id(),
+                }),
             )
             .unwrap();
             {
@@ -1408,7 +1493,7 @@ mod tests {
                 .unwrap();
             }
 
-            let mut requester = NetworkNode::new(DeviceIdentity::generate().into_network_keypair());
+            let mut requester = NetworkNode::new(requester_identity.into_network_keypair());
             requester
                 .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
                 .unwrap();
@@ -1446,12 +1531,13 @@ mod tests {
                 }
             })
             .await
-            .expect("unauthorized sync request should receive a response");
+            .expect("member sync request should receive a response");
 
             assert_eq!(
                 response,
-                SyncResponse::Rejected {
-                    reason: SyncRejectReason::Unauthorized,
+                SyncResponse::Summary {
+                    group_id: invitation.group_id(),
+                    heads: Vec::new(),
                 }
             );
 

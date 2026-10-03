@@ -13,7 +13,7 @@ The current shell implements device onboarding and a local invitation preview.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted
-recovery export and the joined-group interface remain later increments. Accepted
+recovery export and the message timeline remain later increments. Accepted
 invitations survive restarts: safe group metadata is indexed in SQLite while
 the signed bearer credential remains in platform-protected storage. Invitation
 version 2 also pins the root-authorized inviter device; discovery ignores
@@ -52,6 +52,11 @@ wrapping key stays in the platform keyring. Revocation events and the initial
 protected membership event remain later increments. Until the groups list is
 implemented, the backend enforces one locally created group so extra protected
 roots cannot become hidden from the interface.
+
+While an owner advertises an active invitation, authenticated devices already
+present in its MLS group can request bounded synchronization summaries, event
+identifier pages, and signed events. Devices outside that MLS membership get
+only the stable unauthorized response.
 
 The joining client now prepares and reuses one durable MLS KeyPackage, finds
 the invitation's pinned owner through the DHT, exchanges the join request over

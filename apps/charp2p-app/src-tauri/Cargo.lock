@@ -768,6 +768,7 @@ dependencies = [
  "charp2p-mls",
  "charp2p-network",
  "charp2p-store",
+ "charp2p-sync",
  "getrandom 0.4.3",
  "keyring-core",
  "libp2p",
@@ -832,6 +833,15 @@ version = "0.1.0"
 dependencies = [
  "charp2p-core",
  "rusqlite",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "charp2p-sync"
+version = "0.1.0"
+dependencies = [
+ "charp2p-core",
+ "charp2p-store",
  "thiserror 2.0.21",
 ]
 

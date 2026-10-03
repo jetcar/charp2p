@@ -30,7 +30,7 @@ const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
-const MAX_INITIAL_SYNC_EXCHANGES: usize = 4_096;
+const MAX_SYNC_EXCHANGES: usize = 4_096;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -153,6 +153,14 @@ pub struct AdvertisementResult {
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinGroupResult {
+    pub status: &'static str,
+    pub group_id: String,
+    pub synchronized_events: usize,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SynchronizeGroupResult {
     pub status: &'static str,
     pub group_id: String,
     pub synchronized_events: usize,
@@ -527,62 +535,9 @@ impl NetworkService {
             .pending_join
             .prepare_join_request(local_peer, invitation)?;
         let key = DiscoveryKey::from_invitation(invitation);
-        let mut node = NetworkNode::new(identity.into_network_keypair());
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
-        for bootstrap in &self.bootstrap_peers {
-            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
-        }
-        node.bootstrap().map_err(|_| "network_unavailable")?;
-        node.find_group_peers(key);
-
-        let already_connected = timeout(PROVIDER_SEARCH_TIMEOUT, async {
-            let mut connected = false;
-            loop {
-                match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id } if peer_id == expected_inviter => {
-                        connected = true;
-                    }
-                    NetworkEvent::GroupPeersFound {
-                        key: found_key,
-                        providers,
-                    } if found_key == key && providers.contains(&expected_inviter) => {
-                        return Ok(connected);
-                    }
-                    NetworkEvent::GroupPeerSearchFinished { key: found_key }
-                        if found_key == key =>
-                    {
-                        return Err("network_peer_not_found");
-                    }
-                    NetworkEvent::DiscoveryFailed {
-                        key: failed_key, ..
-                    } if failed_key == key => return Err("network_unavailable"),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| "network_search_timed_out")??;
-
-        if !already_connected {
-            node.dial_peer(expected_inviter)
-                .map_err(|_| "network_peer_unreachable")?;
-            timeout(CONNECT_TIMEOUT, async {
-                loop {
-                    if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
-                        if peer_id == expected_inviter {
-                            break;
-                        }
-                    }
-                }
-            })
-            .await
-            .map_err(|_| "network_peer_unreachable")?;
-        }
+        let mut node = self
+            .connect_to_group_provider(identity, key, expected_inviter)
+            .await?;
 
         let request_id = node.send_join_request(expected_inviter, request);
         let response = timeout(JOIN_RESPONSE_TIMEOUT, async {
@@ -629,6 +584,97 @@ impl NetworkService {
         })
     }
 
+    pub async fn synchronize(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        group_id: PeerId,
+        expected_peer: PeerId,
+    ) -> Result<SynchronizeGroupResult, &'static str> {
+        if identity.peer_id() == expected_peer {
+            return Err("synchronization_peer_invalid");
+        }
+        let mut node = self
+            .connect_to_group_provider(identity, key, expected_peer)
+            .await?;
+        let synchronized_events = self
+            .pull_from_connected_peer(&mut node, expected_peer, group_id)
+            .await?;
+        Ok(SynchronizeGroupResult {
+            status: "synchronized",
+            group_id: group_id.to_string(),
+            synchronized_events,
+        })
+    }
+
+    async fn connect_to_group_provider(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        expected_peer: PeerId,
+    ) -> Result<NetworkNode, &'static str> {
+        if self.bootstrap_peers.is_empty() {
+            return Err("network_bootstrap_required");
+        }
+        let mut node = NetworkNode::new(identity.into_network_keypair());
+        node.listen_on(
+            "/ip4/0.0.0.0/udp/0/quic-v1"
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+        for bootstrap in &self.bootstrap_peers {
+            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+        }
+        node.bootstrap().map_err(|_| "network_unavailable")?;
+        node.find_group_peers(key);
+
+        let already_connected = timeout(PROVIDER_SEARCH_TIMEOUT, async {
+            let mut connected = false;
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::PeerConnected { peer_id } if peer_id == expected_peer => {
+                        connected = true;
+                    }
+                    NetworkEvent::GroupPeersFound {
+                        key: found_key,
+                        providers,
+                    } if found_key == key && providers.contains(&expected_peer) => {
+                        return Ok(connected);
+                    }
+                    NetworkEvent::GroupPeerSearchFinished { key: found_key }
+                        if found_key == key =>
+                    {
+                        return Err("network_peer_not_found");
+                    }
+                    NetworkEvent::DiscoveryFailed {
+                        key: failed_key, ..
+                    } if failed_key == key => return Err("network_unavailable"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "network_search_timed_out")??;
+
+        if !already_connected {
+            node.dial_peer(expected_peer)
+                .map_err(|_| "network_peer_unreachable")?;
+            timeout(CONNECT_TIMEOUT, async {
+                loop {
+                    if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
+                        if peer_id == expected_peer {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "network_peer_unreachable")?;
+        }
+        Ok(node)
+    }
+
     async fn pull_from_connected_peer(
         &self,
         node: &mut NetworkNode,
@@ -637,7 +683,7 @@ impl NetworkService {
     ) -> Result<usize, &'static str> {
         let (mut session, mut request) = PullSession::start(group_id);
         let mut inserted = 0_usize;
-        for _ in 0..MAX_INITIAL_SYNC_EXCHANGES {
+        for _ in 0..MAX_SYNC_EXCHANGES {
             let request_id = node
                 .send_sync_request(peer_id, request)
                 .map_err(|_| "synchronization_failed")?;
@@ -1267,6 +1313,105 @@ mod tests {
             assert_eq!(result.group_id, invitation.group_id().to_string());
             assert_eq!(result.synchronized_events, 3);
             assert!(pending_join.completed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn joined_member_rediscovers_the_owner_and_synchronizes() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
+        let invitation = Invitation::issue(
+            &group,
+            owner_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        let discovery_key = DiscoveryKey::from_invitation(&invitation);
+
+        tauri::async_runtime::block_on(async {
+            let member_identity = DeviceIdentity::generate();
+            let member_id = member_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let bootstrap = format!("{address}/p2p/{routing_id}");
+            let owner_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstrap,
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: member_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let advertise = owner_service.advertise(owner, owner_signer, &invitation);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+
+            let member_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstrap,
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let synchronize = member_service.synchronize(
+                member_identity,
+                discovery_key,
+                invitation.group_id(),
+                owner_id,
+            );
+            tokio::pin!(synchronize);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut synchronize => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("synchronization should complete")
+            .unwrap();
+
+            assert_eq!(result.status, "synchronized");
+            assert_eq!(result.group_id, invitation.group_id().to_string());
+            assert_eq!(result.synchronized_events, 3);
         });
     }
 

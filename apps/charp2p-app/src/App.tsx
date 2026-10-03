@@ -41,6 +41,11 @@ type AdvertisementResult = {
   status: "advertising" | "bootstrapRequired";
   expiresAtUnix: number;
 };
+type SynchronizeGroupResult = {
+  status: "synchronized";
+  groupId: string;
+  synchronizedEvents: number;
+};
 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
@@ -52,7 +57,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_record_invalid: "The stored identity is damaged and cannot be opened.",
   identity_service_unavailable: "The identity service is unavailable.",
   identity_store_unavailable: "Protected device storage is unavailable.",
-  identity_missing: "Create a device identity before searching for peers.",
+  identity_missing: "Create a device identity before connecting to peers.",
   group_creation_failed: "The group identity could not be created.",
   group_creation_rollback_failed: "Group setup failed and could not be safely rolled back.",
   group_already_exists: "This version supports one local group at a time.",
@@ -78,7 +83,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   invitation_signature_invalid: "The invitation signature could not be verified.",
   invalid_device_name: "Enter 1–48 characters using no more than 80 UTF-8 bytes.",
   network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
-  network_bootstrap_required: "Configure a bootstrap node before joining.",
+  network_bootstrap_required: "Configure a bootstrap node before connecting to peers.",
   network_configuration_invalid: "The peer network configuration is invalid.",
   network_join_failed: "The secure join exchange failed. Try again.",
   network_join_timed_out: "The group owner did not answer in time. Try again.",
@@ -88,6 +93,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_unavailable: "The peer network is unavailable.",
   mls_group_creation_failed: "Secure group setup failed.",
   mls_group_already_joined: "This device already belongs to that group.",
+  mls_joined_group_missing: "Stored secure membership for this group is missing.",
   mls_group_storage_unavailable: "Secure group storage is unavailable.",
   mls_provider_encryption_failed: "Secure group state could not be encrypted.",
   mls_provider_service_unavailable: "Secure group state is temporarily unavailable.",
@@ -103,9 +109,20 @@ const ERROR_MESSAGES: Record<string, string> = {
   pending_invitation_record_invalid: "A saved invitation is damaged and cannot be opened.",
   pending_invitation_store_unavailable: "The invitation could not be saved securely.",
   pending_invitation_too_large: "This invitation is too large for protected device storage.",
+  joined_group_not_found: "This joined group is no longer available.",
+  joined_discovery_record_missing: "Peer discovery for this group is unavailable on this device.",
+  joined_discovery_record_invalid: "Stored peer discovery information is damaged.",
+  joined_discovery_store_unavailable: "Protected peer discovery storage is unavailable.",
   join_busy: "The group owner is busy. Try again shortly.",
   join_unauthorized: "The group owner did not accept this invitation.",
   join_unsupported_profile: "The group uses an unsupported security profile.",
+  synchronization_busy: "The group peer is busy. Try again shortly.",
+  synchronization_failed: "Group synchronization failed. Try again.",
+  synchronization_limit_exceeded: "Group synchronization exceeded its safe exchange limit.",
+  synchronization_peer_invalid: "The saved synchronization peer is invalid.",
+  synchronization_timed_out: "The group peer did not answer in time. Try again.",
+  synchronization_unauthorized: "This device is no longer authorized to synchronize the group.",
+  synchronization_unavailable: "Group synchronization is temporarily unavailable.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -217,6 +234,9 @@ function App() {
   const [verifyingInvite, setVerifyingInvite] = useState(false);
   const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
   const [joinedGroup, setJoinedGroup] = useState<JoinedGroup | null>(null);
+  const [synchronizingGroup, setSynchronizingGroup] = useState(false);
+  const [synchronizationResult, setSynchronizationResult] =
+    useState<SynchronizeGroupResult | null>(null);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -512,12 +532,31 @@ function App() {
         groupId: pendingGroup.groupId,
       });
       setJoinedGroup(joined);
+      setSynchronizationResult(null);
       setPendingGroup(null);
       setPeerSearchResult(null);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setJoiningGroup(false);
+    }
+  }
+
+  async function synchronizeJoinedGroup() {
+    if (!joinedGroup || synchronizingGroup || !isTauri()) return;
+
+    setError("");
+    setSynchronizationResult(null);
+    setSynchronizingGroup(true);
+    try {
+      const result = await invoke<SynchronizeGroupResult>("synchronize_group", {
+        groupId: joinedGroup.groupId,
+      });
+      setSynchronizationResult(result);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSynchronizingGroup(false);
     }
   }
 
@@ -701,6 +740,13 @@ function App() {
               </header>
               <div className="status-row" aria-label="Group status">
                 <span className="status-chip">✓ Secure membership ready</span>
+                <span className={`status-chip ${synchronizationResult ? "" : "muted"}`}>
+                  {synchronizingGroup
+                    ? "○ Synchronizing…"
+                    : synchronizationResult
+                      ? `✓ ${synchronizationResult.synchronizedEvents} new ${synchronizationResult.synchronizedEvents === 1 ? "event" : "events"}`
+                      : "○ Sync not checked"}
+                </span>
               </div>
               <dl className="preview-facts">
                 <div><dt>Invited by</dt><dd>{joinedGroup.inviterName}</dd></div>
@@ -708,7 +754,11 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
               </dl>
+              {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>
+              <button className="secondary-button" disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
+                {synchronizingGroup ? "Synchronizing securely…" : "Sync now"}
+              </button>
             </section>
           )}
 

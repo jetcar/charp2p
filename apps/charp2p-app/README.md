@@ -70,4 +70,6 @@ interrupted post-join cleanup can resume without repeating the network
 exchange. The derived key supports later peer discovery but cannot authorize
 another join. The pending-group screen exposes the secure join action,
 shows availability separately, and restores the completed joined-group card
-after restart.
+after restart. The joined-group card can use that protected key to rediscover
+the pinned owner and retry a bounded authorized synchronization without keeping
+the bearer invitation.

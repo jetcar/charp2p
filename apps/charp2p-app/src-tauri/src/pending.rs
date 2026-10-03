@@ -261,6 +261,30 @@ impl PendingInvitationService {
         Ok(invitation)
     }
 
+    pub(crate) fn joined_sync_target(
+        &self,
+        group_id: PeerId,
+    ) -> Result<(DiscoveryKey, PeerId), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let joined = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|joined| joined.group_id == group_id)
+            .ok_or("joined_group_not_found")?;
+        let discovery = self
+            .discovery
+            .get_optional(group_id)?
+            .ok_or("joined_discovery_record_missing")?;
+        Ok((discovery, joined.inviter_device_id))
+    }
+
     fn list_at(&self, now_unix: u64) -> Result<Vec<PendingGroup>, &'static str> {
         let _operation = self
             .operations
@@ -559,9 +583,8 @@ mod tests {
     fn completed_join_moves_safe_metadata_and_removes_the_bearer() {
         let service = service();
         let (encoded, group_id) = invitation();
-        let expected_key = charp2p_core::DiscoveryKey::from_invitation(
-            &Invitation::decode(&encoded, NOW).unwrap(),
-        );
+        let invitation = Invitation::decode(&encoded, NOW).unwrap();
+        let expected_key = charp2p_core::DiscoveryKey::from_invitation(&invitation);
         let pending = service.accept_at(&encoded, NOW).unwrap();
 
         let joined = service.complete_join(group_id).unwrap();
@@ -575,6 +598,10 @@ mod tests {
         assert_eq!(
             service.discovery.get_optional(group_id),
             Ok(Some(expected_key))
+        );
+        assert_eq!(
+            service.joined_sync_target(group_id),
+            Ok((expected_key, invitation.inviter_device_id()))
         );
         assert_eq!(
             service.accept_at(&encoded, NOW),

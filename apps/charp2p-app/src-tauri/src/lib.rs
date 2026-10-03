@@ -13,7 +13,7 @@ use std::{
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::MlsProviderService;
-use network::{AdvertisementResult, NetworkService, PeerSearchResult};
+use network::{AdvertisementResult, NetworkService, PeerSearchResult, SynchronizeGroupResult};
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
@@ -186,6 +186,30 @@ async fn join_group(
 }
 
 #[tauri::command]
+async fn synchronize_group(
+    group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<SynchronizeGroupResult, String> {
+    let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
+    if !mls_service.has_group(group_id).map_err(str::to_owned)? {
+        return Err("mls_joined_group_missing".to_owned());
+    }
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    let (discovery_key, inviter_device_id) = pending_service
+        .joined_sync_target(group_id)
+        .map_err(str::to_owned)?;
+    network_service
+        .synchronize(identity, discovery_key, group_id, inviter_device_id)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn advertise_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -305,6 +329,7 @@ pub fn run() {
             create_group_invitation,
             search_group_peers,
             join_group,
+            synchronize_group,
             advertise_group
         ])
         .run(tauri::generate_context!())

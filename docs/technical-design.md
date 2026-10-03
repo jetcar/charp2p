@@ -208,8 +208,10 @@ authenticated owner connection for a bounded pull session. It requests the
 remote summary, missing event-ID pages, and signed envelopes in order; each
 response is validated and event batches commit atomically. The session has a
 hard exchange limit. Initial synchronization failure does not roll back an
-already durable MLS membership; periodic and user-triggered retries remain a
-later increment.
+already durable MLS membership. A joined member can retry synchronization from
+the group screen: it loads the protected derived discovery key, rediscovers the
+invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
+pull. Periodic retries remain a later increment.
 
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS

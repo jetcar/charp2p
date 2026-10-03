@@ -63,6 +63,7 @@ const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
+const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -468,15 +469,27 @@ function App() {
     }
 
     let active = true;
-    invoke<StoredMessage[]>("group_messages", { groupId })
-      .then((messages) => {
+    let firstLoad = true;
+    let timer: number | undefined;
+
+    async function refreshMessages() {
+      try {
+        const messages = await invoke<StoredMessage[]>("group_messages", { groupId });
         if (active) setGroupMessages(messages);
-      })
-      .catch((reason) => {
-        if (active) setError(errorMessage(reason));
-      });
+      } catch (reason) {
+        if (active && firstLoad) setError(errorMessage(reason));
+      } finally {
+        firstLoad = false;
+        if (active) {
+          timer = window.setTimeout(refreshMessages, MESSAGE_REFRESH_INTERVAL_MS);
+        }
+      }
+    }
+
+    void refreshMessages();
     return () => {
       active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [joinedGroup, localGroup]);
 

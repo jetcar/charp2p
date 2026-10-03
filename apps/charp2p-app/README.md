@@ -65,6 +65,9 @@ matches the authenticated connection, persists accepted events idempotently,
 and makes them available to other members through later pulls. Creating a
 joined-member message triggers an immediate synchronization attempt; the
 minute retry loop retains locally saved messages while the owner is offline.
+An active group screen refreshes its encrypted local timeline every two
+seconds, so the owner sees newly accepted member messages without reopening the
+group.
 
 While an owner advertises an active invitation, authenticated devices already
 present in its MLS group can request bounded synchronization summaries, event

@@ -404,7 +404,9 @@ Both owners and joined members can create this protected local event. The
 joined member uploads its own signed message events to the pinned owner during
 synchronization. The interface reports received and newly accepted shared
 event counts; an accepted upload means the owner persisted the event for later
-fan-out, not that every member is currently online.
+fan-out, not that every member is currently online. Active group screens poll
+their encrypted local timeline every two seconds so messages materialized by a
+background synchronization stream appear without reopening the group.
 
 Each device keeps readable message text as one bounded local display copy
 protected with XChaCha20-Poly1305 under the platform-protected provider wrapping

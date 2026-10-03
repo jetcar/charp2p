@@ -380,6 +380,14 @@ wrapping key kept in platform-protected storage. It atomically replaces the
 encrypted record and restores the preceding in-memory provider if a mutation or
 durable write fails. Missing keys, tampering, and invalid envelopes fail closed.
 
+Outgoing text messages are limited to 16 KiB before protection. The sender
+loads its MLS group and signing key from the encrypted provider, creates one
+MLS private application message, then signs that ciphertext in a
+`MessageCreated` event. The event and advanced encrypted MLS provider snapshot
+commit in one SQLite transaction. Any protection, encryption, or storage
+failure restores the preceding in-memory provider so a ratchet generation is
+never advanced without its event.
+
 Whichever construction is selected must provide:
 
 - Authentication of the sending device.

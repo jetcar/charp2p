@@ -17,12 +17,14 @@ use charp2p_mls::{
     merge_prepared_member_admission, prepare_profile_key_package, prepare_profile_member_admission,
     stage_profile_welcome, validate_group_profile, validate_profile_key_package,
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
+    MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
 use charp2p_sync::{build_authorized_response, PullSession, SessionProgress, SynchronizationError};
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
 use openmls_basic_credential::SignatureKeyPair;
+use serde::Serialize as SerdeSerialize;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
@@ -34,6 +36,7 @@ const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 const ENVELOPE_HEADER_BYTES: usize = 2 + NONCE_BYTES;
 const SNAPSHOT_AAD: &[u8] = b"charp2p-mls-provider-snapshot-v1\0";
+const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
 
 trait WrappingKeyStore: Send + Sync {
     fn get_optional(&self) -> Result<Option<Zeroizing<[u8; WRAPPING_KEY_BYTES]>>, &'static str>;
@@ -73,6 +76,16 @@ pub(crate) struct MlsProviderService {
     store: Mutex<EventStore>,
     provider: Mutex<ProfileProvider>,
     wrapping_keys: Box<dyn WrappingKeyStore>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreatedMessage {
+    pub event_id: String,
+    pub group_id: String,
+    pub author_id: String,
+    pub author_sequence: u64,
+    pub created_at_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +164,112 @@ impl MlsProviderService {
         )
         .map(|group| group.is_some())
         .map_err(|_| "mls_group_storage_unavailable")
+    }
+
+    pub(crate) fn create_message(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        message: &str,
+    ) -> Result<CreatedMessage, &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        let event = self.create_message_at(group_id, author, message, created_at_unix_ms)?;
+        Ok(CreatedMessage {
+            event_id: hex_bytes(event.id().as_bytes()),
+            group_id: event.group_id().to_string(),
+            author_id: event.author_id().to_string(),
+            author_sequence: event.author_sequence(),
+            created_at_unix_ms: event.created_at_unix_ms(),
+        })
+    }
+
+    fn create_message_at(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        message: &str,
+        created_at_unix_ms: u64,
+    ) -> Result<SignedEvent, &'static str> {
+        if message.trim().is_empty() || message.len() > MAX_MESSAGE_TEXT_BYTES {
+            return Err("message_invalid");
+        }
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            let mut group = MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&group_id.to_bytes()),
+            )
+            .map_err(|_| "mls_group_storage_unavailable")?
+            .ok_or("mls_joined_group_missing")?;
+            validate_group_profile(&group).map_err(|_| "mls_group_storage_unavailable")?;
+            let own_leaf = group.own_leaf_node().ok_or("mls_group_owner_missing")?;
+            let own_device = device_id_from_credential(own_leaf.credential())
+                .map_err(|_| "mls_group_owner_invalid")?;
+            if own_device != author.peer_id() {
+                return Err("mls_group_author_mismatch");
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                own_leaf.signature_key().as_slice(),
+                CIPHERSUITE.signature_algorithm(),
+            )
+            .ok_or("mls_group_storage_unavailable")?;
+            let protected = group
+                .create_message(&*provider, &signer, message.as_bytes())
+                .map_err(|_| "mls_message_creation_failed")?
+                .to_bytes()
+                .map_err(|_| "mls_message_creation_failed")?;
+            if protected.is_empty() || protected.len() > MAX_MLS_WIRE_BYTES {
+                return Err("mls_message_creation_failed");
+            }
+            let (author_sequence, causal_parents) =
+                next_event_position(&store, group_id, author.peer_id())
+                    .map_err(|_| "message_store_unavailable")?;
+            let event = SignedEvent::create(
+                author,
+                EventSpec {
+                    group_id,
+                    author_sequence,
+                    causal_parents: &causal_parents,
+                    created_at_unix_ms,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: &protected,
+                },
+            )
+            .map_err(|_| "message_creation_failed")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            store
+                .put_event_and_encrypted_mls_provider_snapshot(&event, &encrypted)
+                .map_err(|_| "message_store_unavailable")?;
+            Ok(event)
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
     }
 
     pub(crate) fn answer_sync_request(
@@ -551,6 +670,16 @@ impl MlsProviderService {
     }
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn next_event_position(
     store: &EventStore,
     group_id: PeerId,
@@ -725,15 +854,18 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        SyncRejectReason, SyncRequest, SyncResponse,
+        SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
-        device_credential, device_id_from_credential, group_create_config,
+        decode_profile_message, device_credential, device_id_from_credential, group_create_config,
         merge_prepared_member_admission, prepare_profile_key_package,
         prepare_profile_member_admission, stage_profile_welcome, ProfileProvider, CIPHERSUITE,
     };
     use charp2p_sync::PullSession;
-    use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
+    use openmls::prelude::{
+        CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
+        ProtocolMessage,
+    };
     use openmls_basic_credential::SignatureKeyPair;
     use tempfile::tempdir;
     use zeroize::Zeroizing;
@@ -1061,6 +1193,87 @@ mod tests {
         assert!(members.contains(&owner.peer_id()));
         assert!(members.contains(&member_id));
         assert!(members.contains(&second_member_id));
+    }
+
+    #[test]
+    fn message_event_is_mls_protected_and_sender_state_survives_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (member_provider, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        let response = service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 41)
+            .unwrap();
+        let staged = stage_profile_welcome(&member_provider, response.welcome().unwrap()).unwrap();
+        let mut member_group = staged.into_group(&member_provider).unwrap();
+
+        assert!(matches!(
+            service.create_message_at(group_id, &owner, "   ", 42),
+            Err("message_invalid")
+        ));
+        let first = service
+            .create_message_at(group_id, &owner, "Protected hello", 42)
+            .unwrap();
+        assert_eq!(first.kind(), EventKind::MessageCreated);
+        assert_eq!(first.author_sequence(), 2);
+        assert_eq!(first.created_at_unix_ms(), 42);
+        assert_eq!(first.causal_parents().len(), 1);
+        assert_eq!(
+            decrypt_application_message(&mut member_group, &member_provider, &first),
+            b"Protected hello"
+        );
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        let second = restored
+            .create_message_at(group_id, &owner, "After restart", 43)
+            .unwrap();
+        assert_eq!(second.author_sequence(), 3);
+        assert_eq!(second.causal_parents(), &[first.id()]);
+        assert_eq!(
+            decrypt_application_message(&mut member_group, &member_provider, &second),
+            b"After restart"
+        );
+        let stored = EventStore::open(path).unwrap();
+        assert_eq!(
+            stored
+                .event_ids_after(group_id, owner.peer_id(), 0, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    fn decrypt_application_message(
+        group: &mut MlsGroup,
+        provider: &ProfileProvider,
+        event: &SignedEvent,
+    ) -> Vec<u8> {
+        let message = decode_profile_message(event.protected_payload()).unwrap();
+        let protocol: ProtocolMessage = message.try_into_protocol_message().unwrap();
+        let processed = group.process_message(provider, protocol).unwrap();
+        let ProcessedMessageContent::ApplicationMessage(application) = processed.into_content()
+        else {
+            panic!("expected an MLS application message");
+        };
+        application.into_bytes()
     }
 
     #[test]

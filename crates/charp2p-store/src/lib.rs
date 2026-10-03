@@ -17,10 +17,12 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
+/// Largest locally encrypted body for one materialized text message.
+pub const MAX_ENCRYPTED_MESSAGE_BODY_BYTES: usize = 16 * 1024 + 42;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +92,16 @@ pub struct PutEventsOutcome {
     pub already_present: usize,
 }
 
+/// One locally materialized message whose body remains application-encrypted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedMessage {
+    pub event_id: [u8; 32],
+    pub group_id: PeerId,
+    pub author_id: PeerId,
+    pub created_at_unix_ms: u64,
+    pub encrypted_body: Vec<u8>,
+}
+
 /// SQLite-backed storage for signed events and non-secret application metadata.
 pub struct EventStore {
     connection: Connection,
@@ -146,6 +158,89 @@ impl EventStore {
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Atomically persists a protected message event, advanced MLS state, and
+    /// its locally encrypted display body.
+    pub fn put_message_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        encrypted_body: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MessageCreated {
+            return Err(StoreError::InvalidMessageEvent);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        validate_encrypted_message_body(encrypted_body)?;
+        let created_at = i64::try_from(event.created_at_unix_ms())
+            .map_err(|_| StoreError::TimestampTooLarge(event.created_at_unix_ms()))?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "INSERT INTO materialized_messages (
+                event_id, group_id, author_id, created_at_unix_ms, encrypted_body
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+                created_at,
+                encrypted_body,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Lists locally materialized messages in stable display order.
+    pub fn encrypted_messages(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<EncryptedMessage>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.encoded, m.group_id, m.author_id, m.created_at_unix_ms,
+                    m.encrypted_body
+             FROM materialized_messages m
+             JOIN events e ON e.event_id = m.event_id
+             WHERE m.group_id = ?1
+             ORDER BY m.created_at_unix_ms, m.event_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (encoded, stored_group, stored_author, stored_created_at, encrypted_body) = row?;
+            let event = SignedEvent::decode(&encoded)?;
+            let created_at_unix_ms =
+                u64::try_from(stored_created_at).map_err(|_| StoreError::CorruptIndex)?;
+            validate_encrypted_message_body(&encrypted_body)?;
+            if event.kind() != charp2p_core::EventKind::MessageCreated
+                || event.group_id() != group_id
+                || event.group_id().to_bytes() != stored_group
+                || event.author_id().to_bytes() != stored_author
+                || event.created_at_unix_ms() != created_at_unix_ms
+            {
+                return Err(StoreError::CorruptIndex);
+            }
+            messages.push(EncryptedMessage {
+                event_id: *event.id().as_bytes(),
+                group_id,
+                author_id: event.author_id(),
+                created_at_unix_ms,
+                encrypted_body,
+            });
+        }
+        Ok(messages)
     }
 
     /// Loads and re-verifies an event by its identifier.
@@ -827,7 +922,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6 => {}
+            6 | 7 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -847,6 +942,28 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 7 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE materialized_messages (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    created_at_unix_ms INTEGER NOT NULL
+                        CHECK(created_at_unix_ms >= 0),
+                    encrypted_body BLOB NOT NULL
+                        CHECK(length(encrypted_body) BETWEEN 1 AND 16426)
+                 ) STRICT;
+
+                 CREATE INDEX materialized_messages_by_group_time
+                    ON materialized_messages(group_id, created_at_unix_ms, event_id);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -854,6 +971,13 @@ impl EventStore {
 fn validate_encrypted_mls_provider_snapshot(encrypted: &[u8]) -> Result<(), StoreError> {
     if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
         return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
+    }
+    Ok(())
+}
+
+fn validate_encrypted_message_body(encrypted: &[u8]) -> Result<(), StoreError> {
+    if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MESSAGE_BODY_BYTES {
+        return Err(StoreError::InvalidEncryptedMessageSize(encrypted.len()));
     }
     Ok(())
 }
@@ -1010,6 +1134,12 @@ pub enum StoreError {
     /// A pending join KeyPackage is empty or above the protocol bound.
     #[error("invalid pending MLS KeyPackage size {0}")]
     InvalidMlsKeyPackageSize(usize),
+    /// A local encrypted message body is empty or above the application bound.
+    #[error("invalid encrypted message body size {0}")]
+    InvalidEncryptedMessageSize(usize),
+    /// Only a signed message-creation event can materialize a message body.
+    #[error("event is not a message creation")]
+    InvalidMessageEvent,
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -1038,7 +1168,8 @@ mod tests {
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
         PendingInvitationMetadata, PutEventOutcome, StoreError,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+        MAX_SYNC_BATCH_EVENTS,
     };
 
     fn message_event(
@@ -1618,6 +1749,96 @@ mod tests {
     }
 
     #[test]
+    fn materialized_message_and_snapshot_commit_atomically() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+
+        assert_eq!(
+            store
+                .put_message_and_encrypted_mls_provider_snapshot(
+                    &event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap(),
+            PutEventOutcome::Inserted
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"advanced encrypted provider"
+        );
+        assert_eq!(
+            store.encrypted_messages(group.group_id()).unwrap(),
+            vec![super::EncryptedMessage {
+                event_id: *event.id().as_bytes(),
+                group_id: group.group_id(),
+                author_id: author.peer_id(),
+                created_at_unix_ms: event.created_at_unix_ms(),
+                encrypted_body: b"encrypted local message".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn materialized_message_failure_rolls_back_event_and_snapshot() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_encrypted_mls_provider_snapshot(b"preceding encrypted provider")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_materialized_message
+                 BEFORE INSERT ON materialized_messages
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected message failure');
+                 END;",
+            )
+            .unwrap();
+        let event = message_event(
+            &DeviceIdentity::generate(),
+            &GroupIdentity::generate(),
+            1,
+            b"MLS ciphertext",
+        );
+
+        assert!(matches!(
+            store.put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert!(store.get_event(event.id()).unwrap().is_none());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"preceding encrypted provider"
+        );
+    }
+
+    #[test]
+    fn encrypted_message_body_is_bounded() {
+        let mut store = EventStore::in_memory().unwrap();
+        let event = message_event(
+            &DeviceIdentity::generate(),
+            &GroupIdentity::generate(),
+            1,
+            b"MLS ciphertext",
+        );
+        assert!(matches!(
+            store.put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                &vec![0; MAX_ENCRYPTED_MESSAGE_BODY_BYTES + 1],
+            ),
+            Err(StoreError::InvalidEncryptedMessageSize(_))
+        ));
+    }
+
+    #[test]
     fn version_four_database_adds_mls_provider_snapshot() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -1700,6 +1921,41 @@ mod tests {
             .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
             .unwrap());
         assert_eq!(store.joined_groups().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_seven_database_adds_materialized_messages() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (
+                    event_id BLOB PRIMARY KEY NOT NULL CHECK(length(event_id) = 32),
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    encoded BLOB NOT NULL,
+                    UNIQUE(group_id, author_id, author_sequence)
+                 ) STRICT;
+                 CREATE TABLE mls_provider_snapshot (
+                    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                    encrypted BLOB NOT NULL CHECK(length(encrypted) BETWEEN 1 AND 8388736)
+                 ) STRICT;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+
+        let mut store = EventStore::from_connection(connection).unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+        assert_eq!(store.encrypted_messages(group.group_id()).unwrap().len(), 1);
     }
 
     #[test]

@@ -13,8 +13,8 @@ The current shell implements device onboarding and a local invitation preview.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted
-recovery export and the message timeline remain later increments. Accepted
-invitations survive restarts: safe group metadata is indexed in SQLite while
+recovery export and the received-message timeline remain later increments.
+Accepted invitations survive restarts: safe group metadata is indexed in SQLite while
 the signed bearer credential remains in platform-protected storage. Invitation
 version 2 also pins the root-authorized inviter device; discovery ignores
 providers with another authenticated peer identity.
@@ -55,8 +55,9 @@ roots cannot become hidden from the interface.
 
 The local owner screen can create bounded text messages as MLS private
 application messages and persist each signed `MessageCreated` event atomically
-with sender ratchet state. Delivery receipts and a durable decrypted timeline
-remain later increments.
+with sender ratchet state. It also keeps an event-bound encrypted local display
+copy and restores the owner timeline after restart. Delivery receipts and the
+received-message timeline remain later increments.
 
 While an owner advertises an active invitation, authenticated devices already
 present in its MLS group can request bounded synchronization summaries, event

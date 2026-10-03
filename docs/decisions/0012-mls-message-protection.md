@@ -77,6 +77,13 @@ storage, and replace it atomically. Keep signature private keys and exported
 recovery material protected. Never enable OpenMLS content or crypto debug
 features in application builds. ADR-016 defines the snapshot format and limits.
 
+Materialize plaintext needed by the local conversation view as a separate
+bounded XChaCha20-Poly1305 envelope. Use the platform-protected provider
+wrapping key, a fresh nonce, a distinct application-message domain, and the
+signed event ID as associated data. Commit this local envelope atomically with
+the signed MLS ciphertext event and the advanced provider snapshot. A failure
+in any of the three writes rolls back all of them.
+
 The initial prototype fixes and authenticates the profile configuration,
 rejects mismatched state, and verifies group creation, chained asynchronous
 member admission through self-contained Welcomes, and authenticated encrypted

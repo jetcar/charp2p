@@ -19,7 +19,9 @@ use charp2p_mls::{
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
     MAX_MLS_WIRE_BYTES,
 };
-use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
+use charp2p_store::{
+    EventStore, MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+};
 use charp2p_sync::{build_authorized_response, PullSession, SessionProgress, SynchronizationError};
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
@@ -36,6 +38,7 @@ const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 const ENVELOPE_HEADER_BYTES: usize = 2 + NONCE_BYTES;
 const SNAPSHOT_AAD: &[u8] = b"charp2p-mls-provider-snapshot-v1\0";
+const MESSAGE_AAD: &[u8] = b"charp2p-local-message-v1\0";
 const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
 
 trait WrappingKeyStore: Send + Sync {
@@ -86,6 +89,16 @@ pub(crate) struct CreatedMessage {
     pub author_id: String,
     pub author_sequence: u64,
     pub created_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredMessage {
+    pub event_id: String,
+    pub group_id: String,
+    pub author_id: String,
+    pub created_at_unix_ms: u64,
+    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +200,50 @@ impl MlsProviderService {
         })
     }
 
+    pub(crate) fn messages(&self, group_id: PeerId) -> Result<Vec<StoredMessage>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let encrypted = store
+            .encrypted_messages(group_id)
+            .map_err(|_| "message_store_unavailable")?;
+        if encrypted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = self
+            .wrapping_keys
+            .get_optional()?
+            .ok_or("mls_wrapping_key_missing")?;
+        encrypted
+            .into_iter()
+            .map(|message| {
+                let plaintext = decrypt_local_message(
+                    &message.encrypted_body,
+                    &key,
+                    &message.event_id,
+                )?;
+                let text = std::str::from_utf8(&plaintext)
+                    .map_err(|_| "message_record_invalid")?
+                    .to_owned();
+                if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
+                    return Err("message_record_invalid");
+                }
+                Ok(StoredMessage {
+                    event_id: hex_bytes(&message.event_id),
+                    group_id: message.group_id.to_string(),
+                    author_id: message.author_id.to_string(),
+                    created_at_unix_ms: message.created_at_unix_ms,
+                    text,
+                })
+            })
+            .collect()
+    }
+
     fn create_message_at(
         &self,
         group_id: PeerId,
@@ -260,8 +317,14 @@ impl MlsProviderService {
                 .map_err(|_| "mls_provider_snapshot_invalid")?;
             let key = self.load_or_create_wrapping_key()?;
             let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            let encrypted_body =
+                encrypt_local_message(message.as_bytes(), &key, event.id().as_bytes())?;
             store
-                .put_event_and_encrypted_mls_provider_snapshot(&event, &encrypted)
+                .put_message_and_encrypted_mls_provider_snapshot(
+                    &event,
+                    &encrypted,
+                    &encrypted_body,
+                )
                 .map_err(|_| "message_store_unavailable")?;
             Ok(event)
         })();
@@ -848,6 +911,74 @@ fn decrypt_snapshot(
     Ok(Zeroizing::new(plaintext))
 }
 
+fn encrypt_local_message(
+    plaintext: &[u8],
+    key: &[u8; WRAPPING_KEY_BYTES],
+    event_id: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if plaintext.is_empty() || plaintext.len() > MAX_MESSAGE_TEXT_BYTES {
+        return Err("message_invalid");
+    }
+    let mut nonce = [0; NONCE_BYTES];
+    getrandom::fill(&mut nonce).map_err(|_| "secure_random_unavailable")?;
+    let mut aad = Vec::with_capacity(MESSAGE_AAD.len() + event_id.len());
+    aad.extend_from_slice(MESSAGE_AAD);
+    aad.extend_from_slice(event_id);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "message_encryption_failed")?;
+    let envelope_length = ENVELOPE_HEADER_BYTES
+        .checked_add(ciphertext.len())
+        .filter(|length| *length <= MAX_ENCRYPTED_MESSAGE_BODY_BYTES)
+        .ok_or("message_encryption_failed")?;
+    let mut envelope = Zeroizing::new(Vec::with_capacity(envelope_length));
+    envelope.extend_from_slice(&ENVELOPE_VERSION.to_be_bytes());
+    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+fn decrypt_local_message(
+    envelope: &[u8],
+    key: &[u8; WRAPPING_KEY_BYTES],
+    event_id: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if envelope.len() < ENVELOPE_HEADER_BYTES + TAG_BYTES
+        || envelope.len() > MAX_ENCRYPTED_MESSAGE_BODY_BYTES
+    {
+        return Err("message_record_invalid");
+    }
+    let version = u16::from_be_bytes([envelope[0], envelope[1]]);
+    if version != ENVELOPE_VERSION {
+        return Err("message_record_invalid");
+    }
+    let mut aad = Vec::with_capacity(MESSAGE_AAD.len() + event_id.len());
+    aad.extend_from_slice(MESSAGE_AAD);
+    aad.extend_from_slice(event_id);
+    let nonce = XNonce::from_slice(&envelope[2..ENVELOPE_HEADER_BYTES]);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &envelope[ENVELOPE_HEADER_BYTES..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "message_record_invalid")?;
+    if plaintext.is_empty() || plaintext.len() > MAX_MESSAGE_TEXT_BYTES {
+        return Err("message_record_invalid");
+    }
+    Ok(Zeroizing::new(plaintext))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -871,8 +1002,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        decrypt_snapshot, encrypt_snapshot, MemberAdmissionError, MlsProviderMutationError,
-        MlsProviderService, WrappingKeyStore, WRAPPING_KEY_BYTES,
+        decrypt_local_message, decrypt_snapshot, encrypt_local_message, encrypt_snapshot,
+        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, WrappingKeyStore,
+        WRAPPING_KEY_BYTES,
     };
     use charp2p_store::EventStore;
 
@@ -951,6 +1083,21 @@ mod tests {
             decrypt_snapshot(&first, &key).unwrap().as_slice(),
             b"provider state"
         );
+    }
+
+    #[test]
+    fn local_message_encryption_is_bound_to_its_event() {
+        let key = [9; WRAPPING_KEY_BYTES];
+        let event_id = [3; 32];
+        let encrypted = encrypt_local_message(b"local display text", &key, &event_id).unwrap();
+
+        assert_eq!(
+            decrypt_local_message(&encrypted, &key, &event_id)
+                .unwrap()
+                .as_slice(),
+            b"local display text"
+        );
+        assert!(decrypt_local_message(&encrypted, &key, &[4; 32]).is_err());
     }
 
     #[test]
@@ -1251,7 +1398,20 @@ mod tests {
             decrypt_application_message(&mut member_group, &member_provider, &second),
             b"After restart"
         );
+        let messages = restored.messages(group_id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "Protected hello");
+        assert_eq!(messages[0].author_id, owner.peer_id().to_string());
+        assert_eq!(messages[1].text, "After restart");
         let stored = EventStore::open(path).unwrap();
+        assert!(stored
+            .encrypted_messages(group_id)
+            .unwrap()
+            .iter()
+            .all(|message| !message
+                .encrypted_body
+                .windows(b"Protected hello".len())
+                .any(|window| window == b"Protected hello")));
         assert_eq!(
             stored
                 .event_ids_after(group_id, owner.peer_id(), 0, 3)

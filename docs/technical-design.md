@@ -389,6 +389,13 @@ commit in one SQLite transaction. Any protection, encryption, or storage
 failure restores the preceding in-memory provider so a ratchet generation is
 never advanced without its event.
 
+The sender also keeps one bounded local display copy protected with
+XChaCha20-Poly1305 under the platform-protected provider wrapping key. A fresh
+nonce, a separate local-message domain, and the signed event ID as associated
+data bind that copy to its event. The local copy, signed event, and advanced MLS
+snapshot commit atomically. The owner timeline decrypts these records only when
+loading them for display.
+
 Whichever construction is selected must provide:
 
 - Authentication of the sending device.
@@ -421,6 +428,8 @@ Each client stores:
   pending invitation after MLS completion.
 - One opaque derived discovery key per joined group in platform-protected
   storage. It supports later peer lookup but carries no join authorization.
+- Locally materialized message bodies encrypted and authenticated against their
+  signed event IDs.
 - User preferences and local blocks.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential

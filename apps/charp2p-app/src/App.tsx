@@ -55,6 +55,8 @@ type CreatedMessage = {
   createdAtUnixMs: number;
 };
 
+type StoredMessage = Omit<CreatedMessage, "authorSequence"> & { text: string };
+
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
@@ -117,7 +119,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   mls_wrapping_key_store_unavailable: "Protected secure-group storage is unavailable.",
   mls_message_creation_failed: "The message could not be protected for this group.",
   message_creation_failed: "The message could not be signed.",
+  message_encryption_failed: "The local message copy could not be protected.",
   message_invalid: "Enter a message up to 16 KiB.",
+  message_record_invalid: "A saved message is damaged and cannot be opened.",
   message_store_unavailable: "The encrypted message could not be saved.",
   pending_invitation_not_found: "This pending invitation is no longer available.",
   pending_invitation_service_unavailable: "Pending invitations are temporarily unavailable.",
@@ -149,6 +153,13 @@ function errorMessage(error: unknown) {
 function shortPeerId(peerId: string) {
   if (peerId.length <= 18) return peerId;
   return `${peerId.slice(0, 9)}…${peerId.slice(-8)}`;
+}
+
+function messageTime(createdAtUnixMs: number) {
+  return new Date(createdAtUnixMs).toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 function historyDescription(policy: InvitationPreview["historyPolicy"]) {
@@ -256,6 +267,7 @@ function App() {
   const [outgoingMessage, setOutgoingMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
+  const [localMessages, setLocalMessages] = useState<StoredMessage[]>([]);
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -442,6 +454,25 @@ function App() {
   }, [joinedGroup]);
 
   useEffect(() => {
+    if (!isTauri() || !localGroup) {
+      setLocalMessages([]);
+      return;
+    }
+
+    let active = true;
+    invoke<StoredMessage[]>("group_messages", { groupId: localGroup.groupId })
+      .then((messages) => {
+        if (active) setLocalMessages(messages);
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [localGroup]);
+
+  useEffect(() => {
     if (!isTauri()) return;
 
     let active = true;
@@ -616,12 +647,23 @@ function App() {
     setError("");
     setCreatedMessage(null);
     setSendingMessage(true);
+    const text = outgoingMessage;
     try {
       const created = await invoke<CreatedMessage>("send_group_message", {
         groupId: localGroup.groupId,
-        message: outgoingMessage,
+        message: text,
       });
       setCreatedMessage(created);
+      setLocalMessages((messages) => [
+        ...messages,
+        {
+          eventId: created.eventId,
+          groupId: created.groupId,
+          authorId: created.authorId,
+          createdAtUnixMs: created.createdAtUnixMs,
+          text,
+        },
+      ]);
       setOutgoingMessage("");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -871,6 +913,19 @@ function App() {
                   </p>
                 )}
               </form>
+              {localMessages.length > 0 && (
+                <section className="message-timeline" aria-label="Messages saved on this device">
+                  <h3>Messages</h3>
+                  {localMessages.map((message) => (
+                    <article className="message-bubble own-message" key={message.eventId}>
+                      <p>{message.text}</p>
+                      <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
+                        You · {messageTime(message.createdAtUnixMs)}
+                      </time>
+                    </article>
+                  ))}
+                </section>
+              )}
               {issuedInvitation && issuedInvitation.groupId === localGroup.groupId ? (
                 <>
                   <label htmlFor="issued-invitation">Invitation link</label>

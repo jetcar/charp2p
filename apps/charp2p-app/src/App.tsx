@@ -708,7 +708,7 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
               </dl>
-              <p className="preview-note">The group will synchronize whenever another member is online.</p>
+              <p className="preview-note">Secure membership and verified group state are stored on this device.</p>
             </section>
           )}
 

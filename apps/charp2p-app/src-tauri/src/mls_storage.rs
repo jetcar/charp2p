@@ -19,7 +19,7 @@ use charp2p_mls::{
     PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
 };
 use charp2p_store::{EventStore, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES};
-use charp2p_sync::{build_authorized_response, SynchronizationError};
+use charp2p_sync::{build_authorized_response, PullSession, SessionProgress, SynchronizationError};
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
 use openmls_basic_credential::SignatureKeyPair;
@@ -195,6 +195,24 @@ impl MlsProviderService {
                 _ => SyncRejectReason::Busy,
             },
         })
+    }
+
+    pub(crate) fn advance_pull_session(
+        &self,
+        session: &mut PullSession,
+        response: &SyncResponse,
+    ) -> Result<SessionProgress, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "synchronization_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "synchronization_unavailable")?;
+        session
+            .handle_response(&mut store, response)
+            .map_err(|_| "synchronization_failed")
     }
 
     /// Adds one transport-authenticated device, publishes the resulting MLS
@@ -714,6 +732,7 @@ mod tests {
         merge_prepared_member_admission, prepare_profile_key_package,
         prepare_profile_member_admission, stage_profile_welcome, ProfileProvider, CIPHERSUITE,
     };
+    use charp2p_sync::PullSession;
     use openmls::prelude::{CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
     use tempfile::tempdir;
@@ -1083,6 +1102,67 @@ mod tests {
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
             }
+        );
+    }
+
+    #[test]
+    fn joined_member_pulls_and_persists_the_admission_event() {
+        let directory = tempdir().unwrap();
+        let owner_path = directory.path().join("owner.sqlite3");
+        let member_path = directory.path().join("member.sqlite3");
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let owner_service = MlsProviderService::open_with_key_store(
+            &owner_path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        owner_service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        let member_service = MlsProviderService::open_with_key_store(
+            &member_path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+
+        let (mut session, mut request) = PullSession::start(group_id);
+        let mut inserted = 0;
+        loop {
+            let response = owner_service.answer_sync_request(member_id, &request);
+            let progress = member_service
+                .advance_pull_session(&mut session, &response)
+                .unwrap();
+            inserted += progress.applied.inserted;
+            if progress.complete {
+                break;
+            }
+            request = progress.next_request.unwrap();
+        }
+
+        assert_eq!(inserted, 1);
+        let store = EventStore::open(member_path).unwrap();
+        let event_ids = store
+            .event_ids_after(group_id, owner.peer_id(), 0, 1)
+            .unwrap();
+        assert_eq!(event_ids.len(), 1);
+        assert_eq!(
+            store.get_event(event_ids[0]).unwrap().unwrap().kind(),
+            EventKind::MemberAdded
         );
     }
 

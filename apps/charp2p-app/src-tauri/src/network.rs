@@ -6,10 +6,11 @@ use std::{
 
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, JoinResponse,
-    SyncRequest, SyncResponse,
+    SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{NetworkEvent, NetworkNode};
+use charp2p_sync::{PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
 use tokio::{
@@ -28,6 +29,8 @@ const MAX_DISCOVERED_PEERS: usize = 32;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
+const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
+const MAX_INITIAL_SYNC_EXCHANGES: usize = 4_096;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -68,6 +71,12 @@ trait SynchronizationService: Send + Sync {
         authenticated_peer: PeerId,
         request: &SyncRequest,
     ) -> SyncResponse;
+
+    fn advance_pull_session(
+        &self,
+        session: &mut PullSession,
+        response: &SyncResponse,
+    ) -> Result<SessionProgress, &'static str>;
 }
 
 impl MemberAdmissionService for MlsProviderService {
@@ -110,6 +119,14 @@ impl SynchronizationService for MlsProviderService {
     ) -> SyncResponse {
         MlsProviderService::answer_sync_request(self, authenticated_peer, request)
     }
+
+    fn advance_pull_session(
+        &self,
+        session: &mut PullSession,
+        response: &SyncResponse,
+    ) -> Result<SessionProgress, &'static str> {
+        MlsProviderService::advance_pull_session(self, session, response)
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +155,7 @@ pub struct AdvertisementResult {
 pub struct JoinGroupResult {
     pub status: &'static str,
     pub group_id: String,
+    pub synchronized_events: usize,
 }
 
 struct ActiveAdvertisement {
@@ -600,10 +618,69 @@ impl NetworkService {
         let welcome = response.welcome().ok_or("network_join_failed")?;
         self.pending_join
             .complete_join(invitation.group_id(), welcome)?;
+        let synchronized_events = self
+            .pull_from_connected_peer(&mut node, expected_inviter, invitation.group_id())
+            .await
+            .unwrap_or(0);
         Ok(JoinGroupResult {
             status: "joined",
             group_id: invitation.group_id().to_string(),
+            synchronized_events,
         })
+    }
+
+    async fn pull_from_connected_peer(
+        &self,
+        node: &mut NetworkNode,
+        peer_id: PeerId,
+        group_id: PeerId,
+    ) -> Result<usize, &'static str> {
+        let (mut session, mut request) = PullSession::start(group_id);
+        let mut inserted = 0_usize;
+        for _ in 0..MAX_INITIAL_SYNC_EXCHANGES {
+            let request_id = node
+                .send_sync_request(peer_id, request)
+                .map_err(|_| "synchronization_failed")?;
+            let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
+                loop {
+                    match node.next_event().await {
+                        NetworkEvent::SyncResponseReceived {
+                            peer_id: response_peer,
+                            request_id: response_id,
+                            response,
+                        } if response_peer == peer_id && response_id == request_id => {
+                            return Ok(response);
+                        }
+                        NetworkEvent::SyncRequestFailed {
+                            peer_id: failed_peer,
+                            request_id: failed_id,
+                            ..
+                        } if failed_peer == peer_id && failed_id == request_id => {
+                            return Err("synchronization_failed");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "synchronization_timed_out")??;
+            if let SyncResponse::Rejected { reason } = response {
+                return Err(match reason {
+                    SyncRejectReason::Unauthorized => "synchronization_unauthorized",
+                    SyncRejectReason::InvalidRequest => "synchronization_failed",
+                    SyncRejectReason::Busy => "synchronization_busy",
+                });
+            }
+            let progress = self
+                .synchronization
+                .advance_pull_session(&mut session, &response)?;
+            inserted = inserted.saturating_add(progress.applied.inserted);
+            if progress.complete {
+                return Ok(inserted);
+            }
+            request = progress.next_request.ok_or("synchronization_failed")?;
+        }
+        Err("synchronization_limit_exceeded")
     }
 }
 
@@ -712,6 +789,14 @@ impl SynchronizationService for UnavailableSynchronizationService {
             reason: charp2p_core::SyncRejectReason::Unauthorized,
         }
     }
+
+    fn advance_pull_session(
+        &self,
+        _session: &mut PullSession,
+        _response: &SyncResponse,
+    ) -> Result<SessionProgress, &'static str> {
+        Err("synchronization_unavailable")
+    }
 }
 
 fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
@@ -760,9 +845,9 @@ mod tests {
     use super::{
         join_response, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
         JoinRequestAuthorizer, MemberAdmissionService, NetworkService, PeerSearchResult,
-        PendingJoinService, SynchronizationService, UnavailableJoinRequestAuthorizer,
-        UnavailableMemberAdmissionService, UnavailablePendingJoinService,
-        UnavailableSynchronizationService,
+        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
+        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
+        UnavailablePendingJoinService,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -816,6 +901,21 @@ mod tests {
                     reason: SyncRejectReason::Unauthorized,
                 }
             }
+        }
+
+        fn advance_pull_session(
+            &self,
+            _session: &mut PullSession,
+            _response: &SyncResponse,
+        ) -> Result<SessionProgress, &'static str> {
+            Ok(SessionProgress {
+                next_request: None,
+                applied: charp2p_sync::ApplyOutcome {
+                    inserted: 3,
+                    already_present: 0,
+                },
+                complete: true,
+            })
         }
     }
 
@@ -1078,9 +1178,10 @@ mod tests {
         let now = unix_now();
         let group = GroupIdentity::generate();
         let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
         let invitation = Invitation::issue(
             &group,
-            owner.peer_id(),
+            owner_id,
             InvitationSpec {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
@@ -1093,6 +1194,8 @@ mod tests {
         .unwrap();
 
         tauri::async_runtime::block_on(async {
+            let joiner_identity = DeviceIdentity::generate();
+            let joiner_id = joiner_identity.peer_id();
             let mut routing =
                 NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
             let routing_id = routing.peer_id();
@@ -1113,7 +1216,10 @@ mod tests {
                 )),
                 Arc::new(AcceptingMemberAdmissionService),
                 Arc::new(UnavailablePendingJoinService),
-                Arc::new(UnavailableSynchronizationService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: joiner_id,
+                    group_id: invitation.group_id(),
+                }),
             )
             .unwrap();
             let advertise = owner_service.advertise(owner, owner_signer, &invitation);
@@ -1137,10 +1243,13 @@ mod tests {
                 Arc::new(UnavailableJoinRequestAuthorizer),
                 Arc::new(UnavailableMemberAdmissionService),
                 pending_join.clone(),
-                Arc::new(UnavailableSynchronizationService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id: invitation.group_id(),
+                }),
             )
             .unwrap();
-            let join = joiner_service.join(DeviceIdentity::generate(), &invitation);
+            let join = joiner_service.join(joiner_identity, &invitation);
             tokio::pin!(join);
             let result = timeout(Duration::from_secs(15), async {
                 loop {
@@ -1156,6 +1265,7 @@ mod tests {
 
             assert_eq!(result.status, "joined");
             assert_eq!(result.group_id, invitation.group_id().to_string());
+            assert_eq!(result.synchronized_events, 3);
             assert!(pending_join.completed.load(Ordering::SeqCst));
         });
     }

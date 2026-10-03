@@ -56,7 +56,9 @@ roots cannot become hidden from the interface.
 While an owner advertises an active invitation, authenticated devices already
 present in its MLS group can request bounded synchronization summaries, event
 identifier pages, and signed events. Devices outside that MLS membership get
-only the stable unauthorized response.
+only the stable unauthorized response. Immediately after joining, the new
+device uses the existing authenticated connection to pull and persist the
+owner's verified signed events.
 
 The joining client now prepares and reuses one durable MLS KeyPackage, finds
 the invitation's pinned owner through the DHT, exchanges the join request over

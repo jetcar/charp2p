@@ -166,6 +166,18 @@ function messageTime(createdAtUnixMs: number) {
   });
 }
 
+function messageAuthorLabel(
+  message: StoredMessage,
+  profile: DeviceProfile | null,
+  joinedGroup?: JoinedGroup | null,
+) {
+  if (message.authorId === profile?.peerId) return "You";
+  if (joinedGroup && message.authorId === joinedGroup.inviterDeviceId) {
+    return joinedGroup.inviterName;
+  }
+  return `Peer ${shortPeerId(message.authorId)}`;
+}
+
 function historyDescription(policy: InvitationPreview["historyPolicy"]) {
   if (policy === "none") return "Messages shared after you join";
   if (policy === "allRetained") return "All retained history shared";
@@ -909,7 +921,7 @@ function App() {
                     >
                       <p>{message.text}</p>
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
-                        {message.authorId === profile?.peerId ? "You" : joinedGroup.inviterName}
+                        {messageAuthorLabel(message, profile, joinedGroup)}
                         {" · "}{messageTime(message.createdAtUnixMs)}
                       </time>
                     </article>
@@ -1004,10 +1016,13 @@ function App() {
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
                   {groupMessages.map((message) => (
-                    <article className="message-bubble own-message" key={message.eventId}>
+                    <article
+                      className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
+                      key={message.eventId}
+                    >
                       <p>{message.text}</p>
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
-                        You · {messageTime(message.createdAtUnixMs)}
+                        {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
                       </time>
                     </article>
                   ))}

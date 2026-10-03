@@ -41,6 +41,11 @@ pub enum SyncRequest {
         group_id: PeerId,
         event_ids: Vec<EventId>,
     },
+    /// Offers locally authored signed events to the group owner.
+    PushEvents {
+        group_id: PeerId,
+        encoded_events: Vec<Vec<u8>>,
+    },
 }
 
 impl SyncRequest {
@@ -53,6 +58,15 @@ impl SyncRequest {
             }
             Self::EventIds { limit, .. } => Err(SyncError::InvalidBatchLimit(*limit)),
             Self::Events { event_ids, .. } => validate_event_ids(event_ids),
+            Self::PushEvents {
+                group_id,
+                encoded_events,
+            } => {
+                if encoded_events.is_empty() {
+                    return Err(SyncError::EmptyEventBatch);
+                }
+                validate_events(group_id, encoded_events)
+            }
         }
     }
 }
@@ -78,6 +92,8 @@ pub enum SyncResponse {
         group_id: PeerId,
         encoded_events: Vec<Vec<u8>>,
     },
+    /// Confirms an authenticated push and reports newly persisted events.
+    EventsAccepted { group_id: PeerId, inserted: u16 },
     /// The peer refused the request without disclosing group state.
     Rejected { reason: SyncRejectReason },
 }
@@ -100,6 +116,14 @@ impl SyncResponse {
                 group_id,
                 encoded_events,
             } => validate_events(group_id, encoded_events),
+            Self::EventsAccepted { inserted, .. }
+                if usize::from(*inserted) <= MAX_SYNC_BATCH_ITEMS =>
+            {
+                Ok(())
+            }
+            Self::EventsAccepted { inserted, .. } => {
+                Err(SyncError::InvalidAcceptedCount(*inserted))
+            }
             Self::Rejected { .. } => Ok(()),
         }
     }
@@ -125,6 +149,12 @@ pub enum SyncError {
     /// A request or response carries too many event identifiers.
     #[error("synchronization payload contains too many event identifiers")]
     TooManyEventIds,
+    /// An event upload request contains no events.
+    #[error("synchronization event upload is empty")]
+    EmptyEventBatch,
+    /// An upload acknowledgement exceeds the protocol batch bound.
+    #[error("invalid accepted event count {0}")]
+    InvalidAcceptedCount(u16),
     /// A response carries too many author heads.
     #[error("synchronization summary contains too many authors")]
     TooManyAuthors,
@@ -208,8 +238,8 @@ mod tests {
     use crate::{DeviceIdentity, EventKind, EventSpec, GroupIdentity};
 
     use super::{
-        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncRequest,
-        SyncResponse,
+        SyncAuthorHead, SyncError, SyncRequest, SyncResponse, MAX_SYNC_AUTHORS,
+        MAX_SYNC_BATCH_ITEMS,
     };
 
     #[test]

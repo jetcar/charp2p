@@ -17,15 +17,17 @@ that all earlier events are present.
 
 ## Decision
 
-Use a versioned request-response synchronization protocol with three exchanges:
+Use a versioned request-response synchronization protocol with four exchanges:
 
 1. Request gap-free author heads for one group.
 2. Request up to 256 ordered event identifiers after an author sequence.
 3. Request canonical signed envelopes for selected identifiers.
+4. Upload a bounded batch of locally authored message events to the group
+   owner and receive an inserted-event count.
 
 Carry these messages as CBOR over the libp2p stream protocol
-`/charp2p/sync/1.0.0`. Limit encoded requests to 64 KiB, encoded responses to
-2.125 MiB, each request to 30 seconds, and each connection to 32 concurrent
+`/charp2p/sync/2.0.0`. Limit encoded requests and responses to 2.125 MiB, each
+request to 30 seconds, and each connection to 32 concurrent
 synchronization streams.
 
 Limit summaries to 1,024 authors, identifier and event pages to 256 items, each
@@ -35,6 +37,12 @@ an event response to persistence.
 
 Authorization remains a separate group-state check. An unauthorized request is
 rejected without revealing whether the requested group exists.
+
+The owner accepts uploads only from a current MLS member. Every uploaded event
+must be a `MessageCreated` event signed by the authenticated transport peer.
+Uploads are idempotent and atomically persisted before the owner authenticates,
+decrypts, and stores any readable message. The owner then serves those events
+to other members through the existing pull exchanges.
 
 After authorization, a synchronization engine builds responses from verified
 SQLite events. Incoming event responses are validated as a whole and committed
@@ -50,6 +58,8 @@ that advertise history but fail to advance the local gap-free sequence.
 - Large histories transfer through resumable bounded pages.
 - Invalid signed envelopes fail the entire response before any are committed.
 - A peer may return fewer events than requested to remain under the byte cap.
+- A member cannot upload an event signed by another device or mutate group
+  membership through the message-upload path.
 
 ## Sources
 

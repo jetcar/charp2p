@@ -45,6 +45,7 @@ type SynchronizeGroupResult = {
   status: "synchronized";
   groupId: string;
   synchronizedEvents: number;
+  uploadedEvents: number;
 };
 
 type CreatedMessage = {
@@ -872,7 +873,7 @@ function App() {
                   {synchronizingGroup
                     ? "○ Synchronizing…"
                     : synchronizationResult
-                      ? `✓ ${synchronizationResult.synchronizedEvents} new ${synchronizationResult.synchronizedEvents === 1 ? "event" : "events"}`
+                      ? `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared`
                       : "○ Sync not checked"}
                 </span>
               </div>

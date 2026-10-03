@@ -77,6 +77,13 @@ trait SynchronizationService: Send + Sync {
         session: &mut PullSession,
         response: &SyncResponse,
     ) -> Result<SessionProgress, &'static str>;
+
+    fn next_push_request(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        after_sequence: u64,
+    ) -> Result<Option<(SyncRequest, u64)>, &'static str>;
 }
 
 impl MemberAdmissionService for MlsProviderService {
@@ -127,6 +134,15 @@ impl SynchronizationService for MlsProviderService {
     ) -> Result<SessionProgress, &'static str> {
         MlsProviderService::advance_pull_session(self, session, response)
     }
+
+    fn next_push_request(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        after_sequence: u64,
+    ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
+        MlsProviderService::next_push_request(self, group_id, author_id, after_sequence)
+    }
 }
 
 #[derive(Clone)]
@@ -164,6 +180,7 @@ pub struct SynchronizeGroupResult {
     pub status: &'static str,
     pub group_id: String,
     pub synchronized_events: usize,
+    pub uploaded_events: usize,
 }
 
 struct ActiveAdvertisement {
@@ -591,7 +608,8 @@ impl NetworkService {
         group_id: PeerId,
         expected_peer: PeerId,
     ) -> Result<SynchronizeGroupResult, &'static str> {
-        if identity.peer_id() == expected_peer {
+        let local_peer = identity.peer_id();
+        if local_peer == expected_peer {
             return Err("synchronization_peer_invalid");
         }
         let mut node = self
@@ -600,10 +618,14 @@ impl NetworkService {
         let synchronized_events = self
             .pull_from_connected_peer(&mut node, expected_peer, group_id)
             .await?;
+        let uploaded_events = self
+            .push_to_connected_peer(&mut node, expected_peer, group_id, local_peer)
+            .await?;
         Ok(SynchronizeGroupResult {
             status: "synchronized",
             group_id: group_id.to_string(),
             synchronized_events,
+            uploaded_events,
         })
     }
 
@@ -728,6 +750,72 @@ impl NetworkService {
         }
         Err("synchronization_limit_exceeded")
     }
+
+    async fn push_to_connected_peer(
+        &self,
+        node: &mut NetworkNode,
+        peer_id: PeerId,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<usize, &'static str> {
+        let mut after_sequence = 0_u64;
+        let mut inserted = 0_usize;
+        for _ in 0..MAX_SYNC_EXCHANGES {
+            let Some((request, last_sequence)) =
+                self.synchronization
+                    .next_push_request(group_id, author_id, after_sequence)?
+            else {
+                return Ok(inserted);
+            };
+            if last_sequence <= after_sequence {
+                return Err("synchronization_failed");
+            }
+            let request_id = node
+                .send_sync_request(peer_id, request)
+                .map_err(|_| "synchronization_failed")?;
+            let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
+                loop {
+                    match node.next_event().await {
+                        NetworkEvent::SyncResponseReceived {
+                            peer_id: response_peer,
+                            request_id: response_id,
+                            response,
+                        } if response_peer == peer_id && response_id == request_id => {
+                            return Ok(response);
+                        }
+                        NetworkEvent::SyncRequestFailed {
+                            peer_id: failed_peer,
+                            request_id: failed_id,
+                            ..
+                        } if failed_peer == peer_id && failed_id == request_id => {
+                            return Err("synchronization_failed");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "synchronization_timed_out")??;
+            match response {
+                SyncResponse::EventsAccepted {
+                    group_id: response_group,
+                    inserted: accepted,
+                } if response_group == group_id => {
+                    inserted = inserted.saturating_add(usize::from(accepted));
+                    after_sequence = last_sequence;
+                }
+                SyncResponse::Rejected { reason } => {
+                    return Err(match reason {
+                        SyncRejectReason::Unauthorized => "synchronization_unauthorized",
+                        SyncRejectReason::InvalidRequest => "synchronization_failed",
+                        SyncRejectReason::Busy => "synchronization_busy",
+                    });
+                }
+                _ => return Err("synchronization_failed"),
+            }
+        }
+        Err("synchronization_limit_exceeded")
+    }
 }
 
 fn join_response(
@@ -841,6 +929,15 @@ impl SynchronizationService for UnavailableSynchronizationService {
         _session: &mut PullSession,
         _response: &SyncResponse,
     ) -> Result<SessionProgress, &'static str> {
+        Err("synchronization_unavailable")
+    }
+
+    fn next_push_request(
+        &self,
+        _group_id: PeerId,
+        _author_id: PeerId,
+        _after_sequence: u64,
+    ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
         Err("synchronization_unavailable")
     }
 }
@@ -962,6 +1059,15 @@ mod tests {
                 },
                 complete: true,
             })
+        }
+
+        fn next_push_request(
+            &self,
+            _group_id: PeerId,
+            _author_id: PeerId,
+            _after_sequence: u64,
+        ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
+            Ok(None)
         }
     }
 
@@ -1412,6 +1518,7 @@ mod tests {
             assert_eq!(result.status, "synchronized");
             assert_eq!(result.group_id, invitation.group_id().to_string());
             assert_eq!(result.synchronized_events, 3);
+            assert_eq!(result.uploaded_events, 0);
         });
     }
 

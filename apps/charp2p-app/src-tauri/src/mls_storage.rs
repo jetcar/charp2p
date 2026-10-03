@@ -10,7 +10,8 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
-    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
+    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse, MAX_SYNC_BATCH_ITEMS,
+    MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -22,11 +23,13 @@ use charp2p_mls::{
 use charp2p_store::{
     EventStore, MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
-use charp2p_sync::{build_authorized_response, PullSession, SessionProgress, SynchronizationError};
+use charp2p_sync::{
+    accept_pushed_events, build_authorized_response, PullSession, SessionProgress,
+    SynchronizationError,
+};
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{
-    CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
-    ProtocolMessage,
+    CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use serde::Serialize as SerdeSerialize;
@@ -225,11 +228,8 @@ impl MlsProviderService {
         encrypted
             .into_iter()
             .map(|message| {
-                let plaintext = decrypt_local_message(
-                    &message.encrypted_body,
-                    &key,
-                    &message.event_id,
-                )?;
+                let plaintext =
+                    decrypt_local_message(&message.encrypted_body, &key, &message.event_id)?;
                 let text = std::str::from_utf8(&plaintext)
                     .map_err(|_| "message_record_invalid")?
                     .to_owned();
@@ -348,7 +348,7 @@ impl MlsProviderService {
                 reason: SyncRejectReason::Busy,
             };
         };
-        let Ok(provider) = self.provider.lock() else {
+        let Ok(mut provider) = self.provider.lock() else {
             return SyncResponse::Rejected {
                 reason: SyncRejectReason::Busy,
             };
@@ -369,17 +369,104 @@ impl MlsProviderService {
                 reason: SyncRejectReason::Unauthorized,
             };
         }
-        let Ok(store) = self.store.lock() else {
+        drop(group);
+        let Ok(mut store) = self.store.lock() else {
             return SyncResponse::Rejected {
                 reason: SyncRejectReason::Busy,
             };
         };
+        if let SyncRequest::PushEvents { group_id, .. } = request {
+            return match accept_pushed_events(&mut store, authenticated_peer, request) {
+                Ok(outcome) => {
+                    if self
+                        .materialize_pending_messages(&mut provider, &mut store, *group_id)
+                        .is_err()
+                    {
+                        return SyncResponse::Rejected {
+                            reason: SyncRejectReason::Busy,
+                        };
+                    }
+                    SyncResponse::EventsAccepted {
+                        group_id: *group_id,
+                        inserted: u16::try_from(outcome.inserted).unwrap_or(u16::MAX),
+                    }
+                }
+                Err(error) => SyncResponse::Rejected {
+                    reason: match error {
+                        SynchronizationError::Protocol(_)
+                        | SynchronizationError::PushedAuthorMismatch
+                        | SynchronizationError::UnsupportedPushedEvent => {
+                            SyncRejectReason::InvalidRequest
+                        }
+                        _ => SyncRejectReason::Busy,
+                    },
+                },
+            };
+        }
         build_authorized_response(&store, request).unwrap_or_else(|error| SyncResponse::Rejected {
             reason: match error {
                 SynchronizationError::Protocol(_) => SyncRejectReason::InvalidRequest,
                 _ => SyncRejectReason::Busy,
             },
         })
+    }
+
+    pub(crate) fn next_push_request(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        after_sequence: u64,
+    ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "synchronization_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "synchronization_unavailable")?;
+        let event_ids = store
+            .event_ids_after(group_id, author_id, after_sequence, MAX_SYNC_BATCH_ITEMS)
+            .map_err(|_| "synchronization_unavailable")?;
+        if event_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut encoded_events = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut last_sequence = after_sequence;
+        for event_id in event_ids {
+            let Some(event) = store
+                .get_event(event_id)
+                .map_err(|_| "synchronization_unavailable")?
+            else {
+                continue;
+            };
+            if event.kind() != EventKind::MessageCreated {
+                last_sequence = event.author_sequence();
+                continue;
+            }
+            let encoded = event.encode().map_err(|_| "synchronization_unavailable")?;
+            let Some(next_total) = total_bytes.checked_add(encoded.len()) else {
+                break;
+            };
+            if next_total > MAX_SYNC_RESPONSE_BYTES {
+                break;
+            }
+            total_bytes = next_total;
+            last_sequence = event.author_sequence();
+            encoded_events.push(encoded);
+        }
+        if encoded_events.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            SyncRequest::PushEvents {
+                group_id,
+                encoded_events,
+            },
+            last_sequence,
+        )))
     }
 
     pub(crate) fn advance_pull_session(
@@ -477,7 +564,8 @@ impl MlsProviderService {
             return Err(MaterializeMessageError::Unreadable);
         };
         let plaintext = Zeroizing::new(application.into_bytes());
-        let text = std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
+        let text =
+            std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
         if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
             return Err(MaterializeMessageError::Unreadable);
         }
@@ -487,8 +575,8 @@ impl MlsProviderService {
         let key = self
             .load_or_create_wrapping_key()
             .map_err(MaterializeMessageError::Unavailable)?;
-        let encrypted_snapshot = encrypt_snapshot(&snapshot, &key)
-            .map_err(MaterializeMessageError::Unavailable)?;
+        let encrypted_snapshot =
+            encrypt_snapshot(&snapshot, &key).map_err(MaterializeMessageError::Unavailable)?;
         let encrypted_body = encrypt_local_message(&plaintext, &key, event.id().as_bytes())
             .map_err(MaterializeMessageError::Unavailable)?;
         store
@@ -962,7 +1050,8 @@ fn sync_request_group_id(request: &SyncRequest) -> PeerId {
     match request {
         SyncRequest::Summary { group_id }
         | SyncRequest::EventIds { group_id, .. }
-        | SyncRequest::Events { group_id, .. } => *group_id,
+        | SyncRequest::Events { group_id, .. }
+        | SyncRequest::PushEvents { group_id, .. } => *group_id,
     }
 }
 
@@ -1591,6 +1680,67 @@ mod tests {
                 })
                 .unwrap(),
             b"Hello from member"
+        );
+    }
+
+    #[test]
+    fn owner_accepts_and_materializes_an_authenticated_member_message_push() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = MlsProviderService::open_with_key_store(
+            directory.path().join("owner.sqlite3"),
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        owner_service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        let member_service = MlsProviderService::open_with_key_store(
+            directory.path().join("member.sqlite3"),
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        let join = member_service
+            .prepare_join_request(member.peer_id(), &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member.peer_id(), join.key_package(), 41)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        member_service
+            .create_message_at(group_id, &member, "Hello from member", 42)
+            .unwrap();
+
+        let (request, sequence) = member_service
+            .next_push_request(group_id, member.peer_id(), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequence, 1);
+        assert_eq!(
+            owner_service.answer_sync_request(member.peer_id(), &request),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 1,
+            }
+        );
+        assert_eq!(
+            owner_service.messages(group_id).unwrap()[0].text,
+            "Hello from member"
+        );
+        assert_eq!(
+            owner_service.answer_sync_request(member.peer_id(), &request),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 0,
+            }
         );
     }
 

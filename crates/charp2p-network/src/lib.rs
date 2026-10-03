@@ -7,15 +7,16 @@ mod join_codec;
 use std::{collections::HashMap, time::Duration};
 
 use charp2p_core::{
-    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError,
-    SyncRejectReason, SyncRequest, SyncResponse,
+    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, SyncError, SyncRejectReason,
+    SyncRequest, SyncResponse, MAX_SYNC_RESPONSE_BYTES,
 };
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
+    identify,
     identity::Keypair,
     kad, ping, request_response,
     swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent},
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use thiserror::Error;
 
@@ -24,11 +25,11 @@ use crate::join_codec::JoinCodec;
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
-const SYNC_PROTOCOL: &str = "/charp2p/sync/1.0.0";
+const SYNC_PROTOCOL: &str = "/charp2p/sync/2.0.0";
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_PROTOCOL: &str = "/charp2p/join/1.0.0";
 const JOIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 
 #[derive(NetworkBehaviour)]
@@ -709,7 +710,7 @@ mod tests {
         DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
         JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
     };
-    use libp2p::{Multiaddr, identity::Keypair};
+    use libp2p::{identity::Keypair, Multiaddr};
     use tokio::time::timeout;
 
     use super::{NetworkEvent, NetworkNode};

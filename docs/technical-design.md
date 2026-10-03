@@ -218,6 +218,12 @@ new MLS application messages it can read, binds the MLS sender credential to
 the signed event author, and adds event-bound encrypted local display copies.
 Messages from epochs before the device joined remain stored as signed opaque
 events and are not shown when their MLS ciphertext cannot be decrypted.
+After pulling, a joined member uploads bounded batches of its locally authored
+message events to the pinned owner over the same authenticated connection. The
+owner accepts only `MessageCreated` events whose signature author matches the
+transport peer, stores them idempotently, and materializes readable plaintext
+into encrypted local display copies. Other members receive those events from
+the owner during later pulls.
 
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
@@ -395,10 +401,10 @@ failure restores the preceding in-memory provider so a ratchet generation is
 never advanced without its event.
 
 Both owners and joined members can create this protected local event. The
-current network path pulls events from the pinned owner; upload of a joined
-member's new event to that owner remains a later synchronization increment. The
-interface therefore reports local encrypted persistence without claiming peer
-delivery.
+joined member uploads its own signed message events to the pinned owner during
+synchronization. The interface reports received and newly accepted shared
+event counts; an accepted upload means the owner persisted the event for later
+fan-out, not that every member is currently online.
 
 Each device keeps readable message text as one bounded local display copy
 protected with XChaCha20-Poly1305 under the platform-protected provider wrapping

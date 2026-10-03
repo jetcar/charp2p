@@ -5,8 +5,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use charp2p_core::{
-    EventError, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId, SignedEvent, SyncAuthorHead,
-    SyncError, SyncRequest, SyncResponse,
+    EventError, EventKind, PeerId, SignedEvent, SyncAuthorHead, SyncError, SyncRequest,
+    SyncResponse, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_store::{EventStore, PutEventsOutcome, StoreError};
 use thiserror::Error;
@@ -73,9 +73,41 @@ pub fn build_authorized_response(
                 encoded_events,
             }
         }
+        SyncRequest::PushEvents { .. } => {
+            return Err(SynchronizationError::UnexpectedRequest);
+        }
     };
     response.validate()?;
     Ok(response)
+}
+
+/// Validates and atomically stores events uploaded by an authenticated group member.
+///
+/// Uploads are restricted to messages signed by the connected device. Membership
+/// authorization remains the caller's responsibility.
+pub fn accept_pushed_events(
+    store: &mut EventStore,
+    authenticated_peer: PeerId,
+    request: &SyncRequest,
+) -> Result<ApplyOutcome, SynchronizationError> {
+    request.validate()?;
+    let SyncRequest::PushEvents { encoded_events, .. } = request else {
+        return Err(SynchronizationError::UnexpectedRequest);
+    };
+
+    let mut events = Vec::with_capacity(encoded_events.len());
+    for encoded in encoded_events {
+        let event = SignedEvent::decode(encoded)?;
+        if event.author_id() != authenticated_peer {
+            return Err(SynchronizationError::PushedAuthorMismatch);
+        }
+        if event.kind() != EventKind::MessageCreated {
+            return Err(SynchronizationError::UnsupportedPushedEvent);
+        }
+        events.push(event);
+    }
+
+    Ok(store.put_events(&events)?.into())
 }
 
 /// Validates and atomically commits signed events from a peer response.
@@ -327,6 +359,15 @@ pub enum SynchronizationError {
     /// A completed session received another response.
     #[error("synchronization session is already complete")]
     SessionComplete,
+    /// A push request was passed to a read-only response builder, or vice versa.
+    #[error("unexpected synchronization request")]
+    UnexpectedRequest,
+    /// An uploaded event was not authored by the authenticated connection.
+    #[error("uploaded event author does not match the authenticated peer")]
+    PushedAuthorMismatch,
+    /// Only group messages can be uploaded by a member.
+    #[error("uploaded event kind is not supported")]
+    UnsupportedPushedEvent,
 }
 
 fn event_ids_request(group_id: PeerId, author_id: PeerId, after_sequence: u64) -> SyncRequest {
@@ -358,7 +399,10 @@ mod tests {
     };
     use charp2p_store::EventStore;
 
-    use super::{ApplyOutcome, PullSession, apply_response, build_authorized_response};
+    use super::{
+        accept_pushed_events, apply_response, build_authorized_response, ApplyOutcome, PullSession,
+        SynchronizationError,
+    };
 
     #[test]
     fn missing_events_move_between_independent_stores() {
@@ -444,6 +488,49 @@ mod tests {
                 .already_present,
             1
         );
+    }
+
+    #[test]
+    fn authenticated_message_push_is_idempotent() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let event = message_event(&author, &group, 1, b"message");
+        let request = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![event.encode().unwrap()],
+        };
+        let mut store = EventStore::in_memory().unwrap();
+
+        assert_eq!(
+            accept_pushed_events(&mut store, author.peer_id(), &request)
+                .unwrap()
+                .inserted,
+            1
+        );
+        assert_eq!(
+            accept_pushed_events(&mut store, author.peer_id(), &request)
+                .unwrap()
+                .already_present,
+            1
+        );
+    }
+
+    #[test]
+    fn push_rejects_events_signed_by_another_device() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let authenticated = DeviceIdentity::generate();
+        let event = message_event(&author, &group, 1, b"message");
+        let request = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![event.encode().unwrap()],
+        };
+        let mut store = EventStore::in_memory().unwrap();
+
+        assert!(matches!(
+            accept_pushed_events(&mut store, authenticated.peer_id(), &request),
+            Err(SynchronizationError::PushedAuthorMismatch)
+        ));
     }
 
     #[test]

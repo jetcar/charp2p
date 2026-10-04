@@ -167,6 +167,49 @@ impl PendingInvitationService {
         Ok(groups.into_iter().map(JoinedGroup::from_metadata).collect())
     }
 
+    pub fn cancel(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let mut metadata = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let exists = metadata
+            .pending_invitations()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .iter()
+            .any(|pending| pending.group_id == group_id);
+        if !exists {
+            return Err("pending_invitation_not_found");
+        }
+        self.secrets.remove(group_id)?;
+        if !metadata
+            .remove_pending_invitation(group_id)
+            .map_err(|_| "pending_invitation_store_unavailable")?
+        {
+            return Err("pending_invitation_not_found");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_pending(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let exists = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .pending_invitations()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .iter()
+            .any(|pending| pending.group_id == group_id);
+        exists.then_some(()).ok_or("pending_invitation_not_found")
+    }
+
     pub(crate) fn complete_join(&self, group_id: PeerId) -> Result<JoinedGroup, &'static str> {
         let _operation = self
             .operations
@@ -607,6 +650,19 @@ mod tests {
             service.accept_at(&encoded, NOW),
             Err("group_already_joined")
         );
+    }
+
+    #[test]
+    fn cancellation_removes_pending_metadata_and_bearer() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        service.accept_at(&encoded, NOW).unwrap();
+
+        service.cancel(group_id).unwrap();
+
+        assert!(service.list_at(NOW).unwrap().is_empty());
+        assert!(service.secrets.get_optional(group_id).unwrap().is_none());
+        assert_eq!(service.cancel(group_id), Err("pending_invitation_not_found"));
     }
 
     #[test]

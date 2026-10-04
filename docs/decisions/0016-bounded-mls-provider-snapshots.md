@@ -44,6 +44,9 @@ Mutations represented by signed group events persist that event and the
 resulting encrypted snapshot in one SQLite transaction. A pending join stores
 its bounded public KeyPackage alongside the snapshot containing the matching
 private material; creation and completion of that pair are transactional.
+Cancelling a pending invitation deletes the one-time KeyPackage from the
+provider, then atomically removes its public index and stores the reduced
+encrypted snapshot before the bearer invitation is discarded.
 
 ## Consequences
 

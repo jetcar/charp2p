@@ -63,6 +63,22 @@ fn pending_invitations(
 }
 
 #[tauri::command]
+fn cancel_pending_invitation(
+    group_id: String,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
+    pending_service
+        .ensure_pending(group_id)
+        .map_err(str::to_owned)?;
+    mls_service
+        .cancel_pending_join(group_id)
+        .map_err(str::to_owned)?;
+    pending_service.cancel(group_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn joined_groups(
     service: tauri::State<'_, PendingInvitationService>,
 ) -> Result<Vec<JoinedGroup>, String> {
@@ -395,6 +411,7 @@ pub fn run() {
             preview_invitation,
             accept_invitation,
             pending_invitations,
+            cancel_pending_invitation,
             joined_groups,
             local_groups,
             issued_invitations,

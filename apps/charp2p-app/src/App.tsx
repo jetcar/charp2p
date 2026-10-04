@@ -407,6 +407,7 @@ function App() {
   );
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
+  const [cancellingPending, setCancellingPending] = useState(false);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
@@ -824,6 +825,25 @@ function App() {
     }
   }
 
+  async function cancelPendingInvitation() {
+    if (!pendingGroup || cancellingPending || !isTauri()) return;
+    if (!window.confirm("Remove this saved invitation from this device?")) return;
+
+    setError("");
+    setCancellingPending(true);
+    try {
+      await invoke("cancel_pending_invitation", {
+        groupId: pendingGroup.groupId,
+      });
+      setPendingGroup(null);
+      setPeerSearchResult(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCancellingPending(false);
+    }
+  }
+
   async function performJoinedGroupSynchronization(groupId: string, reportErrors: boolean) {
     if (synchronizationInFlight.current || !isTauri()) return;
 
@@ -1124,11 +1144,14 @@ function App() {
               </dl>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Your invitation is stored securely until the invited owner is online.</p>
-              <button className="primary-button join-button" disabled={joiningGroup || searchingPeers || !isTauri()} onClick={joinPendingGroup} type="button">
+              <button className="primary-button join-button" disabled={joiningGroup || searchingPeers || cancellingPending || !isTauri()} onClick={joinPendingGroup} type="button">
                 {joiningGroup ? "Joining securely…" : "Connect and join"}
               </button>
-              <button className="secondary-button" disabled={joiningGroup || searchingPeers || !isTauri()} onClick={searchForPeers} type="button">
+              <button className="secondary-button" disabled={joiningGroup || searchingPeers || cancellingPending || !isTauri()} onClick={searchForPeers} type="button">
                 {searchingPeers ? "Checking availability…" : "Check peer availability"}
+              </button>
+              <button className="text-button" disabled={joiningGroup || searchingPeers || cancellingPending || !isTauri()} onClick={cancelPendingInvitation} type="button">
+                {cancellingPending ? "Removing…" : "Remove invitation"}
               </button>
             </section>
           )}

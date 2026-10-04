@@ -31,10 +31,11 @@ use charp2p_sync::{
 };
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{
-    ContentType, CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
-    ProtocolMessage,
+    tls_codec::Deserialize, ContentType, CredentialWithKey, GroupId, KeyPackageIn, MlsGroup,
+    OpenMlsProvider, ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
 };
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::storage::StorageProvider;
 use serde::Serialize as SerdeSerialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -1249,6 +1250,69 @@ impl MlsProviderService {
         result
     }
 
+    /// Removes a pending join's one-time KeyPackage and its durable private
+    /// material before an invitation is discarded.
+    pub(crate) fn cancel_pending_join(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let Some(encoded) = store
+            .pending_mls_join_key_package(group_id)
+            .map_err(|_| "mls_provider_store_unavailable")?
+        else {
+            return Ok(());
+        };
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let mut remaining = encoded.as_slice();
+            let key_package = KeyPackageIn::tls_deserialize(&mut remaining)
+                .map_err(|_| "mls_pending_join_invalid")?;
+            if !remaining.is_empty() {
+                return Err("mls_pending_join_invalid");
+            }
+            let key_package = key_package
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .map_err(|_| "mls_pending_join_invalid")?;
+            let reference = key_package
+                .hash_ref(provider.crypto())
+                .map_err(|_| "mls_pending_join_invalid")?;
+            provider
+                .storage()
+                .delete_key_package(&reference)
+                .map_err(|_| "mls_group_storage_unavailable")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            if !store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id, &encrypted,
+                )
+                .map_err(|_| "mls_provider_store_unavailable")?
+            {
+                return Err("mls_pending_join_missing");
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
+    }
+
     #[cfg(test)]
     fn read<T>(&self, operation: impl FnOnce(&ProfileProvider) -> T) -> Result<T, &'static str> {
         let _operation = self
@@ -1958,6 +2022,45 @@ mod tests {
             .prepare_join_request(device_id, &invitation)
             .unwrap();
         assert_eq!(first.key_package(), after_restart.key_package());
+    }
+
+    #[test]
+    fn cancelled_pending_join_removes_key_material_and_can_start_fresh() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let invitation = invitation(&GroupIdentity::generate());
+        let group_id = invitation.group_id();
+        let device_id = DeviceIdentity::generate().peer_id();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+
+        let first = service
+            .prepare_join_request(device_id, &invitation)
+            .unwrap();
+        service.cancel_pending_join(group_id).unwrap();
+        service.cancel_pending_join(group_id).unwrap();
+        assert!(EventStore::open(&path)
+            .unwrap()
+            .pending_mls_join_key_package(group_id)
+            .unwrap()
+            .is_none());
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        let replacement = restored
+            .prepare_join_request(device_id, &invitation)
+            .unwrap();
+        assert_ne!(first.key_package(), replacement.key_package());
     }
 
     #[test]

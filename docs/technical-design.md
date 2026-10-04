@@ -555,9 +555,9 @@ Before protocol implementation:
 
 1. ~~Select and prototype the group-message protection construction.~~ MLS via
    OpenMLS is selected and its initial multi-member flow is covered by an
-   executable Windows prototype. Android target and device validation remains
-   part of the application integration gate because upstream builds but does
-   not test Android targets.
+   executable Windows prototype. The Android project now cross-compiles the
+   same Rust core and assembles an arm64 debug APK. Emulator and physical-device
+   validation remain part of the application integration gate.
 2. Select the portable core and UI stack.
 3. Define canonical binary serialization and size limits.
 4. Write protocol test vectors for identities, invitations, event signatures,

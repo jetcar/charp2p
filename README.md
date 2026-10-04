@@ -49,13 +49,17 @@ The node prints its full bootstrap multiaddress after binding. See the
 [routing-node guide](crates/charp2p-node/README.md) for identity storage and
 client configuration.
 
-Initialize or run the Android target after installing Tauri's Android
+Build or run the initialized Android target after installing Tauri's Android
 prerequisites:
 
 ```powershell
-pnpm tauri android init
+pnpm tauri android build --debug --apk
 pnpm tauri android dev
 ```
+
+Windows development hosts must allow symbolic-link creation, normally by
+enabling Developer Mode, before the Tauri Android command packages native
+libraries.
 
 Architecture decisions are recorded in [docs/decisions](docs/decisions).
 

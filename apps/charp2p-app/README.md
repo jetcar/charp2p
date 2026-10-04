@@ -9,6 +9,11 @@ pnpm build
 pnpm tauri dev
 ```
 
+The checked-in Android Studio project supports arm64, armv7, x86, and x86_64.
+Build an arm64 debug APK with `pnpm tauri android build --debug --apk` after
+installing Tauri's Android prerequisites. Windows build hosts must allow
+symbolic-link creation, normally through Developer Mode.
+
 The current shell implements device onboarding and a local invitation preview.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links

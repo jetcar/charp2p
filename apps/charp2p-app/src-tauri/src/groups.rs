@@ -5,10 +5,12 @@ use std::{
 };
 
 use charp2p_core::{
-    GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId, InvitationSpec,
-    JoinRequest, PeerId,
+    DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId,
+    InvitationSpec, JoinRequest, PeerId,
 };
-use charp2p_store::{EventStore, IssuedInvitationMetadata, LocalGroupMetadata};
+use charp2p_store::{
+    EventStore, IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
+};
 use keyring_core::Error as KeyringError;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -19,10 +21,12 @@ use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
 const CREDENTIAL_PREFIX: &str = "group-identity-v1-";
 const INVITATION_CREDENTIAL_PREFIX: &str = "issued-invitation-v1-";
+const OWNER_DISCOVERY_CREDENTIAL_PREFIX: &str = "owner-discovery-v1-";
 const MAX_GROUP_NAME_CHARS: usize = 80;
 const MAX_GROUP_NAME_BYTES: usize = 80;
 const MAX_GROUP_SECRET_BYTES: usize = 512;
 const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
+const MAX_OWNER_DISCOVERY_KEYS: usize = 64;
 const ALLOWED_INVITATION_LIFETIMES: [u64; 4] = [86_400, 604_800, 1_209_600, 2_592_000];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -98,8 +102,18 @@ trait IssuedInvitationSecretStore: Send + Sync {
     fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str>;
 }
 
+trait OwnerDiscoveryKeyStore: Send + Sync {
+    fn put(&self, invitation_id: InvitationId, key: DiscoveryKey) -> Result<(), &'static str>;
+    fn get_optional(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<Option<DiscoveryKey>, &'static str>;
+    fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str>;
+}
+
 struct PlatformGroupSecretStore;
 struct PlatformIssuedInvitationSecretStore;
+struct PlatformOwnerDiscoveryKeyStore;
 
 impl GroupSecretStore for PlatformGroupSecretStore {
     fn put(&self, group_id: PeerId, secret: &[u8]) -> Result<(), &'static str> {
@@ -155,11 +169,45 @@ impl IssuedInvitationSecretStore for PlatformIssuedInvitationSecretStore {
     }
 }
 
+impl OwnerDiscoveryKeyStore for PlatformOwnerDiscoveryKeyStore {
+    fn put(&self, invitation_id: InvitationId, key: DiscoveryKey) -> Result<(), &'static str> {
+        protected_entry(&owner_discovery_credential_user(invitation_id))?
+            .set_secret(key.as_bytes())
+            .map_err(|_| "owner_discovery_store_unavailable")
+    }
+
+    fn get_optional(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<Option<DiscoveryKey>, &'static str> {
+        match protected_entry(&owner_discovery_credential_user(invitation_id))?.get_secret() {
+            Ok(encoded) => {
+                let encoded: [u8; 32] = encoded
+                    .try_into()
+                    .map_err(|_| "owner_discovery_record_invalid")?;
+                Ok(Some(DiscoveryKey::from_bytes(encoded)))
+            }
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(_) => Err("owner_discovery_store_unavailable"),
+        }
+    }
+
+    fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str> {
+        match protected_entry(&owner_discovery_credential_user(invitation_id))?
+            .delete_credential()
+        {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(_) => Err("owner_discovery_store_unavailable"),
+        }
+    }
+}
+
 pub struct GroupService {
     operations: Arc<Mutex<()>>,
     metadata: Mutex<EventStore>,
     secrets: Box<dyn GroupSecretStore>,
     invitation_secrets: Box<dyn IssuedInvitationSecretStore>,
+    owner_discovery_keys: Box<dyn OwnerDiscoveryKeyStore>,
 }
 
 impl GroupService {
@@ -169,6 +217,7 @@ impl GroupService {
             metadata: Mutex::new(EventStore::open(path).map_err(|_| "group_store_unavailable")?),
             secrets: Box::new(PlatformGroupSecretStore),
             invitation_secrets: Box::new(PlatformIssuedInvitationSecretStore),
+            owner_discovery_keys: Box::new(PlatformOwnerDiscoveryKeyStore),
         })
     }
 
@@ -282,6 +331,7 @@ impl GroupService {
             let secret = match self.secrets.get(stored.group_id) {
                 Ok(secret) => secret,
                 Err("group_identity_missing") => {
+                    self.remove_owner_discovery_keys(&mut store, stored.group_id)?;
                     store
                         .remove_local_group(stored.group_id)
                         .map_err(|_| "group_store_unavailable")?;
@@ -325,6 +375,50 @@ impl GroupService {
         self.issued_invitations_at(now_unix)
     }
 
+    /// Loads every rendezvous key retained for existing members of an owned group.
+    pub fn owner_discovery_keys(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<DiscoveryKey>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        if !store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .any(|group| group.group_id == group_id)
+        {
+            return Err("group_not_found");
+        }
+        let indexed = store
+            .owner_discovery_keys(group_id)
+            .map_err(|_| "group_store_unavailable")?;
+        if indexed.len() > MAX_OWNER_DISCOVERY_KEYS {
+            return Err("owner_discovery_record_invalid");
+        }
+        let mut keys = Vec::with_capacity(indexed.len());
+        for metadata in indexed {
+            match self
+                .owner_discovery_keys
+                .get_optional(metadata.invitation_id)?
+            {
+                Some(key) => keys.push(key),
+                None => {
+                    store
+                        .remove_owner_discovery_key(metadata.invitation_id)
+                        .map_err(|_| "group_store_unavailable")?;
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     /// Revokes the active invitation for one locally owned group.
     ///
     /// The protected bearer is removed before its index so any interrupted
@@ -356,6 +450,19 @@ impl GroupService {
             return Err("issued_invitation_not_found");
         }
         for invitation in invitations {
+            if let Some(encoded) = self
+                .invitation_secrets
+                .get_optional(invitation.invitation_id)?
+            {
+                let (decoded, _) = decode_issued_invitation(&encoded)?;
+                if decoded.invitation_id() != invitation.invitation_id
+                    || decoded.group_id() != invitation.group_id
+                    || decoded.expires_at_unix() != invitation.expires_at_unix
+                {
+                    return Err("issued_invitation_record_invalid");
+                }
+                self.retain_owner_discovery_key(&mut store, &decoded)?;
+            }
             self.invitation_secrets.remove(invitation.invitation_id)?;
             store
                 .remove_issued_invitation(invitation.invitation_id)
@@ -497,6 +604,7 @@ impl GroupService {
             {
                 return Err("issued_invitation_record_invalid");
             }
+            self.retain_owner_discovery_key(&mut store, &invitation)?;
             if invitation.expires_at_unix() > now_unix {
                 return Err("invitation_already_exists");
             }
@@ -504,6 +612,14 @@ impl GroupService {
             store
                 .remove_issued_invitation(existing.invitation_id)
                 .map_err(|_| "group_store_unavailable")?;
+        }
+        if store
+            .owner_discovery_keys(group_id)
+            .map_err(|_| "group_store_unavailable")?
+            .len()
+            >= MAX_OWNER_DISCOVERY_KEYS
+        {
+            return Err("owner_discovery_limit_reached");
         }
         let secret = self.secrets.get(group_id)?;
         let identity = GroupIdentity::from_persisted_secret(&secret)
@@ -552,6 +668,13 @@ impl GroupService {
                 .map_err(|_| "group_store_unavailable")?;
             return Err(error);
         }
+        if let Err(error) = self.retain_owner_discovery_key(&mut store, &invitation) {
+            self.invitation_secrets.remove(indexed.invitation_id)?;
+            store
+                .remove_issued_invitation(indexed.invitation_id)
+                .map_err(|_| "group_store_unavailable")?;
+            return Err(error);
+        }
         Ok(issued_invitation(&invitation, encoded.as_str()))
     }
 
@@ -577,6 +700,10 @@ impl GroupService {
         for indexed in indexed {
             if !local_group_ids.contains(&indexed.group_id) {
                 self.invitation_secrets.remove(indexed.invitation_id)?;
+                self.owner_discovery_keys.remove(indexed.invitation_id)?;
+                store
+                    .remove_owner_discovery_key(indexed.invitation_id)
+                    .map_err(|_| "group_store_unavailable")?;
                 store
                     .remove_issued_invitation(indexed.invitation_id)
                     .map_err(|_| "group_store_unavailable")?;
@@ -614,6 +741,7 @@ impl GroupService {
             {
                 return Err("issued_invitation_record_invalid");
             }
+            self.retain_owner_discovery_key(&mut store, &invitation)?;
             if indexed.expires_at_unix <= now_unix {
                 self.invitation_secrets.remove(indexed.invitation_id)?;
                 store
@@ -624,6 +752,55 @@ impl GroupService {
             invitations.push(issued_invitation(&invitation, encoded));
         }
         Ok(invitations)
+    }
+
+    fn retain_owner_discovery_key(
+        &self,
+        store: &mut EventStore,
+        invitation: &Invitation,
+    ) -> Result<(), &'static str> {
+        let invitation_id = invitation.invitation_id();
+        let key = DiscoveryKey::from_invitation(invitation);
+        let created = if let Some(existing) = self.owner_discovery_keys.get_optional(invitation_id)? {
+            if existing != key {
+                return Err("owner_discovery_record_invalid");
+            }
+            false
+        } else {
+            self.owner_discovery_keys.put(invitation_id, key)?;
+            true
+        };
+        if let Err(error) = store.put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+            invitation_id,
+            group_id: invitation.group_id(),
+        }) {
+            if created {
+                self.owner_discovery_keys.remove(invitation_id)?;
+            }
+            return Err(if matches!(error, charp2p_store::StoreError::Sqlite(_)) {
+                "group_store_unavailable"
+            } else {
+                "owner_discovery_record_invalid"
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_owner_discovery_keys(
+        &self,
+        store: &mut EventStore,
+        group_id: PeerId,
+    ) -> Result<(), &'static str> {
+        for metadata in store
+            .owner_discovery_keys(group_id)
+            .map_err(|_| "group_store_unavailable")?
+        {
+            self.owner_discovery_keys.remove(metadata.invitation_id)?;
+            store
+                .remove_owner_discovery_key(metadata.invitation_id)
+                .map_err(|_| "group_store_unavailable")?;
+        }
+        Ok(())
     }
 }
 
@@ -662,6 +839,13 @@ fn credential_user(group_id: PeerId) -> String {
 fn invitation_credential_user(invitation_id: InvitationId) -> String {
     format!(
         "{INVITATION_CREDENTIAL_PREFIX}{}",
+        encode_identifier(invitation_id)
+    )
+}
+
+fn owner_discovery_credential_user(invitation_id: InvitationId) -> String {
+    format!(
+        "{OWNER_DISCOVERY_CREDENTIAL_PREFIX}{}",
         encode_identifier(invitation_id)
     )
 }
@@ -731,14 +915,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use charp2p_core::{
-        DeviceIdentity, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation,
-        InvitationId, InvitationSpec, JoinRequest, PeerId,
+        DeviceIdentity, DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy,
+        Invitation, InvitationId, InvitationSpec, JoinRequest, PeerId,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
     use super::{
         CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
-        JoinInvitationAuthorizationError,
+        JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
     };
     use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
@@ -752,6 +936,11 @@ mod tests {
     #[derive(Default)]
     struct MemoryInvitationStore {
         saved: Mutex<Vec<(InvitationId, Vec<u8>)>>,
+    }
+
+    #[derive(Default)]
+    struct MemoryOwnerDiscoveryStore {
+        saved: Mutex<Vec<(InvitationId, DiscoveryKey)>>,
     }
 
     impl GroupSecretStore for FailingSecretStore {
@@ -826,12 +1015,42 @@ mod tests {
         }
     }
 
+    impl OwnerDiscoveryKeyStore for MemoryOwnerDiscoveryStore {
+        fn put(&self, invitation_id: InvitationId, key: DiscoveryKey) -> Result<(), &'static str> {
+            self.saved.lock().unwrap().push((invitation_id, key));
+            Ok(())
+        }
+
+        fn get_optional(
+            &self,
+            invitation_id: InvitationId,
+        ) -> Result<Option<DiscoveryKey>, &'static str> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(saved_id, _)| *saved_id == invitation_id)
+                .map(|(_, key)| *key))
+        }
+
+        fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str> {
+            self.saved
+                .lock()
+                .unwrap()
+                .retain(|(saved_id, _)| *saved_id != invitation_id);
+            Ok(())
+        }
+    }
+
     fn service() -> GroupService {
         GroupService {
             operations: Arc::new(Mutex::new(())),
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::new(MemorySecretStore::default()),
             invitation_secrets: Box::new(MemoryInvitationStore::default()),
+            owner_discovery_keys: Box::new(MemoryOwnerDiscoveryStore::default()),
         }
     }
 
@@ -961,7 +1180,14 @@ mod tests {
             .unwrap();
         let request = join_request(&issued.link, NOW);
         let invitation_id = request_invitation_id(&request, NOW);
+        let expected_discovery_key = DiscoveryKey::from_invitation(
+            &Invitation::decode_input(&issued.link, NOW).unwrap(),
+        );
         assert!(service.authorize_join_request_at(&request, NOW).is_ok());
+        assert_eq!(
+            service.owner_discovery_keys(group_id).unwrap(),
+            vec![expected_discovery_key]
+        );
 
         service.revoke_invitation(group_id).unwrap();
 
@@ -975,6 +1201,10 @@ mod tests {
             .get_optional(invitation_id)
             .unwrap()
             .is_none());
+        assert_eq!(
+            service.owner_discovery_keys(group_id).unwrap(),
+            vec![expected_discovery_key]
+        );
         assert_eq!(
             service.revoke_invitation(group_id),
             Err("issued_invitation_not_found")
@@ -1052,7 +1282,7 @@ mod tests {
         let service = service();
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
-        service
+        let issued = service
             .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
             .unwrap();
         service
@@ -1070,6 +1300,18 @@ mod tests {
             .issued_invitations()
             .unwrap()
             .is_empty());
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .owner_discovery_keys(group_id)
+            .unwrap()
+            .is_empty());
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(request_invitation_id(&join_request(&issued.link, NOW), NOW))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1178,6 +1420,7 @@ mod tests {
             metadata: Mutex::new(EventStore::in_memory().unwrap()),
             secrets: Box::new(FailingSecretStore),
             invitation_secrets: Box::new(MemoryInvitationStore::default()),
+            owner_discovery_keys: Box::new(MemoryOwnerDiscoveryStore::default()),
         };
 
         assert_eq!(
@@ -1212,6 +1455,7 @@ mod tests {
             metadata: Mutex::new(metadata),
             secrets: Box::new(MemorySecretStore::default()),
             invitation_secrets: Box::new(MemoryInvitationStore::default()),
+            owner_discovery_keys: Box::new(MemoryOwnerDiscoveryStore::default()),
         };
 
         assert!(service.list().unwrap().is_empty());

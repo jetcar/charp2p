@@ -164,13 +164,14 @@ advertiser refuses to publish an invitation bound to another local identity.
 This turns the authenticated libp2p connection into the first root-authorized
 connection instead of trusting whichever peer knows the rendezvous secret.
 
-After loading and revalidating an issued invitation, the owner client starts
-providing its rendezvous key and keeps the libp2p swarm active until the signed
-invitation expiry. Reopening the same invitation reuses the active advertiser;
-replacing it stops the earlier task. Closing the app removes the live provider,
-while short-lived DHT records may remain until their network TTL elapses. The
-client refreshes publication every five minutes and restarts failed advertisers
-from its status poll.
+After loading and revalidating an issued invitation, the owner retains its
+derived rendezvous key in platform-protected storage under a non-secret SQLite
+index. Revoking or expiring the bearer removes join authority but keeps that
+key so members admitted through it can still find the owner. The owner provides
+all retained keys while the group is open, refreshes publication every five
+minutes, and restarts failed advertisers from its status poll. The set is
+bounded to 64 keys per group. Closing the app removes the live provider, while
+short-lived DHT records may remain until their network TTL elapses.
 
 LAN discovery may use mDNS as an additional path, never as the only discovery
 mechanism.
@@ -502,6 +503,8 @@ Each client stores:
   pending invitation after MLS completion.
 - One opaque derived discovery key per joined group in platform-protected
   storage. It supports later peer lookup but carries no join authorization.
+- Owner-side rendezvous keys retained in platform-protected storage after
+  invitation revocation or expiry, with non-secret indexes in SQLite.
 - Locally materialized message bodies encrypted and authenticated against their
   signed event IDs.
 - User preferences and local blocks.

@@ -46,9 +46,10 @@ and invitation defaults. Group creation also initializes the owner's durable
 MLS group and rolls the local group back if that secure setup fails. Existing
 local groups are reconciled with MLS state at startup. Expired invitations are
 removed from both stores. The owner can explicitly revoke an active invitation;
-the bearer and index are removed and its live network advertisement stops. The
-owner view renders the signed invitation as a QR code for Windows and Android
-handoff without sending it to a QR service.
+the bearer and index are removed immediately. Its protected rendezvous key is
+retained so already admitted members can still discover the owner, while new
+join attempts are rejected. The owner view renders the signed invitation as a
+QR code for Windows and Android handoff without sending it to a QR service.
 The current secure profile exposes only expiring reusable invitations, direct
 invite-based admission, and messages sent after joining. The backend rejects
 single-use, manual-approval, and retained-history creation options so the UI
@@ -81,7 +82,8 @@ atomically with sender ratchet state. They also keep an event-bound encrypted
 local display copy and restore the timeline after restart. Timeline actions can
 copy text or delete only the readable copy on this device. A durable local
 marker prevents the retained signed event from recreating a deleted copy;
-other members keep their copies. Delivery receipts remain a later increment.
+other members keep their copies. A durable acknowledgement head distinguishes
+messages saved only on this device from messages accepted by at least one peer.
 
 Joined members upload bounded batches of their own signed message events to the
 pinned owner after each pull. The owner verifies that every event author

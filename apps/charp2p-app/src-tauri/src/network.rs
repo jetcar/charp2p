@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::{
     sync::Mutex,
     task::JoinHandle,
-    time::{interval, interval_at, sleep, timeout, Instant, MissedTickBehavior},
+    time::{interval, interval_at, timeout, Instant, MissedTickBehavior},
 };
 
 use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
@@ -26,6 +26,7 @@ const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
 const MAX_BOOTSTRAP_PEERS: usize = 16;
 const MAX_BOOTSTRAP_ADDRESS_BYTES: usize = 512;
 const MAX_DISCOVERED_PEERS: usize = 32;
+const MAX_OWNER_DISCOVERY_KEYS: usize = 64;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -204,8 +205,8 @@ pub struct SynchronizeGroupResult {
 }
 
 struct ActiveAdvertisement {
-    key: DiscoveryKey,
-    expires_at_unix: u64,
+    keys: Vec<DiscoveryKey>,
+    expires_at_unix: Option<u64>,
     task: JoinHandle<()>,
 }
 
@@ -285,6 +286,7 @@ impl NetworkService {
         })
     }
 
+    #[cfg(test)]
     pub async fn advertise(
         &self,
         network_identity: DeviceIdentity,
@@ -297,23 +299,70 @@ impl NetworkService {
             return Err("invitation_inviter_mismatch");
         }
         remaining_until_expiry(invitation.expires_at_unix())?;
+        self.advertise_keys(
+            network_identity,
+            owner_identity,
+            vec![DiscoveryKey::from_invitation(invitation)],
+            Some(invitation.expires_at_unix()),
+        )
+        .await
+    }
+
+    /// Advertises retained rendezvous keys for existing members without tying
+    /// synchronization availability to bearer-invitation expiry.
+    pub async fn advertise_owner_group(
+        &self,
+        network_identity: DeviceIdentity,
+        owner_identity: DeviceIdentity,
+        keys: Vec<DiscoveryKey>,
+    ) -> Result<AdvertisementResult, &'static str> {
+        if network_identity.peer_id() != owner_identity.peer_id() {
+            return Err("invitation_inviter_mismatch");
+        }
+        if keys.is_empty() {
+            return Ok(AdvertisementResult {
+                status: "inactive",
+                expires_at_unix: 0,
+            });
+        }
+        self.advertise_keys(network_identity, owner_identity, keys, None)
+            .await
+    }
+
+    async fn advertise_keys(
+        &self,
+        network_identity: DeviceIdentity,
+        owner_identity: DeviceIdentity,
+        mut keys: Vec<DiscoveryKey>,
+        expires_at_unix: Option<u64>,
+    ) -> Result<AdvertisementResult, &'static str> {
+        keys.dedup();
+        if keys.is_empty() {
+            return Err("owner_discovery_key_missing");
+        }
+        if keys.len() > MAX_OWNER_DISCOVERY_KEYS {
+            return Err("owner_discovery_record_invalid");
+        }
+        if let Some(expiry) = expires_at_unix {
+            remaining_until_expiry(expiry)?;
+        }
+        let reported_expiry = expires_at_unix.unwrap_or(0);
         if self.bootstrap_peers.is_empty() {
             return Ok(AdvertisementResult {
                 status: "bootstrapRequired",
-                expires_at_unix: invitation.expires_at_unix(),
+                expires_at_unix: reported_expiry,
             });
         }
 
-        let key = DiscoveryKey::from_invitation(invitation);
         let mut active = self.advertisement.lock().await;
         if let Some(existing) = active.as_ref() {
-            if existing.key == key
-                && existing.expires_at_unix == invitation.expires_at_unix()
+            if existing.keys == keys
+                && existing.expires_at_unix == expires_at_unix
                 && !existing.task.is_finished()
             {
                 return Ok(AdvertisementResult {
                     status: "advertising",
-                    expires_at_unix: existing.expires_at_unix,
+                    expires_at_unix: existing.expires_at_unix.unwrap_or(0),
                 });
             }
         }
@@ -332,19 +381,27 @@ impl NetworkService {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
-        node.announce_group(key)
-            .map_err(|_| "network_unavailable")?;
+        for key in &keys {
+            node.announce_group(*key)
+                .map_err(|_| "network_unavailable")?;
+        }
 
         timeout(PROVIDER_SEARCH_TIMEOUT, async {
+            let mut pending = keys.clone();
             loop {
                 match node.next_event().await {
-                    NetworkEvent::GroupAnnounced { key: announced } if announced == key => {
-                        return Ok(());
+                    NetworkEvent::GroupAnnounced { key: announced }
+                        if pending.contains(&announced) =>
+                    {
+                        pending.retain(|key| *key != announced);
+                        if pending.is_empty() {
+                            return Ok(());
+                        }
                     }
                     NetworkEvent::DiscoveryFailed {
                         key: failed,
                         operation: charp2p_network::DiscoveryOperation::Announcement,
-                    } if failed == key => return Err("network_unavailable"),
+                    } if keys.contains(&failed) => return Err("network_unavailable"),
                     NetworkEvent::SyncRequestReceived {
                         peer_id,
                         request_id,
@@ -374,12 +431,14 @@ impl NetworkService {
         .await
         .map_err(|_| "network_advertisement_timed_out")??;
 
-        remaining_until_expiry(invitation.expires_at_unix())?;
+        if let Some(expiry) = expires_at_unix {
+            remaining_until_expiry(expiry)?;
+        }
 
-        let expires_at_unix = invitation.expires_at_unix();
         let join_authorizer = Arc::clone(&self.join_authorizer);
         let member_admission = Arc::clone(&self.member_admission);
         let synchronization = Arc::clone(&self.synchronization);
+        let task_keys = keys.clone();
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
                 Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
@@ -388,12 +447,14 @@ impl NetworkService {
             refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut expiry_check = interval(EXPIRY_CHECK_INTERVAL);
             expiry_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            while let Ok(remaining) = remaining_until_expiry(expires_at_unix) {
+            loop {
+                if expires_at_unix.is_some_and(|expiry| remaining_until_expiry(expiry).is_err()) {
+                    break;
+                }
                 tokio::select! {
-                    _ = sleep(remaining) => {}
                     _ = expiry_check.tick() => {}
                     _ = refresh.tick() => {
-                        if node.announce_group(key).is_err() {
+                        if task_keys.iter().any(|key| node.announce_group(*key).is_err()) {
                             break;
                         }
                     }
@@ -402,7 +463,7 @@ impl NetworkService {
                             NetworkEvent::DiscoveryFailed {
                                 key: failed,
                                 operation: charp2p_network::DiscoveryOperation::Announcement,
-                            } if failed == key => break,
+                            } if task_keys.contains(&failed) => break,
                             NetworkEvent::SyncRequestReceived {
                                 peer_id,
                                 request_id,
@@ -433,17 +494,18 @@ impl NetworkService {
             }
         });
         *active = Some(ActiveAdvertisement {
-            key,
-            expires_at_unix: invitation.expires_at_unix(),
+            keys,
+            expires_at_unix,
             task,
         });
         Ok(AdvertisementResult {
             status: "advertising",
-            expires_at_unix: invitation.expires_at_unix(),
+            expires_at_unix: reported_expiry,
         })
     }
 
     /// Stops the local provider and request listener for the active invitation.
+    #[cfg(test)]
     pub async fn stop_advertising(&self) {
         self.advertisement.lock().await.take();
     }
@@ -1842,6 +1904,68 @@ mod tests {
             .await
             .expect("advertisement should stop at signed expiry");
             assert!(unix_now() >= invitation.expires_at_unix());
+        });
+    }
+
+    #[test]
+    fn owner_group_advertisement_survives_invitation_expiry() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let invitation = Invitation::issue(
+            &group,
+            owner.peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 2,
+                history_policy: HistoryPolicy::None,
+                reusable: true,
+            },
+            now,
+        )
+        .unwrap();
+        let key = DiscoveryKey::from_invitation(&invitation);
+
+        tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service =
+                NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
+            let advertise = service.advertise_owner_group(owner, owner_signer, vec![key]);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should publish before invitation expiry")
+            .unwrap();
+
+            while unix_now() <= invitation.expires_at_unix() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(!service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("owner advertisement should remain active")
+                .task
+                .is_finished());
         });
     }
 

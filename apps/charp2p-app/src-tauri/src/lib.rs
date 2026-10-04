@@ -5,10 +5,7 @@ mod mls_storage;
 mod network;
 mod pending;
 
-use std::{
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::{Arc, Mutex};
 
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
@@ -106,13 +103,11 @@ fn create_group_invitation(
 async fn revoke_group_invitation(
     group_id: String,
     group_service: tauri::State<'_, Arc<GroupService>>,
-    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     group_service
         .revoke_invitation(group_id)
         .map_err(str::to_owned)?;
-    network_service.stop_advertising().await;
     Ok(())
 }
 
@@ -309,17 +304,10 @@ async fn advertise_group(
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<AdvertisementResult, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
-    let issued = group_service.issued_invitations().map_err(str::to_owned)?;
-    let issued = issued
-        .into_iter()
-        .find(|invitation| invitation.group_id == group_id.to_string())
-        .ok_or_else(|| "issued_invitation_not_found".to_owned())?;
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system_clock_invalid".to_owned())?
-        .as_secs();
-    let invitation = charp2p_core::Invitation::decode_input(&issued.link, now_unix)
-        .map_err(|_| "issued_invitation_record_invalid".to_owned())?;
+    group_service.issued_invitations().map_err(str::to_owned)?;
+    let keys = group_service
+        .owner_discovery_keys(group_id)
+        .map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -327,7 +315,7 @@ async fn advertise_group(
         .load_network_identity()
         .map_err(str::to_owned)?;
     network_service
-        .advertise(identity, owner_identity, &invitation)
+        .advertise_owner_group(identity, owner_identity, keys)
         .await
         .map_err(str::to_owned)
 }

@@ -39,7 +39,7 @@ type PeerSearchResult = {
   reachablePeers: number;
 };
 type AdvertisementResult = {
-  status: "advertising" | "bootstrapRequired";
+  status: "advertising" | "bootstrapRequired" | "inactive";
   expiresAtUnix: number;
 };
 type SynchronizeGroupResult = {
@@ -115,6 +115,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_peer_unreachable: "The invited group owner could not be reached.",
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
+  owner_discovery_limit_reached: "This group has reached its safe invitation rotation limit.",
+  owner_discovery_record_invalid: "The saved group discovery record is damaged.",
+  owner_discovery_store_unavailable: "Protected group discovery storage is unavailable.",
   mls_group_creation_failed: "Secure group setup failed.",
   mls_group_author_mismatch: "This device is not the authorized sender for that group.",
   mls_group_already_joined: "This device already belongs to that group.",
@@ -525,8 +528,6 @@ function App() {
     if (
       !isTauri()
       || !localGroup
-      || !issuedInvitation
-      || issuedInvitation.groupId !== localGroup.groupId
     ) {
       setAdvertisement(null);
       setAdvertisementError("");
@@ -1266,6 +1267,18 @@ function App() {
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
               </button>
+              <div className="status-row" aria-label="Member synchronization status">
+                <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
+                  {advertisement?.status === "advertising"
+                    ? "● Available for member sync"
+                    : advertisement?.status === "bootstrapRequired"
+                      ? "○ Bootstrap node needed"
+                      : advertisementRetrying
+                        ? "○ Peer advertising failed · Retrying…"
+                        : "○ No member rendezvous key yet"}
+                </span>
+              </div>
+              {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 <label htmlFor="outgoing-message">Protected message</label>
                 <textarea
@@ -1354,18 +1367,6 @@ function App() {
                     </figure>
                   )}
                   {invitationQrError && <p className="form-error preview-error" role="alert">{invitationQrError}</p>}
-                  <div className="status-row" aria-label="Invitation network status">
-                    <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
-                      {advertisement?.status === "advertising"
-                        ? "● Advertising to peers"
-                        : advertisement?.status === "bootstrapRequired"
-                          ? "○ Bootstrap node needed"
-                          : advertisementRetrying
-                            ? "○ Advertising failed · Retrying…"
-                          : "○ Starting peer advertising…"}
-                    </span>
-                  </div>
-                  {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
                   {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" onClick={copyInvitation} type="button">
                     {invitationCopied ? "Invitation copied" : "Copy invitation"}

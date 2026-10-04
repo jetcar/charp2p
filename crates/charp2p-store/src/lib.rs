@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -80,6 +80,13 @@ pub struct IssuedInvitationMetadata {
     pub invitation_id: InvitationId,
     pub group_id: PeerId,
     pub expires_at_unix: u64,
+}
+
+/// Non-secret index for an owner-side rendezvous key retained after join.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerDiscoveryKeyMetadata {
+    pub invitation_id: InvitationId,
+    pub group_id: PeerId,
 }
 
 /// Largest event-identifier page returned for one synchronization request.
@@ -893,6 +900,75 @@ impl EventStore {
         )? != 0)
     }
 
+    /// Adds the index for an owner-side rendezvous key kept in protected storage.
+    pub fn put_owner_discovery_key(
+        &mut self,
+        metadata: &OwnerDiscoveryKeyMetadata,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO owner_discovery_keys (invitation_id, group_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(invitation_id) DO NOTHING",
+            params![
+                metadata.invitation_id.as_bytes().as_slice(),
+                metadata.group_id.to_bytes(),
+            ],
+        )?;
+        let stored_group_id: Vec<u8> = self.connection.query_row(
+            "SELECT group_id FROM owner_discovery_keys WHERE invitation_id = ?1",
+            [metadata.invitation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if stored_group_id != metadata.group_id.to_bytes() {
+            return Err(StoreError::CorruptIndex);
+        }
+        Ok(())
+    }
+
+    /// Lists rendezvous-key indexes for a locally owned group.
+    pub fn owner_discovery_keys(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<OwnerDiscoveryKeyMetadata>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT invitation_id, group_id
+             FROM owner_discovery_keys
+             WHERE group_id = ?1
+             ORDER BY invitation_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let (invitation_id, stored_group_id) = row?;
+            let invitation_id: [u8; 16] = invitation_id
+                .try_into()
+                .map_err(|_| StoreError::CorruptIndex)?;
+            let stored_group_id =
+                PeerId::from_bytes(&stored_group_id).map_err(|_| StoreError::CorruptIndex)?;
+            if stored_group_id != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            keys.push(OwnerDiscoveryKeyMetadata {
+                invitation_id: InvitationId::from_bytes(invitation_id),
+                group_id,
+            });
+        }
+        Ok(keys)
+    }
+
+    /// Removes a dangling owner rendezvous-key index.
+    pub fn remove_owner_discovery_key(
+        &mut self,
+        invitation_id: InvitationId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM owner_discovery_keys WHERE invitation_id = ?1",
+            [invitation_id.as_bytes().as_slice()],
+        )? != 0)
+    }
+
     /// Persists the non-secret settings for a locally owned group.
     pub fn put_local_group(&mut self, group: &LocalGroupMetadata) -> Result<(), StoreError> {
         let lifetime = i64::try_from(group.invitation_lifetime_seconds)
@@ -1269,7 +1345,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=12 => {}
+            6..=13 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1396,6 +1472,22 @@ impl EventStore {
                     ON peer_acknowledged_author_heads(
                         group_id, author_id, contiguous_sequence
                     );",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 13 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS owner_discovery_keys (
+                    invitation_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(invitation_id) = 16),
+                    group_id BLOB NOT NULL
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS owner_discovery_keys_by_group
+                    ON owner_discovery_keys(group_id, invitation_id);",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -1616,9 +1708,9 @@ mod tests {
 
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
-        PendingInvitationMetadata, PutEventOutcome, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
-        MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
-        MAX_SYNC_BATCH_EVENTS,
+        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome, StoreError,
+        MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
     };
 
     fn message_event(
@@ -1994,6 +2086,40 @@ mod tests {
             .remove_issued_invitation(invitation.invitation_id)
             .unwrap());
         assert!(reopened.issued_invitations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn owner_discovery_key_indexes_survive_invitation_removal() {
+        let file = NamedTempFile::new().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let invitation_id = InvitationId::from_bytes([8; 16]);
+        let mut store = EventStore::open(file.path()).unwrap();
+        store
+            .put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+                invitation_id,
+                group_id,
+            })
+            .unwrap();
+        store
+            .put_issued_invitation(&IssuedInvitationMetadata {
+                invitation_id,
+                group_id,
+                expires_at_unix: 1_800_003_600,
+            })
+            .unwrap();
+        store.remove_issued_invitation(invitation_id).unwrap();
+        drop(store);
+
+        let mut reopened = EventStore::open(file.path()).unwrap();
+        assert_eq!(
+            reopened.owner_discovery_keys(group_id).unwrap(),
+            vec![OwnerDiscoveryKeyMetadata {
+                invitation_id,
+                group_id,
+            }]
+        );
+        assert!(reopened.remove_owner_discovery_key(invitation_id).unwrap());
+        assert!(reopened.owner_discovery_keys(group_id).unwrap().is_empty());
     }
 
     #[test]
@@ -2900,6 +3026,33 @@ mod tests {
                 .max_acknowledged_author_head(group_id, author_id)
                 .unwrap(),
             7
+        );
+    }
+
+    #[test]
+    fn version_thirteen_database_adds_owner_discovery_keys() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE owner_discovery_keys;
+                     PRAGMA user_version = 13;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let metadata = OwnerDiscoveryKeyMetadata {
+            invitation_id: InvitationId::from_bytes([9; 16]),
+            group_id: GroupIdentity::generate().group_id(),
+        };
+        store.put_owner_discovery_key(&metadata).unwrap();
+        assert_eq!(
+            store.owner_discovery_keys(metadata.group_id).unwrap(),
+            vec![metadata]
         );
     }
 

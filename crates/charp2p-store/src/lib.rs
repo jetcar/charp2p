@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -292,6 +292,79 @@ impl EventStore {
             }
         }
         Ok(events)
+    }
+
+    /// Returns verified MLS membership commits that have not advanced the
+    /// local provider snapshot yet.
+    pub fn unapplied_mls_commit_events(
+        &self,
+        group_id: PeerId,
+        limit: usize,
+    ) -> Result<Vec<SignedEvent>, StoreError> {
+        if !(1..=MAX_SYNC_BATCH_EVENTS).contains(&limit) {
+            return Err(StoreError::InvalidBatchLimit(limit));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT e.encoded
+             FROM events e
+             LEFT JOIN applied_mls_events a ON a.event_id = e.event_id
+             WHERE e.group_id = ?1 AND a.event_id IS NULL
+             ORDER BY e.author_id, e.author_sequence",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut events = Vec::with_capacity(limit);
+        for encoded in rows {
+            let event = SignedEvent::decode(&encoded?)?;
+            if event.group_id() != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            if event.kind() == charp2p_core::EventKind::MemberAdded {
+                events.push(event);
+                if events.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// Atomically records an applied MLS membership commit and the resulting
+    /// encrypted provider state.
+    pub fn put_applied_mls_event_and_encrypted_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+    ) -> Result<bool, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MemberAdded {
+            return Err(StoreError::CorruptIndex);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let transaction = self.connection.transaction()?;
+        let stored: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT encoded FROM events WHERE event_id = ?1",
+                [event.id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Err(StoreError::CorruptIndex);
+        };
+        if SignedEvent::decode(&stored)?.id() != event.id() {
+            return Err(StoreError::CorruptIndex);
+        }
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        let inserted = transaction.execute(
+            "INSERT INTO applied_mls_events (event_id, group_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes()
+            ],
+        )? != 0;
+        transaction.commit()?;
+        Ok(inserted)
     }
 
     /// Loads and re-verifies an event by its identifier.
@@ -973,7 +1046,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6 | 7 => {}
+            6..=8 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1010,6 +1083,23 @@ impl EventStore {
 
                  CREATE INDEX materialized_messages_by_group_time
                     ON materialized_messages(group_id, created_at_unix_ms, event_id);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 8 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE applied_mls_events (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL
+                 ) STRICT;
+
+                 CREATE INDEX applied_mls_events_by_group
+                    ON applied_mls_events(group_id, event_id);",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -1884,6 +1974,48 @@ mod tests {
     }
 
     #[test]
+    fn applied_mls_commit_and_provider_snapshot_commit_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = SignedEvent::create(
+            &author,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        store.put_event(&event).unwrap();
+        assert_eq!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unwrap()[0]
+                .id(),
+            event.id()
+        );
+
+        assert!(store
+            .put_applied_mls_event_and_encrypted_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+            )
+            .unwrap());
+        assert!(store
+            .unapplied_mls_commit_events(group.group_id(), 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"advanced encrypted provider"
+        );
+    }
+
+    #[test]
     fn materialized_message_failure_rolls_back_event_and_snapshot() {
         let mut store = EventStore::in_memory().unwrap();
         store
@@ -2065,6 +2197,29 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn version_eight_database_adds_applied_mls_events() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_mls_events;
+                     PRAGMA user_version = 8;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let group = GroupIdentity::generate();
+        assert!(store
+            .unapplied_mls_commit_events(group.group_id(), 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

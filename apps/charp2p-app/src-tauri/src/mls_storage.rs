@@ -17,8 +17,8 @@ use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
     merge_prepared_member_admission, prepare_profile_key_package, prepare_profile_member_admission,
     stage_profile_welcome, validate_group_profile, validate_profile_key_package,
-    PrepareMemberAdmissionError, ProfileKeyPackageError, ProfileProvider, CIPHERSUITE,
-    MAX_MLS_WIRE_BYTES,
+    validate_staged_commit_profile, PrepareMemberAdmissionError, ProfileKeyPackageError,
+    ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
     EventStore, MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
@@ -29,7 +29,8 @@ use charp2p_sync::{
 };
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{
-    CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
+    ContentType, CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
+    ProtocolMessage,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use serde::Serialize as SerdeSerialize;
@@ -504,8 +505,109 @@ impl MlsProviderService {
         let progress = session
             .handle_response(&mut store, response)
             .map_err(|_| "synchronization_failed")?;
+        self.apply_pending_group_commits(&mut provider, &mut store, session.group_id())?;
         self.materialize_pending_messages(&mut provider, &mut store, session.group_id())?;
         Ok(progress)
+    }
+
+    fn apply_pending_group_commits(
+        &self,
+        provider: &mut ProfileProvider,
+        store: &mut EventStore,
+        group_id: PeerId,
+    ) -> Result<(), &'static str> {
+        loop {
+            let events = store
+                .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+                .map_err(|_| "mls_group_storage_unavailable")?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            let mut applied = 0usize;
+            for event in events {
+                let previous = provider
+                    .snapshot()
+                    .map_err(|_| "mls_provider_snapshot_invalid")?;
+                match self.apply_group_commit(provider, store, group_id, &event) {
+                    Ok(true) => applied += 1,
+                    Ok(false) => {}
+                    Err(ApplyGroupCommitError::Unreadable) => {
+                        *provider = ProfileProvider::from_snapshot(&previous)
+                            .map_err(|_| "mls_provider_snapshot_invalid")?;
+                    }
+                    Err(ApplyGroupCommitError::Unavailable(error)) => {
+                        *provider = ProfileProvider::from_snapshot(&previous)
+                            .map_err(|_| "mls_provider_snapshot_invalid")?;
+                        return Err(error);
+                    }
+                }
+            }
+            if applied == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    fn apply_group_commit(
+        &self,
+        provider: &mut ProfileProvider,
+        store: &mut EventStore,
+        group_id: PeerId,
+        event: &SignedEvent,
+    ) -> Result<bool, ApplyGroupCommitError> {
+        let mut group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map_err(|_| ApplyGroupCommitError::Unavailable("mls_group_storage_unavailable"))?
+        .ok_or(ApplyGroupCommitError::Unavailable(
+            "mls_joined_group_missing",
+        ))?;
+        validate_group_profile(&group).map_err(|_| ApplyGroupCommitError::Unreadable)?;
+        let message = decode_profile_message(event.protected_payload())
+            .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+        let protocol: ProtocolMessage = message
+            .try_into_protocol_message()
+            .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+        if protocol.content_type() != ContentType::Commit || protocol.group_id() != group.group_id()
+        {
+            return Err(ApplyGroupCommitError::Unreadable);
+        }
+        if protocol.epoch() > group.epoch() {
+            return Ok(false);
+        }
+        if protocol.epoch() == group.epoch() {
+            let processed = group
+                .process_message(&*provider, protocol)
+                .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            let sender = device_id_from_credential(processed.credential())
+                .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            if sender != event.author_id() {
+                return Err(ApplyGroupCommitError::Unreadable);
+            }
+            let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
+            else {
+                return Err(ApplyGroupCommitError::Unreadable);
+            };
+            validate_staged_commit_profile(&staged)
+                .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            group
+                .merge_staged_commit(&*provider, *staged)
+                .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            validate_group_profile(&group).map_err(|_| ApplyGroupCommitError::Unreadable)?;
+        }
+        let snapshot = provider
+            .snapshot()
+            .map_err(|_| ApplyGroupCommitError::Unavailable("mls_provider_snapshot_invalid"))?;
+        let key = self
+            .load_or_create_wrapping_key()
+            .map_err(ApplyGroupCommitError::Unavailable)?;
+        let encrypted =
+            encrypt_snapshot(&snapshot, &key).map_err(ApplyGroupCommitError::Unavailable)?;
+        store
+            .put_applied_mls_event_and_encrypted_provider_snapshot(event, &encrypted)
+            .map_err(|_| ApplyGroupCommitError::Unavailable("mls_group_storage_unavailable"))?;
+        Ok(true)
     }
 
     fn materialize_pending_messages(
@@ -1052,6 +1154,11 @@ enum MaterializeMessageError {
     Unavailable(&'static str),
 }
 
+enum ApplyGroupCommitError {
+    Unreadable,
+    Unavailable(&'static str),
+}
+
 fn restore_provider<E>(
     provider: &mut ProfileProvider,
     snapshot: &[u8],
@@ -1194,11 +1301,14 @@ fn decrypt_local_message(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
     use charp2p_core::{
         DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
+        PeerId, SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -1759,6 +1869,115 @@ mod tests {
                 inserted: 0,
             }
         );
+    }
+
+    #[test]
+    fn membership_commits_advance_existing_members_for_message_fanout() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let first_member = DeviceIdentity::generate();
+        let second_member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let first_service = test_service(directory.path().join("first.sqlite3"));
+        let second_service = test_service(directory.path().join("second.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+
+        let first_join = first_service
+            .prepare_join_request(first_member.peer_id(), &invitation)
+            .unwrap();
+        let first_welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                first_member.peer_id(),
+                first_join.key_package(),
+                41,
+            )
+            .unwrap();
+        first_service
+            .complete_join(group_id, first_welcome.welcome().unwrap())
+            .unwrap();
+
+        let second_join = second_service
+            .prepare_join_request(second_member.peer_id(), &invitation)
+            .unwrap();
+        let second_welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                second_member.peer_id(),
+                second_join.key_package(),
+                42,
+            )
+            .unwrap();
+        second_service
+            .complete_join(group_id, second_welcome.welcome().unwrap())
+            .unwrap();
+
+        pull_all(
+            &owner_service,
+            &first_service,
+            first_member.peer_id(),
+            group_id,
+        );
+        first_service
+            .create_message_at(group_id, &first_member, "Hello everyone", 43)
+            .unwrap();
+        let (push, _) = first_service
+            .next_push_request(group_id, first_member.peer_id(), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_service.answer_sync_request(first_member.peer_id(), &push),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 1,
+            }
+        );
+
+        pull_all(
+            &owner_service,
+            &second_service,
+            second_member.peer_id(),
+            group_id,
+        );
+        assert_eq!(
+            second_service.messages(group_id).unwrap().messages[0].text,
+            "Hello everyone"
+        );
+    }
+
+    fn test_service(path: impl AsRef<Path>) -> MlsProviderService {
+        MlsProviderService::open_with_key_store(
+            path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap()
+    }
+
+    fn pull_all(
+        source: &MlsProviderService,
+        target: &MlsProviderService,
+        target_id: PeerId,
+        group_id: PeerId,
+    ) {
+        let (mut session, mut request) = PullSession::start(group_id);
+        loop {
+            let response = source.answer_sync_request(target_id, &request);
+            let progress = target
+                .advance_pull_session(&mut session, &response)
+                .unwrap();
+            if progress.complete {
+                return;
+            }
+            request = progress.next_request.unwrap();
+        }
     }
 
     fn decrypt_application_message(

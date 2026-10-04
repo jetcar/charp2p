@@ -218,6 +218,12 @@ new MLS application messages it can read, binds the MLS sender credential to
 the signed event author, and adds event-bound encrypted local display copies.
 Messages from epochs before the device joined remain stored as signed opaque
 events and are not shown when their MLS ciphertext cannot be decrypted.
+Before decrypting messages, the client applies synchronized `MemberAdded` MLS
+commits in author sequence. It validates the commit profile and binds its MLS
+sender credential to the event author, then atomically stores an applied-event
+marker with the advanced encrypted provider snapshot. Commits already included
+in the joining Welcome are marked without replay, while commits from a future
+epoch wait for their predecessor.
 After pulling, a joined member uploads bounded batches of its locally authored
 message events to the pinned owner over the same authenticated connection. The
 owner accepts only `MessageCreated` events whose signature author matches the

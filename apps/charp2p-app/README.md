@@ -94,3 +94,5 @@ minute while the app runs, and keeps manual retry available. Readable MLS
 application messages are authenticated against their signed event authors,
 stored as event-bound encrypted local copies, and shown in the joined-group
 timeline. Messages from epochs before this device joined remain opaque.
+Synchronized membership commits advance existing members before message
+decryption, so messages continue to fan out after more members join.

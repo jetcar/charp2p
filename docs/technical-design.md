@@ -338,6 +338,15 @@ KeyEpochAdvanced
 Deletion is a signed tombstone request. It hides content in conforming clients
 but cannot guarantee erasure from devices that already received it.
 
+Creating an owner MLS group also creates the owner's sequence-one
+`GroupCreated` event. The event and initial encrypted provider snapshot commit
+in one SQLite transaction; a failure restores the previous provider state and
+the application rolls back the new local-group metadata and protected root.
+The event carries no secret payload. Its signed group identifier and owner
+device author establish the causal root for later membership and message
+events. Existing pre-migration groups retain their established event sequence
+instead of rewriting history.
+
 ## Synchronization
 
 Peers first exchange a compact summary containing each author's highest

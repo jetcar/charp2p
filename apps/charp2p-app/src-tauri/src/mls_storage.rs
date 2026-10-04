@@ -178,13 +178,60 @@ impl MlsProviderService {
     pub(crate) fn initialize_owner_group(
         &self,
         group_id: PeerId,
-        device_id: PeerId,
+        owner_identity: &DeviceIdentity,
     ) -> Result<(), &'static str> {
-        self.mutate(|provider| initialize_owner_group(provider, group_id, device_id))
-            .map_err(|error| match error {
-                MlsProviderMutationError::Operation(error)
-                | MlsProviderMutationError::Unavailable(error) => error,
-            })
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            initialize_owner_group(&mut provider, group_id, owner_identity.peer_id())?;
+            if store
+                .synchronization_summary(group_id)
+                .map_err(|_| "mls_provider_store_unavailable")?
+                .into_iter()
+                .any(|head| head.author_id == owner_identity.peer_id())
+            {
+                return Ok(());
+            }
+            let event = SignedEvent::create(
+                owner_identity,
+                EventSpec {
+                    group_id,
+                    author_sequence: 1,
+                    causal_parents: &[],
+                    created_at_unix_ms: unix_time_millis()?,
+                    kind: EventKind::GroupCreated,
+                    protected_payload: &[],
+                },
+            )
+            .map_err(|_| "group_creation_event_failed")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            store
+                .put_event_and_encrypted_mls_provider_snapshot(&event, &encrypted)
+                .map_err(|_| "mls_provider_store_unavailable")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
     }
 
     pub(crate) fn has_group(&self, group_id: PeerId) -> Result<bool, &'static str> {
@@ -1160,6 +1207,7 @@ impl MlsProviderService {
 
     /// Runs one provider mutation and persists its encrypted snapshot. A failed
     /// operation or durable write restores the preceding in-memory state.
+    #[cfg(test)]
     fn mutate<T, E>(
         &self,
         operation: impl FnOnce(&mut ProfileProvider) -> Result<T, E>,
@@ -1241,6 +1289,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
     encoded
+}
+
+fn unix_time_millis() -> Result<u64, &'static str> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or("system_clock_invalid")
 }
 
 fn next_event_position(
@@ -1361,6 +1417,8 @@ fn validate_owner_group(
 }
 
 /// Result of a provider operation that may fail before durable replacement.
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug)]
 enum MlsProviderMutationError<E> {
     Operation(E),
@@ -1377,6 +1435,7 @@ enum ApplyGroupCommitError {
     Unavailable(&'static str),
 }
 
+#[cfg(test)]
 fn restore_provider<E>(
     provider: &mut ProfileProvider,
     snapshot: &[u8],
@@ -1765,7 +1824,8 @@ mod tests {
         let path = directory.path().join("charp2p.sqlite3");
         let key_store = MemoryWrappingKeyStore::default();
         let group_id = GroupIdentity::generate().group_id();
-        let device_id = DeviceIdentity::generate().peer_id();
+        let owner = DeviceIdentity::generate();
+        let device_id = owner.peer_id();
         let service = MlsProviderService::open_with_key_store(
             &path,
             Arc::new(Mutex::new(())),
@@ -1773,14 +1833,21 @@ mod tests {
         )
         .unwrap();
 
-        service.initialize_owner_group(group_id, device_id).unwrap();
-        service.initialize_owner_group(group_id, device_id).unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         assert_eq!(
             service.group_members(group_id).unwrap(),
             vec![GroupMemberDevice {
                 device_id: device_id.to_string(),
             }]
         );
+        let store = EventStore::open(&path).unwrap();
+        let event_ids = store.event_ids_after(group_id, device_id, 0, 2).unwrap();
+        assert_eq!(event_ids.len(), 1);
+        let created = store.get_event(event_ids[0]).unwrap().unwrap();
+        assert_eq!(created.kind(), EventKind::GroupCreated);
+        assert_eq!(created.author_sequence(), 1);
+        drop(store);
         drop(service);
 
         let restored = MlsProviderService::open_with_key_store(
@@ -1789,9 +1856,7 @@ mod tests {
             Box::new(key_store),
         )
         .unwrap();
-        restored
-            .initialize_owner_group(group_id, device_id)
-            .unwrap();
+        restored.initialize_owner_group(group_id, &owner).unwrap();
     }
 
     #[test]
@@ -1940,9 +2005,7 @@ mod tests {
             Box::new(key_store.clone()),
         )
         .unwrap();
-        service
-            .initialize_owner_group(group_id, owner.peer_id())
-            .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
 
         let response = service
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
@@ -2004,15 +2067,19 @@ mod tests {
 
         let store = EventStore::open(&path).unwrap();
         let event_ids = store
-            .event_ids_after(group_id, owner.peer_id(), 0, 2)
+            .event_ids_after(group_id, owner.peer_id(), 0, 3)
             .unwrap();
-        let first = store.get_event(event_ids[0]).unwrap().unwrap();
-        let second = store.get_event(event_ids[1]).unwrap().unwrap();
+        let created = store.get_event(event_ids[0]).unwrap().unwrap();
+        let first = store.get_event(event_ids[1]).unwrap().unwrap();
+        let second = store.get_event(event_ids[2]).unwrap().unwrap();
+        assert_eq!(created.kind(), EventKind::GroupCreated);
+        assert_eq!(created.author_sequence(), 1);
         assert_eq!(first.kind(), EventKind::MemberAdded);
-        assert_eq!(first.author_sequence(), 1);
+        assert_eq!(first.author_sequence(), 2);
+        assert_eq!(first.causal_parents(), &[created.id()]);
         assert_eq!(first.created_at_unix_ms(), 42);
         assert_eq!(second.kind(), EventKind::MemberAdded);
-        assert_eq!(second.author_sequence(), 2);
+        assert_eq!(second.author_sequence(), 3);
         assert_eq!(second.causal_parents(), &[first.id()]);
         assert_eq!(second.created_at_unix_ms(), 43);
         drop(store);
@@ -2057,9 +2124,7 @@ mod tests {
             Box::new(key_store.clone()),
         )
         .unwrap();
-        service
-            .initialize_owner_group(group_id, owner.peer_id())
-            .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         service
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
             .unwrap();
@@ -2080,14 +2145,14 @@ mod tests {
             .unwrap()
             .is_none());
         let event_ids = store
-            .event_ids_after(group_id, owner.peer_id(), 0, 2)
+            .event_ids_after(group_id, owner.peer_id(), 0, 3)
             .unwrap();
-        let removal = store.get_event(event_ids[1]).unwrap().unwrap();
+        let removal = store.get_event(event_ids[2]).unwrap().unwrap();
         assert_eq!(removal.kind(), EventKind::MemberRemoved);
-        assert_eq!(removal.author_sequence(), 2);
+        assert_eq!(removal.author_sequence(), 3);
         assert_eq!(
             removal.causal_parents(),
-            &[store.get_event(event_ids[0]).unwrap().unwrap().id()]
+            &[store.get_event(event_ids[1]).unwrap().unwrap().id()]
         );
         drop(store);
         drop(service);
@@ -2121,9 +2186,7 @@ mod tests {
             Box::new(key_store.clone()),
         )
         .unwrap();
-        service
-            .initialize_owner_group(group_id, owner.peer_id())
-            .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         let response = service
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 41)
             .unwrap();
@@ -2138,7 +2201,7 @@ mod tests {
             .create_message_at(group_id, &owner, "Protected hello", 42)
             .unwrap();
         assert_eq!(first.kind(), EventKind::MessageCreated);
-        assert_eq!(first.author_sequence(), 2);
+        assert_eq!(first.author_sequence(), 3);
         assert_eq!(first.created_at_unix_ms(), 42);
         assert_eq!(first.causal_parents().len(), 1);
         assert_eq!(
@@ -2156,7 +2219,7 @@ mod tests {
         let second = restored
             .create_message_at(group_id, &owner, "After restart", 43)
             .unwrap();
-        assert_eq!(second.author_sequence(), 3);
+        assert_eq!(second.author_sequence(), 4);
         assert_eq!(second.causal_parents(), &[first.id()]);
         assert_eq!(
             decrypt_application_message(&mut member_group, &member_provider, &second),
@@ -2204,7 +2267,7 @@ mod tests {
         )
         .unwrap();
         owner_service
-            .initialize_owner_group(group_id, owner.peer_id())
+            .initialize_owner_group(group_id, &owner)
             .unwrap();
         let member_service = MlsProviderService::open_with_key_store(
             &member_path,
@@ -2266,7 +2329,7 @@ mod tests {
         )
         .unwrap();
         owner_service
-            .initialize_owner_group(group_id, owner.peer_id())
+            .initialize_owner_group(group_id, &owner)
             .unwrap();
         let member_service = MlsProviderService::open_with_key_store(
             directory.path().join("member.sqlite3"),
@@ -2325,7 +2388,7 @@ mod tests {
         let first_service = test_service(directory.path().join("first.sqlite3"));
         let second_service = test_service(directory.path().join("second.sqlite3"));
         owner_service
-            .initialize_owner_group(group_id, owner.peer_id())
+            .initialize_owner_group(group_id, &owner)
             .unwrap();
 
         let first_join = first_service
@@ -2426,10 +2489,8 @@ mod tests {
             "After removal"
         );
         assert_eq!(
-            owner_service.answer_sync_request(
-                first_member.peer_id(),
-                &SyncRequest::Summary { group_id },
-            ),
+            owner_service
+                .answer_sync_request(first_member.peer_id(), &SyncRequest::Summary { group_id },),
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
             }
@@ -2493,9 +2554,7 @@ mod tests {
             Box::new(MemoryWrappingKeyStore::default()),
         )
         .unwrap();
-        service
-            .initialize_owner_group(group_id, owner.peer_id())
-            .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         service
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
             .unwrap();
@@ -2512,7 +2571,7 @@ mod tests {
         assert_eq!(response_group, group_id);
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].author_id, owner.peer_id());
-        assert_eq!(heads[0].contiguous_sequence, 1);
+        assert_eq!(heads[0].contiguous_sequence, 2);
         assert_eq!(
             service.answer_sync_request(DeviceIdentity::generate().peer_id(), &request),
             SyncResponse::Rejected {
@@ -2538,7 +2597,7 @@ mod tests {
         )
         .unwrap();
         owner_service
-            .initialize_owner_group(group_id, owner.peer_id())
+            .initialize_owner_group(group_id, &owner)
             .unwrap();
         owner_service
             .create_message_at(group_id, &owner, "Before join", 41)
@@ -2576,7 +2635,7 @@ mod tests {
             request = progress.next_request.unwrap();
         }
 
-        assert_eq!(inserted, 3);
+        assert_eq!(inserted, 4);
         assert_eq!(
             member_service
                 .messages(group_id)
@@ -2589,11 +2648,11 @@ mod tests {
         );
         let store = EventStore::open(member_path).unwrap();
         let event_ids = store
-            .event_ids_after(group_id, owner.peer_id(), 0, 3)
+            .event_ids_after(group_id, owner.peer_id(), 0, 4)
             .unwrap();
-        assert_eq!(event_ids.len(), 3);
+        assert_eq!(event_ids.len(), 4);
         assert_eq!(
-            store.get_event(event_ids[1]).unwrap().unwrap().kind(),
+            store.get_event(event_ids[2]).unwrap().unwrap().kind(),
             EventKind::MemberAdded
         );
     }
@@ -2610,9 +2669,7 @@ mod tests {
             Box::new(MemoryWrappingKeyStore::default()),
         )
         .unwrap();
-        service
-            .initialize_owner_group(group_id, owner.peer_id())
-            .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         let before = service
             .read(|provider| provider.snapshot().unwrap())
             .unwrap();
@@ -2634,11 +2691,15 @@ mod tests {
                 .as_slice(),
             before.as_slice()
         );
-        assert!(EventStore::open(&path)
-            .unwrap()
-            .event_ids_after(group_id, owner.peer_id(), 0, 1)
-            .unwrap()
-            .is_empty());
+        let store = EventStore::open(&path).unwrap();
+        let event_ids = store
+            .event_ids_after(group_id, owner.peer_id(), 0, 2)
+            .unwrap();
+        assert_eq!(event_ids.len(), 1);
+        assert_eq!(
+            store.get_event(event_ids[0]).unwrap().unwrap().kind(),
+            EventKind::GroupCreated
+        );
     }
 
     #[test]
@@ -2646,20 +2707,20 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("charp2p.sqlite3");
         let group_id = GroupIdentity::generate().group_id();
-        let device_id = DeviceIdentity::generate().peer_id();
+        let owner = DeviceIdentity::generate();
         let service = MlsProviderService::open_with_key_store(
             &path,
             Arc::new(Mutex::new(())),
             Box::new(MemoryWrappingKeyStore::default()),
         )
         .unwrap();
-        service.initialize_owner_group(group_id, device_id).unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
         let before = service
             .read(|provider| provider.snapshot().unwrap())
             .unwrap();
 
         assert_eq!(
-            service.initialize_owner_group(group_id, DeviceIdentity::generate().peer_id()),
+            service.initialize_owner_group(group_id, &DeviceIdentity::generate()),
             Err("mls_group_owner_mismatch")
         );
         assert_eq!(

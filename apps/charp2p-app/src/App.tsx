@@ -77,6 +77,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_store_unavailable: "Protected device storage is unavailable.",
   identity_missing: "Create a device identity before connecting to peers.",
   group_creation_failed: "The group identity could not be created.",
+  group_creation_event_failed: "The initial group event could not be created.",
   group_creation_rollback_failed: "Group setup failed and could not be safely rolled back.",
   group_already_exists: "This version supports one local group at a time.",
   group_option_unsupported: "This option is not available in the current secure group profile.",

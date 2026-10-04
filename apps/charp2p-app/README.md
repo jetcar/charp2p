@@ -57,13 +57,14 @@ owner restart returns the same Welcome without adding the device twice. A
 different KeyPackage for an already admitted device is rejected. MLS group
 state and one-time private material survive restarts in an authenticated
 encrypted SQLite snapshot whose
-wrapping key stays in the platform keyring. The owner can remove a verified
+wrapping key stays in the platform keyring. New owner groups atomically store a
+signed `GroupCreated` event with their initial encrypted MLS provider state, so
+later owner events begin from one durable causal root. The owner can remove a verified
 device from the Members & devices view. The signed `MemberRemoved` event,
 advanced MLS state, and durable re-admission block commit atomically; cached
 join responses are deleted so active reusable invitations cannot restore the
 removed device. Removing a device prevents future access but cannot erase
-messages it already stored. The initial protected membership event remains a
-later increment. Until the groups list is
+messages it already stored. Until the groups list is
 implemented, the backend enforces one locally created group so extra protected
 roots cannot become hidden from the interface.
 

@@ -128,11 +128,9 @@ fn create_group(
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<LocalGroup, String> {
-    let profile = identity_service
-        .status()
-        .map_err(str::to_owned)?
-        .ok_or_else(|| "identity_missing".to_owned())?;
-    let device_id = parse_group_id(&profile.peer_id, "identity_record_invalid")?;
+    let owner_identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
     let group = group_service
         .create(CreateGroupSpec {
             group_name: &group_name,
@@ -144,7 +142,7 @@ fn create_group(
         })
         .map_err(str::to_owned)?;
     let group_id = parse_group_id(&group.group_id, "group_creation_failed")?;
-    if let Err(error) = mls_service.initialize_owner_group(group_id, device_id) {
+    if let Err(error) = mls_service.initialize_owner_group(group_id, &owner_identity) {
         group_service
             .rollback_created_group(group_id)
             .map_err(|_| "group_creation_rollback_failed".to_owned())?;
@@ -364,20 +362,15 @@ pub fn run() {
             );
             let local_groups = groups.list().map_err(std::io::Error::other)?;
             if !local_groups.is_empty() {
-                let profile = identity
-                    .status()
-                    .map_err(std::io::Error::other)?
-                    .ok_or_else(|| std::io::Error::other("identity_missing"))?;
-                let device_id = profile
-                    .peer_id
-                    .parse()
-                    .map_err(|_| std::io::Error::other("identity_record_invalid"))?;
+                let owner_identity = identity
+                    .load_network_identity()
+                    .map_err(std::io::Error::other)?;
                 for group in &local_groups {
                     let group_id = group
                         .group_id
                         .parse()
                         .map_err(|_| std::io::Error::other("group_identity_record_invalid"))?;
-                    mls.initialize_owner_group(group_id, device_id)
+                    mls.initialize_owner_group(group_id, &owner_identity)
                         .map_err(std::io::Error::other)?;
                 }
             }

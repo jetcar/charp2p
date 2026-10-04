@@ -153,6 +153,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   synchronization_timed_out: "The group peer did not answer in time. Try again.",
   synchronization_unauthorized: "This device is no longer authorized to synchronize the group.",
   synchronization_unavailable: "Group synchronization is temporarily unavailable.",
+  member_not_found: "That device is no longer a group member.",
+  member_owner_cannot_remove: "The owner device cannot remove itself.",
+  member_removal_failed: "The device could not be removed securely.",
+  member_removal_not_allowed: "Only this group's owner can remove devices.",
+  member_removal_store_unavailable: "The removal could not be saved securely.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -275,6 +280,9 @@ function MembersView({
   ownerName,
   profile,
   error,
+  canManageMembers,
+  removingDeviceId,
+  onRemove,
   onClose,
 }: {
   groupName: string;
@@ -283,6 +291,9 @@ function MembersView({
   ownerName: string;
   profile: DeviceProfile | null;
   error: string;
+  canManageMembers: boolean;
+  removingDeviceId: string;
+  onRemove: (deviceId: string) => void;
   onClose: () => void;
 }) {
   const ordered = [...members].sort((left, right) => {
@@ -322,12 +333,25 @@ function MembersView({
                 <span>{isOwner ? "Owner device" : "Member device"}</span>
                 <code title={member.deviceId}>{shortPeerId(member.deviceId)}</code>
               </div>
-              <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
+              <div className="member-actions">
+                <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
+                {canManageMembers && !isOwner && (
+                  <button
+                    className="member-remove"
+                    disabled={Boolean(removingDeviceId)}
+                    onClick={() => onRemove(member.deviceId)}
+                    type="button"
+                  >
+                    {removingDeviceId === member.deviceId ? "Removing…" : "Remove device"}
+                  </button>
+                )}
+              </div>
             </article>
           );
         })}
       </div>
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
+      {canManageMembers && <p className="preview-note">Removing a device blocks future group messages and invitation reuse. Messages already saved on that device cannot be erased.</p>}
       <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
     </section>
   );
@@ -357,6 +381,7 @@ function App() {
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
+  const [removingMember, setRemovingMember] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
@@ -786,6 +811,24 @@ function App() {
     await performJoinedGroupSynchronization(joinedGroup.groupId, true);
   }
 
+  async function removeGroupMember(memberDeviceId: string) {
+    if (!localGroup || removingMember || !isTauri()) return;
+    if (!window.confirm("Remove this device from the group? It will lose access to future messages.")) return;
+    setMembersError("");
+    setRemovingMember(memberDeviceId);
+    try {
+      const members = await invoke<GroupMemberDevice[]>("remove_group_member", {
+        groupId: localGroup.groupId,
+        memberDeviceId,
+      });
+      setGroupMembers(members);
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setRemovingMember("");
+    }
+  }
+
   async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -1003,6 +1046,9 @@ function App() {
               groupName={(joinedGroup ?? localGroup)!.groupName}
               members={groupMembers}
               error={membersError}
+              canManageMembers={Boolean(localGroup)}
+              removingDeviceId={removingMember}
+              onRemove={removeGroupMember}
               onClose={() => setShowMembers(false)}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}

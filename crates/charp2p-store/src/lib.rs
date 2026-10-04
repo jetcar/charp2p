@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -241,6 +241,59 @@ impl EventStore {
         .transpose()
     }
 
+    /// Reports whether an owner has removed this device from the group.
+    pub fn is_removed_mls_member(
+        &self,
+        group_id: PeerId,
+        member_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM removed_mls_members
+                 WHERE group_id = ?1 AND member_id = ?2",
+                params![group_id.to_bytes(), member_id.to_bytes()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Atomically persists a member-removal event, the advanced MLS state,
+    /// and the durable re-admission block for that device.
+    pub fn put_mls_member_removal(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        removed_member_id: PeerId,
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MemberRemoved {
+            return Err(StoreError::CorruptIndex);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "DELETE FROM mls_join_admissions WHERE group_id = ?1 AND member_id = ?2",
+            params![event.group_id().to_bytes(), removed_member_id.to_bytes()],
+        )?;
+        transaction.execute(
+            "INSERT INTO removed_mls_members (
+                group_id, member_id, removal_event_id
+             ) VALUES (?1, ?2, ?3)
+             ON CONFLICT(group_id, member_id) DO UPDATE SET
+                removal_event_id = excluded.removal_event_id",
+            params![
+                event.group_id().to_bytes(),
+                removed_member_id.to_bytes(),
+                event.id().as_bytes().as_slice(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Atomically persists a protected message event, advanced MLS state, and
     /// its locally encrypted display body.
     pub fn put_message_and_encrypted_mls_provider_snapshot(
@@ -390,7 +443,10 @@ impl EventStore {
             if event.group_id() != group_id {
                 return Err(StoreError::CorruptIndex);
             }
-            if event.kind() == charp2p_core::EventKind::MemberAdded {
+            if matches!(
+                event.kind(),
+                charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
+            ) {
                 events.push(event);
                 if events.len() == limit {
                     break;
@@ -407,7 +463,10 @@ impl EventStore {
         event: &SignedEvent,
         encrypted_snapshot: &[u8],
     ) -> Result<bool, StoreError> {
-        if event.kind() != charp2p_core::EventKind::MemberAdded {
+        if !matches!(
+            event.kind(),
+            charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
+        ) {
             return Err(StoreError::CorruptIndex);
         }
         validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
@@ -1118,7 +1177,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=9 => {}
+            6..=10 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1196,6 +1255,22 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 10 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS removed_mls_members (
+                    group_id BLOB NOT NULL,
+                    member_id BLOB NOT NULL,
+                    removal_event_id BLOB NOT NULL
+                        CHECK(length(removal_event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    PRIMARY KEY(group_id, member_id)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -1216,7 +1291,9 @@ fn validate_encrypted_message_body(encrypted: &[u8]) -> Result<(), StoreError> {
 
 fn validate_encrypted_join_response(encrypted: &[u8]) -> Result<(), StoreError> {
     if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_JOIN_RESPONSE_BYTES {
-        return Err(StoreError::InvalidEncryptedJoinResponseSize(encrypted.len()));
+        return Err(StoreError::InvalidEncryptedJoinResponseSize(
+            encrypted.len(),
+        ));
     }
     Ok(())
 }
@@ -1993,10 +2070,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(admission.request_hash, request_hash);
-        assert_eq!(
-            admission.encrypted_response,
-            b"encrypted accepted response"
-        );
+        assert_eq!(admission.encrypted_response, b"encrypted accepted response");
         assert!(matches!(
             store.put_mls_join_admission(
                 &event,
@@ -2007,6 +2081,69 @@ mod tests {
             ),
             Err(StoreError::InvalidEncryptedJoinResponseSize(_))
         ));
+    }
+
+    #[test]
+    fn member_removal_snapshot_and_readmission_block_commit_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let group = GroupIdentity::generate();
+        let added = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS add commit",
+            },
+        )
+        .unwrap();
+        store
+            .put_mls_join_admission(
+                &added,
+                b"admitted provider snapshot",
+                member_id,
+                &[7; 32],
+                b"encrypted accepted response",
+            )
+            .unwrap();
+        let removed = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 2,
+                causal_parents: &[added.id()],
+                created_at_unix_ms: 1_800_000_001_000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS remove commit",
+            },
+        )
+        .unwrap();
+
+        store
+            .put_mls_member_removal(&removed, b"removed provider snapshot", member_id)
+            .unwrap();
+
+        assert!(store.get_event(removed.id()).unwrap().is_some());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"removed provider snapshot"
+        );
+        assert!(store
+            .mls_join_admission(group.group_id(), member_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .is_removed_mls_member(group.group_id(), member_id)
+            .unwrap());
+        assert!(store
+            .unapplied_mls_commit_events(group.group_id(), 2)
+            .unwrap()
+            .iter()
+            .any(|event| event.id() == removed.id()));
     }
 
     #[test]
@@ -2403,6 +2540,30 @@ mod tests {
             .mls_join_admission(group_id, member_id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn version_ten_database_adds_removed_member_blocks() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE removed_mls_members;
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert!(!store
+            .is_removed_mls_member(
+                GroupIdentity::generate().group_id(),
+                DeviceIdentity::generate().peer_id(),
+            )
+            .unwrap());
     }
 
     #[test]

@@ -218,8 +218,8 @@ new MLS application messages it can read, binds the MLS sender credential to
 the signed event author, and adds event-bound encrypted local display copies.
 Messages from epochs before the device joined remain stored as signed opaque
 events and are not shown when their MLS ciphertext cannot be decrypted.
-Before decrypting messages, the client applies synchronized `MemberAdded` MLS
-commits in author sequence. It validates the commit profile and binds its MLS
+Before decrypting messages, the client applies synchronized `MemberAdded` and
+`MemberRemoved` MLS commits in author sequence. It validates the commit profile and binds its MLS
 sender credential to the event author, then atomically stores an applied-event
 marker with the advanced encrypted provider snapshot. Commits already included
 in the joining Welcome are marked without replay, while commits from a future
@@ -283,6 +283,15 @@ Commit as a signed group event, explicitly merges it, and then sends the
 Welcome. Preparation failures clear the pending commit, and event-publication
 failure explicitly aborts it. Generated wire buffers are bounded, redacted,
 and zeroed on drop.
+
+An owner removes a non-owner device by staging a profile-valid OpenMLS remove
+commit and signing it as a `MemberRemoved` event. The event, advanced encrypted
+provider snapshot, and removed-device marker are stored in one transaction.
+That transaction also deletes the device's cached admission response. Owner
+admission checks the durable marker first, so an active reusable invitation or
+an exact retry cannot re-admit the removed device. Remaining members apply the
+removal commit through the synchronized membership-commit path. The new epoch
+protects future messages; removal cannot erase data already received.
 
 ## Group protocol
 

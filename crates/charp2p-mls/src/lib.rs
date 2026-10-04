@@ -9,11 +9,11 @@ use charp2p_core::{Invitation, JoinError, JoinRequest, PeerId};
 use openmls::{
     group::GroupContext,
     prelude::{
-        Capabilities, Ciphersuite, CredentialType, CredentialWithKey, Extension, ExtensionType,
-        Extensions, KeyPackage, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig,
-        MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
-        RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
         tls_codec::{Deserialize, Serialize},
+        Capabilities, Ciphersuite, CredentialType, CredentialWithKey, Extension, ExtensionType,
+        Extensions, KeyPackage, KeyPackageIn, LeafNodeIndex, MlsGroup, MlsGroupCreateConfig,
+        MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
+        RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
     },
 };
 use openmls_memory_storage::MemoryStorage;
@@ -443,6 +443,80 @@ pub enum AbortMemberAdmissionError {
     StorageFailed,
 }
 
+/// Bounded MLS Commit produced while staging one member removal.
+pub struct PreparedMemberRemoval {
+    peer_id: PeerId,
+    commit: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedMemberRemoval {
+    /// Device removed by this Commit.
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Commit that remaining members must authenticate and merge.
+    pub fn commit(&self) -> &[u8] {
+        self.commit.as_slice()
+    }
+}
+
+impl fmt::Debug for PreparedMemberRemoval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMemberRemoval")
+            .field("peer_id", &self.peer_id)
+            .field("commit_bytes", &self.commit.len())
+            .finish()
+    }
+}
+
+/// Failure while staging a member removal.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PrepareMemberRemovalError {
+    /// The existing group state is outside the fixed profile.
+    #[error("MLS group does not match the CharP2P profile")]
+    InvalidGroupProfile,
+    /// The requested device is not a current member.
+    #[error("MLS member to remove was not found")]
+    MemberNotFound,
+    /// The local member cannot remove its own leaf through the owner path.
+    #[error("MLS owner leaf cannot be removed")]
+    OwnLeaf,
+    /// OpenMLS could not stage the removal.
+    #[error("MLS member removal could not be staged")]
+    MemberRemovalFailed,
+    /// The locally generated pending commit violates the profile.
+    #[error("generated MLS removal commit violates the profile")]
+    InvalidPendingCommit,
+    /// A pure removal unexpectedly generated a Welcome.
+    #[error("MLS removal generated an unexpected Welcome")]
+    UnexpectedWelcome,
+    /// OpenMLS could not encode the generated Commit.
+    #[error("generated MLS removal commit could not be encoded")]
+    WireEncodingFailed,
+    /// The generated Commit exceeds the profile wire bound.
+    #[error("generated MLS removal commit exceeds the profile wire bound")]
+    WireSizeExceeded,
+    /// A failed preparation could not clear its pending commit.
+    #[error("failed MLS removal preparation could not be rolled back")]
+    RollbackFailed,
+}
+
+/// Failure while merging a previously persisted removal Commit.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MergeMemberRemovalError {
+    /// There is no locally prepared removal Commit.
+    #[error("no MLS member removal is pending")]
+    MissingPendingCommit,
+    /// The pending Commit violates the fixed profile.
+    #[error("pending MLS member removal violates the profile")]
+    InvalidPendingCommit,
+    /// OpenMLS could not durably advance the group epoch.
+    #[error("pending MLS member removal could not be merged")]
+    MergeFailed,
+}
+
 /// Returns the group configuration required by profile version 1.
 ///
 /// The ratchet tree travels in the MLS Welcome so a joining peer does not
@@ -690,6 +764,87 @@ pub fn abort_prepared_member_admission<Provider: OpenMlsProvider>(
         .map_err(|_| AbortMemberAdmissionError::StorageFailed)
 }
 
+/// Stages removal of one current member without advancing the local epoch.
+///
+/// The caller must durably publish `commit()` before merging it. The local leaf
+/// is rejected because owner removal uses a separate ownership-transfer policy.
+pub fn prepare_profile_member_removal<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    signer: &impl Signer,
+    removed_peer: PeerId,
+) -> Result<PreparedMemberRemoval, PrepareMemberRemovalError> {
+    validate_group_profile(group).map_err(|_| PrepareMemberRemovalError::InvalidGroupProfile)?;
+    let mut target: Option<LeafNodeIndex> = None;
+    for member in group.members() {
+        let peer_id = device_id_from_credential(&member.credential)
+            .map_err(|_| PrepareMemberRemovalError::InvalidGroupProfile)?;
+        if peer_id == removed_peer && target.replace(member.index).is_some() {
+            return Err(PrepareMemberRemovalError::InvalidGroupProfile);
+        }
+    }
+    let target = target.ok_or(PrepareMemberRemovalError::MemberNotFound)?;
+    if target == group.own_leaf_index() {
+        return Err(PrepareMemberRemovalError::OwnLeaf);
+    }
+    let (commit, welcome, _) = group
+        .remove_members(provider, signer, &[target])
+        .map_err(|_| PrepareMemberRemovalError::MemberRemovalFailed)?;
+    let pending_is_valid = group
+        .pending_commit()
+        .is_some_and(|pending| validate_staged_commit_profile(pending).is_ok());
+    if !pending_is_valid {
+        return Err(rollback_prepared_removal(
+            group,
+            provider,
+            PrepareMemberRemovalError::InvalidPendingCommit,
+        ));
+    }
+    if welcome.is_some() {
+        return Err(rollback_prepared_removal(
+            group,
+            provider,
+            PrepareMemberRemovalError::UnexpectedWelcome,
+        ));
+    }
+    let commit = match commit.tls_serialize_detached() {
+        Ok(commit) => Zeroizing::new(commit),
+        Err(_) => {
+            return Err(rollback_prepared_removal(
+                group,
+                provider,
+                PrepareMemberRemovalError::WireEncodingFailed,
+            ));
+        }
+    };
+    if commit.is_empty() || commit.len() > MAX_MLS_WIRE_BYTES {
+        return Err(rollback_prepared_removal(
+            group,
+            provider,
+            PrepareMemberRemovalError::WireSizeExceeded,
+        ));
+    }
+    Ok(PreparedMemberRemoval {
+        peer_id: removed_peer,
+        commit,
+    })
+}
+
+/// Merges one prepared member removal after its Commit is durably published.
+pub fn merge_prepared_member_removal<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+) -> Result<(), MergeMemberRemovalError> {
+    let pending = group
+        .pending_commit()
+        .ok_or(MergeMemberRemovalError::MissingPendingCommit)?;
+    validate_staged_commit_profile(pending)
+        .map_err(|_| MergeMemberRemovalError::InvalidPendingCommit)?;
+    group
+        .merge_pending_commit(provider)
+        .map_err(|_| MergeMemberRemovalError::MergeFailed)
+}
+
 fn rollback_prepared_admission<Provider: OpenMlsProvider>(
     group: &mut MlsGroup,
     provider: &Provider,
@@ -698,6 +853,17 @@ fn rollback_prepared_admission<Provider: OpenMlsProvider>(
     match group.clear_pending_commit(provider.storage()) {
         Ok(()) => error,
         Err(_) => PrepareMemberAdmissionError::RollbackFailed,
+    }
+}
+
+fn rollback_prepared_removal<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    error: PrepareMemberRemovalError,
+) -> PrepareMemberRemovalError {
+    match group.clear_pending_commit(provider.storage()) {
+        Ok(()) => error,
+        Err(_) => PrepareMemberRemovalError::RollbackFailed,
     }
 }
 
@@ -797,22 +963,22 @@ mod tests {
         DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId,
     };
     use openmls::prelude::{
-        BasicCredential, Ciphersuite, CredentialWithKey, Extensions, KeyPackage, MlsGroup,
-        MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
-        WireFormat, tls_codec::Serialize,
+        tls_codec::Serialize, BasicCredential, Ciphersuite, CredentialWithKey, Extensions,
+        KeyPackage, MlsGroup, MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent,
+        ProtocolMessage, WireFormat,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
-        MlsWireError, PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError,
-        ProfileKeyPackageError, ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
         abort_prepared_member_admission, decode_profile_message, device_credential,
         device_id_from_credential, group_create_config, merge_prepared_member_admission,
         prepare_profile_key_package, prepare_profile_member_admission, profile_capabilities,
         profile_extensions, stage_profile_welcome, validate_group_profile,
-        validate_profile_key_package, validate_staged_commit_profile,
+        validate_profile_key_package, validate_staged_commit_profile, DeviceCredentialError,
+        MergeMemberAdmissionError, MlsWireError, PrepareKeyPackageError,
+        PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError, ProfileProvider,
+        ProfileProviderSnapshotError, StageWelcomeError, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
     };
 
     fn credential(

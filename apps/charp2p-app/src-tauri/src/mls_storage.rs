@@ -10,14 +10,15 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
-    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse, MAX_SYNC_BATCH_ITEMS,
-    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_RESPONSE_BYTES,
+    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES,
+    MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
-    merge_prepared_member_admission, prepare_profile_key_package, prepare_profile_member_admission,
-    stage_profile_welcome, validate_group_profile, validate_profile_key_package,
-    validate_staged_commit_profile, PrepareMemberAdmissionError, ProfileKeyPackageError,
+    merge_prepared_member_admission, merge_prepared_member_removal, prepare_profile_key_package,
+    prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
+    validate_group_profile, validate_profile_key_package, validate_staged_commit_profile,
+    PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
     ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
@@ -225,23 +226,104 @@ impl MlsProviderService {
         if group.group_id().as_slice() != group_id.to_bytes() {
             return Err("mls_group_identity_invalid");
         }
-        let mut member_ids = group
-            .members()
-            .map(|member| {
-                device_id_from_credential(&member.credential)
-                    .map_err(|_| "mls_group_members_invalid")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        member_ids.sort_by_key(|member_id| member_id.to_bytes());
-        if member_ids.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err("mls_group_members_invalid");
+        group_member_devices(&group)
+    }
+
+    /// Removes one current device and durably blocks it from reusing an
+    /// outstanding reusable invitation.
+    pub(crate) fn remove_member(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        removed_peer: PeerId,
+    ) -> Result<Vec<GroupMemberDevice>, &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        self.remove_member_at(group_id, owner_identity, removed_peer, created_at_unix_ms)
+    }
+
+    fn remove_member_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        removed_peer: PeerId,
+        created_at_unix_ms: u64,
+    ) -> Result<Vec<GroupMemberDevice>, &'static str> {
+        if removed_peer == owner_identity.peer_id() {
+            return Err("member_owner_cannot_remove");
         }
-        Ok(member_ids
-            .into_iter()
-            .map(|device_id| GroupMemberDevice {
-                device_id: device_id.to_string(),
-            })
-            .collect())
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let mut group = MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&group_id.to_bytes()),
+            )
+            .map_err(|_| "mls_group_storage_unavailable")?
+            .ok_or("mls_joined_group_missing")?;
+            validate_owner_group(&group, group_id, owner_identity.peer_id())
+                .map_err(|_| "member_removal_not_allowed")?;
+            let own_signature_key = group
+                .own_leaf_node()
+                .ok_or("mls_group_storage_unavailable")?
+                .signature_key();
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                own_signature_key.as_slice(),
+                CIPHERSUITE.signature_algorithm(),
+            )
+            .ok_or("mls_group_storage_unavailable")?;
+            let (author_sequence, causal_parents) =
+                next_event_position(&store, group_id, owner_identity.peer_id())
+                    .map_err(|_| "member_removal_failed")?;
+            let removal =
+                prepare_profile_member_removal(&mut group, &*provider, &signer, removed_peer)
+                    .map_err(map_removal_preparation_error)?;
+            let event = SignedEvent::create(
+                owner_identity,
+                EventSpec {
+                    group_id,
+                    author_sequence,
+                    causal_parents: &causal_parents,
+                    created_at_unix_ms,
+                    kind: EventKind::MemberRemoved,
+                    protected_payload: removal.commit(),
+                },
+            )
+            .map_err(|_| "member_removal_failed")?;
+            merge_prepared_member_removal(&mut group, &*provider)
+                .map_err(|_| "member_removal_failed")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            store
+                .put_mls_member_removal(&event, &encrypted, removed_peer)
+                .map_err(|_| "member_removal_store_unavailable")?;
+            group_member_devices(&group)
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
     }
 
     pub(crate) fn create_message(
@@ -801,6 +883,12 @@ impl MlsProviderService {
             .store
             .lock()
             .map_err(|_| MemberAdmissionError::Unavailable)?;
+        if store
+            .is_removed_mls_member(group_id, authenticated_peer)
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+        {
+            return Err(MemberAdmissionError::Unauthorized);
+        }
         let request_hash = join_request_hash(encoded_key_package);
         if let Some(admission) = store
             .mls_join_admission(group_id, authenticated_peer)
@@ -822,8 +910,8 @@ impl MlsProviderService {
                 &request_hash,
             )
             .map_err(|_| MemberAdmissionError::Unavailable)?;
-            let response = JoinResponse::decode(&encoded)
-                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let response =
+                JoinResponse::decode(&encoded).map_err(|_| MemberAdmissionError::Unavailable)?;
             if response.welcome().is_none() {
                 return Err(MemberAdmissionError::Unavailable);
             }
@@ -1194,6 +1282,33 @@ fn map_preparation_error(error: PrepareMemberAdmissionError) -> MemberAdmissionE
     }
 }
 
+fn map_removal_preparation_error(error: PrepareMemberRemovalError) -> &'static str {
+    match error {
+        PrepareMemberRemovalError::MemberNotFound => "member_not_found",
+        PrepareMemberRemovalError::OwnLeaf => "member_owner_cannot_remove",
+        _ => "member_removal_failed",
+    }
+}
+
+fn group_member_devices(group: &MlsGroup) -> Result<Vec<GroupMemberDevice>, &'static str> {
+    let mut member_ids = group
+        .members()
+        .map(|member| {
+            device_id_from_credential(&member.credential).map_err(|_| "mls_group_members_invalid")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    member_ids.sort_by_key(|member_id| member_id.to_bytes());
+    if member_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("mls_group_members_invalid");
+    }
+    Ok(member_ids
+        .into_iter()
+        .map(|device_id| GroupMemberDevice {
+            device_id: device_id.to_string(),
+        })
+        .collect())
+}
+
 fn initialize_owner_group(
     provider: &mut ProfileProvider,
     group_id: PeerId,
@@ -1341,11 +1456,7 @@ fn join_request_hash(encoded_key_package: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn join_response_aad(
-    group_id: PeerId,
-    member_id: PeerId,
-    request_hash: &[u8; 32],
-) -> Vec<u8> {
+fn join_response_aad(group_id: PeerId, member_id: PeerId, request_hash: &[u8; 32]) -> Vec<u8> {
     let group_id = group_id.to_bytes();
     let member_id = member_id.to_bytes();
     let mut aad = Vec::with_capacity(
@@ -1641,14 +1752,10 @@ mod tests {
                 .as_slice(),
             b"encoded accepted response"
         );
-        assert!(decrypt_join_response(
-            &encrypted,
-            &key,
-            group_id,
-            other_member,
-            &request_hash,
-        )
-        .is_err());
+        assert!(
+            decrypt_join_response(&encrypted, &key, group_id, other_member, &request_hash,)
+                .is_err()
+        );
         assert!(decrypt_join_response(&encrypted, &key, group_id, member_id, &[8; 32]).is_err());
     }
 
@@ -1855,7 +1962,10 @@ mod tests {
         let retried = service
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 99)
             .unwrap();
-        assert_eq!(retried.encode().unwrap().as_slice(), first_response.as_slice());
+        assert_eq!(
+            retried.encode().unwrap().as_slice(),
+            first_response.as_slice()
+        );
         let members = service.group_members(group_id).unwrap();
         assert_eq!(members.len(), 2);
         assert!(members
@@ -1930,6 +2040,70 @@ mod tests {
         assert!(members.contains(&owner.peer_id()));
         assert!(members.contains(&member_id));
         assert!(members.contains(&second_member_id));
+    }
+
+    #[test]
+    fn owner_removal_persists_and_blocks_invitation_reuse() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (_, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        service
+            .initialize_owner_group(group_id, owner.peer_id())
+            .unwrap();
+        service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
+            .unwrap();
+
+        let members = service
+            .remove_member_at(group_id, &owner, member_id, 43)
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].device_id, owner.peer_id().to_string());
+        assert!(matches!(
+            service.admit_member_at(group_id, &owner, member_id, key_package.encoded(), 44),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
+        let store = EventStore::open(&path).unwrap();
+        assert!(store.is_removed_mls_member(group_id, member_id).unwrap());
+        assert!(store
+            .mls_join_admission(group_id, member_id)
+            .unwrap()
+            .is_none());
+        let event_ids = store
+            .event_ids_after(group_id, owner.peer_id(), 0, 2)
+            .unwrap();
+        let removal = store.get_event(event_ids[1]).unwrap().unwrap();
+        assert_eq!(removal.kind(), EventKind::MemberRemoved);
+        assert_eq!(removal.author_sequence(), 2);
+        assert_eq!(
+            removal.causal_parents(),
+            &[store.get_event(event_ids[0]).unwrap().unwrap().id()]
+        );
+        drop(store);
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        assert_eq!(restored.group_members(group_id).unwrap().len(), 1);
+        let (_, replacement) = member_key_package(member_id);
+        assert!(matches!(
+            restored.admit_member_at(group_id, &owner, member_id, replacement.encoded(), 45),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
     }
 
     #[test]
@@ -2216,6 +2390,49 @@ mod tests {
         assert_eq!(
             second_service.messages(group_id).unwrap().messages[0].text,
             "Hello everyone"
+        );
+
+        owner_service
+            .remove_member_at(group_id, &owner, first_member.peer_id(), 44)
+            .unwrap();
+        pull_all(
+            &owner_service,
+            &second_service,
+            second_member.peer_id(),
+            group_id,
+        );
+        assert!(!second_service
+            .group_members(group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.device_id == first_member.peer_id().to_string()));
+        owner_service
+            .create_message_at(group_id, &owner, "After removal", 45)
+            .unwrap();
+        pull_all(
+            &owner_service,
+            &second_service,
+            second_member.peer_id(),
+            group_id,
+        );
+        assert_eq!(
+            second_service
+                .messages(group_id)
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .text,
+            "After removal"
+        );
+        assert_eq!(
+            owner_service.answer_sync_request(
+                first_member.peer_id(),
+                &SyncRequest::Summary { group_id },
+            ),
+            SyncResponse::Rejected {
+                reason: SyncRejectReason::Unauthorized,
+            }
         );
     }
 

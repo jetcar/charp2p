@@ -244,6 +244,32 @@ fn group_members(
 }
 
 #[tauri::command]
+fn remove_group_member(
+    group_id: String,
+    member_device_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<GroupMemberDevice>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let member_id = parse_group_id(&member_device_id, "member_not_found")?;
+    if !group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == group_id.to_string())
+    {
+        return Err("member_removal_not_allowed".to_owned());
+    }
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .remove_member(group_id, &identity, member_id)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn advertise_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -367,6 +393,7 @@ pub fn run() {
             send_group_message,
             group_messages,
             group_members,
+            remove_group_member,
             advertise_group
         ])
         .run(tauri::generate_context!())

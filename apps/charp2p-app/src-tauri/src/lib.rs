@@ -102,6 +102,20 @@ fn create_group_invitation(
 }
 
 #[tauri::command]
+async fn revoke_group_invitation(
+    group_id: String,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    group_service
+        .revoke_invitation(group_id)
+        .map_err(str::to_owned)?;
+    network_service.stop_advertising().await;
+    Ok(())
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn create_group(
     group_name: String,
@@ -387,6 +401,7 @@ pub fn run() {
             issued_invitations,
             create_group,
             create_group_invitation,
+            revoke_group_invitation,
             search_group_peers,
             join_group,
             synchronize_group,

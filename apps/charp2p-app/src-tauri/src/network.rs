@@ -423,6 +423,11 @@ impl NetworkService {
         })
     }
 
+    /// Stops the local provider and request listener for the active invitation.
+    pub async fn stop_advertising(&self) {
+        self.advertisement.lock().await.take();
+    }
+
     pub async fn search(
         &self,
         identity: DeviceIdentity,
@@ -1697,7 +1702,7 @@ mod tests {
 
             let search = service.search(DeviceIdentity::generate(), &invitation);
             tokio::pin!(search);
-            timeout(Duration::from_secs(10), async {
+            let result = timeout(Duration::from_secs(10), async {
                 loop {
                     tokio::select! {
                         result = &mut search => break result,
@@ -1707,7 +1712,10 @@ mod tests {
             })
             .await
             .expect("provider search should complete")
-            .unwrap()
+            .unwrap();
+            service.stop_advertising().await;
+            assert!(service.advertisement.lock().await.is_none());
+            result
         });
 
         assert_eq!(result.status, "peerReachable");

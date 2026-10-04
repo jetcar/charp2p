@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted; invitation revocation is superseded by ADR-021.
 
 ## Date
 

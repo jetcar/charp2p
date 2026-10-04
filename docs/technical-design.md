@@ -243,9 +243,12 @@ Owner-side capability verification checks the signature and expiry, the group
 claimed by the request, ownership through the protected group root, the SQLite
 issued-invitation index, and an exact constant-time match with the protected
 bearer record. It returns only non-secret invitation metadata. This proves that
-the owner currently recognizes the bearer. The current MVP issues only
-expiring reusable invitations; single-use consumption and revocation remain
-future signed membership-state transitions.
+the owner currently recognizes the bearer. Revocation removes the protected
+bearer first and then its SQLite index while holding the shared storage lock,
+so authorization fails closed if either deletion is interrupted. It also stops
+the active provider and request-listener task. The current MVP issues only
+expiring reusable invitations; single-use consumption remains a future state
+transition.
 An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
 with a valid profile proceeds through durable admission and receives a Welcome;
 temporary authorization, MLS, or storage failures return `busy`. These public

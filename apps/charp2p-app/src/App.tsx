@@ -399,6 +399,7 @@ function App() {
   const [invitationLifetime, setInvitationLifetime] = useState(604800);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
+  const [revokingInvitation, setRevokingInvitation] = useState(false);
   const [invitationCopied, setInvitationCopied] = useState(false);
   const [advertisement, setAdvertisement] = useState<AdvertisementResult | null>(null);
   const [advertisementError, setAdvertisementError] = useState("");
@@ -926,6 +927,25 @@ function App() {
     }
   }
 
+  async function revokeInvitation() {
+    if (!localGroup || !issuedInvitation || revokingInvitation || !isTauri()) return;
+    if (!window.confirm("Revoke this invitation? Anyone who has not joined yet will lose access.")) return;
+    setError("");
+    setRevokingInvitation(true);
+    try {
+      await invoke("revoke_group_invitation", { groupId: localGroup.groupId });
+      setIssuedInvitation(null);
+      setInvitationCopied(false);
+      setAdvertisement(null);
+      setAdvertisementError("");
+      setAdvertisementRetrying(false);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setRevokingInvitation(false);
+    }
+  }
+
   function closeJoinFlow() {
     setJoinMode(false);
     setInviteInput("");
@@ -1238,6 +1258,9 @@ function App() {
                   {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" onClick={copyInvitation} type="button">
                     {invitationCopied ? "Invitation copied" : "Copy invitation"}
+                  </button>
+                  <button className="danger-button" disabled={revokingInvitation} onClick={revokeInvitation} type="button">
+                    {revokingInvitation ? "Revoking invitation…" : "Revoke invitation"}
                   </button>
                 </>
               ) : (

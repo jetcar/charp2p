@@ -325,6 +325,45 @@ impl GroupService {
         self.issued_invitations_at(now_unix)
     }
 
+    /// Revokes the active invitation for one locally owned group.
+    ///
+    /// The protected bearer is removed before its index so any interrupted
+    /// operation fails closed during authorization.
+    pub fn revoke_invitation(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let owns_group = store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .any(|group| group.group_id == group_id);
+        if !owns_group {
+            return Err("group_not_found");
+        }
+        let invitations = store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .filter(|invitation| invitation.group_id == group_id)
+            .collect::<Vec<_>>();
+        if invitations.is_empty() {
+            return Err("issued_invitation_not_found");
+        }
+        for invitation in invitations {
+            self.invitation_secrets.remove(invitation.invitation_id)?;
+            store
+                .remove_issued_invitation(invitation.invitation_id)
+                .map_err(|_| "group_store_unavailable")?;
+        }
+        Ok(())
+    }
+
     /// Verifies that an inbound bearer invitation is active and was issued by
     /// this owner. This does not consume single-use invitations; consumption
     /// requires the signed membership event that commits the new member.
@@ -909,6 +948,37 @@ mod tests {
             JoinRequestAuthorization::Authorized
         );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revoked_invitation_is_removed_and_no_longer_authorizes_joining() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        let invitation_id = request_invitation_id(&request, NOW);
+        assert!(service.authorize_join_request_at(&request, NOW).is_ok());
+
+        service.revoke_invitation(group_id).unwrap();
+
+        assert_eq!(
+            service.authorize_join_request_at(&request, NOW),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+        assert!(service
+            .invitation_secrets
+            .get_optional(invitation_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            service.revoke_invitation(group_id),
+            Err("issued_invitation_not_found")
+        );
     }
 
     #[test]

@@ -83,7 +83,7 @@ button { cursor: pointer; }
 .join-form textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 4px rgba(16, 168, 159, .12); }
 .join-form textarea::placeholder { color: #9ba5b9; }
 
-.primary-button, .secondary-button { width: 100%; min-height: 76px; display: flex; align-items: center; justify-content: center; gap: 18px; border-radius: 14px; font-size: 22px; font-weight: 700; transition: transform .15s, box-shadow .2s, opacity .2s; }
+.primary-button, .secondary-button, .danger-button { width: 100%; min-height: 76px; display: flex; align-items: center; justify-content: center; gap: 18px; border-radius: 14px; font-size: 22px; font-weight: 700; transition: transform .15s, box-shadow .2s, opacity .2s; }
 .primary-button { border: 0; color: white; background: linear-gradient(100deg, #13b7aa, #009e95); box-shadow: 0 13px 26px rgba(0, 151, 145, .18); }
 .primary-button span { font-size: 36px; font-weight: 300; }
 .primary-button:disabled { cursor: default; opacity: .5; box-shadow: none; }
@@ -92,6 +92,9 @@ button { cursor: pointer; }
 .secondary-button:hover { border-color: #9baabd; background: #f7fafb; }
 .secondary-button:disabled { cursor: default; opacity: .55; border-color: #d9e0e9; background: #f7f9fb; }
 .secondary-button span { font-size: 34px; font-weight: 400; }
+.danger-button { margin-top: 12px; border: 2px solid #e4a4ac; color: #9e2838; background: #fff5f6; }
+.danger-button:hover:not(:disabled) { border-color: #c84959; background: #ffe8eb; }
+.danger-button:disabled { cursor: wait; opacity: .55; }
 .text-button { align-self: center; margin-top: 20px; padding: 12px 20px; border: 0; color: #536181; background: transparent; font-weight: 600; }
 
 .form-error { margin: -26px 0 24px; color: #a43143; font-size: 15px; font-weight: 600; }
@@ -235,7 +238,7 @@ button { cursor: pointer; }
   .setup-form h2 { font-size: 36px; letter-spacing: -1.7px; }
   .setup-form header { margin-bottom: 36px; }
   .setup-form header > p:last-child { font-size: 18px; }
-  .setup-form input, .primary-button, .secondary-button { min-height: 64px; height: 64px; font-size: 18px; }
+  .setup-form input, .primary-button, .secondary-button, .danger-button { min-height: 64px; height: 64px; font-size: 18px; }
   .setup-form input { margin-bottom: 28px; }
   .join-form textarea { margin-bottom: 28px; }
   .preview-facts div { grid-template-columns: 1fr; gap: 5px; }

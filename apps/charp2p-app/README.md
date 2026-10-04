@@ -40,7 +40,8 @@ credentials use the platform keyring; SQLite stores their non-secret indexes
 and invitation defaults. Group creation also initializes the owner's durable
 MLS group and rolls the local group back if that secure setup fails. Existing
 local groups are reconciled with MLS state at startup. Expired invitations are
-removed from both stores.
+removed from both stores. The owner can explicitly revoke an active invitation;
+the bearer and index are removed and its live network advertisement stops.
 The current secure profile exposes only expiring reusable invitations, direct
 invite-based admission, and messages sent after joining. The backend rejects
 single-use, manual-approval, and retained-history creation options so the UI

@@ -763,6 +763,7 @@ name = "charp2p-app"
 version = "0.1.0"
 dependencies = [
  "android-native-keyring-store",
+ "blake3",
  "chacha20poly1305",
  "charp2p-core",
  "charp2p-mls",

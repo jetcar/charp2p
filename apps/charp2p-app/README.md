@@ -50,8 +50,12 @@ MLS processing. The advertiser then verifies the bounded MLS KeyPackage,
 requires the pinned profile, and binds its signed device credential to the
 authenticated connection. An accepted request publishes the MLS Commit as a
 signed `MemberAdded` event and atomically persists the advanced MLS provider
-state before returning the Welcome. MLS group state and one-time private
-material survive restarts in an authenticated encrypted SQLite snapshot whose
+state before returning the Welcome. The encrypted accepted response is cached
+with that transaction, so retrying the exact request after a lost connection or
+owner restart returns the same Welcome without adding the device twice. A
+different KeyPackage for an already admitted device is rejected. MLS group
+state and one-time private material survive restarts in an authenticated
+encrypted SQLite snapshot whose
 wrapping key stays in the platform keyring. Revocation events and the initial
 protected membership event remain later increments. Until the groups list is
 implemented, the backend enforces one locally created group so extra protected

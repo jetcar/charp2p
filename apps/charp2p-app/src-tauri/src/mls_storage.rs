@@ -11,7 +11,7 @@ use chacha20poly1305::{
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
     SignedEvent, SyncRejectReason, SyncRequest, SyncResponse, MAX_SYNC_BATCH_ITEMS,
-    MAX_SYNC_RESPONSE_BYTES,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -21,7 +21,8 @@ use charp2p_mls::{
     ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
-    EventStore, MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+    EventStore, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
+    MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
 use charp2p_sync::{
     accept_pushed_events, build_authorized_response, PullSession, SessionProgress,
@@ -34,6 +35,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use serde::Serialize as SerdeSerialize;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
@@ -46,6 +48,8 @@ const TAG_BYTES: usize = 16;
 const ENVELOPE_HEADER_BYTES: usize = 2 + NONCE_BYTES;
 const SNAPSHOT_AAD: &[u8] = b"charp2p-mls-provider-snapshot-v1\0";
 const MESSAGE_AAD: &[u8] = b"charp2p-local-message-v1\0";
+const JOIN_RESPONSE_AAD: &[u8] = b"charp2p-join-response-v1\0";
+const JOIN_REQUEST_HASH_DOMAIN: &[u8] = b"charp2p-join-request-v1\0";
 const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
 
 trait WrappingKeyStore: Send + Sync {
@@ -746,20 +750,55 @@ impl MlsProviderService {
             .provider
             .lock()
             .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let request_hash = join_request_hash(encoded_key_package);
+        if let Some(admission) = store
+            .mls_join_admission(group_id, authenticated_peer)
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+        {
+            if !bool::from(admission.request_hash.ct_eq(&request_hash)) {
+                return Err(MemberAdmissionError::Unauthorized);
+            }
+            let key = self
+                .wrapping_keys
+                .get_optional()
+                .map_err(|_| MemberAdmissionError::Unavailable)?
+                .ok_or(MemberAdmissionError::Unavailable)?;
+            let encoded = decrypt_join_response(
+                &admission.encrypted_response,
+                &key,
+                group_id,
+                authenticated_peer,
+                &request_hash,
+            )
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let response = JoinResponse::decode(&encoded)
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            if response.welcome().is_none() {
+                return Err(MemberAdmissionError::Unavailable);
+            }
+            return Ok(response);
+        }
         let previous = provider
             .snapshot()
             .map_err(|_| MemberAdmissionError::Unavailable)?;
         let result = (|| {
-            let mut store = self
-                .store
-                .lock()
-                .map_err(|_| MemberAdmissionError::Unavailable)?;
             let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
             let mut group = MlsGroup::load(provider.storage(), &mls_group_id)
                 .map_err(|_| MemberAdmissionError::Unavailable)?
                 .ok_or(MemberAdmissionError::Unavailable)?;
             validate_owner_group(&group, group_id, owner_identity.peer_id())
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
+            for member in group.members() {
+                let member_id = device_id_from_credential(&member.credential)
+                    .map_err(|_| MemberAdmissionError::Unavailable)?;
+                if member_id == authenticated_peer {
+                    return Err(MemberAdmissionError::Unauthorized);
+                }
+            }
             let own_signature_key = group
                 .own_leaf_node()
                 .ok_or(MemberAdmissionError::Unavailable)?
@@ -781,6 +820,9 @@ impl MlsProviderService {
             )
             .map_err(map_preparation_error)?;
             let response = JoinResponse::accepted(admission.welcome().to_vec())
+                .map_err(|_| MemberAdmissionError::Unavailable)?;
+            let encoded_response = response
+                .encode()
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
             let event = SignedEvent::create(
                 owner_identity,
@@ -804,8 +846,22 @@ impl MlsProviderService {
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
             let encrypted =
                 encrypt_snapshot(&snapshot, &key).map_err(|_| MemberAdmissionError::Unavailable)?;
+            let encrypted_response = encrypt_join_response(
+                &encoded_response,
+                &key,
+                group_id,
+                authenticated_peer,
+                &request_hash,
+            )
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
             store
-                .put_event_and_encrypted_mls_provider_snapshot(&event, &encrypted)
+                .put_mls_join_admission(
+                    &event,
+                    &encrypted,
+                    authenticated_peer,
+                    &request_hash,
+                    &encrypted_response,
+                )
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
             Ok(response)
         })();
@@ -1231,6 +1287,98 @@ fn decrypt_snapshot(
     Ok(Zeroizing::new(plaintext))
 }
 
+fn join_request_hash(encoded_key_package: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(JOIN_REQUEST_HASH_DOMAIN);
+    hasher.update(encoded_key_package);
+    *hasher.finalize().as_bytes()
+}
+
+fn join_response_aad(
+    group_id: PeerId,
+    member_id: PeerId,
+    request_hash: &[u8; 32],
+) -> Vec<u8> {
+    let group_id = group_id.to_bytes();
+    let member_id = member_id.to_bytes();
+    let mut aad = Vec::with_capacity(
+        JOIN_RESPONSE_AAD.len() + group_id.len() + member_id.len() + request_hash.len(),
+    );
+    aad.extend_from_slice(JOIN_RESPONSE_AAD);
+    aad.extend_from_slice(&group_id);
+    aad.extend_from_slice(&member_id);
+    aad.extend_from_slice(request_hash);
+    aad
+}
+
+fn encrypt_join_response(
+    encoded: &[u8],
+    key: &[u8; WRAPPING_KEY_BYTES],
+    group_id: PeerId,
+    member_id: PeerId,
+    request_hash: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if encoded.is_empty() || encoded.len() > MAX_JOIN_RESPONSE_WIRE_BYTES {
+        return Err("mls_join_response_invalid");
+    }
+    let mut nonce = [0; NONCE_BYTES];
+    getrandom::fill(&mut nonce).map_err(|_| "secure_random_unavailable")?;
+    let aad = join_response_aad(group_id, member_id, request_hash);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: encoded,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "mls_join_response_encryption_failed")?;
+    let envelope_length = ENVELOPE_HEADER_BYTES
+        .checked_add(ciphertext.len())
+        .filter(|length| *length <= MAX_ENCRYPTED_JOIN_RESPONSE_BYTES)
+        .ok_or("mls_join_response_invalid")?;
+    let mut envelope = Zeroizing::new(Vec::with_capacity(envelope_length));
+    envelope.extend_from_slice(&ENVELOPE_VERSION.to_be_bytes());
+    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+fn decrypt_join_response(
+    envelope: &[u8],
+    key: &[u8; WRAPPING_KEY_BYTES],
+    group_id: PeerId,
+    member_id: PeerId,
+    request_hash: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if envelope.len() < ENVELOPE_HEADER_BYTES + TAG_BYTES
+        || envelope.len() > MAX_ENCRYPTED_JOIN_RESPONSE_BYTES
+    {
+        return Err("mls_join_response_invalid");
+    }
+    let version = u16::from_be_bytes([envelope[0], envelope[1]]);
+    if version != ENVELOPE_VERSION {
+        return Err("mls_join_response_invalid");
+    }
+    let aad = join_response_aad(group_id, member_id, request_hash);
+    let nonce = XNonce::from_slice(&envelope[2..ENVELOPE_HEADER_BYTES]);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &envelope[ENVELOPE_HEADER_BYTES..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "mls_join_response_invalid")?;
+    if plaintext.is_empty() || plaintext.len() > MAX_JOIN_RESPONSE_WIRE_BYTES {
+        return Err("mls_join_response_invalid");
+    }
+    Ok(Zeroizing::new(plaintext))
+}
+
 fn encrypt_local_message(
     plaintext: &[u8],
     key: &[u8; WRAPPING_KEY_BYTES],
@@ -1325,9 +1473,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        decrypt_local_message, decrypt_snapshot, encrypt_local_message, encrypt_snapshot,
-        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, WrappingKeyStore,
-        WRAPPING_KEY_BYTES,
+        decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
+        encrypt_local_message, encrypt_snapshot, join_request_hash, MemberAdmissionError,
+        MlsProviderMutationError, MlsProviderService, WrappingKeyStore, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::EventStore;
 
@@ -1421,6 +1569,39 @@ mod tests {
             b"local display text"
         );
         assert!(decrypt_local_message(&encrypted, &key, &[4; 32]).is_err());
+    }
+
+    #[test]
+    fn cached_join_response_is_bound_to_the_exact_request_and_membership() {
+        let key = [5; WRAPPING_KEY_BYTES];
+        let group_id = GroupIdentity::generate().group_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let other_member = DeviceIdentity::generate().peer_id();
+        let request_hash = join_request_hash(b"bounded key package");
+        let encrypted = encrypt_join_response(
+            b"encoded accepted response",
+            &key,
+            group_id,
+            member_id,
+            &request_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decrypt_join_response(&encrypted, &key, group_id, member_id, &request_hash)
+                .unwrap()
+                .as_slice(),
+            b"encoded accepted response"
+        );
+        assert!(decrypt_join_response(
+            &encrypted,
+            &key,
+            group_id,
+            other_member,
+            &request_hash,
+        )
+        .is_err());
+        assert!(decrypt_join_response(&encrypted, &key, group_id, member_id, &[8; 32]).is_err());
     }
 
     #[test]
@@ -1608,6 +1789,30 @@ mod tests {
         let staged = stage_profile_welcome(&member_provider, response.welcome().unwrap()).unwrap();
         let joined = staged.into_group(&member_provider).unwrap();
         assert_eq!(joined.group_id().as_slice(), group_id.to_bytes());
+
+        let first_response = response.encode().unwrap();
+        drop(service);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        let retried = service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 99)
+            .unwrap();
+        assert_eq!(retried.encode().unwrap().as_slice(), first_response.as_slice());
+        let (_, replacement_key_package) = member_key_package(member_id);
+        assert!(matches!(
+            service.admit_member_at(
+                group_id,
+                &owner,
+                member_id,
+                replacement_key_package.encoded(),
+                100,
+            ),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
 
         let second_member_id = DeviceIdentity::generate().peer_id();
         let (second_member_provider, second_key_package) = member_key_package(second_member_id);

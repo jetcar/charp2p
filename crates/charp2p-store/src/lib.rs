@@ -10,19 +10,21 @@ use std::{
 
 use charp2p_core::{
     EventError, EventId, HistoryPolicy, InvitationId, PeerId, SignedEvent,
-    MAX_JOIN_MLS_MESSAGE_BYTES, MAX_SYNC_BATCH_ITEMS,
+    MAX_JOIN_MLS_MESSAGE_BYTES, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
 /// Largest locally encrypted body for one materialized text message.
 pub const MAX_ENCRYPTED_MESSAGE_BODY_BYTES: usize = 16 * 1024 + 42;
+/// Largest encrypted cached join response accepted by the local store.
+pub const MAX_ENCRYPTED_JOIN_RESPONSE_BYTES: usize = MAX_JOIN_RESPONSE_WIRE_BYTES + 42;
 /// Largest recent-message page exposed to an application view.
 pub const MAX_RECENT_MESSAGE_EVENTS: usize = 256;
 
@@ -111,6 +113,13 @@ pub struct EncryptedMessage {
     pub encrypted_body: Vec<u8>,
 }
 
+/// Cached response for an already committed MLS member admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlsJoinAdmission {
+    pub request_hash: [u8; 32],
+    pub encrypted_response: Vec<u8>,
+}
+
 /// SQLite-backed storage for signed events and non-secret application metadata.
 pub struct EventStore {
     connection: Connection,
@@ -167,6 +176,69 @@ impl EventStore {
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Atomically persists an admitted member event, the advanced MLS state,
+    /// and the encrypted response used to retry that exact join request.
+    pub fn put_mls_join_admission(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        member_id: PeerId,
+        request_hash: &[u8; 32],
+        encrypted_response: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MemberAdded {
+            return Err(StoreError::CorruptIndex);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        validate_encrypted_join_response(encrypted_response)?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "INSERT INTO mls_join_admissions (
+                group_id, member_id, request_hash, encrypted_response, event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.group_id().to_bytes(),
+                member_id.to_bytes(),
+                request_hash.as_slice(),
+                encrypted_response,
+                event.id().as_bytes().as_slice(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Loads the cached response for a previously admitted device.
+    pub fn mls_join_admission(
+        &self,
+        group_id: PeerId,
+        member_id: PeerId,
+    ) -> Result<Option<MlsJoinAdmission>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT request_hash, encrypted_response
+                 FROM mls_join_admissions
+                 WHERE group_id = ?1 AND member_id = ?2",
+                params![group_id.to_bytes(), member_id.to_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        row.map(|(request_hash, encrypted_response)| {
+            let request_hash: [u8; 32] = request_hash
+                .try_into()
+                .map_err(|_| StoreError::CorruptIndex)?;
+            validate_encrypted_join_response(&encrypted_response)?;
+            Ok(MlsJoinAdmission {
+                request_hash,
+                encrypted_response,
+            })
+        })
+        .transpose()
     }
 
     /// Atomically persists a protected message event, advanced MLS state, and
@@ -1046,7 +1118,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=8 => {}
+            6..=9 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1105,6 +1177,25 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 9 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE mls_join_admissions (
+                    group_id BLOB NOT NULL,
+                    member_id BLOB NOT NULL,
+                    request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+                    encrypted_response BLOB NOT NULL
+                        CHECK(length(encrypted_response) BETWEEN 1 AND 131121),
+                    event_id BLOB NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    PRIMARY KEY(group_id, member_id)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -1119,6 +1210,13 @@ fn validate_encrypted_mls_provider_snapshot(encrypted: &[u8]) -> Result<(), Stor
 fn validate_encrypted_message_body(encrypted: &[u8]) -> Result<(), StoreError> {
     if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MESSAGE_BODY_BYTES {
         return Err(StoreError::InvalidEncryptedMessageSize(encrypted.len()));
+    }
+    Ok(())
+}
+
+fn validate_encrypted_join_response(encrypted: &[u8]) -> Result<(), StoreError> {
+    if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_JOIN_RESPONSE_BYTES {
+        return Err(StoreError::InvalidEncryptedJoinResponseSize(encrypted.len()));
     }
     Ok(())
 }
@@ -1278,6 +1376,9 @@ pub enum StoreError {
     /// A local encrypted message body is empty or above the application bound.
     #[error("invalid encrypted message body size {0}")]
     InvalidEncryptedMessageSize(usize),
+    /// An encrypted cached join response is empty or above its protocol bound.
+    #[error("invalid encrypted join response size {0}")]
+    InvalidEncryptedJoinResponseSize(usize),
     /// Only a signed message-creation event can materialize a message body.
     #[error("event is not a message creation")]
     InvalidMessageEvent,
@@ -1308,8 +1409,9 @@ mod tests {
 
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
-        PendingInvitationMetadata, PutEventOutcome, StoreError, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        PendingInvitationMetadata, PutEventOutcome, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
+        MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+        MAX_SYNC_BATCH_EVENTS,
     };
 
     fn message_event(
@@ -1852,6 +1954,62 @@ mod tests {
     }
 
     #[test]
+    fn member_admission_event_snapshot_and_retry_response_commit_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let group = GroupIdentity::generate();
+        let event = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        let request_hash = [7; 32];
+
+        store
+            .put_mls_join_admission(
+                &event,
+                b"advanced provider snapshot",
+                member_id,
+                &request_hash,
+                b"encrypted accepted response",
+            )
+            .unwrap();
+
+        assert!(store.get_event(event.id()).unwrap().is_some());
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"advanced provider snapshot"
+        );
+        let admission = store
+            .mls_join_admission(group.group_id(), member_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.request_hash, request_hash);
+        assert_eq!(
+            admission.encrypted_response,
+            b"encrypted accepted response"
+        );
+        assert!(matches!(
+            store.put_mls_join_admission(
+                &event,
+                b"other snapshot",
+                member_id,
+                &request_hash,
+                &vec![0; MAX_ENCRYPTED_JOIN_RESPONSE_BYTES + 1],
+            ),
+            Err(StoreError::InvalidEncryptedJoinResponseSize(_))
+        ));
+    }
+
+    #[test]
     fn snapshot_write_failure_rolls_back_the_event() {
         let mut store = EventStore::in_memory().unwrap();
         store
@@ -2208,7 +2366,8 @@ mod tests {
             store
                 .connection
                 .execute_batch(
-                    "DROP TABLE applied_mls_events;
+                    "DROP TABLE mls_join_admissions;
+                     DROP TABLE applied_mls_events;
                      PRAGMA user_version = 8;",
                 )
                 .unwrap();
@@ -2220,6 +2379,30 @@ mod tests {
             .unapplied_mls_commit_events(group.group_id(), 1)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn version_nine_database_adds_join_admission_retries() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE mls_join_admissions;
+                     PRAGMA user_version = 9;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        assert!(store
+            .mls_join_admission(group_id, member_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

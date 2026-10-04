@@ -250,6 +250,11 @@ An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
 with a valid profile proceeds through durable admission and receives a Welcome;
 temporary authorization, MLS, or storage failures return `busy`. These public
 categories do not reveal which local record was missing or unavailable.
+Admission is idempotent for one authenticated device and exact KeyPackage. The
+owner commits the membership event, advanced provider snapshot, request hash,
+and an encrypted accepted response in one transaction. An exact retry returns
+that response even after restart. A different KeyPackage for an already present
+device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
 lets a valid invitation grant access directly. Group creation rejects approval,
 single-use, and retained-history options until their enforcement paths exist.

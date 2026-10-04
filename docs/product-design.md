@@ -92,9 +92,8 @@ the operating system permits background work.
 ### 3. Create group
 
 - Name and optional icon.
-- Whether new members receive no history, history since invitation, or all
-  retained history.
-- Join mode: invitation grants access or owner approval is required.
+- New members receive messages sent after joining.
+- A valid reusable invitation grants access until its selected expiry.
 
 ### 4. Join preview
 
@@ -174,8 +173,6 @@ nodes.
 ## Product decisions still to validate
 
 - Maximum supported group size.
-- Whether the MVP permits reusable invitations or only expiring invitations.
-- Exact history-sharing choices exposed to owners.
 - Whether Android contributes DHT routing while foregrounded or always acts as
   a light client.
 - Accessibility, localization, and minimum supported OS versions.

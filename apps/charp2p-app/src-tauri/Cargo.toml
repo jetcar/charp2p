@@ -18,6 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+blake3 = "1.8.7"
 charp2p-core = { path = "../../../crates/charp2p-core" }
 charp2p-mls = { path = "../../../crates/charp2p-mls" }
 charp2p-network = { path = "../../../crates/charp2p-network" }

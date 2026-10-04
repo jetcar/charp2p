@@ -119,6 +119,12 @@ pub(crate) struct StoredMessagePage {
     pub has_earlier: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GroupMemberDevice {
+    pub device_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemberAdmissionError {
     Unauthorized,
@@ -195,6 +201,47 @@ impl MlsProviderService {
         )
         .map(|group| group.is_some())
         .map_err(|_| "mls_group_storage_unavailable")
+    }
+
+    pub(crate) fn group_members(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<GroupMemberDevice>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map_err(|_| "mls_group_storage_unavailable")?
+        .ok_or("mls_joined_group_missing")?;
+        validate_group_profile(&group).map_err(|_| "mls_group_profile_invalid")?;
+        if group.group_id().as_slice() != group_id.to_bytes() {
+            return Err("mls_group_identity_invalid");
+        }
+        let mut member_ids = group
+            .members()
+            .map(|member| {
+                device_id_from_credential(&member.credential)
+                    .map_err(|_| "mls_group_members_invalid")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        member_ids.sort_by_key(|member_id| member_id.to_bytes());
+        if member_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("mls_group_members_invalid");
+        }
+        Ok(member_ids
+            .into_iter()
+            .map(|device_id| GroupMemberDevice {
+                device_id: device_id.to_string(),
+            })
+            .collect())
     }
 
     pub(crate) fn create_message(
@@ -1474,8 +1521,9 @@ mod tests {
 
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
-        encrypt_local_message, encrypt_snapshot, join_request_hash, MemberAdmissionError,
-        MlsProviderMutationError, MlsProviderService, WrappingKeyStore, WRAPPING_KEY_BYTES,
+        encrypt_local_message, encrypt_snapshot, join_request_hash, GroupMemberDevice,
+        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, WrappingKeyStore,
+        WRAPPING_KEY_BYTES,
     };
     use charp2p_store::EventStore;
 
@@ -1620,6 +1668,12 @@ mod tests {
 
         service.initialize_owner_group(group_id, device_id).unwrap();
         service.initialize_owner_group(group_id, device_id).unwrap();
+        assert_eq!(
+            service.group_members(group_id).unwrap(),
+            vec![GroupMemberDevice {
+                device_id: device_id.to_string(),
+            }]
+        );
         drop(service);
 
         let restored = MlsProviderService::open_with_key_store(
@@ -1802,6 +1856,14 @@ mod tests {
             .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 99)
             .unwrap();
         assert_eq!(retried.encode().unwrap().as_slice(), first_response.as_slice());
+        let members = service.group_members(group_id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .any(|member| member.device_id == owner.peer_id().to_string()));
+        assert!(members
+            .iter()
+            .any(|member| member.device_id == member_id.to_string()));
         let (_, replacement_key_package) = member_key_package(member_id);
         assert!(matches!(
             service.admit_member_at(

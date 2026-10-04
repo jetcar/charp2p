@@ -58,6 +58,7 @@ type CreatedMessage = {
 
 type StoredMessage = Omit<CreatedMessage, "authorSequence"> & { text: string };
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
+type GroupMemberDevice = { deviceId: string };
 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
@@ -65,6 +66,7 @@ const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
+const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -111,8 +113,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   mls_group_creation_failed: "Secure group setup failed.",
   mls_group_author_mismatch: "This device is not the authorized sender for that group.",
   mls_group_already_joined: "This device already belongs to that group.",
+  mls_group_identity_invalid: "Stored secure group identity is damaged.",
+  mls_group_profile_invalid: "Stored secure group profile is unsupported.",
   mls_joined_group_missing: "Stored secure membership for this group is missing.",
   mls_group_storage_unavailable: "Secure group storage is unavailable.",
+  mls_group_members_invalid: "Stored group membership is damaged.",
   mls_provider_encryption_failed: "Secure group state could not be encrypted.",
   mls_provider_service_unavailable: "Secure group state is temporarily unavailable.",
   mls_provider_snapshot_invalid: "Stored secure group state is damaged.",
@@ -263,6 +268,71 @@ function Stepper({ step }: { step: SetupStep }) {
   );
 }
 
+function MembersView({
+  groupName,
+  members,
+  ownerDeviceId,
+  ownerName,
+  profile,
+  error,
+  onClose,
+}: {
+  groupName: string;
+  members: GroupMemberDevice[];
+  ownerDeviceId: string;
+  ownerName: string;
+  profile: DeviceProfile | null;
+  error: string;
+  onClose: () => void;
+}) {
+  const ordered = [...members].sort((left, right) => {
+    if (left.deviceId === right.deviceId) return 0;
+    if (left.deviceId === ownerDeviceId) return -1;
+    if (right.deviceId === ownerDeviceId) return 1;
+    if (left.deviceId === profile?.peerId) return -1;
+    if (right.deviceId === profile?.peerId) return 1;
+    return left.deviceId.localeCompare(right.deviceId);
+  });
+
+  return (
+    <section className="setup-form members-card">
+      <header className="members-header">
+        <div>
+          <p className="eyebrow">{groupName}</p>
+          <h2>Members &amp; devices</h2>
+          <p>{members.length > 0 ? `${members.length} verified ${members.length === 1 ? "device" : "devices"}` : "Loading verified membership…"}</p>
+        </div>
+        <button aria-label="Close members and devices" className="member-close" onClick={onClose} type="button">×</button>
+      </header>
+      <p className="preview-note">Each membership belongs to one cryptographic device identity.</p>
+      <div className="member-list" role="list">
+        {ordered.map((member) => {
+          const isOwner = member.deviceId === ownerDeviceId;
+          const isLocal = member.deviceId === profile?.peerId;
+          const name = isLocal
+            ? `${profile?.deviceName ?? "This device"} (You)`
+            : isOwner
+              ? ownerName
+              : `Member ${shortPeerId(member.deviceId)}`;
+          return (
+            <article className={`member-row ${isLocal ? "local-member" : ""}`} key={member.deviceId} role="listitem">
+              <div className="member-avatar" aria-hidden="true">{isOwner ? "♛" : "●"}</div>
+              <div className="member-identity">
+                <strong>{name}</strong>
+                <span>{isOwner ? "Owner device" : "Member device"}</span>
+                <code title={member.deviceId}>{shortPeerId(member.deviceId)}</code>
+              </div>
+              <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
+            </article>
+          );
+        })}
+      </div>
+      {error && <p className="form-error preview-error" role="alert">{error}</p>}
+      <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
+    </section>
+  );
+}
+
 function App() {
   const [step, setStep] = useState<SetupStep>(1);
   const [deviceName, setDeviceName] = useState("");
@@ -285,6 +355,9 @@ function App() {
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
+  const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
+  const [membersError, setMembersError] = useState("");
+  const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
     [outgoingMessage],
@@ -501,6 +574,41 @@ function App() {
     }
 
     void refreshMessages();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [joinedGroup, localGroup]);
+
+  useEffect(() => {
+    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    setShowMembers(false);
+    if (!isTauri() || !groupId) {
+      setGroupMembers([]);
+      setMembersError("");
+      return;
+    }
+
+    let active = true;
+    let firstLoad = true;
+    let timer: number | undefined;
+
+    async function refreshMembers() {
+      try {
+        const members = await invoke<GroupMemberDevice[]>("group_members", { groupId });
+        if (active) {
+          setGroupMembers(members);
+          setMembersError("");
+        }
+      } catch (reason) {
+        if (active && firstLoad) setMembersError(errorMessage(reason));
+      } finally {
+        firstLoad = false;
+        if (active) timer = window.setTimeout(refreshMembers, MEMBER_REFRESH_INTERVAL_MS);
+      }
+    }
+
+    void refreshMembers();
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
@@ -890,7 +998,19 @@ function App() {
             </section>
           )}
 
-          {step === 3 && joinedGroup && !pendingGroup && !joinMode && !createGroupMode && (
+          {step === 3 && showMembers && !pendingGroup && !joinMode && !createGroupMode && (joinedGroup || localGroup) && (
+            <MembersView
+              groupName={(joinedGroup ?? localGroup)!.groupName}
+              members={groupMembers}
+              error={membersError}
+              onClose={() => setShowMembers(false)}
+              ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
+              ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}
+              profile={profile}
+            />
+          )}
+
+          {step === 3 && joinedGroup && !pendingGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form joined-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>
@@ -914,6 +1034,9 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
               </dl>
+              <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
+                Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
+              </button>
               {groupMessages.length > 0 && (
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
@@ -972,7 +1095,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && localGroup && !pendingGroup && !joinedGroup && !joinMode && !createGroupMode && (
+          {step === 3 && localGroup && !pendingGroup && !joinedGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form group-ready-card">
               <div className={`group-avatar icon-${localGroup.icon}`} aria-hidden="true">
                 {['●●●', '◆', '▲', '♥', '★'][localGroup.icon]}
@@ -988,6 +1111,9 @@ function App() {
                 <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
               </dl>
+              <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
+                Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
+              </button>
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 <label htmlFor="outgoing-message">Protected message</label>
                 <textarea

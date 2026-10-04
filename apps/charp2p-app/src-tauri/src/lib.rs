@@ -12,7 +12,7 @@ use std::{
 
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
-use mls_storage::{CreatedMessage, MlsProviderService, StoredMessagePage};
+use mls_storage::{CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage};
 use network::{AdvertisementResult, NetworkService, PeerSearchResult, SynchronizeGroupResult};
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
@@ -235,6 +235,15 @@ fn group_messages(
 }
 
 #[tauri::command]
+fn group_members(
+    group_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<GroupMemberDevice>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    mls_service.group_members(group_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn advertise_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -357,6 +366,7 @@ pub fn run() {
             synchronize_group,
             send_group_message,
             group_messages,
+            group_members,
             advertise_group
         ])
         .run(tauri::generate_context!())

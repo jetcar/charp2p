@@ -123,6 +123,8 @@ the operating system permits background work.
 - Approve, remove, block locally, or revoke a device according to permissions.
 - Show key fingerprints and last observed activity.
 - Make clear that a peer identity is not a verified legal identity.
+- Until account-level membership exists, list each verified MLS device as one
+  membership and avoid inventing person names or presence.
 
 ### 8. Invitations
 

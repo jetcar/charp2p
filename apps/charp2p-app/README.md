@@ -104,3 +104,7 @@ stored as event-bound encrypted local copies, and shown in the joined-group
 timeline. Messages from epochs before this device joined remain opaque.
 Synchronized membership commits advance existing members before message
 decryption, so messages continue to fan out after more members join.
+The group screen also exposes a responsive Members & devices view backed by the
+current verified MLS leaf credentials. It identifies the local device and owner
+device without inventing account-level names or presence that the protocol does
+not yet provide.

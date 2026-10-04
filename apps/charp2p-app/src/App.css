@@ -135,6 +135,21 @@ button { cursor: pointer; }
 .group-ready-card, .joined-card { align-items: stretch; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }
+.members-button { min-height: 58px; margin: 0 0 26px; font-size: 18px; }
+.members-card { align-items: stretch; }
+.members-card .members-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+.members-card .members-header h2 { margin-bottom: 9px; font-size: clamp(36px, 3.8vw, 52px); }
+.members-card .members-header p:last-child { font-size: 19px; }
+.member-close { width: 48px; height: 48px; flex: 0 0 auto; border: 1px solid #dce4ec; border-radius: 50%; color: #55627e; background: white; font-size: 30px; line-height: 1; }
+.member-close:hover { border-color: #9baabd; background: #f5f8fb; }
+.member-list { display: grid; gap: 12px; margin-bottom: 8px; }
+.member-row { min-width: 0; display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 18px; border: 1px solid #dce4ec; border-radius: 16px; background: white; }
+.member-row.local-member { border-color: #a9e0da; background: linear-gradient(110deg, #effbf9, #fff); }
+.member-avatar { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; color: #087d75; background: #dff5f2; font-size: 22px; }
+.member-identity { min-width: 0; display: grid; gap: 3px; }
+.member-identity strong { color: #172044; font-size: 18px; }
+.member-identity span { color: #68748f; font-size: 14px; }
+.member-identity code { overflow: hidden; color: #50617c; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .message-composer { display: grid; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #f5f8fb; }
 .message-composer textarea { width: 100%; min-height: 96px; margin: 10px 0 0; padding: 14px 16px; resize: vertical; border: 1px solid #cad5e2; border-radius: 11px; outline: none; color: #172044; background: white; line-height: 1.5; }
 .message-composer textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
@@ -221,6 +236,9 @@ button { cursor: pointer; }
   .join-form textarea { margin-bottom: 28px; }
   .preview-facts div { grid-template-columns: 1fr; gap: 5px; }
   .preview-facts dd { text-align: left; }
+  .member-row { grid-template-columns: 46px minmax(0, 1fr); }
+  .member-row > .status-chip { grid-column: 2; justify-self: start; }
+  .member-avatar { width: 46px; height: 46px; }
   .join-options { grid-template-columns: 1fr; }
   .segmented-options { grid-template-columns: 1fr; }
   .segmented-options button + button { border-top: 1px solid #dbe2ea; border-left: 0; }

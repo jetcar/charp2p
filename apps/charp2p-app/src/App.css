@@ -172,6 +172,12 @@ button { cursor: pointer; }
 .message-bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .message-bubble time { display: block; margin-top: 7px; color: rgba(255, 255, 255, .78); font-size: 12px; text-align: right; }
 .message-bubble:not(.own-message) time { color: #68748f; text-align: left; }
+.message-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
+.message-bubble:not(.own-message) .message-actions { justify-content: flex-start; }
+.message-actions button { padding: 0; border: 0; color: rgba(255, 255, 255, .82); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.message-bubble:not(.own-message) .message-actions button { color: #52607d; }
+.message-actions button:hover { text-decoration: underline; }
+.message-actions button:disabled { opacity: .48; cursor: wait; }
 .invitation-link-box { width: 100%; min-height: 104px; margin: 0 0 18px; padding: 16px 18px; resize: none; border: 1px solid #ced9e5; border-radius: 12px; outline: none; color: #33415f; background: #f5f8fb; font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .invitation-link-box:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
 .group-avatar { width: 82px; height: 82px; display: grid; place-items: center; align-self: center; margin-bottom: 24px; border-radius: 24px; color: white; font-size: 25px; font-weight: 800; letter-spacing: -6px; }

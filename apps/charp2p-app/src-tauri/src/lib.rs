@@ -18,6 +18,7 @@ use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
 const MAX_GROUP_ID_TEXT_BYTES: usize = 256;
+const EVENT_ID_HEX_BYTES: usize = 64;
 
 #[tauri::command]
 fn identity_status(
@@ -247,6 +248,19 @@ fn group_messages(
 }
 
 #[tauri::command]
+fn hide_group_message(
+    group_id: String,
+    event_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let event_id = parse_event_id(&event_id)?;
+    mls_service
+        .hide_message_locally(group_id, &event_id)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn group_members(
     group_id: String,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
@@ -400,6 +414,7 @@ pub fn run() {
             synchronize_group,
             send_group_message,
             group_messages,
+            hide_group_message,
             group_members,
             remove_group_member,
             advertise_group
@@ -408,11 +423,28 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+fn parse_event_id(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != EVENT_ID_HEX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("message_not_found".to_owned());
+    }
+    let mut result = [0u8; 32];
+    for (index, byte) in result.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .map_err(|_| "message_not_found".to_owned())?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use charp2p_core::GroupIdentity;
 
-    use super::parse_group_id;
+    use super::{parse_event_id, parse_group_id};
 
     #[test]
     fn webview_group_identifiers_are_bounded_before_parsing() {
@@ -424,6 +456,23 @@ mod tests {
         assert_eq!(
             parse_group_id(&"1".repeat(257), "invalid"),
             Err("invalid".to_owned())
+        );
+    }
+
+    #[test]
+    fn webview_event_identifiers_require_canonical_hex() {
+        assert_eq!(parse_event_id(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        assert_eq!(
+            parse_event_id(&"AB".repeat(32)),
+            Err("message_not_found".to_owned())
+        );
+        assert_eq!(
+            parse_event_id(&"a".repeat(63)),
+            Err("message_not_found".to_owned())
+        );
+        assert_eq!(
+            parse_event_id(&"gg".repeat(32)),
+            Err("message_not_found".to_owned())
         );
     }
 }

@@ -443,6 +443,28 @@ impl MlsProviderService {
         })
     }
 
+    pub(crate) fn hide_message_locally(
+        &self,
+        group_id: PeerId,
+        event_id: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        if !store
+            .hide_message_locally(group_id, event_id)
+            .map_err(|_| "message_delete_failed")?
+        {
+            return Err("message_not_found");
+        }
+        Ok(())
+    }
+
     fn create_message_at(
         &self,
         group_id: PeerId,
@@ -2231,16 +2253,19 @@ mod tests {
         assert_eq!(messages.messages[0].text, "Protected hello");
         assert_eq!(messages.messages[0].author_id, owner.peer_id().to_string());
         assert_eq!(messages.messages[1].text, "After restart");
+        restored
+            .hide_message_locally(group_id, first.id().as_bytes())
+            .unwrap();
+        let messages = restored.messages(group_id).unwrap();
+        assert_eq!(messages.messages.len(), 1);
+        assert_eq!(messages.messages[0].text, "After restart");
         let stored = EventStore::open(path).unwrap();
-        assert!(stored
-            .encrypted_messages(group_id)
-            .unwrap()
-            .messages
-            .iter()
-            .all(|message| !message
-                .encrypted_body
-                .windows(b"Protected hello".len())
-                .any(|window| window == b"Protected hello")));
+        let encrypted_messages = stored.encrypted_messages(group_id).unwrap();
+        assert_eq!(encrypted_messages.messages.len(), 1);
+        assert!(encrypted_messages.messages.iter().all(|message| !message
+            .encrypted_body
+            .windows(b"After restart".len())
+            .any(|window| window == b"After restart")));
         assert_eq!(
             stored
                 .event_ids_after(group_id, owner.peer_id(), 0, 3)

@@ -132,6 +132,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_creation_failed: "The message could not be signed.",
   message_encryption_failed: "The local message copy could not be protected.",
   message_invalid: "Enter a message up to 16 KiB.",
+  message_delete_failed: "The local message copy could not be deleted.",
+  message_not_found: "That message is no longer stored on this device.",
   message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",
   message_store_unavailable: "The encrypted message could not be saved.",
@@ -380,6 +382,7 @@ function App() {
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
+  const [deletingMessage, setDeletingMessage] = useState("");
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
   const [removingMember, setRemovingMember] = useState("");
@@ -873,6 +876,34 @@ function App() {
     }
   }
 
+  async function copyMessage(message: StoredMessage) {
+    try {
+      await navigator.clipboard.writeText(message.text);
+    } catch {
+      setError("The message could not be copied.");
+    }
+  }
+
+  async function hideMessage(message: StoredMessage) {
+    if (deletingMessage || !isTauri()) return;
+    if (!window.confirm("Delete this message from this device? Other group members will keep their copies.")) return;
+
+    setError("");
+    setDeletingMessage(message.eventId);
+    try {
+      await invoke("hide_group_message", {
+        groupId: message.groupId,
+        eventId: message.eventId,
+      });
+      setGroupMessages((messages) => messages.filter(({ eventId }) => eventId !== message.eventId));
+      if (createdMessage?.eventId === message.eventId) setCreatedMessage(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setDeletingMessage("");
+    }
+  }
+
   async function createGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!groupName.trim() || creatingGroup || !isTauri()) return;
@@ -1117,6 +1148,16 @@ function App() {
                         {messageAuthorLabel(message, profile, joinedGroup)}
                         {" · "}{messageTime(message.createdAtUnixMs)}
                       </time>
+                      <div className="message-actions">
+                        <button onClick={() => void copyMessage(message)} type="button">Copy</button>
+                        <button
+                          disabled={Boolean(deletingMessage)}
+                          onClick={() => void hideMessage(message)}
+                          type="button"
+                        >
+                          {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
+                        </button>
+                      </div>
                     </article>
                   ))}
                   {hasEarlierMessages && (
@@ -1223,6 +1264,16 @@ function App() {
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
                       </time>
+                      <div className="message-actions">
+                        <button onClick={() => void copyMessage(message)} type="button">Copy</button>
+                        <button
+                          disabled={Boolean(deletingMessage)}
+                          onClick={() => void hideMessage(message)}
+                          type="button"
+                        >
+                          {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
+                        </button>
+                      </div>
                     </article>
                   ))}
                   {hasEarlierMessages && (

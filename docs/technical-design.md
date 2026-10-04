@@ -458,6 +458,10 @@ associated data bind that copy to its event. The sender commits the local copy,
 signed event, and advanced MLS snapshot atomically. A receiver first commits the
 verified event batch, then atomically commits each decrypted local copy with the
 advanced receiver snapshot. Timelines decrypt these records only for display.
+Local deletion removes that encrypted display copy and records the event ID in
+a device-local hidden-message table. The signed event remains available for
+synchronization and audit, while future materialization queries skip the hidden
+event. This action never creates a group-wide `MessageDeleted` event.
 
 Whichever construction is selected must provide:
 

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -384,6 +384,48 @@ impl EventStore {
         })
     }
 
+    /// Removes a readable message copy from this device and prevents the
+    /// retained signed event from materializing it again locally.
+    pub fn hide_message_locally(
+        &mut self,
+        group_id: PeerId,
+        event_id: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let encoded = transaction
+            .query_row(
+                "SELECT encoded FROM events WHERE event_id = ?1",
+                [event_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let event = SignedEvent::decode(&encoded)?;
+        if event.id().as_bytes() != event_id
+            || event.group_id() != group_id
+            || event.kind() != charp2p_core::EventKind::MessageCreated
+        {
+            return Err(StoreError::CorruptIndex);
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM materialized_messages WHERE event_id = ?1",
+            [event_id.as_slice()],
+        )?;
+        if deleted == 0 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO hidden_local_messages (event_id, group_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![event_id.as_slice(), group_id.to_bytes()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Returns at most `limit` verified message events that do not yet have a
     /// local materialized body. Events are ordered by author and sequence so
     /// each sender ratchet advances consistently.
@@ -399,7 +441,8 @@ impl EventStore {
             "SELECT e.encoded
              FROM events e
              LEFT JOIN materialized_messages m ON m.event_id = e.event_id
-             WHERE e.group_id = ?1 AND m.event_id IS NULL
+             LEFT JOIN hidden_local_messages h ON h.event_id = e.event_id
+             WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
@@ -1177,7 +1220,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=10 => {}
+            6..=11 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1266,6 +1309,23 @@ impl EventStore {
                         REFERENCES events(event_id) ON DELETE CASCADE,
                     PRIMARY KEY(group_id, member_id)
                  ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 11 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS hidden_local_messages (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS hidden_local_messages_by_group
+                    ON hidden_local_messages(group_id, event_id);",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -2232,6 +2292,87 @@ mod tests {
     }
 
     #[test]
+    fn locally_hidden_message_stays_hidden_without_deleting_its_event() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+
+        assert!(store
+            .hide_message_locally(group.group_id(), event.id().as_bytes())
+            .unwrap());
+        assert!(store
+            .encrypted_messages(group.group_id())
+            .unwrap()
+            .messages
+            .is_empty());
+        assert!(store.get_event(event.id()).unwrap().is_some());
+        assert!(store
+            .unmaterialized_message_events(group.group_id(), 1)
+            .unwrap()
+            .is_empty());
+        assert!(!store
+            .hide_message_locally(group.group_id(), event.id().as_bytes())
+            .unwrap());
+    }
+
+    #[test]
+    fn local_message_hide_rejects_the_wrong_group() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.hide_message_locally(other_group.group_id(), event.id().as_bytes()),
+            Err(StoreError::CorruptIndex)
+        ));
+        assert_eq!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unmaterialized_message_cannot_be_hidden_before_advancing_mls_state() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store.put_event(&event).unwrap();
+
+        assert!(!store
+            .hide_message_locally(group.group_id(), event.id().as_bytes())
+            .unwrap());
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 1)
+                .unwrap()[0]
+                .id(),
+            event.id()
+        );
+    }
+
+    #[test]
     fn recent_message_page_is_bounded_and_keeps_display_order() {
         let mut store = EventStore::in_memory().unwrap();
         let author = DeviceIdentity::generate();
@@ -2563,6 +2704,37 @@ mod tests {
                 GroupIdentity::generate().group_id(),
                 DeviceIdentity::generate().peer_id(),
             )
+            .unwrap());
+    }
+
+    #[test]
+    fn version_eleven_database_adds_local_message_hides() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE hidden_local_messages;
+                     PRAGMA user_version = 11;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+        assert!(store
+            .hide_message_locally(group.group_id(), event.id().as_bytes())
             .unwrap());
     }
 

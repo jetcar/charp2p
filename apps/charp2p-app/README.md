@@ -71,8 +71,10 @@ roots cannot become hidden from the interface.
 The owner and joined-group screens can create bounded text messages as MLS
 private application messages and persist each signed `MessageCreated` event
 atomically with sender ratchet state. They also keep an event-bound encrypted
-local display copy and restore the timeline after restart. Delivery receipts
-remain a later increment.
+local display copy and restore the timeline after restart. Timeline actions can
+copy text or delete only the readable copy on this device. A durable local
+marker prevents the retained signed event from recreating a deleted copy;
+other members keep their copies. Delivery receipts remain a later increment.
 
 Joined members upload bounded batches of their own signed message events to the
 pinned owner after each pull. The owner verifies that every event author

@@ -243,12 +243,16 @@ Owner-side capability verification checks the signature and expiry, the group
 claimed by the request, ownership through the protected group root, the SQLite
 issued-invitation index, and an exact constant-time match with the protected
 bearer record. It returns only non-secret invitation metadata. This proves that
-the owner currently recognizes the bearer; single-use consumption and
-revocation still derive from signed membership state when admission commits.
+the owner currently recognizes the bearer. The current MVP issues only
+expiring reusable invitations; single-use consumption and revocation remain
+future signed membership-state transitions.
 An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
 with a valid profile proceeds through durable admission and receives a Welcome;
 temporary authorization, MLS, or storage failures return `busy`. These public
 categories do not reveal which local record was missing or unavailable.
+The current group profile also fixes history to messages sent after joining and
+lets a valid invitation grant access directly. Group creation rejects approval,
+single-use, and retained-history options until their enforcement paths exist.
 The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before

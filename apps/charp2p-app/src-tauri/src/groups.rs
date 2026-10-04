@@ -182,6 +182,12 @@ impl GroupService {
             return Err("invalid_group_icon");
         }
         let history_policy = parse_history_policy(spec.history_policy)?;
+        if history_policy != HistoryPolicy::None
+            || spec.approval_required
+            || !spec.reusable_invitation
+        {
+            return Err("group_option_unsupported");
+        }
         if !ALLOWED_INVITATION_LIFETIMES.contains(&spec.invitation_lifetime_seconds) {
             return Err("invalid_invitation_lifetime");
         }
@@ -794,10 +800,10 @@ mod tests {
         CreateGroupSpec {
             group_name: name,
             icon: 1,
-            history_policy: "fromInvitation",
+            history_policy: "none",
             approval_required: false,
             invitation_lifetime_seconds: 604_800,
-            reusable_invitation: false,
+            reusable_invitation: true,
         }
     }
 
@@ -881,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn issued_invitation_authorizes_without_consuming_the_bearer() {
+    fn reusable_invitation_authorizes_repeatedly_until_expiry() {
         const NOW: u64 = 1_800_000_000;
         let service = service();
         let created = service.create(spec("Project Atlas")).unwrap();
@@ -897,7 +903,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.group_id(), group_id);
         assert_eq!(first.invitation_id(), request_invitation_id(&request, NOW));
-        assert!(!first.is_reusable());
+        assert!(first.is_reusable());
         assert_eq!(
             JoinRequestAuthorizer::authorize_join_request(&service, &request),
             JoinRequestAuthorization::Authorized
@@ -1052,6 +1058,31 @@ mod tests {
             "invalid_invitation_lifetime"
         );
         assert!(service.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unimplemented_access_and_history_options_are_rejected() {
+        let service = service();
+        let mut unsupported_history = spec("Design Crew");
+        unsupported_history.history_policy = "allRetained";
+        assert!(matches!(
+            service.create(unsupported_history),
+            Err("group_option_unsupported")
+        ));
+
+        let mut approval = spec("Design Crew");
+        approval.approval_required = true;
+        assert!(matches!(
+            service.create(approval),
+            Err("group_option_unsupported")
+        ));
+
+        let mut single_use = spec("Design Crew");
+        single_use.reusable_invitation = false;
+        assert!(matches!(
+            service.create(single_use),
+            Err("group_option_unsupported")
+        ));
     }
 
     #[test]

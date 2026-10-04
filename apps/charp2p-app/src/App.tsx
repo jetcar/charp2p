@@ -77,6 +77,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   group_creation_failed: "The group identity could not be created.",
   group_creation_rollback_failed: "Group setup failed and could not be safely rolled back.",
   group_already_exists: "This version supports one local group at a time.",
+  group_option_unsupported: "This option is not available in the current secure group profile.",
   group_already_joined: "This device already belongs to that group.",
   group_identity_record_invalid: "A stored group identity is damaged.",
   group_identity_store_unavailable: "Protected group storage is unavailable.",
@@ -179,10 +180,8 @@ function messageAuthorLabel(
   return `Peer ${shortPeerId(message.authorId)}`;
 }
 
-function historyDescription(policy: InvitationPreview["historyPolicy"]) {
-  if (policy === "none") return "Messages shared after you join";
-  if (policy === "allRetained") return "All retained history shared";
-  return "History shared from invitation";
+function historyDescription(_policy: InvitationPreview["historyPolicy"]) {
+  return "Messages shared after you join";
 }
 
 function expiryDescription(expiresAtUnix: number) {
@@ -299,10 +298,7 @@ function App() {
   const [createGroupMode, setCreateGroupMode] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [groupIcon, setGroupIcon] = useState(0);
-  const [groupHistory, setGroupHistory] = useState<InvitationPreview["historyPolicy"]>("fromInvitation");
-  const [approvalRequired, setApprovalRequired] = useState(false);
   const [invitationLifetime, setInvitationLifetime] = useState(604800);
-  const [reusableInvitation, setReusableInvitation] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
   const [invitationCopied, setInvitationCopied] = useState(false);
@@ -734,10 +730,10 @@ function App() {
       const created = await invoke<LocalGroup>("create_group", {
         groupName,
         icon: groupIcon,
-        historyPolicy: groupHistory,
-        approvalRequired,
+        historyPolicy: "none",
+        approvalRequired: false,
         invitationLifetimeSeconds: invitationLifetime,
-        reusableInvitation,
+        reusableInvitation: true,
       });
       setLocalGroup(created);
       setIssuedInvitation(null);
@@ -988,7 +984,7 @@ function App() {
               </header>
               <dl className="preview-facts">
                 <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
-                <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Owner approval required" : "Invite grants access"}</dd></div>
+                <div><dt>Join mode</dt><dd>Valid invitation grants access</dd></div>
                 <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
               </dl>
@@ -1053,7 +1049,7 @@ function App() {
                   />
                   <p className="preview-note">
                     {expiryDescription(issuedInvitation.expiresAtUnix)}
-                    {issuedInvitation.reusable ? " · Reusable" : " · Single use"}
+                    {" · Valid until expiry"}
                   </p>
                   <div className="status-row" aria-label="Invitation network status">
                     <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
@@ -1119,34 +1115,8 @@ function App() {
               />
 
               <fieldset className="choice-group">
-                <legend>History for new members</legend>
-                <div className="segmented-options">
-                  {([
-                    ["none", "None"],
-                    ["fromInvitation", "From invitation"],
-                    ["allRetained", "All retained"],
-                  ] as const).map(([value, label]) => (
-                    <button
-                      aria-pressed={groupHistory === value}
-                      className={groupHistory === value ? "selected" : ""}
-                      key={value}
-                      onClick={() => setGroupHistory(value)}
-                      type="button"
-                    >{label}</button>
-                  ))}
-                </div>
-              </fieldset>
-
-              <fieldset className="choice-group">
-                <legend>Join mode</legend>
-                <div className="join-options">
-                  <button aria-pressed={!approvalRequired} className={!approvalRequired ? "selected" : ""} onClick={() => setApprovalRequired(false)} type="button">
-                    <strong>Invite grants access</strong><span>People can join with a valid invitation.</span>
-                  </button>
-                  <button aria-pressed={approvalRequired} className={approvalRequired ? "selected" : ""} onClick={() => setApprovalRequired(true)} type="button">
-                    <strong>Owner approval required</strong><span>Join requests must be approved.</span>
-                  </button>
-                </div>
+                <legend>Current secure group profile</legend>
+                <p className="preview-note">A valid invitation grants access until it expires. New members receive messages sent after they join.</p>
               </fieldset>
 
               <div className="invitation-defaults">
@@ -1157,10 +1127,7 @@ function App() {
                   <option value={1209600}>14 days</option>
                   <option value={2592000}>30 days</option>
                 </select>
-                <label className="toggle-row">
-                  <span><strong>Reusable invitation</strong><small>Allow the link to be used multiple times.</small></span>
-                  <input checked={reusableInvitation} onChange={(event) => setReusableInvitation(event.target.checked)} type="checkbox" />
-                </label>
+                <p className="preview-note">Invitation links remain valid for their selected lifetime.</p>
               </div>
 
               {error && <p className="form-error preview-error" role="alert">{error}</p>}

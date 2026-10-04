@@ -35,7 +35,8 @@ availability. A node operator does not become a group administrator.
 ### Create a group
 
 1. The user creates or unlocks a local device identity.
-2. The user chooses a group name and history policy.
+2. The user chooses a group name. The current secure profile shares messages
+   sent after a member joins.
 3. The app creates the group identity and initial membership state.
 4. The app starts advertising an opaque discovery key while it is online.
 5. The user can create an expiring invitation.

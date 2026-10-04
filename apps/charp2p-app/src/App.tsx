@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import QRCode from "qrcode";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
@@ -405,6 +406,8 @@ function App() {
   const [creatingInvitation, setCreatingInvitation] = useState(false);
   const [revokingInvitation, setRevokingInvitation] = useState(false);
   const [invitationCopied, setInvitationCopied] = useState(false);
+  const [invitationQrCode, setInvitationQrCode] = useState("");
+  const [invitationQrError, setInvitationQrError] = useState("");
   const [advertisement, setAdvertisement] = useState<AdvertisementResult | null>(null);
   const [advertisementError, setAdvertisementError] = useState("");
   const [advertisementRetrying, setAdvertisementRetrying] = useState(false);
@@ -573,6 +576,30 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [joinedGroup]);
+
+  useEffect(() => {
+    let active = true;
+    setInvitationQrCode("");
+    setInvitationQrError("");
+    if (!issuedInvitation) return;
+
+    void QRCode.toDataURL(issuedInvitation.link, {
+      color: { dark: "#172044", light: "#ffffff" },
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    })
+      .then((dataUrl) => {
+        if (active) setInvitationQrCode(dataUrl);
+      })
+      .catch(() => {
+        if (active) setInvitationQrError("The QR code could not be created. Copy the invitation link instead.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [issuedInvitation]);
 
   useEffect(() => {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -1295,6 +1322,18 @@ function App() {
                     {expiryDescription(issuedInvitation.expiresAtUnix)}
                     {" · Valid until expiry"}
                   </p>
+                  {invitationQrCode && (
+                    <figure className="invitation-qr">
+                      <img
+                        alt={`QR code invitation for ${localGroup.groupName}`}
+                        height="320"
+                        src={invitationQrCode}
+                        width="320"
+                      />
+                      <figcaption>Scan with CharP2P to join</figcaption>
+                    </figure>
+                  )}
+                  {invitationQrError && <p className="form-error preview-error" role="alert">{invitationQrError}</p>}
                   <div className="status-row" aria-label="Invitation network status">
                     <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
                       {advertisement?.status === "advertising"

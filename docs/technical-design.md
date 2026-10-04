@@ -231,6 +231,13 @@ transport peer, stores them idempotently, and materializes readable plaintext
 into encrypted local display copies. Other members receive those events from
 the owner during later pulls.
 
+After the peer explicitly accepts every upload page, the sender durably records
+the highest contiguous author sequence acknowledged by that peer. The
+conversation can therefore distinguish a message saved only on this device
+from one shared with at least one peer. A partial or failed exchange does not
+advance the acknowledgement. This state does not imply that every member has
+observed the message or that a permanent copy exists.
+
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
 Welcome. Invitation payloads are limited to 8 KiB; KeyPackages and Welcomes are

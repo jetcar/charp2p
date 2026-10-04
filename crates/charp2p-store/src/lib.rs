@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -109,6 +109,7 @@ pub struct EncryptedMessage {
     pub event_id: [u8; 32],
     pub group_id: PeerId,
     pub author_id: PeerId,
+    pub author_sequence: u64,
     pub created_at_unix_ms: u64,
     pub encrypted_body: Vec<u8>,
 }
@@ -371,6 +372,7 @@ impl EventStore {
                 event_id: *event.id().as_bytes(),
                 group_id,
                 author_id: event.author_id(),
+                author_sequence: event.author_sequence(),
                 created_at_unix_ms,
                 encrypted_body,
             });
@@ -382,6 +384,53 @@ impl EventStore {
             messages,
             has_earlier,
         })
+    }
+
+    /// Records the highest contiguous sequence for one author explicitly
+    /// accepted by a peer. A later stale acknowledgement cannot move it back.
+    pub fn acknowledge_author_head(
+        &mut self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+        sequence: u64,
+    ) -> Result<(), StoreError> {
+        if sequence == 0 {
+            return Ok(());
+        }
+        let sequence = i64::try_from(sequence).map_err(|_| StoreError::SequenceTooLarge(sequence))?;
+        self.connection.execute(
+            "INSERT INTO peer_acknowledged_author_heads
+                (group_id, peer_id, author_id, contiguous_sequence)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(group_id, peer_id, author_id) DO UPDATE SET
+                contiguous_sequence = MAX(contiguous_sequence, excluded.contiguous_sequence)",
+            params![
+                group_id.to_bytes(),
+                peer_id.to_bytes(),
+                author_id.to_bytes(),
+                sequence,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the highest sequence for an author accepted by any peer.
+    pub fn max_acknowledged_author_head(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<u64, StoreError> {
+        let sequence: Option<i64> = self.connection.query_row(
+            "SELECT MAX(contiguous_sequence)
+             FROM peer_acknowledged_author_heads
+             WHERE group_id = ?1 AND author_id = ?2",
+            params![group_id.to_bytes(), author_id.to_bytes()],
+            |row| row.get(0),
+        )?;
+        sequence
+            .map(|value| u64::try_from(value).map_err(|_| StoreError::CorruptIndex))
+            .unwrap_or(Ok(0))
     }
 
     /// Removes a readable message copy from this device and prevents the
@@ -1220,7 +1269,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=11 => {}
+            6..=12 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1326,6 +1375,27 @@ impl EventStore {
 
                  CREATE INDEX IF NOT EXISTS hidden_local_messages_by_group
                     ON hidden_local_messages(group_id, event_id);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 12 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_acknowledged_author_heads (
+                    group_id BLOB NOT NULL,
+                    peer_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    contiguous_sequence INTEGER NOT NULL
+                        CHECK(contiguous_sequence > 0),
+                    PRIMARY KEY(group_id, peer_id, author_id)
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS peer_acknowledged_heads_by_group_author
+                    ON peer_acknowledged_author_heads(
+                        group_id, author_id, contiguous_sequence
+                    );",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -2279,6 +2349,7 @@ mod tests {
                     event_id: *event.id().as_bytes(),
                     group_id: group.group_id(),
                     author_id: author.peer_id(),
+                    author_sequence: event.author_sequence(),
                     created_at_unix_ms: event.created_at_unix_ms(),
                     encrypted_body: b"encrypted local message".to_vec(),
                 }],
@@ -2289,6 +2360,70 @@ mod tests {
             .unmaterialized_message_events(group.group_id(), 1)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn peer_acknowledged_author_heads_are_monotonic_and_scoped() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let peer = DeviceIdentity::generate();
+        let other_peer = DeviceIdentity::generate();
+
+        assert_eq!(
+            store
+                .max_acknowledged_author_head(group.group_id(), author.peer_id())
+                .unwrap(),
+            0
+        );
+        store
+            .acknowledge_author_head(
+                group.group_id(),
+                peer.peer_id(),
+                author.peer_id(),
+                4,
+            )
+            .unwrap();
+        store
+            .acknowledge_author_head(
+                group.group_id(),
+                peer.peer_id(),
+                author.peer_id(),
+                2,
+            )
+            .unwrap();
+        store
+            .acknowledge_author_head(
+                group.group_id(),
+                other_peer.peer_id(),
+                author.peer_id(),
+                6,
+            )
+            .unwrap();
+        store
+            .acknowledge_author_head(
+                group.group_id(),
+                peer.peer_id(),
+                author.peer_id(),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .max_acknowledged_author_head(group.group_id(), author.peer_id())
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            store
+                .max_acknowledged_author_head(
+                    GroupIdentity::generate().group_id(),
+                    author.peer_id(),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2736,6 +2871,36 @@ mod tests {
         assert!(store
             .hide_message_locally(group.group_id(), event.id().as_bytes())
             .unwrap());
+    }
+
+    #[test]
+    fn version_twelve_database_adds_peer_acknowledgements() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE peer_acknowledged_author_heads;
+                     PRAGMA user_version = 12;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let author_id = DeviceIdentity::generate().peer_id();
+        let peer_id = DeviceIdentity::generate().peer_id();
+        store
+            .acknowledge_author_head(group_id, peer_id, author_id, 7)
+            .unwrap();
+        assert_eq!(
+            store
+                .max_acknowledged_author_head(group_id, author_id)
+                .unwrap(),
+            7
+        );
     }
 
     #[test]

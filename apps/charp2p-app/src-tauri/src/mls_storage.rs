@@ -109,8 +109,10 @@ pub(crate) struct StoredMessage {
     pub event_id: String,
     pub group_id: String,
     pub author_id: String,
+    pub author_sequence: u64,
     pub created_at_unix_ms: u64,
     pub text: String,
+    pub delivery_state: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
@@ -394,7 +396,11 @@ impl MlsProviderService {
         })
     }
 
-    pub(crate) fn messages(&self, group_id: PeerId) -> Result<StoredMessagePage, &'static str> {
+    pub(crate) fn messages(
+        &self,
+        group_id: PeerId,
+        local_device_id: PeerId,
+    ) -> Result<StoredMessagePage, &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -405,6 +411,9 @@ impl MlsProviderService {
             .map_err(|_| "mls_provider_service_unavailable")?;
         let encrypted_page = store
             .encrypted_messages(group_id)
+            .map_err(|_| "message_list_unavailable")?;
+        let acknowledged_head = store
+            .max_acknowledged_author_head(group_id, local_device_id)
             .map_err(|_| "message_list_unavailable")?;
         if encrypted_page.messages.is_empty() {
             return Ok(StoredMessagePage {
@@ -432,8 +441,16 @@ impl MlsProviderService {
                     event_id: hex_bytes(&message.event_id),
                     group_id: message.group_id.to_string(),
                     author_id: message.author_id.to_string(),
+                    author_sequence: message.author_sequence,
                     created_at_unix_ms: message.created_at_unix_ms,
                     text,
+                    delivery_state: if message.author_id != local_device_id {
+                        "received"
+                    } else if message.author_sequence <= acknowledged_head {
+                        "sharedWithPeer"
+                    } else {
+                        "local"
+                    },
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -441,6 +458,24 @@ impl MlsProviderService {
             messages,
             has_earlier: encrypted_page.has_earlier,
         })
+    }
+
+    pub(crate) fn acknowledge_messages_shared(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+        sequence: u64,
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        self.store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?
+            .acknowledge_author_head(group_id, peer_id, author_id, sequence)
+            .map_err(|_| "message_delivery_state_unavailable")
     }
 
     pub(crate) fn hide_message_locally(
@@ -2247,16 +2282,23 @@ mod tests {
             decrypt_application_message(&mut member_group, &member_provider, &second),
             b"After restart"
         );
-        let messages = restored.messages(group_id).unwrap();
+        let messages = restored.messages(group_id, owner.peer_id()).unwrap();
         assert_eq!(messages.messages.len(), 2);
         assert!(!messages.has_earlier);
         assert_eq!(messages.messages[0].text, "Protected hello");
         assert_eq!(messages.messages[0].author_id, owner.peer_id().to_string());
+        assert_eq!(messages.messages[0].delivery_state, "local");
         assert_eq!(messages.messages[1].text, "After restart");
+        restored
+            .acknowledge_messages_shared(group_id, member_id, owner.peer_id(), 3)
+            .unwrap();
+        let messages = restored.messages(group_id, owner.peer_id()).unwrap();
+        assert_eq!(messages.messages[0].delivery_state, "sharedWithPeer");
+        assert_eq!(messages.messages[1].delivery_state, "local");
         restored
             .hide_message_locally(group_id, first.id().as_bytes())
             .unwrap();
-        let messages = restored.messages(group_id).unwrap();
+        let messages = restored.messages(group_id, owner.peer_id()).unwrap();
         assert_eq!(messages.messages.len(), 1);
         assert_eq!(messages.messages[0].text, "After restart");
         let stored = EventStore::open(path).unwrap();
@@ -2320,7 +2362,11 @@ mod tests {
             .create_message_at(group_id, &member, "Hello from member", 42)
             .unwrap();
         assert_eq!(
-            member_service.messages(group_id).unwrap().messages[0].text,
+            member_service
+                .messages(group_id, member.peer_id())
+                .unwrap()
+                .messages[0]
+                .text,
             "Hello from member"
         );
         assert_eq!(
@@ -2388,7 +2434,11 @@ mod tests {
             }
         );
         assert_eq!(
-            owner_service.messages(group_id).unwrap().messages[0].text,
+            owner_service
+                .messages(group_id, owner.peer_id())
+                .unwrap()
+                .messages[0]
+                .text,
             "Hello from member"
         );
         assert_eq!(
@@ -2476,7 +2526,11 @@ mod tests {
             group_id,
         );
         assert_eq!(
-            second_service.messages(group_id).unwrap().messages[0].text,
+            second_service
+                .messages(group_id, second_member.peer_id())
+                .unwrap()
+                .messages[0]
+                .text,
             "Hello everyone"
         );
 
@@ -2505,7 +2559,7 @@ mod tests {
         );
         assert_eq!(
             second_service
-                .messages(group_id)
+                .messages(group_id, second_member.peer_id())
                 .unwrap()
                 .messages
                 .last()
@@ -2663,7 +2717,7 @@ mod tests {
         assert_eq!(inserted, 4);
         assert_eq!(
             member_service
-                .messages(group_id)
+                .messages(group_id, member_id)
                 .unwrap()
                 .messages
                 .iter()

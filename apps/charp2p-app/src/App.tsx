@@ -57,7 +57,10 @@ type CreatedMessage = {
   createdAtUnixMs: number;
 };
 
-type StoredMessage = Omit<CreatedMessage, "authorSequence"> & { text: string };
+type StoredMessage = CreatedMessage & {
+  text: string;
+  deliveryState: "local" | "sharedWithPeer" | "received";
+};
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
 type GroupMemberDevice = { deviceId: string };
 
@@ -134,6 +137,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_encryption_failed: "The local message copy could not be protected.",
   message_invalid: "Enter a message up to 16 KiB.",
   message_delete_failed: "The local message copy could not be deleted.",
+  message_delivery_state_unavailable: "The message was shared, but its delivery state could not be saved.",
   message_not_found: "That message is no longer stored on this device.",
   message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",
@@ -192,6 +196,12 @@ function messageAuthorLabel(
     return joinedGroup.inviterName;
   }
   return `Peer ${shortPeerId(message.authorId)}`;
+}
+
+function messageDeliveryLabel(message: StoredMessage) {
+  return message.deliveryState === "sharedWithPeer"
+    ? "Shared with a peer"
+    : "Saved on this device";
 }
 
 function historyDescription(_policy: InvitationPreview["historyPolicy"]) {
@@ -888,8 +898,10 @@ function App() {
           eventId: created.eventId,
           groupId: created.groupId,
           authorId: created.authorId,
+          authorSequence: created.authorSequence,
           createdAtUnixMs: created.createdAtUnixMs,
           text,
+          deliveryState: "local",
         },
       ]);
       setOutgoingMessage("");
@@ -1174,6 +1186,9 @@ function App() {
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile, joinedGroup)}
                         {" · "}{messageTime(message.createdAtUnixMs)}
+                        {message.authorId === profile?.peerId && (
+                          <>{" · "}{messageDeliveryLabel(message)}</>
+                        )}
                       </time>
                       <div className="message-actions">
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>
@@ -1218,7 +1233,9 @@ function App() {
                 </button>
                 {createdMessage && (
                   <p className="message-receipt" role="status">
-                    ✓ Encrypted event {createdMessage.authorSequence} saved. It will sync when the owner is reachable.
+                    {groupMessages.find(({ eventId }) => eventId === createdMessage.eventId)?.deliveryState === "sharedWithPeer"
+                      ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
+                      : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`}
                   </p>
                 )}
               </form>
@@ -1290,6 +1307,9 @@ function App() {
                       <p>{message.text}</p>
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
+                        {message.authorId === profile?.peerId && (
+                          <>{" · "}{messageDeliveryLabel(message)}</>
+                        )}
                       </time>
                       <div className="message-actions">
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>

@@ -73,5 +73,6 @@ Architecture decisions are recorded in [docs/decisions](docs/decisions).
   construction; no custom cryptography.
 - Open DHT-based discovery with bootstrap nodes, direct connections, and relay
   fallback.
+- Durable local and shared-with-peer message delivery states.
 - No central message storage.
 - No public group directory or file transfer in the first release.

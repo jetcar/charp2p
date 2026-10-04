@@ -241,10 +241,16 @@ fn send_group_message(
 #[tauri::command]
 fn group_messages(
     group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<StoredMessagePage, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
-    mls_service.messages(group_id).map_err(str::to_owned)
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .messages(group_id, identity.peer_id())
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]

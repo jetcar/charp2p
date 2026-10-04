@@ -84,6 +84,14 @@ trait SynchronizationService: Send + Sync {
         author_id: PeerId,
         after_sequence: u64,
     ) -> Result<Option<(SyncRequest, u64)>, &'static str>;
+
+    fn acknowledge_messages_shared(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+        sequence: u64,
+    ) -> Result<(), &'static str>;
 }
 
 impl MemberAdmissionService for MlsProviderService {
@@ -142,6 +150,18 @@ impl SynchronizationService for MlsProviderService {
         after_sequence: u64,
     ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
         MlsProviderService::next_push_request(self, group_id, author_id, after_sequence)
+    }
+
+    fn acknowledge_messages_shared(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+        sequence: u64,
+    ) -> Result<(), &'static str> {
+        MlsProviderService::acknowledge_messages_shared(
+            self, group_id, peer_id, author_id, sequence,
+        )
     }
 }
 
@@ -770,6 +790,12 @@ impl NetworkService {
                 self.synchronization
                     .next_push_request(group_id, author_id, after_sequence)?
             else {
+                self.synchronization.acknowledge_messages_shared(
+                    group_id,
+                    peer_id,
+                    author_id,
+                    after_sequence,
+                )?;
                 return Ok(inserted);
             };
             if last_sequence <= after_sequence {
@@ -945,6 +971,16 @@ impl SynchronizationService for UnavailableSynchronizationService {
     ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
         Err("synchronization_unavailable")
     }
+
+    fn acknowledge_messages_shared(
+        &self,
+        _group_id: PeerId,
+        _peer_id: PeerId,
+        _author_id: PeerId,
+        _sequence: u64,
+    ) -> Result<(), &'static str> {
+        Err("synchronization_unavailable")
+    }
 }
 
 fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
@@ -1073,6 +1109,16 @@ mod tests {
             _after_sequence: u64,
         ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
             Ok(None)
+        }
+
+        fn acknowledge_messages_shared(
+            &self,
+            _group_id: PeerId,
+            _peer_id: PeerId,
+            _author_id: PeerId,
+            _sequence: u64,
+        ) -> Result<(), &'static str> {
+            Ok(())
         }
     }
 

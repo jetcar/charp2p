@@ -89,7 +89,6 @@ const ERROR_MESSAGES: Record<string, string> = {
   group_creation_failed: "The group identity could not be created.",
   group_creation_event_failed: "The initial group event could not be created.",
   group_creation_rollback_failed: "Group setup failed and could not be safely rolled back.",
-  group_already_exists: "This version supports one local group at a time.",
   group_option_unsupported: "This option is not available in the current secure group profile.",
   group_already_joined: "This device already belongs to that group.",
   group_identity_record_invalid: "A stored group identity is damaged.",
@@ -530,7 +529,7 @@ function App() {
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
   const [activeGroupId, setActiveGroupId] = useState("");
   const activeGroupIdRef = useRef("");
-  const [issuedInvitation, setIssuedInvitation] = useState<IssuedInvitation | null>(null);
+  const [issuedInvitations, setIssuedInvitations] = useState<IssuedInvitation[]>([]);
   const [createGroupMode, setCreateGroupMode] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [groupIcon, setGroupIcon] = useState(0);
@@ -550,6 +549,9 @@ function App() {
   );
   const joinedGroup = joinedGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
   const localGroup = localGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
+  const issuedInvitation = localGroup
+    ? issuedInvitations.find(({ groupId }) => groupId === localGroup.groupId) ?? null
+    : null;
   const availableGroups = useMemo(
     () => [
       ...localGroups.map((group) => ({
@@ -607,7 +609,7 @@ function App() {
           setError(errorMessage(groupsResult.reason));
         }
         if (invitationsResult.status === "fulfilled") {
-          setIssuedInvitation(invitationsResult.value[0] ?? null);
+          setIssuedInvitations(invitationsResult.value);
         } else {
           setError(errorMessage(invitationsResult.reason));
         }
@@ -643,10 +645,13 @@ function App() {
               (invitation) => invitation.invitationId === issuedInvitation.invitationId,
             );
             if (refreshed) {
-              setIssuedInvitation(refreshed);
+              setIssuedInvitations((current) => current.map((invitation) =>
+                invitation.invitationId === refreshed.invitationId ? refreshed : invitation));
               timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
             } else {
-              setIssuedInvitation(null);
+              setIssuedInvitations((current) => current.filter(
+                ({ invitationId }) => invitationId !== issuedInvitation.invitationId,
+              ));
               setInvitationCopied(false);
             }
           })
@@ -1240,7 +1245,7 @@ function App() {
         created,
       ]);
       setActiveGroupId(created.groupId);
-      setIssuedInvitation(null);
+      setInvitationCopied(false);
       setGroupName(created.groupName);
       setCreateGroupMode(false);
     } catch (reason) {
@@ -1260,7 +1265,10 @@ function App() {
       const invitation = await invoke<IssuedInvitation>("create_group_invitation", {
         groupId: localGroup.groupId,
       });
-      setIssuedInvitation(invitation);
+      setIssuedInvitations((current) => [
+        ...current.filter(({ groupId }) => groupId !== invitation.groupId),
+        invitation,
+      ]);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -1285,8 +1293,9 @@ function App() {
     setError("");
     setRevokingInvitation(true);
     try {
-      await invoke("revoke_group_invitation", { groupId: localGroup.groupId });
-      setIssuedInvitation(null);
+      const groupId = localGroup.groupId;
+      await invoke("revoke_group_invitation", { groupId });
+      setIssuedInvitations((current) => current.filter((invitation) => invitation.groupId !== groupId));
       setInvitationCopied(false);
       setAdvertisement(null);
       setAdvertisementError("");
@@ -1431,6 +1440,7 @@ function App() {
                     onClick={() => {
                       setActiveGroupId(group.groupId);
                       setError("");
+                      setInvitationCopied(false);
                       setSynchronizationResult(null);
                       setSynchronizingGroup(false);
                       setCreatedMessage(null);
@@ -1461,6 +1471,16 @@ function App() {
                 type="button"
               >
                 ＋ Join another group
+              </button>
+              <button
+                className="group-switcher-join"
+                onClick={() => {
+                  setCreateGroupMode(true);
+                  setError("");
+                }}
+                type="button"
+              >
+                ＋ Create a group
               </button>
             </nav>
           )}

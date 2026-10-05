@@ -243,14 +243,6 @@ impl GroupService {
             .metadata
             .lock()
             .map_err(|_| "group_service_unavailable")?;
-        if !store
-            .local_groups()
-            .map_err(|_| "group_store_unavailable")?
-            .is_empty()
-        {
-            return Err("group_already_exists");
-        }
-
         let (identity, secret) =
             GroupIdentity::generate_persistable().map_err(|_| "group_creation_failed")?;
         if secret.expose_for_protected_storage().len() > MAX_GROUP_SECRET_BYTES {
@@ -1084,10 +1076,36 @@ mod tests {
 
         assert_eq!(restored, vec![created]);
         assert_eq!(restored[0].group_name, "Project Atlas");
-        assert_eq!(
-            service.create(spec("Hidden second group")).unwrap_err(),
-            "group_already_exists"
-        );
+    }
+
+    #[test]
+    fn owner_can_create_several_groups_with_separate_roots_and_invitations() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let first = service.create(spec("Project Atlas")).unwrap();
+        let second = service.create(spec("Launch room")).unwrap();
+        assert_ne!(first.group_id, second.group_id);
+
+        let restored = service.list().unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(&first) && restored.contains(&second));
+
+        let first_id: PeerId = first.group_id.parse().unwrap();
+        let second_id: PeerId = second.group_id.parse().unwrap();
+        let inviter = DeviceIdentity::generate().peer_id();
+        service
+            .issue_invitation_at(first_id, inviter, "Maya's PC", NOW)
+            .unwrap();
+        let second_invitation = service
+            .issue_invitation_at(second_id, inviter, "Maya's PC", NOW)
+            .unwrap();
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 2);
+
+        service.revoke_invitation(first_id).unwrap();
+        let remaining = service.issued_invitations_at(NOW).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].invitation_id, second_invitation.invitation_id);
+        assert_eq!(remaining[0].group_id, second.group_id);
     }
 
     #[test]

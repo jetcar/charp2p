@@ -39,6 +39,11 @@ built-in bootstrap list. During local development, set
 ending in `/p2p/<peer-id>`. With no configured node, the app reports that a
 bootstrap node is required.
 
+Owner advertisements request a Circuit Relay v2 reservation from configured
+bootstrap nodes. The relay transport uses Noise and Yamux over the authenticated
+relay connection, so discovered peers can establish the existing join and sync
+protocols when the owner's direct QUIC address is not reachable.
+
 The ready screen can create and restore a first local group, then issue and
 copy signed custom-URI invitations. Group-root keys and issued bearer
 credentials use the platform keyring; SQLite stores their non-secret indexes

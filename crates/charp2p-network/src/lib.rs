@@ -14,9 +14,9 @@ use futures::StreamExt;
 use libp2p::{
     identify,
     identity::Keypair,
-    kad, ping, request_response,
-    swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    kad, noise, ping, relay, request_response,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, StreamProtocol, SwarmEvent},
+    yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use thiserror::Error;
 
@@ -31,6 +31,9 @@ const JOIN_PROTOCOL: &str = "/charp2p/join/1.0.0";
 const JOIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
+const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(60 * 60);
+const RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(5 * 60);
+const RELAY_CIRCUIT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -39,10 +42,17 @@ struct Behaviour {
     dht: kad::Behaviour<kad::store::MemoryStore>,
     join: request_response::Behaviour<JoinCodec>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
 }
 
 impl Behaviour {
-    fn new(identity: &Keypair, dht_mode: kad::Mode) -> Self {
+    fn new(
+        identity: &Keypair,
+        dht_mode: kad::Mode,
+        relay_client: relay::client::Behaviour,
+        relay_server: bool,
+    ) -> Self {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
         dht.set_mode(Some(dht_mode));
@@ -79,13 +89,31 @@ impl Behaviour {
             dht,
             join,
             sync,
+            relay_client,
+            relay_server: Toggle::from(relay_server.then(|| {
+                relay::Behaviour::new(peer_id, relay_server_config())
+            })),
         }
     }
 }
 
-/// A client-mode CharP2P node using authenticated, encrypted QUIC transport.
+fn relay_server_config() -> relay::Config {
+    relay::Config {
+        max_reservations: 32,
+        max_reservations_per_peer: 1,
+        reservation_duration: RELAY_RESERVATION_DURATION,
+        max_circuits: 32,
+        max_circuits_per_peer: 4,
+        max_circuit_duration: RELAY_CIRCUIT_DURATION,
+        max_circuit_bytes: RELAY_CIRCUIT_BYTES,
+        ..Default::default()
+    }
+}
+
+/// A client-mode CharP2P node using authenticated direct and relayed transport.
 pub struct NetworkNode {
     swarm: Swarm<Behaviour>,
+    relay_server: bool,
     discovery_queries: HashMap<kad::QueryId, DiscoveryKey>,
     pending_sync_responses:
         HashMap<InboundSyncRequestId, request_response::ResponseChannel<SyncResponse>>,
@@ -96,19 +124,23 @@ pub struct NetworkNode {
 impl NetworkNode {
     /// Builds a node from its persistent libp2p device identity.
     pub fn new(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Client)
+        Self::with_dht_mode(identity, kad::Mode::Client, false)
     }
 
     /// Builds a routing node that answers Kademlia queries from other peers.
     pub fn new_routing(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Server)
+        Self::with_dht_mode(identity, kad::Mode::Server, true)
     }
 
-    fn with_dht_mode(identity: Keypair, dht_mode: kad::Mode) -> Self {
+    fn with_dht_mode(identity: Keypair, dht_mode: kad::Mode, relay_server: bool) -> Self {
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_quic()
-            .with_behaviour(|identity| Behaviour::new(identity, dht_mode))
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .expect("relay transport construction is infallible")
+            .with_behaviour(|identity, relay_client| {
+                Behaviour::new(identity, dht_mode, relay_client, relay_server)
+            })
             .expect("behaviour construction is infallible")
             .with_swarm_config(|config| {
                 config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT)
@@ -117,6 +149,7 @@ impl NetworkNode {
 
         Self {
             swarm,
+            relay_server,
             discovery_queries: HashMap::new(),
             pending_sync_responses: HashMap::new(),
             pending_join_responses: HashMap::new(),
@@ -132,6 +165,19 @@ impl NetworkNode {
     pub fn listen_on(&mut self, address: Multiaddr) -> Result<(), NetworkError> {
         self.swarm.listen_on(address)?;
         Ok(())
+    }
+
+    /// Requests a circuit-relay reservation and starts listening through it.
+    pub fn reserve_relay(
+        &mut self,
+        relay_peer_id: PeerId,
+        relay_address: Multiaddr,
+    ) -> Result<(), NetworkError> {
+        self.listen_on(
+            relay_address
+                .with(libp2p::multiaddr::Protocol::P2p(relay_peer_id))
+                .with(libp2p::multiaddr::Protocol::P2pCircuit),
+        )
     }
 
     /// Dials a peer multiaddress.
@@ -276,6 +322,9 @@ impl NetworkNode {
         loop {
             match self.swarm.select_next_some().await {
                 SwarmEvent::NewListenAddr { address, .. } => {
+                    if self.relay_server {
+                        self.swarm.add_external_address(address.clone());
+                    }
                     return NetworkEvent::Listening { address };
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -299,6 +348,11 @@ impl NetworkNode {
                         peer_id,
                         listen_addresses: info.listen_addrs,
                     };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+                )) => {
+                    return NetworkEvent::RelayReservationAccepted { relay_peer_id };
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dht(
                     kad::Event::OutboundQueryProgressed {
@@ -504,9 +558,14 @@ pub enum NetworkEvent {
         /// Bound network address.
         address: Multiaddr,
     },
+    /// A configured relay granted this node a bounded listen reservation.
+    RelayReservationAccepted {
+        /// Authenticated relay peer.
+        relay_peer_id: PeerId,
+    },
     /// An authenticated transport connection was established.
     PeerConnected {
-        /// Remote peer identity authenticated by QUIC.
+        /// Remote peer identity authenticated by the negotiated transport.
         peer_id: PeerId,
     },
     /// An authenticated connection ended.
@@ -710,7 +769,7 @@ mod tests {
         DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
         JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
     };
-    use libp2p::{identity::Keypair, Multiaddr};
+    use libp2p::{identity::Keypair, multiaddr::Protocol, Multiaddr};
     use tokio::time::timeout;
 
     use super::{NetworkEvent, NetworkNode};
@@ -799,6 +858,64 @@ mod tests {
         assert_eq!(response_peer, listener_id);
         assert_eq!(received_id, outbound_id);
         assert_eq!(response.welcome(), Some([4, 5, 6].as_slice()));
+    }
+
+    #[tokio::test]
+    async fn routing_node_relays_an_authenticated_connection() {
+        let mut relay = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let relay_id = relay.peer_id();
+        relay
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let relay_address = next_listen_address(&mut relay).await;
+
+        let mut destination = NetworkNode::new(Keypair::generate_ed25519());
+        let destination_id = destination.peer_id();
+        destination.reserve_relay(relay_id, relay_address).unwrap();
+        let relayed_address = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = destination.next_event() => {
+                        if let NetworkEvent::Listening { address } = event
+                            && address.iter().any(|protocol| protocol == Protocol::P2pCircuit)
+                        {
+                            break address;
+                        }
+                    }
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("relay should grant a listen reservation");
+
+        let mut source = NetworkNode::new(Keypair::generate_ed25519());
+        let source_id = source.peer_id();
+        source.dial(relayed_address).unwrap();
+
+        timeout(TEST_TIMEOUT, async {
+            let mut source_connected = false;
+            let mut destination_connected = false;
+            while !source_connected || !destination_connected {
+                tokio::select! {
+                    event = source.next_event() => {
+                        source_connected |= matches!(
+                            event,
+                            NetworkEvent::PeerConnected { peer_id } if peer_id == destination_id
+                        );
+                    }
+                    event = destination.next_event() => {
+                        destination_connected |= matches!(
+                            event,
+                            NetworkEvent::PeerConnected { peer_id } if peer_id == source_id
+                        );
+                    }
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("peers should connect through the routing node relay");
     }
 
     async fn connected_nodes() -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {

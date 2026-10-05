@@ -191,8 +191,8 @@ and destination peer metadata and traffic characteristics but not group
 payloads.
 
 A provider record means a peer recently advertised the invitation rendezvous
-key. The UI reports a peer as reachable only after an authenticated QUIC
-connection succeeds; stale provider records remain a separate status.
+key. The UI reports a peer as reachable only after an authenticated direct or
+relayed connection succeeds; stale provider records remain a separate status.
 Discovery and transport authentication do not grant group access. Until the
 join protocol authorizes a device, an advertiser rejects its synchronization
 requests.
@@ -532,9 +532,11 @@ The project node stores only bounded DHT records, relay reservations, routing
 state, and minimal security telemetry. It does not store group events or
 message payloads.
 
-The initial standalone node implements bootstrap and Kademlia routing with
-in-memory DHT state. It rejects group synchronization requests. Relay service,
-traffic quotas, metrics, and deployment packaging remain production gates.
+The standalone node implements bootstrap and Kademlia routing with in-memory
+DHT state plus Circuit Relay v2. It rejects group synchronization requests.
+Relay reservations and circuits have fixed count, duration, byte, per-peer,
+and upstream per-IP rate bounds. Load-tested quotas, metrics, and deployment
+packaging remain production gates.
 
 It can:
 

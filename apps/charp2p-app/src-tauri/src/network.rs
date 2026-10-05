@@ -379,6 +379,8 @@ impl NetworkService {
         .map_err(|_| "network_unavailable")?;
         for bootstrap in &self.bootstrap_peers {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+            node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
+                .map_err(|_| "network_unavailable")?;
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
         for key in &keys {

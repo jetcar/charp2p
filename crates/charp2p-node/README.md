@@ -1,8 +1,14 @@
 # CharP2P routing node
 
-`charp2p-node` is a standalone community bootstrap and Kademlia routing node.
-It stores no group events or message payloads and rejects synchronization
-requests. Relay service and production traffic controls are later increments.
+`charp2p-node` is a standalone community bootstrap, Kademlia routing, and
+Circuit Relay v2 node. It stores no group events or message payloads and
+rejects synchronization requests.
+
+Relay service is bounded to 32 reservations, one reservation per peer, 32
+simultaneous circuits, four circuits per peer, five minutes per circuit, and
+32 MiB per circuit. The upstream per-peer and per-IP request rate limits remain
+enabled. Production metrics, deployment packaging, and load-tested quotas are
+later increments.
 
 Run it with a persistent identity file:
 
@@ -30,3 +36,6 @@ Multiple client bootstrap addresses are separated by semicolons.
 
 The process logs only its peer ID, listen addresses, shutdown, and coarse DHT
 operation failures. It does not log discovery keys or connected peer IDs.
+Relay operators can still observe source and destination peer metadata, timing,
+and traffic volume; relayed peer streams remain end-to-end authenticated and
+encrypted.

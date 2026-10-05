@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,7 +9,7 @@ use charp2p_core::{
     SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
-use charp2p_network::{NetworkEvent, NetworkNode};
+use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode};
 use charp2p_sync::{PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -178,6 +178,7 @@ pub struct PeerSearchResult {
     pub status: &'static str,
     pub discovered_peers: usize,
     pub reachable_peers: usize,
+    pub connection_type: Option<&'static str>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -522,6 +523,7 @@ impl NetworkService {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
                 reachable_peers: 0,
+                connection_type: None,
             });
         }
 
@@ -542,11 +544,11 @@ impl NetworkService {
 
         let discovery = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut discovered = BTreeSet::new();
-            let mut connected = BTreeSet::new();
+            let mut connected = BTreeMap::new();
             loop {
                 match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id } => {
-                        connected.insert(peer_id);
+                    NetworkEvent::PeerConnected { peer_id, path } => {
+                        connected.insert(peer_id, path);
                     }
                     NetworkEvent::GroupPeersFound {
                         key: found_key,
@@ -568,6 +570,7 @@ impl NetworkService {
                             status: "noPeers",
                             discovered_peers: 0,
                             reachable_peers: 0,
+                            connection_type: None,
                         });
                     }
                     NetworkEvent::DiscoveryFailed {
@@ -577,6 +580,7 @@ impl NetworkService {
                             status: "unavailable",
                             discovered_peers: 0,
                             reachable_peers: 0,
+                            connection_type: None,
                         });
                     }
                     _ => {}
@@ -590,11 +594,12 @@ impl NetworkService {
             Err(result) => return Ok(result),
         };
 
-        if discovered.iter().any(|peer| connected.contains(peer)) {
+        if let Some(path) = discovered.iter().find_map(|peer| connected.get(peer)) {
             return Ok(PeerSearchResult {
                 status: "peerReachable",
                 discovered_peers: discovered.len(),
                 reachable_peers: 1,
+                connection_type: Some(connection_type_name(*path)),
             });
         }
 
@@ -603,24 +608,25 @@ impl NetworkService {
         }
         let reachable = timeout(CONNECT_TIMEOUT, async {
             loop {
-                if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
+                if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
                     if discovered.contains(&peer_id) {
-                        return peer_id;
+                        return path;
                     }
                 }
             }
         })
         .await
-        .is_ok();
+        .ok();
 
         Ok(PeerSearchResult {
-            status: if reachable {
+            status: if reachable.is_some() {
                 "peerReachable"
             } else {
                 "peersFound"
             },
             discovered_peers: discovered.len(),
-            reachable_peers: usize::from(reachable),
+            reachable_peers: usize::from(reachable.is_some()),
+            connection_type: reachable.map(connection_type_name),
         })
     }
 
@@ -744,7 +750,7 @@ impl NetworkService {
             let mut connected = false;
             loop {
                 match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id } if peer_id == expected_peer => {
+                    NetworkEvent::PeerConnected { peer_id, .. } if peer_id == expected_peer => {
                         connected = true;
                     }
                     NetworkEvent::GroupPeersFound {
@@ -773,7 +779,7 @@ impl NetworkService {
                 .map_err(|_| "network_peer_unreachable")?;
             timeout(CONNECT_TIMEOUT, async {
                 loop {
-                    if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
+                    if let NetworkEvent::PeerConnected { peer_id, .. } = node.next_event().await {
                         if peer_id == expected_peer {
                             break;
                         }
@@ -1054,6 +1060,13 @@ fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str
     expiry
         .duration_since(SystemTime::now())
         .map_err(|_| "invitation_expired")
+}
+
+fn connection_type_name(path: ConnectionPath) -> &'static str {
+    match path {
+        ConnectionPath::Direct => "direct",
+        ConnectionPath::Relayed => "relayed",
+    }
 }
 
 fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
@@ -1412,6 +1425,7 @@ mod tests {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
                 reachable_peers: 0,
+                connection_type: None,
             }
         );
     }
@@ -1831,6 +1845,7 @@ mod tests {
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
         assert_eq!(result.reachable_peers, 1);
+        assert_eq!(result.connection_type, Some("direct"));
     }
 
     #[test]
@@ -2184,6 +2199,7 @@ mod tests {
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
         assert_eq!(result.reachable_peers, 1);
+        assert_eq!(result.connection_type, Some("direct"));
     }
 
     #[test]
@@ -2237,5 +2253,6 @@ mod tests {
         assert_eq!(result.status, "noPeers");
         assert_eq!(result.discovered_peers, 0);
         assert_eq!(result.reachable_peers, 0);
+        assert_eq!(result.connection_type, None);
     }
 }

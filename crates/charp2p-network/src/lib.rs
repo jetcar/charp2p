@@ -327,8 +327,19 @@ impl NetworkNode {
                     }
                     return NetworkEvent::Listening { address };
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    return NetworkEvent::PeerConnected { peer_id };
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    endpoint,
+                    ..
+                } => {
+                    return NetworkEvent::PeerConnected {
+                        peer_id,
+                        path: if endpoint.is_relayed() {
+                            ConnectionPath::Relayed
+                        } else {
+                            ConnectionPath::Direct
+                        },
+                    };
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     return NetworkEvent::PeerDisconnected { peer_id };
@@ -567,6 +578,8 @@ pub enum NetworkEvent {
     PeerConnected {
         /// Remote peer identity authenticated by the negotiated transport.
         peer_id: PeerId,
+        /// Whether this connection reached the peer directly or through a relay.
+        path: ConnectionPath,
     },
     /// An authenticated connection ended.
     PeerDisconnected {
@@ -658,6 +671,15 @@ pub enum NetworkEvent {
         /// Stable failure category.
         failure: SyncFailure,
     },
+}
+
+/// Transport path used by an authenticated peer connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionPath {
+    /// The endpoints established a direct connection.
+    Direct,
+    /// The endpoints connected through Circuit Relay v2.
+    Relayed,
 }
 
 /// Stable membership transport failure categories.
@@ -772,7 +794,7 @@ mod tests {
     use libp2p::{identity::Keypair, multiaddr::Protocol, Multiaddr};
     use tokio::time::timeout;
 
-    use super::{NetworkEvent, NetworkNode};
+    use super::{ConnectionPath, NetworkEvent, NetworkNode};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
@@ -901,13 +923,19 @@ mod tests {
                     event = source.next_event() => {
                         source_connected |= matches!(
                             event,
-                            NetworkEvent::PeerConnected { peer_id } if peer_id == destination_id
+                            NetworkEvent::PeerConnected {
+                                peer_id,
+                                path: ConnectionPath::Relayed,
+                            } if peer_id == destination_id
                         );
                     }
                     event = destination.next_event() => {
                         destination_connected |= matches!(
                             event,
-                            NetworkEvent::PeerConnected { peer_id } if peer_id == source_id
+                            NetworkEvent::PeerConnected {
+                                peer_id,
+                                path: ConnectionPath::Relayed,
+                            } if peer_id == source_id
                         );
                     }
                     _ = relay.next_event() => {}
@@ -933,17 +961,20 @@ mod tests {
             .unwrap();
         dialer.dial(dial_address).unwrap();
 
-        let (listener_peer, dialer_peer) = timeout(TEST_TIMEOUT, async {
-            futures::join!(
-                next_connected_peer(&mut listener),
-                next_connected_peer(&mut dialer)
-            )
-        })
-        .await
-        .expect("loopback QUIC connection should complete");
+        let ((listener_peer, listener_path), (dialer_peer, dialer_path)) =
+            timeout(TEST_TIMEOUT, async {
+                futures::join!(
+                    next_connected_peer(&mut listener),
+                    next_connected_peer(&mut dialer)
+                )
+            })
+            .await
+            .expect("loopback QUIC connection should complete");
 
         assert_eq!(listener_peer, dialer_id);
+        assert_eq!(listener_path, ConnectionPath::Direct);
         assert_eq!(dialer_peer, listener_id);
+        assert_eq!(dialer_path, ConnectionPath::Direct);
 
         (listener, dialer, listener_id, dialer_id)
     }
@@ -982,10 +1013,10 @@ mod tests {
         }
     }
 
-    async fn next_connected_peer(node: &mut NetworkNode) -> libp2p::PeerId {
+    async fn next_connected_peer(node: &mut NetworkNode) -> (libp2p::PeerId, ConnectionPath) {
         loop {
-            if let NetworkEvent::PeerConnected { peer_id } = node.next_event().await {
-                return peer_id;
+            if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
+                return (peer_id, path);
             }
         }
     }

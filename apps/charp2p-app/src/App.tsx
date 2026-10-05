@@ -408,6 +408,7 @@ function App() {
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [cancellingPending, setCancellingPending] = useState(false);
+  const pendingExpiryCleanupRef = useRef("");
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
@@ -524,6 +525,49 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [issuedInvitation]);
+
+  useEffect(() => {
+    if (!pendingGroup || !isTauri()) return;
+    const groupId = pendingGroup.groupId;
+    if (pendingExpiryCleanupRef.current === groupId) return;
+    let active = true;
+    let timer: number | undefined;
+    const scheduleExpiry = () => {
+      const remainingMs = pendingGroup.expiresAtUnix * 1000 - Date.now();
+      if (remainingMs > 0) {
+        timer = window.setTimeout(
+          scheduleExpiry,
+          Math.min(remainingMs, INVITATION_EXPIRY_CHECK_INTERVAL_MS),
+        );
+        return;
+      }
+      if (joiningGroup || pendingExpiryCleanupRef.current === groupId) return;
+      pendingExpiryCleanupRef.current = groupId;
+      setCancellingPending(true);
+      void invoke("cancel_pending_invitation", { groupId })
+        .then(() => {
+          if (!active) return;
+          setPendingGroup((current) => current?.groupId === groupId ? null : current);
+          setPeerSearchResult(null);
+          setError("");
+        })
+        .catch((reason) => {
+          if (active) {
+            pendingExpiryCleanupRef.current = "";
+            setError(errorMessage(reason));
+            timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
+          }
+        })
+        .finally(() => {
+          if (active) setCancellingPending(false);
+        });
+    };
+    scheduleExpiry();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [pendingGroup, joiningGroup]);
 
   useEffect(() => {
     if (
@@ -775,6 +819,7 @@ function App() {
       const accepted = await invoke<PendingGroup>("accept_invitation", {
         input: inviteInput,
       });
+      pendingExpiryCleanupRef.current = "";
       setPendingGroup(accepted);
       setJoinedGroup(null);
       setPeerSearchResult(null);
@@ -816,6 +861,7 @@ function App() {
       });
       setJoinedGroup(joined);
       setSynchronizationResult(null);
+      pendingExpiryCleanupRef.current = "";
       setPendingGroup(null);
       setPeerSearchResult(null);
     } catch (reason) {
@@ -830,14 +876,17 @@ function App() {
     if (!window.confirm("Remove this saved invitation from this device?")) return;
 
     setError("");
+    pendingExpiryCleanupRef.current = pendingGroup.groupId;
     setCancellingPending(true);
     try {
       await invoke("cancel_pending_invitation", {
         groupId: pendingGroup.groupId,
       });
+      pendingExpiryCleanupRef.current = "";
       setPendingGroup(null);
       setPeerSearchResult(null);
     } catch (reason) {
+      pendingExpiryCleanupRef.current = "";
       setError(errorMessage(reason));
     } finally {
       setCancellingPending(false);

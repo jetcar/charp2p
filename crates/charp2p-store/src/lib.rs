@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -619,9 +619,69 @@ impl EventStore {
             .collect()
     }
 
-    /// Returns at most `limit` verified message events that do not yet have a
-    /// local materialized body. Events are ordered by author and sequence so
-    /// each sender ratchet advances consistently.
+    /// Atomically stores a decrypted group-metadata change and the advanced
+    /// encrypted MLS provider state. The caller authorizes the author; the
+    /// change with the highest author sequence becomes the current name.
+    pub fn put_group_metadata_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        metadata: &charp2p_core::GroupMetadata,
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::GroupMetadataChanged {
+            return Err(StoreError::InvalidGroupMetadataEvent);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let sequence = i64::try_from(event.author_sequence())
+            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "INSERT INTO applied_group_metadata (
+                event_id, group_id, author_id, author_sequence, group_name
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+                sequence,
+                metadata.group_name(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Returns the current authenticated group name for every group with an
+    /// applied metadata change.
+    pub fn current_group_names(&self) -> Result<Vec<(PeerId, String)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT g.group_id, g.group_name
+             FROM applied_group_metadata g
+             WHERE g.author_sequence = (
+                 SELECT MAX(latest.author_sequence)
+                 FROM applied_group_metadata latest
+                 WHERE latest.group_id = g.group_id
+             )
+             ORDER BY g.group_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (group_id, group_name) = row?;
+            let group_id = PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?;
+            charp2p_core::GroupMetadata::new(&group_name).map_err(|_| StoreError::CorruptIndex)?;
+            Ok((group_id, group_name))
+        })
+        .collect()
+    }
+
+    /// Returns at most `limit` verified message and group-metadata events that
+    /// have not been decrypted locally yet. Events are ordered by author and
+    /// sequence so each sender ratchet advances consistently.
     pub fn unmaterialized_message_events(
         &self,
         group_id: PeerId,
@@ -635,7 +695,9 @@ impl EventStore {
              FROM events e
              LEFT JOIN materialized_messages m ON m.event_id = e.event_id
              LEFT JOIN hidden_local_messages h ON h.event_id = e.event_id
+             LEFT JOIN applied_group_metadata g ON g.event_id = e.event_id
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
+               AND g.event_id IS NULL
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
@@ -645,7 +707,11 @@ impl EventStore {
             if event.group_id() != group_id {
                 return Err(StoreError::CorruptIndex);
             }
-            if event.kind() == charp2p_core::EventKind::MessageCreated {
+            if matches!(
+                event.kind(),
+                charp2p_core::EventKind::MessageCreated
+                    | charp2p_core::EventKind::GroupMetadataChanged
+            ) {
                 events.push(event);
                 if events.len() == limit {
                     break;
@@ -1510,7 +1576,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=16 => {}
+            6..=17 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1717,6 +1783,26 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 17 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS applied_group_metadata (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    group_name TEXT NOT NULL
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS applied_group_metadata_by_group
+                    ON applied_group_metadata(group_id, author_sequence);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -1905,6 +1991,9 @@ pub enum StoreError {
     /// Only a signed message-creation event can materialize a message body.
     #[error("event is not a message creation")]
     InvalidMessageEvent,
+    /// Only a signed metadata-change event can update group metadata.
+    #[error("event is not a group metadata change")]
+    InvalidGroupMetadataEvent,
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -3006,6 +3095,100 @@ mod tests {
                 .contains(&(group.group_id(), 1)),
             "blocked messages do not become unread after unblocking"
         );
+    }
+
+    #[test]
+    fn group_metadata_changes_apply_in_author_sequence_order() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let metadata_event = |sequence| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::GroupMetadataChanged,
+                    protected_payload: b"protected metadata",
+                },
+            )
+            .unwrap()
+        };
+        let first = metadata_event(1);
+        let message = message_event(&owner, &group, 2, b"protected message");
+        let second = metadata_event(3);
+        for event in [&first, &message, &second] {
+            store.put_event(event).unwrap();
+        }
+
+        let pending = store
+            .unmaterialized_message_events(group.group_id(), 10)
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(SignedEvent::id).collect::<Vec<_>>(),
+            vec![first.id(), message.id(), second.id()]
+        );
+        assert!(matches!(
+            store.put_group_metadata_and_encrypted_mls_provider_snapshot(
+                &message,
+                b"snapshot",
+                &charp2p_core::GroupMetadata::new("Wrong").unwrap(),
+            ),
+            Err(StoreError::InvalidGroupMetadataEvent)
+        ));
+
+        store
+            .put_group_metadata_and_encrypted_mls_provider_snapshot(
+                &second,
+                b"snapshot two",
+                &charp2p_core::GroupMetadata::new("Renamed Crew").unwrap(),
+            )
+            .unwrap();
+        store
+            .put_group_metadata_and_encrypted_mls_provider_snapshot(
+                &first,
+                b"snapshot one",
+                &charp2p_core::GroupMetadata::new("Old Crew").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.current_group_names().unwrap(),
+            vec![(group.group_id(), "Renamed Crew".to_owned())]
+        );
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .iter()
+                .map(SignedEvent::id)
+                .collect::<Vec<_>>(),
+            vec![message.id()]
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"snapshot one"
+        );
+    }
+
+    #[test]
+    fn version_seventeen_database_adds_group_metadata() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_group_metadata;
+                     PRAGMA user_version = 17;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert!(store.current_group_names().unwrap().is_empty());
     }
 
     #[test]

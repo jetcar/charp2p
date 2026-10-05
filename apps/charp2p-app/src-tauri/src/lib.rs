@@ -94,13 +94,55 @@ fn cancel_pending_invitation(
 #[tauri::command]
 fn joined_groups(
     service: tauri::State<'_, PendingInvitationService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<Vec<JoinedGroup>, String> {
-    service.joined().map_err(str::to_owned)
+    let mut groups = service.joined().map_err(str::to_owned)?;
+    let names = mls_service.current_group_names().map_err(str::to_owned)?;
+    for group in &mut groups {
+        apply_current_group_name(&names, &group.group_id, &mut group.group_name);
+    }
+    Ok(groups)
 }
 
 #[tauri::command]
-fn local_groups(service: tauri::State<'_, Arc<GroupService>>) -> Result<Vec<LocalGroup>, String> {
-    service.list().map_err(str::to_owned)
+fn local_groups(
+    service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<LocalGroup>, String> {
+    let mut groups = service.list().map_err(str::to_owned)?;
+    let names = mls_service.current_group_names().map_err(str::to_owned)?;
+    for group in &mut groups {
+        apply_current_group_name(&names, &group.group_id, &mut group.group_name);
+    }
+    Ok(groups)
+}
+
+#[tauri::command]
+fn rename_group(
+    group_id: String,
+    group_name: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    if !group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == group_id.to_string())
+    {
+        return Err("group_not_owned".to_owned());
+    }
+    let group_name = groups::normalize_group_name(&group_name).map_err(str::to_owned)?;
+    let metadata =
+        charp2p_core::GroupMetadata::new(&group_name).map_err(|_| "invalid_group_name")?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .change_group_metadata(group_id, &identity, &metadata)
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -468,6 +510,7 @@ pub fn run() {
             cancel_pending_invitation,
             joined_groups,
             local_groups,
+            rename_group,
             issued_invitations,
             create_group,
             create_group_invitation,
@@ -487,6 +530,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Replaces invitation-time display names with the latest authenticated
+/// owner rename applied on this device.
+fn apply_current_group_name(
+    names: &[(charp2p_core::PeerId, String)],
+    group_id: &str,
+    group_name: &mut String,
+) {
+    if let Some((_, name)) = names
+        .iter()
+        .find(|(candidate, _)| candidate.to_string() == group_id)
+    {
+        group_name.clone_from(name);
+    }
 }
 
 fn parse_event_id(value: &str) -> Result<[u8; 32], String> {

@@ -156,6 +156,9 @@ button { cursor: pointer; }
 .members-card { align-items: stretch; }
 .members-card .members-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .members-card .members-header h2 { margin-bottom: 9px; font-size: clamp(36px, 3.8vw, 52px); }
+.rename-group-form { display: grid; gap: 8px; margin-bottom: 18px; }
+.rename-group-form .rename-group-row { display: flex; gap: 10px; }
+.rename-group-form .rename-group-row input { flex: 1; min-width: 0; }
 .members-card .members-header p:last-child { font-size: 19px; }
 .member-close { width: 48px; height: 48px; flex: 0 0 auto; border: 1px solid #dce4ec; border-radius: 50%; color: #55627e; background: white; font-size: 30px; line-height: 1; }
 .member-close:hover { border-color: #9baabd; background: #f5f8fb; }

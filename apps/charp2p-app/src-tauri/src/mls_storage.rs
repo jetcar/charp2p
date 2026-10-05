@@ -9,9 +9,9 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use charp2p_core::{
-    DeviceIdentity, EventId, EventKind, EventSpec, Invitation, JoinRequest, JoinResponse, PeerId,
-    SignedEvent, SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES,
-    MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, JoinRequest,
+    JoinResponse, PeerId, SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -579,6 +579,99 @@ impl MlsProviderService {
         if message.trim().is_empty() || message.len() > MAX_MESSAGE_TEXT_BYTES {
             return Err("message_invalid");
         }
+        self.create_application_event_at(
+            group_id,
+            author,
+            EventKind::MessageCreated,
+            message.as_bytes(),
+            created_at_unix_ms,
+            |store, event, encrypted_snapshot, key| {
+                let encrypted_body =
+                    encrypt_local_message(message.as_bytes(), key, event.id().as_bytes())?;
+                store
+                    .put_message_and_encrypted_mls_provider_snapshot(
+                        event,
+                        encrypted_snapshot,
+                        &encrypted_body,
+                    )
+                    .map_err(|_| "message_store_unavailable")?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Protects owner-authored display metadata as an MLS application message
+    /// and stores the signed `GroupMetadataChanged` event with the advanced
+    /// provider state in one transaction.
+    pub(crate) fn change_group_metadata(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        metadata: &GroupMetadata,
+    ) -> Result<(), &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        let encoded = metadata.encode().map_err(|_| "invalid_group_name")?;
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            let joined = store
+                .joined_groups()
+                .map_err(|_| "message_store_unavailable")?;
+            if joined.iter().any(|group| group.group_id == group_id) {
+                return Err("group_not_owned");
+            }
+        }
+        self.create_application_event_at(
+            group_id,
+            author,
+            EventKind::GroupMetadataChanged,
+            &encoded,
+            created_at_unix_ms,
+            |store, event, encrypted_snapshot, _key| {
+                store
+                    .put_group_metadata_and_encrypted_mls_provider_snapshot(
+                        event,
+                        encrypted_snapshot,
+                        metadata,
+                    )
+                    .map_err(|_| "message_store_unavailable")?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Returns authenticated group names from applied metadata changes.
+    pub(crate) fn current_group_names(&self) -> Result<Vec<(PeerId, String)>, &'static str> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        store
+            .current_group_names()
+            .map_err(|_| "message_store_unavailable")
+    }
+
+    fn create_application_event_at(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        kind: EventKind,
+        plaintext: &[u8],
+        created_at_unix_ms: u64,
+        persist: impl FnOnce(
+            &mut EventStore,
+            &SignedEvent,
+            &[u8],
+            &[u8; WRAPPING_KEY_BYTES],
+        ) -> Result<(), &'static str>,
+    ) -> Result<SignedEvent, &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -615,7 +708,7 @@ impl MlsProviderService {
             )
             .ok_or("mls_group_storage_unavailable")?;
             let protected = group
-                .create_message(&*provider, &signer, message.as_bytes())
+                .create_message(&*provider, &signer, plaintext)
                 .map_err(|_| "mls_message_creation_failed")?
                 .to_bytes()
                 .map_err(|_| "mls_message_creation_failed")?;
@@ -632,7 +725,7 @@ impl MlsProviderService {
                     author_sequence,
                     causal_parents: &causal_parents,
                     created_at_unix_ms,
-                    kind: EventKind::MessageCreated,
+                    kind,
                     protected_payload: &protected,
                 },
             )
@@ -642,15 +735,7 @@ impl MlsProviderService {
                 .map_err(|_| "mls_provider_snapshot_invalid")?;
             let key = self.load_or_create_wrapping_key()?;
             let encrypted = encrypt_snapshot(&snapshot, &key)?;
-            let encrypted_body =
-                encrypt_local_message(message.as_bytes(), &key, event.id().as_bytes())?;
-            store
-                .put_message_and_encrypted_mls_provider_snapshot(
-                    &event,
-                    &encrypted,
-                    &encrypted_body,
-                )
-                .map_err(|_| "message_store_unavailable")?;
+            persist(&mut store, &event, &encrypted, &key)?;
             Ok(event)
         })();
         if result.is_err() {
@@ -960,6 +1045,12 @@ impl MlsProviderService {
         group_id: PeerId,
         event: &SignedEvent,
     ) -> Result<(), MaterializeMessageError> {
+        if event.kind() == EventKind::GroupMetadataChanged
+            && !is_joined_group_owner(store, group_id, event.author_id())
+                .map_err(MaterializeMessageError::Unavailable)?
+        {
+            return Err(MaterializeMessageError::Unreadable);
+        }
         let mut group = MlsGroup::load(
             provider.storage(),
             &GroupId::from_slice(&group_id.to_bytes()),
@@ -987,11 +1078,19 @@ impl MlsProviderService {
             return Err(MaterializeMessageError::Unreadable);
         };
         let plaintext = Zeroizing::new(application.into_bytes());
-        let text =
-            std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
-        if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
-            return Err(MaterializeMessageError::Unreadable);
-        }
+        let metadata = if event.kind() == EventKind::GroupMetadataChanged {
+            Some(
+                GroupMetadata::decode(&plaintext)
+                    .map_err(|_| MaterializeMessageError::Unreadable)?,
+            )
+        } else {
+            let text =
+                std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
+            if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
+                return Err(MaterializeMessageError::Unreadable);
+            }
+            None
+        };
         let snapshot = provider
             .snapshot()
             .map_err(|_| MaterializeMessageError::Unavailable("mls_provider_snapshot_invalid"))?;
@@ -1000,6 +1099,16 @@ impl MlsProviderService {
             .map_err(MaterializeMessageError::Unavailable)?;
         let encrypted_snapshot =
             encrypt_snapshot(&snapshot, &key).map_err(MaterializeMessageError::Unavailable)?;
+        if let Some(metadata) = metadata {
+            store
+                .put_group_metadata_and_encrypted_mls_provider_snapshot(
+                    event,
+                    &encrypted_snapshot,
+                    &metadata,
+                )
+                .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
+            return Ok(());
+        }
         let encrypted_body = encrypt_local_message(&plaintext, &key, event.id().as_bytes())
             .map_err(MaterializeMessageError::Unavailable)?;
         store
@@ -1650,6 +1759,22 @@ fn sync_request_group_id(request: &SyncRequest) -> PeerId {
         | SyncRequest::Events { group_id, .. }
         | SyncRequest::PushEvents { group_id, .. } => *group_id,
     }
+}
+
+/// Only the owner device that issued this device's invitation may change a
+/// joined group's metadata. The owner applies its own changes when it creates
+/// them, so a received change for a locally owned group is never authorized.
+fn is_joined_group_owner(
+    store: &EventStore,
+    group_id: PeerId,
+    author_id: PeerId,
+) -> Result<bool, &'static str> {
+    let joined = store
+        .joined_groups()
+        .map_err(|_| "message_store_unavailable")?;
+    Ok(joined
+        .iter()
+        .any(|group| group.group_id == group_id && group.inviter_device_id == author_id))
 }
 
 fn encrypt_snapshot(
@@ -2998,6 +3123,123 @@ mod tests {
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["Blocked text"]
+        );
+    }
+
+    #[test]
+    fn owner_rename_reaches_members_and_other_authors_are_ignored() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        {
+            let mut store = member_service.store.lock().unwrap();
+            store
+                .put_pending_invitation(&charp2p_store::PendingInvitationMetadata {
+                    group_id,
+                    group_name: "Design Crew".to_owned(),
+                    inviter_name: "Owner".to_owned(),
+                    expires_at_unix: u64::from(u32::MAX),
+                    history_policy: charp2p_core::HistoryPolicy::None,
+                    reusable: false,
+                })
+                .unwrap();
+            assert!(store
+                .promote_pending_invitation_to_joined_group(group_id, owner.peer_id())
+                .unwrap());
+        }
+
+        // A member device cannot rename the group for others.
+        assert_eq!(
+            member_service.change_group_metadata(
+                group_id,
+                &member,
+                &charp2p_core::GroupMetadata::new("Hijacked").unwrap()
+            ),
+            Err("group_not_owned")
+        );
+        let hijack = charp2p_core::GroupMetadata::new("Hijacked")
+            .unwrap()
+            .encode()
+            .unwrap();
+        let forged = member_service
+            .create_application_event_at(
+                group_id,
+                &member,
+                EventKind::GroupMetadataChanged,
+                &hijack,
+                42,
+                |store, event, _, _| {
+                    store.put_event(event).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        owner_service
+            .change_group_metadata(
+                group_id,
+                &owner,
+                &charp2p_core::GroupMetadata::new("Old Name").unwrap(),
+            )
+            .unwrap();
+        owner_service
+            .create_message_at(group_id, &owner, "After rename", 43)
+            .unwrap();
+        owner_service
+            .change_group_metadata(
+                group_id,
+                &owner,
+                &charp2p_core::GroupMetadata::new("Renamed Crew").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            owner_service.current_group_names().unwrap(),
+            vec![(group_id, "Renamed Crew".to_owned())]
+        );
+        {
+            let mut owner_store = owner_service.store.lock().unwrap();
+            owner_store.put_event(&forged).unwrap();
+            let mut provider = owner_service.provider.lock().unwrap();
+            owner_service
+                .materialize_pending_messages(&mut provider, &mut owner_store, group_id)
+                .unwrap();
+        }
+        assert_eq!(
+            owner_service.current_group_names().unwrap(),
+            vec![(group_id, "Renamed Crew".to_owned())]
+        );
+
+        pull_all(&owner_service, &member_service, member_id, group_id);
+        assert_eq!(
+            member_service.current_group_names().unwrap(),
+            vec![(group_id, "Renamed Crew".to_owned())]
+        );
+        assert_eq!(
+            member_service
+                .messages(group_id, member_id)
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["After rename"]
         );
     }
 

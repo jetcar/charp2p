@@ -346,6 +346,13 @@ MessageDeleted
 KeyEpochAdvanced
 ```
 
+A `GroupMetadataChanged` event carries versioned display metadata (currently
+the group name) as an MLS application message. Only the owner device may
+author it: members apply a change only when its author is the owner device that
+admitted them, and the change with the owner's highest author sequence is the
+current name. Metadata changes are delivered by pull synchronization and are
+never accepted through member pushes.
+
 Deletion is a signed tombstone request. It hides content in conforming clients
 but cannot guarantee erasure from devices that already received it.
 

@@ -919,7 +919,7 @@ fn issued_invitation(invitation: &Invitation, encoded: &str) -> IssuedInvitation
     }
 }
 
-fn normalize_group_name(requested: &str) -> Result<String, &'static str> {
+pub(crate) fn normalize_group_name(requested: &str) -> Result<String, &'static str> {
     let name = requested.trim();
     if name.is_empty()
         || name.chars().count() > MAX_GROUP_NAME_CHARS

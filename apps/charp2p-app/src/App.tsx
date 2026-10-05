@@ -332,6 +332,7 @@ function MembersView({
   blockedDeviceIds,
   blockingDeviceId,
   onToggleBlock,
+  onRename,
   onClose,
 }: {
   groupName: string;
@@ -346,8 +347,28 @@ function MembersView({
   blockedDeviceIds: string[];
   blockingDeviceId: string;
   onToggleBlock: (deviceId: string, blocked: boolean) => void;
+  onRename: (groupName: string) => Promise<void>;
   onClose: () => void;
 }) {
+  const [renameInput, setRenameInput] = useState(groupName);
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState("");
+
+  async function submitRename(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const requested = renameInput.trim();
+    if (!requested || requested === groupName || renaming) return;
+    setRenaming(true);
+    setRenameError("");
+    try {
+      await onRename(requested);
+    } catch (reason) {
+      setRenameError(errorMessage(reason));
+    } finally {
+      setRenaming(false);
+    }
+  }
+
   const ordered = [...members].sort((left, right) => {
     if (left.deviceId === right.deviceId) return 0;
     if (left.deviceId === ownerDeviceId) return -1;
@@ -367,6 +388,28 @@ function MembersView({
         </div>
         <button aria-label="Close members and devices" className="member-close" onClick={onClose} type="button">×</button>
       </header>
+      {canManageMembers && (
+        <form className="rename-group-form" onSubmit={submitRename}>
+          <label htmlFor="rename-group">Group name</label>
+          <div className="rename-group-row">
+            <input
+              id="rename-group"
+              maxLength={80}
+              onChange={(event) => setRenameInput(event.currentTarget.value)}
+              value={renameInput}
+            />
+            <button
+              className="secondary-button"
+              disabled={renaming || !renameInput.trim() || renameInput.trim() === groupName}
+              type="submit"
+            >
+              {renaming ? "Saving…" : "Rename"}
+            </button>
+          </div>
+          <p className="preview-note">The new name is signed by this owner device and reaches members when they synchronize.</p>
+          {renameError && <p className="form-error preview-error" role="alert">{renameError}</p>}
+        </form>
+      )}
       <p className="preview-note">Each membership belongs to one cryptographic device identity.</p>
       <div className="member-list" role="list">
         {ordered.map((member) => {
@@ -1098,9 +1141,13 @@ function App() {
       const result = await invoke<SynchronizeGroupResult>("synchronize_group", {
         groupId,
       });
-      setJoinedGroups((groups) => groups.map((group) => group.groupId === groupId
-        ? { ...group, lastSynchronizedAtUnix: result.synchronizedAtUnix }
-        : group));
+      const refreshedGroups = await invoke<JoinedGroup[]>("joined_groups");
+      setJoinedGroups((groups) => groups.map((group) => {
+        const refreshed = refreshedGroups.find((candidate) => candidate.groupId === group.groupId);
+        return group.groupId === groupId
+          ? { ...group, groupName: refreshed?.groupName ?? group.groupName, lastSynchronizedAtUnix: result.synchronizedAtUnix }
+          : group;
+      }));
       if (activeGroupIdRef.current === groupId) {
         setSynchronizationResult(result);
         const page = await invoke<StoredMessagePage>("group_messages", { groupId });
@@ -1153,6 +1200,13 @@ function App() {
     } finally {
       setBlockingDevice("");
     }
+  }
+
+  async function renameLocalGroup(requested: string) {
+    const groupId = localGroup?.groupId;
+    if (!groupId || !isTauri()) return;
+    await invoke("rename_group", { groupId, groupName: requested });
+    setLocalGroups(await invoke<LocalGroup[]>("local_groups"));
   }
 
   async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {
@@ -1498,6 +1552,7 @@ function App() {
               blockedDeviceIds={blockedDevices}
               blockingDeviceId={blockingDevice}
               onToggleBlock={setDeviceBlocked}
+              onRename={renameLocalGroup}
               onClose={() => setShowMembers(false)}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}

@@ -26,7 +26,7 @@ const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
 const MAX_BOOTSTRAP_PEERS: usize = 16;
 const MAX_BOOTSTRAP_ADDRESS_BYTES: usize = 512;
 const MAX_DISCOVERED_PEERS: usize = 32;
-const MAX_OWNER_DISCOVERY_KEYS: usize = 64;
+const MAX_OWNER_DISCOVERY_KEYS: usize = crate::groups::MAX_ADVERTISED_DISCOVERY_KEYS;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -311,8 +311,9 @@ impl NetworkService {
         .await
     }
 
-    /// Advertises retained rendezvous keys for existing members without tying
-    /// synchronization availability to bearer-invitation expiry.
+    /// Advertises retained rendezvous keys of all owned groups for existing
+    /// members without tying synchronization availability to bearer-invitation
+    /// expiry.
     pub async fn advertise_owner_group(
         &self,
         network_identity: DeviceIdentity,

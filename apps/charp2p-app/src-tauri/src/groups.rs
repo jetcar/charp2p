@@ -27,6 +27,8 @@ const MAX_GROUP_NAME_BYTES: usize = 80;
 const MAX_GROUP_SECRET_BYTES: usize = 512;
 const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
 const MAX_OWNER_DISCOVERY_KEYS: usize = 64;
+/// Upper bound on rendezvous keys advertised together for all owned groups.
+pub const MAX_ADVERTISED_DISCOVERY_KEYS: usize = 256;
 const ALLOWED_INVITATION_LIFETIMES: [u64; 4] = [86_400, 604_800, 1_209_600, 2_592_000];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -410,6 +412,37 @@ impl GroupService {
         Ok(keys)
     }
 
+    /// Loads the retained rendezvous keys of every locally owned group so one
+    /// background advertisement keeps all of them discoverable.
+    pub fn all_owner_discovery_keys(&self) -> Result<Vec<DiscoveryKey>, &'static str> {
+        let group_ids = {
+            let _operation = self
+                .operations
+                .lock()
+                .map_err(|_| "group_service_unavailable")?;
+            self.metadata
+                .lock()
+                .map_err(|_| "group_service_unavailable")?
+                .local_groups()
+                .map_err(|_| "group_store_unavailable")?
+                .into_iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>()
+        };
+        let mut keys = Vec::new();
+        for group_id in group_ids {
+            match self.owner_discovery_keys(group_id) {
+                Ok(group_keys) => keys.extend(group_keys),
+                Err("group_not_found") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if keys.len() > MAX_ADVERTISED_DISCOVERY_KEYS {
+            return Err("owner_discovery_record_invalid");
+        }
+        Ok(keys)
+    }
+
     /// Revokes the active invitation for one locally owned group.
     ///
     /// The protected bearer is removed before its index so any interrupted
@@ -611,6 +644,19 @@ impl GroupService {
             >= MAX_OWNER_DISCOVERY_KEYS
         {
             return Err("owner_discovery_limit_reached");
+        }
+        let mut advertised_keys = 0;
+        for owned in store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+        {
+            advertised_keys += store
+                .owner_discovery_keys(owned.group_id)
+                .map_err(|_| "group_store_unavailable")?
+                .len();
+        }
+        if advertised_keys >= MAX_ADVERTISED_DISCOVERY_KEYS {
+            return Err("advertised_discovery_limit_reached");
         }
         let secret = self.secrets.get(group_id)?;
         let identity = GroupIdentity::from_persisted_secret(&secret)
@@ -1100,6 +1146,12 @@ mod tests {
             .issue_invitation_at(second_id, inviter, "Maya's PC", NOW)
             .unwrap();
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 2);
+        let mut all_keys = service.owner_discovery_keys(first_id).unwrap();
+        all_keys.extend(service.owner_discovery_keys(second_id).unwrap());
+        assert_eq!(all_keys.len(), 2);
+        let advertised = service.all_owner_discovery_keys().unwrap();
+        assert_eq!(advertised.len(), all_keys.len());
+        assert!(all_keys.iter().all(|key| advertised.contains(key)));
 
         service.revoke_invitation(first_id).unwrap();
         let remaining = service.issued_invitations_at(NOW).unwrap();

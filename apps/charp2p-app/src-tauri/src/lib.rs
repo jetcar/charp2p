@@ -366,17 +366,17 @@ fn remove_group_member(
         .map_err(str::to_owned)
 }
 
+/// Advertises every owned group from one background provider, independent of
+/// the group currently open in the interface.
 #[tauri::command]
-async fn advertise_group(
-    group_id: String,
+async fn advertise_owned_groups(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<AdvertisementResult, String> {
-    let group_id = parse_group_id(&group_id, "group_not_found")?;
     group_service.issued_invitations().map_err(str::to_owned)?;
     let keys = group_service
-        .owner_discovery_keys(group_id)
+        .all_owner_discovery_keys()
         .map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
@@ -483,7 +483,7 @@ pub fn run() {
             remove_group_member,
             blocked_group_devices,
             set_group_device_blocked,
-            advertise_group
+            advertise_owned_groups
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

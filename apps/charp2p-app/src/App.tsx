@@ -121,6 +121,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_search_timed_out: "The peer search timed out. Try again.",
   network_unavailable: "The peer network is unavailable.",
   owner_discovery_limit_reached: "This group has reached its safe invitation rotation limit.",
+  advertised_discovery_limit_reached: "This device has reached its safe limit of advertised group invitations.",
   owner_discovery_record_invalid: "The saved group discovery record is damaged.",
   owner_discovery_store_unavailable: "Protected group discovery storage is unavailable.",
   mls_group_creation_failed: "Secure group setup failed.",
@@ -718,17 +719,20 @@ function App() {
     };
   }, [pendingGroup, joiningGroup]);
 
+  // One background advertisement covers every owned group, so members of a
+  // group that is not open here can still join and synchronize.
+  const ownedAdvertisementKey = [
+    ...localGroups.map(({ groupId }) => groupId),
+    ...issuedInvitations.map(({ invitationId }) => invitationId),
+  ].join(",");
+
   useEffect(() => {
-    if (
-      !isTauri()
-      || !localGroup
-    ) {
+    if (!isTauri() || !ownedAdvertisementKey) {
       setAdvertisement(null);
       setAdvertisementError("");
       setAdvertisementRetrying(false);
       return;
     }
-    const groupId = localGroup.groupId;
     let active = true;
     let timer: number | undefined;
     setAdvertisement(null);
@@ -737,9 +741,7 @@ function App() {
 
     async function refreshAdvertisement() {
       try {
-        const result = await invoke<AdvertisementResult>("advertise_group", {
-          groupId,
-        });
+        const result = await invoke<AdvertisementResult>("advertise_owned_groups");
         if (!active) return;
         setAdvertisement(result);
         setAdvertisementError("");
@@ -759,7 +761,7 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [issuedInvitation, localGroup]);
+  }, [ownedAdvertisementKey]);
 
   useEffect(() => {
     if (!isTauri() || !joinedGroup) return;

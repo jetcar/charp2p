@@ -142,6 +142,7 @@ button { cursor: pointer; }
 .group-switcher-list button.active { border-color: #0ba69d; background: #effaf8; box-shadow: 0 0 0 1px #0ba69d; }
 .group-switcher-list strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .group-switcher-list span { color: #68748f; font-size: 12px; font-weight: 650; }
+.group-switcher-list .unread-count { margin-left: 8px; padding: 1px 7px; border-radius: 999px; color: white; background: #0ba69d; font-size: 11px; font-style: normal; font-weight: 800; }
 .group-switcher-join { justify-self: start; padding: 7px 3px; border: 0; color: #087d75; background: transparent; font-weight: 700; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }

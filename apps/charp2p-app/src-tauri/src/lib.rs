@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
-use mls_storage::{CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage};
+use mls_storage::{
+    CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage, UnreadMessageCount,
+};
 use network::{AdvertisementResult, NetworkService, PeerSearchResult, SynchronizeGroupResult};
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
@@ -280,6 +282,13 @@ fn group_messages(
 }
 
 #[tauri::command]
+fn unread_message_counts(
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<UnreadMessageCount>, String> {
+    mls_service.unread_message_counts().map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn hide_group_message(
     group_id: String,
     event_id: String,
@@ -439,6 +448,7 @@ pub fn run() {
             send_group_message,
             group_messages,
             hide_group_message,
+            unread_message_counts,
             group_members,
             remove_group_member,
             advertise_group

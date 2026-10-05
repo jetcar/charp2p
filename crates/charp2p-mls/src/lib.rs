@@ -9,11 +9,11 @@ use charp2p_core::{Invitation, JoinError, JoinRequest, PeerId};
 use openmls::{
     group::GroupContext,
     prelude::{
-        tls_codec::{Deserialize, Serialize},
         Capabilities, Ciphersuite, CredentialType, CredentialWithKey, Extension, ExtensionType,
         Extensions, KeyPackage, KeyPackageIn, LeafNodeIndex, MlsGroup, MlsGroupCreateConfig,
         MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProtocolVersion,
         RequiredCapabilitiesExtension, StagedCommit, StagedWelcome, UnknownExtension, WelcomeError,
+        tls_codec::{Deserialize, Serialize},
     },
 };
 use openmls_memory_storage::MemoryStorage;
@@ -963,22 +963,22 @@ mod tests {
         DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, PeerId,
     };
     use openmls::prelude::{
-        tls_codec::Serialize, BasicCredential, Ciphersuite, CredentialWithKey, Extensions,
-        KeyPackage, MlsGroup, MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent,
-        ProtocolMessage, WireFormat,
+        BasicCredential, Ciphersuite, CredentialWithKey, Extensions, KeyPackage, MlsGroup,
+        MlsGroupCreateConfig, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage,
+        WireFormat, tls_codec::Serialize,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
+        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
+        MlsWireError, PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError,
+        ProfileKeyPackageError, ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
         abort_prepared_member_admission, decode_profile_message, device_credential,
         device_id_from_credential, group_create_config, merge_prepared_member_admission,
         prepare_profile_key_package, prepare_profile_member_admission, profile_capabilities,
         profile_extensions, stage_profile_welcome, validate_group_profile,
-        validate_profile_key_package, validate_staged_commit_profile, DeviceCredentialError,
-        MergeMemberAdmissionError, MlsWireError, PrepareKeyPackageError,
-        PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError, ProfileProvider,
-        ProfileProviderSnapshotError, StageWelcomeError, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+        validate_profile_key_package, validate_staged_commit_profile,
     };
 
     fn credential(

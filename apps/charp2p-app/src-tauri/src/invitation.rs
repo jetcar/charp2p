@@ -53,9 +53,7 @@ pub(crate) fn public_error_code(error: InvitationError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::preview_invitation_at;
-    use charp2p_core::{
-        DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-    };
+    use charp2p_core::{DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
 
     const NOW: u64 = 1_800_000_000;
 

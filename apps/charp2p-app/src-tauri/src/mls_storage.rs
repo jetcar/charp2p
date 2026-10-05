@@ -125,6 +125,13 @@ pub(crate) struct StoredMessagePage {
 
 #[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct UnreadMessageCount {
+    pub group_id: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct GroupMemberDevice {
     pub device_id: String,
 }
@@ -406,12 +413,15 @@ impl MlsProviderService {
             .operations
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
-        let store = self
+        let mut store = self
             .store
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
         let encrypted_page = store
             .encrypted_messages(group_id)
+            .map_err(|_| "message_list_unavailable")?;
+        store
+            .mark_messages_read(group_id)
             .map_err(|_| "message_list_unavailable")?;
         let acknowledged_head = store
             .max_acknowledged_author_head(group_id, local_device_id)
@@ -459,6 +469,27 @@ impl MlsProviderService {
             messages,
             has_earlier: encrypted_page.has_earlier,
         })
+    }
+
+    /// Returns this device's unread message counts for groups that have any.
+    pub(crate) fn unread_message_counts(&self) -> Result<Vec<UnreadMessageCount>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let counts = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?
+            .unread_message_counts()
+            .map_err(|_| "message_list_unavailable")?;
+        Ok(counts
+            .into_iter()
+            .map(|(group_id, count)| UnreadMessageCount {
+                group_id: group_id.to_string(),
+                count,
+            })
+            .collect())
     }
 
     pub(crate) fn acknowledge_messages_shared(
@@ -935,7 +966,7 @@ impl MlsProviderService {
         let encrypted_body = encrypt_local_message(&plaintext, &key, event.id().as_bytes())
             .map_err(MaterializeMessageError::Unavailable)?;
         store
-            .put_message_and_encrypted_mls_provider_snapshot(
+            .put_received_message_and_encrypted_mls_provider_snapshot(
                 event,
                 &encrypted_snapshot,
                 &encrypted_body,
@@ -1813,8 +1844,8 @@ mod tests {
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
         encrypt_local_message, encrypt_snapshot, join_request_hash, GroupMemberDevice,
-        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, WrappingKeyStore,
-        WRAPPING_KEY_BYTES,
+        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
+        WrappingKeyStore, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::EventStore;
 
@@ -2819,6 +2850,13 @@ mod tests {
 
         assert_eq!(inserted, 4);
         assert_eq!(
+            member_service.unread_message_counts().unwrap(),
+            vec![UnreadMessageCount {
+                group_id: group_id.to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
             member_service
                 .messages(group_id, member_id)
                 .unwrap()
@@ -2828,6 +2866,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["After join"]
         );
+        assert!(member_service.unread_message_counts().unwrap().is_empty());
         let store = EventStore::open(member_path).unwrap();
         let event_ids = store
             .event_ids_after(group_id, owner.peer_id(), 0, 4)

@@ -359,10 +359,7 @@ impl PendingInvitationService {
         Ok(pending)
     }
 
-    fn inspect_at(
-        &self,
-        now_unix: u64,
-    ) -> Result<(Vec<PendingGroup>, Vec<PeerId>), &'static str> {
+    fn inspect_at(&self, now_unix: u64) -> Result<(Vec<PendingGroup>, Vec<PeerId>), &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -699,7 +696,10 @@ mod tests {
 
         assert!(service.list_at(NOW).unwrap().is_empty());
         assert!(service.secrets.get_optional(group_id).unwrap().is_none());
-        assert_eq!(service.cancel(group_id), Err("pending_invitation_not_found"));
+        assert_eq!(
+            service.cancel(group_id),
+            Err("pending_invitation_not_found")
+        );
     }
 
     #[test]

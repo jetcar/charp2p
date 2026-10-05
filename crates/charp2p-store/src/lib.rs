@@ -9,15 +9,15 @@ use std::{
 };
 
 use charp2p_core::{
-    EventError, EventId, HistoryPolicy, InvitationId, PeerId, SignedEvent,
-    MAX_JOIN_MLS_MESSAGE_BYTES, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS,
+    EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -311,6 +311,27 @@ impl EventStore {
         encrypted_snapshot: &[u8],
         encrypted_body: &[u8],
     ) -> Result<PutEventOutcome, StoreError> {
+        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, false)
+    }
+
+    /// Atomically persists a message received from another device and marks
+    /// its new display copy unread on this device.
+    pub fn put_received_message_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        encrypted_body: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, true)
+    }
+
+    fn put_materialized_message(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        encrypted_body: &[u8],
+        unread: bool,
+    ) -> Result<PutEventOutcome, StoreError> {
         if event.kind() != charp2p_core::EventKind::MessageCreated {
             return Err(StoreError::InvalidMessageEvent);
         }
@@ -321,7 +342,7 @@ impl EventStore {
         let transaction = self.connection.transaction()?;
         let outcome = put_event_in_transaction(&transaction, event)?;
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
-        transaction.execute(
+        let materialized = transaction.execute(
             "INSERT INTO materialized_messages (
                 event_id, group_id, author_id, created_at_unix_ms, encrypted_body
              ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -334,6 +355,17 @@ impl EventStore {
                 encrypted_body,
             ],
         )?;
+        if unread && materialized == 1 {
+            transaction.execute(
+                "INSERT INTO unread_local_messages (event_id, group_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(event_id) DO NOTHING",
+                params![
+                    event.id().as_bytes().as_slice(),
+                    event.group_id().to_bytes()
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(outcome)
     }
@@ -406,7 +438,8 @@ impl EventStore {
         if sequence == 0 {
             return Ok(());
         }
-        let sequence = i64::try_from(sequence).map_err(|_| StoreError::SequenceTooLarge(sequence))?;
+        let sequence =
+            i64::try_from(sequence).map_err(|_| StoreError::SequenceTooLarge(sequence))?;
         self.connection.execute(
             "INSERT INTO peer_acknowledged_author_heads
                 (group_id, peer_id, author_id, contiguous_sequence)
@@ -474,6 +507,10 @@ impl EventStore {
             return Ok(false);
         }
         transaction.execute(
+            "DELETE FROM unread_local_messages WHERE event_id = ?1",
+            [event_id.as_slice()],
+        )?;
+        transaction.execute(
             "INSERT INTO hidden_local_messages (event_id, group_id)
              VALUES (?1, ?2)
              ON CONFLICT(event_id) DO NOTHING",
@@ -481,6 +518,39 @@ impl EventStore {
         )?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Counts readable messages from other devices not yet viewed on this
+    /// device, grouped by group identifier.
+    pub fn unread_message_counts(&self) -> Result<Vec<(PeerId, u64)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT u.group_id, COUNT(*)
+             FROM unread_local_messages u
+             JOIN materialized_messages m ON m.event_id = u.event_id
+             WHERE m.group_id = u.group_id
+             GROUP BY u.group_id
+             ORDER BY u.group_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (group_id, count) = row?;
+            let group_id = PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?;
+            let count = u64::try_from(count).map_err(|_| StoreError::CorruptIndex)?;
+            Ok((group_id, count))
+        })
+        .collect()
+    }
+
+    /// Clears this device's unread markers for one group after its timeline
+    /// has been shown. Returns the number of messages marked read.
+    pub fn mark_messages_read(&mut self, group_id: PeerId) -> Result<u64, StoreError> {
+        let cleared = self.connection.execute(
+            "DELETE FROM unread_local_messages WHERE group_id = ?1",
+            [group_id.to_bytes()],
+        )?;
+        Ok(cleared as u64)
     }
 
     /// Returns at most `limit` verified message events that do not yet have a
@@ -846,9 +916,7 @@ impl EventStore {
                     .map_err(|_| StoreError::CorruptIndex)?,
                 history_policy: history_policy_from_code(history_policy)?,
                 last_synchronized_at_unix: last_synchronized_at_unix
-                    .map(|timestamp| {
-                        u64::try_from(timestamp).map_err(|_| StoreError::CorruptIndex)
-                    })
+                    .map(|timestamp| u64::try_from(timestamp).map_err(|_| StoreError::CorruptIndex))
                     .transpose()?,
             });
         }
@@ -1376,7 +1444,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=14 => {}
+            6..=15 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1549,6 +1617,23 @@ impl EventStore {
                         CHECK(last_synchronized_at_unix >= 0);",
                 )?;
             }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 15 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS unread_local_messages (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS unread_local_messages_by_group
+                    ON unread_local_messages(group_id, event_id);",
+            )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1761,16 +1846,16 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 mod tests {
     use charp2p_core::{
         DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, InvitationId,
-        SignedEvent, MAX_JOIN_MLS_MESSAGE_BYTES,
+        MAX_JOIN_MLS_MESSAGE_BYTES, SignedEvent,
     };
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
     use tempfile::NamedTempFile;
 
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
-        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome, StoreError,
         MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
         MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome, StoreError,
     };
 
     fn message_event(
@@ -1970,10 +2055,12 @@ mod tests {
             store.put_events(&[second, conflict]),
             Err(StoreError::SequenceConflict { sequence: 1 })
         ));
-        assert!(store
-            .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .event_ids_after(group.group_id(), author.peer_id(), 1, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1999,9 +2086,11 @@ mod tests {
             reopened.pending_invitations().unwrap(),
             vec![pending.clone()]
         );
-        assert!(reopened
-            .remove_pending_invitation(group.group_id())
-            .unwrap());
+        assert!(
+            reopened
+                .remove_pending_invitation(group.group_id())
+                .unwrap()
+        );
         assert!(reopened.pending_invitations().unwrap().is_empty());
     }
 
@@ -2043,9 +2132,11 @@ mod tests {
         };
         store.put_pending_invitation(&pending).unwrap();
 
-        assert!(store
-            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
-            .unwrap());
+        assert!(
+            store
+                .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+                .unwrap()
+        );
         assert!(store.pending_invitations().unwrap().is_empty());
         assert_eq!(
             store.joined_groups().unwrap(),
@@ -2058,9 +2149,11 @@ mod tests {
                 last_synchronized_at_unix: None,
             }]
         );
-        assert!(store
-            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
-            .unwrap());
+        assert!(
+            store
+                .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2078,15 +2171,22 @@ mod tests {
         };
         let mut store = EventStore::open(file.path()).unwrap();
         store.put_pending_invitation(&pending).unwrap();
-        assert!(store
-            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
-            .unwrap());
-        assert!(store
-            .record_joined_group_synchronization(group_id, 1_800_000_123)
-            .unwrap());
+        assert!(
+            store
+                .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_joined_group_synchronization(group_id, 1_800_000_123)
+                .unwrap()
+        );
         drop(store);
 
-        let restored = EventStore::open(file.path()).unwrap().joined_groups().unwrap();
+        let restored = EventStore::open(file.path())
+            .unwrap()
+            .joined_groups()
+            .unwrap();
         assert_eq!(restored[0].last_synchronized_at_unix, Some(1_800_000_123));
     }
 
@@ -2170,9 +2270,11 @@ mod tests {
             reopened.issued_invitations().unwrap(),
             vec![invitation.clone()]
         );
-        assert!(reopened
-            .remove_issued_invitation(invitation.invitation_id)
-            .unwrap());
+        assert!(
+            reopened
+                .remove_issued_invitation(invitation.invitation_id)
+                .unwrap()
+        );
         assert!(reopened.issued_invitations().unwrap().is_empty());
     }
 
@@ -2248,10 +2350,12 @@ mod tests {
     fn pending_mls_join_and_provider_snapshot_follow_one_atomic_lifecycle() {
         let mut store = EventStore::in_memory().unwrap();
         let group_id = GroupIdentity::generate().group_id();
-        assert!(store
-            .pending_mls_join_key_package(group_id)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .is_none()
+        );
 
         store
             .put_pending_mls_join_and_encrypted_mls_provider_snapshot(
@@ -2272,26 +2376,32 @@ mod tests {
             b"provider with private key package"
         );
 
-        assert!(store
-            .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
-                group_id,
-                b"provider with joined group",
-            )
-            .unwrap());
-        assert!(store
-            .pending_mls_join_key_package(group_id)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id,
+                    b"provider with joined group",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .pending_mls_join_key_package(group_id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"provider with joined group"
         );
-        assert!(!store
-            .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
-                group_id,
-                b"must not replace provider without a pending join",
-            )
-            .unwrap());
+        assert!(
+            !store
+                .remove_pending_mls_join_and_put_encrypted_mls_provider_snapshot(
+                    group_id,
+                    b"must not replace provider without a pending join",
+                )
+                .unwrap()
+        );
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"provider with joined group"
@@ -2476,18 +2586,24 @@ mod tests {
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"removed provider snapshot"
         );
-        assert!(store
-            .mls_join_admission(group.group_id(), member_id)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .is_removed_mls_member(group.group_id(), member_id)
-            .unwrap());
-        assert!(store
-            .unapplied_mls_commit_events(group.group_id(), 2)
-            .unwrap()
-            .iter()
-            .any(|event| event.id() == removed.id()));
+        assert!(
+            store
+                .mls_join_admission(group.group_id(), member_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .is_removed_mls_member(group.group_id(), member_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 2)
+                .unwrap()
+                .iter()
+                .any(|event| event.id() == removed.id())
+        );
     }
 
     #[test]
@@ -2570,10 +2686,12 @@ mod tests {
                 has_earlier: false,
             }
         );
-        assert!(store
-            .unmaterialized_message_events(group.group_id(), 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2591,36 +2709,16 @@ mod tests {
             0
         );
         store
-            .acknowledge_author_head(
-                group.group_id(),
-                peer.peer_id(),
-                author.peer_id(),
-                4,
-            )
+            .acknowledge_author_head(group.group_id(), peer.peer_id(), author.peer_id(), 4)
             .unwrap();
         store
-            .acknowledge_author_head(
-                group.group_id(),
-                peer.peer_id(),
-                author.peer_id(),
-                2,
-            )
+            .acknowledge_author_head(group.group_id(), peer.peer_id(), author.peer_id(), 2)
             .unwrap();
         store
-            .acknowledge_author_head(
-                group.group_id(),
-                other_peer.peer_id(),
-                author.peer_id(),
-                6,
-            )
+            .acknowledge_author_head(group.group_id(), other_peer.peer_id(), author.peer_id(), 6)
             .unwrap();
         store
-            .acknowledge_author_head(
-                group.group_id(),
-                peer.peer_id(),
-                author.peer_id(),
-                0,
-            )
+            .acknowledge_author_head(group.group_id(), peer.peer_id(), author.peer_id(), 0)
             .unwrap();
 
         assert_eq!(
@@ -2654,22 +2752,121 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store
-            .hide_message_locally(group.group_id(), event.id().as_bytes())
-            .unwrap());
-        assert!(store
-            .encrypted_messages(group.group_id())
-            .unwrap()
-            .messages
-            .is_empty());
+        assert!(
+            store
+                .hide_message_locally(group.group_id(), event.id().as_bytes())
+                .unwrap()
+        );
+        assert!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
         assert!(store.get_event(event.id()).unwrap().is_some());
-        assert!(store
-            .unmaterialized_message_events(group.group_id(), 1)
-            .unwrap()
-            .is_empty());
-        assert!(!store
-            .hide_message_locally(group.group_id(), event.id().as_bytes())
-            .unwrap());
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .hide_message_locally(group.group_id(), event.id().as_bytes())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn received_messages_stay_unread_until_their_group_is_marked_read() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let first = message_event(&author, &group, 1, b"first MLS ciphertext");
+        let second = message_event(&author, &group, 2, b"second MLS ciphertext");
+        let own = message_event(&author, &other_group, 1, b"own MLS ciphertext");
+        for event in [&first, &second] {
+            store
+                .put_received_message_and_encrypted_mls_provider_snapshot(
+                    event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap();
+        }
+        store
+            .put_received_message_and_encrypted_mls_provider_snapshot(
+                &first,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(
+                &own,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 2)]
+        );
+        assert!(
+            store
+                .hide_message_locally(group.group_id(), first.id().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
+        assert_eq!(store.mark_messages_read(other_group.group_id()).unwrap(), 0);
+        assert_eq!(store.mark_messages_read(group.group_id()).unwrap(), 1);
+        assert!(store.unread_message_counts().unwrap().is_empty());
+        assert_eq!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn version_fifteen_database_adds_unread_message_markers() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE unread_local_messages;
+                     PRAGMA user_version = 15;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = message_event(&author, &group, 1, b"MLS ciphertext");
+        store
+            .put_received_message_and_encrypted_mls_provider_snapshot(
+                &event,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
     }
 
     #[test]
@@ -2709,9 +2906,11 @@ mod tests {
         let event = message_event(&author, &group, 1, b"MLS ciphertext");
         store.put_event(&event).unwrap();
 
-        assert!(!store
-            .hide_message_locally(group.group_id(), event.id().as_bytes())
-            .unwrap());
+        assert!(
+            !store
+                .hide_message_locally(group.group_id(), event.id().as_bytes())
+                .unwrap()
+        );
         assert_eq!(
             store
                 .unmaterialized_message_events(group.group_id(), 1)
@@ -2784,16 +2983,20 @@ mod tests {
             event.id()
         );
 
-        assert!(store
-            .put_applied_mls_event_and_encrypted_provider_snapshot(
-                &event,
-                b"advanced encrypted provider",
-            )
-            .unwrap());
-        assert!(store
-            .unapplied_mls_commit_events(group.group_id(), 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .put_applied_mls_event_and_encrypted_provider_snapshot(
+                    &event,
+                    b"advanced encrypted provider",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"advanced encrypted provider"
@@ -2936,9 +3139,11 @@ mod tests {
                 reusable: false,
             })
             .unwrap();
-        assert!(store
-            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
-            .unwrap());
+        assert!(
+            store
+                .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+                .unwrap()
+        );
         assert_eq!(store.joined_groups().unwrap().len(), 1);
     }
 
@@ -3002,10 +3207,12 @@ mod tests {
 
         let store = EventStore::open(path).unwrap();
         let group = GroupIdentity::generate();
-        assert!(store
-            .unapplied_mls_commit_events(group.group_id(), 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3026,10 +3233,12 @@ mod tests {
         let store = EventStore::open(path).unwrap();
         let group_id = GroupIdentity::generate().group_id();
         let member_id = DeviceIdentity::generate().peer_id();
-        assert!(store
-            .mls_join_admission(group_id, member_id)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .mls_join_admission(group_id, member_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3048,12 +3257,14 @@ mod tests {
         }
 
         let store = EventStore::open(path).unwrap();
-        assert!(!store
-            .is_removed_mls_member(
-                GroupIdentity::generate().group_id(),
-                DeviceIdentity::generate().peer_id(),
-            )
-            .unwrap());
+        assert!(
+            !store
+                .is_removed_mls_member(
+                    GroupIdentity::generate().group_id(),
+                    DeviceIdentity::generate().peer_id(),
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3082,9 +3293,11 @@ mod tests {
                 b"encrypted local message",
             )
             .unwrap();
-        assert!(store
-            .hide_message_locally(group.group_id(), event.id().as_bytes())
-            .unwrap());
+        assert!(
+            store
+                .hide_message_locally(group.group_id(), event.id().as_bytes())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3177,10 +3390,15 @@ mod tests {
             .unwrap();
 
         let mut store = EventStore::from_connection(connection).unwrap();
-        assert_eq!(store.joined_groups().unwrap()[0].last_synchronized_at_unix, None);
-        assert!(store
-            .record_joined_group_synchronization(group_id, 1_800_000_123)
-            .unwrap());
+        assert_eq!(
+            store.joined_groups().unwrap()[0].last_synchronized_at_unix,
+            None
+        );
+        assert!(
+            store
+                .record_joined_group_synchronization(group_id, 1_800_000_123)
+                .unwrap()
+        );
         assert_eq!(
             store.joined_groups().unwrap()[0].last_synchronized_at_unix,
             Some(1_800_000_123)

@@ -45,6 +45,7 @@ type AdvertisementResult = {
   status: "advertising" | "bootstrapRequired" | "inactive";
   expiresAtUnix: number;
 };
+type UnreadMessageCount = { groupId: string; count: number };
 type SynchronizeGroupResult = {
   status: "synchronized";
   groupId: string;
@@ -485,6 +486,7 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
@@ -810,6 +812,39 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [joinedGroup, localGroup]);
+
+  useEffect(() => {
+    if (!isTauri() || availableGroups.length === 0) {
+      setUnreadCounts({});
+      return;
+    }
+
+    let active = true;
+    let timer: number | undefined;
+
+    async function refreshUnreadCounts() {
+      try {
+        const counts = await invoke<UnreadMessageCount[]>("unread_message_counts");
+        if (active) {
+          setUnreadCounts(
+            Object.fromEntries(counts.map(({ groupId, count }) => [groupId, count])),
+          );
+        }
+      } catch {
+        // Unread badges are advisory; the active timeline reports its own errors.
+      } finally {
+        if (active) {
+          timer = window.setTimeout(refreshUnreadCounts, MESSAGE_REFRESH_INTERVAL_MS);
+        }
+      }
+    }
+
+    void refreshUnreadCounts();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [availableGroups.length]);
 
   useEffect(() => {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -1359,7 +1394,17 @@ function App() {
                     type="button"
                   >
                     <strong>{group.groupName}</strong>
-                    <span>{group.role}</span>
+                    <span>
+                      {group.role}
+                      {group.groupId !== activeGroupId && (unreadCounts[group.groupId] ?? 0) > 0 && (
+                        <em
+                          aria-label={`${unreadCounts[group.groupId]} unread`}
+                          className="unread-count"
+                        >
+                          {unreadCounts[group.groupId] > 99 ? "99+" : unreadCounts[group.groupId]}
+                        </em>
+                      )}
+                    </span>
                   </button>
                 ))}
               </div>

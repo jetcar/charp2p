@@ -238,8 +238,8 @@ mod tests {
     use crate::{DeviceIdentity, EventKind, EventSpec, GroupIdentity};
 
     use super::{
-        SyncAuthorHead, SyncError, SyncRequest, SyncResponse, MAX_SYNC_AUTHORS,
-        MAX_SYNC_BATCH_ITEMS,
+        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncRequest,
+        SyncResponse,
     };
 
     #[test]

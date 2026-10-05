@@ -193,8 +193,7 @@ impl OwnerDiscoveryKeyStore for PlatformOwnerDiscoveryKeyStore {
     }
 
     fn remove(&self, invitation_id: InvitationId) -> Result<(), &'static str> {
-        match protected_entry(&owner_discovery_credential_user(invitation_id))?
-            .delete_credential()
+        match protected_entry(&owner_discovery_credential_user(invitation_id))?.delete_credential()
         {
             Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
             Err(_) => Err("owner_discovery_store_unavailable"),
@@ -492,8 +491,8 @@ impl GroupService {
     ) -> Result<AuthorizedJoinInvitation, JoinInvitationAuthorizationError> {
         use JoinInvitationAuthorizationError::{Unauthorized, Unavailable};
 
-        let invitation = Invitation::decode(request.invitation(), now_unix)
-            .map_err(|_| Unauthorized)?;
+        let invitation =
+            Invitation::decode(request.invitation(), now_unix).map_err(|_| Unauthorized)?;
         if invitation.group_id() != request.group_id() {
             return Err(Unauthorized);
         }
@@ -761,15 +760,16 @@ impl GroupService {
     ) -> Result<(), &'static str> {
         let invitation_id = invitation.invitation_id();
         let key = DiscoveryKey::from_invitation(invitation);
-        let created = if let Some(existing) = self.owner_discovery_keys.get_optional(invitation_id)? {
-            if existing != key {
-                return Err("owner_discovery_record_invalid");
-            }
-            false
-        } else {
-            self.owner_discovery_keys.put(invitation_id, key)?;
-            true
-        };
+        let created =
+            if let Some(existing) = self.owner_discovery_keys.get_optional(invitation_id)? {
+                if existing != key {
+                    return Err("owner_discovery_record_invalid");
+                }
+                false
+            } else {
+                self.owner_discovery_keys.put(invitation_id, key)?;
+                true
+            };
         if let Err(error) = store.put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
             invitation_id,
             group_id: invitation.group_id(),
@@ -1113,7 +1113,12 @@ mod tests {
         let group_id = created.group_id.parse().unwrap();
 
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let decoded = Invitation::decode_input(&issued.link, NOW).unwrap();
         assert_eq!(decoded.group_id(), group_id);
@@ -1127,7 +1132,12 @@ mod tests {
         assert_eq!(restored[0].reusable, issued.reusable);
         assert!(Invitation::decode_input(&restored[0].link, NOW).is_ok());
         assert!(matches!(
-            service.issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW + 1),
+            service.issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW + 1
+            ),
             Err("invitation_already_exists")
         ));
 
@@ -1151,7 +1161,12 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let request = join_request(&issued.link, NOW);
 
@@ -1176,13 +1191,17 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let request = join_request(&issued.link, NOW);
         let invitation_id = request_invitation_id(&request, NOW);
-        let expected_discovery_key = DiscoveryKey::from_invitation(
-            &Invitation::decode_input(&issued.link, NOW).unwrap(),
-        );
+        let expected_discovery_key =
+            DiscoveryKey::from_invitation(&Invitation::decode_input(&issued.link, NOW).unwrap());
         assert!(service.authorize_join_request_at(&request, NOW).is_ok());
         assert_eq!(
             service.owner_discovery_keys(group_id).unwrap(),
@@ -1218,7 +1237,12 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let request = join_request(&issued.link, NOW);
         assert_eq!(
@@ -1240,8 +1264,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let foreign_request =
-            JoinRequest::from_invitation(&foreign_invitation, vec![1]).unwrap();
+        let foreign_request = JoinRequest::from_invitation(&foreign_invitation, vec![1]).unwrap();
         assert_eq!(
             service.authorize_join_request_at(&foreign_request, NOW),
             Err(JoinInvitationAuthorizationError::Unauthorized)
@@ -1255,7 +1278,12 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let request = join_request(&issued.link, NOW);
         let invitation_id = request_invitation_id(&request, NOW);
@@ -1283,7 +1311,12 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         let issued = service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         service
             .metadata
@@ -1321,7 +1354,12 @@ mod tests {
         let created = service.create(spec("Project Atlas")).unwrap();
         let group_id = created.group_id.parse().unwrap();
         service
-            .issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW)
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
             .unwrap();
         let indexed = service
             .metadata
@@ -1336,7 +1374,12 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            service.issue_invitation_at(group_id, DeviceIdentity::generate().peer_id(), "Maya's PC", NOW + 1),
+            service.issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW + 1
+            ),
             Err("issued_invitation_record_invalid")
         ));
         assert_eq!(

@@ -5,8 +5,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use charp2p_core::{
-    EventError, EventKind, PeerId, SignedEvent, SyncAuthorHead, SyncError, SyncRequest,
-    SyncResponse, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    EventError, EventKind, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId, SignedEvent,
+    SyncAuthorHead, SyncError, SyncRequest, SyncResponse,
 };
 use charp2p_store::{EventStore, PutEventsOutcome, StoreError};
 use thiserror::Error;
@@ -400,8 +400,8 @@ mod tests {
     use charp2p_store::EventStore;
 
     use super::{
-        accept_pushed_events, apply_response, build_authorized_response, ApplyOutcome, PullSession,
-        SynchronizationError,
+        ApplyOutcome, PullSession, SynchronizationError, accept_pushed_events, apply_response,
+        build_authorized_response,
     };
 
     #[test]

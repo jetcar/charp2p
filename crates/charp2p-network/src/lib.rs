@@ -7,16 +7,16 @@ mod join_codec;
 use std::{collections::HashMap, time::Duration};
 
 use charp2p_core::{
-    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, SyncError, SyncRejectReason,
-    SyncRequest, SyncResponse, MAX_SYNC_RESPONSE_BYTES,
+    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError,
+    SyncRejectReason, SyncRequest, SyncResponse,
 };
 use futures::StreamExt;
 use libp2p::{
-    identify,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
     identity::Keypair,
     kad, noise, ping, relay, request_response,
-    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, StreamProtocol, SwarmEvent},
-    yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
+    swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle},
+    yamux,
 };
 use thiserror::Error;
 
@@ -90,9 +90,9 @@ impl Behaviour {
             join,
             sync,
             relay_client,
-            relay_server: Toggle::from(relay_server.then(|| {
-                relay::Behaviour::new(peer_id, relay_server_config())
-            })),
+            relay_server: Toggle::from(
+                relay_server.then(|| relay::Behaviour::new(peer_id, relay_server_config())),
+            ),
         }
     }
 }
@@ -328,9 +328,7 @@ impl NetworkNode {
                     return NetworkEvent::Listening { address };
                 }
                 SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint,
-                    ..
+                    peer_id, endpoint, ..
                 } => {
                     return NetworkEvent::PeerConnected {
                         peer_id,
@@ -813,7 +811,7 @@ mod tests {
         DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
         JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
     };
-    use libp2p::{identity::Keypair, multiaddr::Protocol, Multiaddr};
+    use libp2p::{Multiaddr, identity::Keypair, multiaddr::Protocol};
     use tokio::time::timeout;
 
     use super::{ConnectionPath, NetworkEvent, NetworkNode};

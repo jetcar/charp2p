@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -65,6 +65,7 @@ pub struct JoinedGroupMetadata {
     pub inviter_name: String,
     pub inviter_device_id: PeerId,
     pub history_policy: HistoryPolicy,
+    pub last_synchronized_at_unix: Option<u64>,
 }
 
 /// Bounded page of locally materialized encrypted messages.
@@ -812,7 +813,8 @@ impl EventStore {
     /// Lists durable metadata for groups joined by this device.
     pub fn joined_groups(&self) -> Result<Vec<JoinedGroupMetadata>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT group_id, group_name, inviter_name, inviter_device_id, history_policy
+            "SELECT group_id, group_name, inviter_name, inviter_device_id, history_policy,
+                    last_synchronized_at_unix
              FROM joined_groups
              ORDER BY group_name, group_id",
         )?;
@@ -823,11 +825,19 @@ impl EventStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })?;
         let mut groups = Vec::new();
         for row in rows {
-            let (group_id, group_name, inviter_name, inviter_device_id, history_policy) = row?;
+            let (
+                group_id,
+                group_name,
+                inviter_name,
+                inviter_device_id,
+                history_policy,
+                last_synchronized_at_unix,
+            ) = row?;
             groups.push(JoinedGroupMetadata {
                 group_id: PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?,
                 group_name,
@@ -835,9 +845,30 @@ impl EventStore {
                 inviter_device_id: PeerId::from_bytes(&inviter_device_id)
                     .map_err(|_| StoreError::CorruptIndex)?,
                 history_policy: history_policy_from_code(history_policy)?,
+                last_synchronized_at_unix: last_synchronized_at_unix
+                    .map(|timestamp| {
+                        u64::try_from(timestamp).map_err(|_| StoreError::CorruptIndex)
+                    })
+                    .transpose()?,
             });
         }
         Ok(groups)
+    }
+
+    /// Records the most recent successful peer synchronization for a joined group.
+    pub fn record_joined_group_synchronization(
+        &mut self,
+        group_id: PeerId,
+        synchronized_at_unix: u64,
+    ) -> Result<bool, StoreError> {
+        let synchronized_at_unix = i64::try_from(synchronized_at_unix)
+            .map_err(|_| StoreError::TimestampTooLarge(synchronized_at_unix))?;
+        Ok(self.connection.execute(
+            "UPDATE joined_groups
+             SET last_synchronized_at_unix = ?2
+             WHERE group_id = ?1",
+            params![group_id.to_bytes(), synchronized_at_unix],
+        )? > 0)
     }
 
     /// Adds the non-secret index for a newly issued bearer invitation.
@@ -1345,7 +1376,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=13 => {}
+            6..=14 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1489,6 +1520,35 @@ impl EventStore {
                  CREATE INDEX IF NOT EXISTS owner_discovery_keys_by_group
                     ON owner_discovery_keys(group_id, invitation_id);",
             )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 14 {
+            let joined_groups_exists = connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'joined_groups'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let sync_column_exists = connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('joined_groups')
+                    WHERE name = 'last_synchronized_at_unix'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let transaction = connection.transaction()?;
+            if joined_groups_exists && !sync_column_exists {
+                transaction.execute_batch(
+                    "ALTER TABLE joined_groups
+                     ADD COLUMN last_synchronized_at_unix INTEGER
+                        CHECK(last_synchronized_at_unix >= 0);",
+                )?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1995,11 +2055,39 @@ mod tests {
                 inviter_name: "Maya".to_owned(),
                 inviter_device_id,
                 history_policy: HistoryPolicy::FromInvitation,
+                last_synchronized_at_unix: None,
             }]
         );
         assert!(store
             .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
             .unwrap());
+    }
+
+    #[test]
+    fn joined_group_synchronization_time_survives_restart() {
+        let file = NamedTempFile::new().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let pending = PendingInvitationMetadata {
+            group_id,
+            group_name: "Design Crew".to_owned(),
+            inviter_name: "Maya".to_owned(),
+            expires_at_unix: 1_800_003_600,
+            history_policy: HistoryPolicy::None,
+            reusable: false,
+        };
+        let mut store = EventStore::open(file.path()).unwrap();
+        store.put_pending_invitation(&pending).unwrap();
+        assert!(store
+            .promote_pending_invitation_to_joined_group(group_id, inviter_device_id)
+            .unwrap());
+        assert!(store
+            .record_joined_group_synchronization(group_id, 1_800_000_123)
+            .unwrap());
+        drop(store);
+
+        let restored = EventStore::open(file.path()).unwrap().joined_groups().unwrap();
+        assert_eq!(restored[0].last_synchronized_at_unix, Some(1_800_000_123));
     }
 
     #[test]
@@ -3053,6 +3141,49 @@ mod tests {
         assert_eq!(
             store.owner_discovery_keys(metadata.group_id).unwrap(),
             vec![metadata]
+        );
+    }
+
+    #[test]
+    fn version_fourteen_database_adds_joined_group_sync_time() {
+        let connection = Connection::open_in_memory().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        connection
+            .execute_batch(
+                "CREATE TABLE joined_groups (
+                    group_id BLOB PRIMARY KEY NOT NULL,
+                    group_name TEXT NOT NULL,
+                    inviter_name TEXT NOT NULL,
+                    inviter_device_id BLOB NOT NULL,
+                    history_policy INTEGER NOT NULL CHECK(history_policy BETWEEN 0 AND 2)
+                 ) STRICT;
+                 PRAGMA user_version = 14;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO joined_groups (
+                    group_id, group_name, inviter_name, inviter_device_id, history_policy
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    group_id.to_bytes(),
+                    "Design Crew",
+                    "Maya",
+                    inviter_device_id.to_bytes(),
+                    0,
+                ],
+            )
+            .unwrap();
+
+        let mut store = EventStore::from_connection(connection).unwrap();
+        assert_eq!(store.joined_groups().unwrap()[0].last_synchronized_at_unix, None);
+        assert!(store
+            .record_joined_group_synchronization(group_id, 1_800_000_123)
+            .unwrap());
+        assert_eq!(
+            store.joined_groups().unwrap()[0].last_synchronized_at_unix,
+            Some(1_800_000_123)
         );
     }
 

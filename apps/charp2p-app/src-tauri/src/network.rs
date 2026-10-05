@@ -203,6 +203,7 @@ pub struct SynchronizeGroupResult {
     pub group_id: String,
     pub synchronized_events: usize,
     pub uploaded_events: usize,
+    pub synchronized_at_unix: u64,
 }
 
 struct ActiveAdvertisement {
@@ -721,6 +722,10 @@ impl NetworkService {
             group_id: group_id.to_string(),
             synchronized_events,
             uploaded_events,
+            synchronized_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "system_clock_invalid")?
+                .as_secs(),
         })
     }
 
@@ -1649,6 +1654,7 @@ mod tests {
             assert_eq!(result.group_id, invitation.group_id().to_string());
             assert_eq!(result.synchronized_events, 3);
             assert_eq!(result.uploaded_events, 0);
+            assert!(result.synchronized_at_unix >= now);
         });
     }
 

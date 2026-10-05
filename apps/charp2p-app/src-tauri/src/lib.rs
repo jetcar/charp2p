@@ -238,10 +238,14 @@ async fn synchronize_group(
     let (discovery_key, inviter_device_id) = pending_service
         .joined_sync_target(group_id)
         .map_err(str::to_owned)?;
-    network_service
+    let result = network_service
         .synchronize(identity, discovery_key, group_id, inviter_device_id)
         .await
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    pending_service
+        .record_synchronization(group_id, result.synchronized_at_unix)
+        .map_err(str::to_owned)?;
+    Ok(result)
 }
 
 #[tauri::command]

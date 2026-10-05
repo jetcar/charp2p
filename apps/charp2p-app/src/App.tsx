@@ -16,7 +16,9 @@ type InvitationPreview = {
   reusable: boolean;
 };
 type PendingGroup = InvitationPreview;
-type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable">;
+type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable"> & {
+  lastSynchronizedAtUnix: number | null;
+};
 type LocalGroup = {
   groupId: string;
   groupName: string;
@@ -48,6 +50,7 @@ type SynchronizeGroupResult = {
   groupId: string;
   synchronizedEvents: number;
   uploadedEvents: number;
+  synchronizedAtUnix: number;
 };
 
 type CreatedMessage = {
@@ -162,6 +165,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   synchronization_failed: "Group synchronization failed. Try again.",
   synchronization_limit_exceeded: "Group synchronization exceeded its safe exchange limit.",
   synchronization_peer_invalid: "The saved synchronization peer is invalid.",
+  synchronization_state_store_unavailable: "Synchronization completed, but its time could not be saved.",
   synchronization_timed_out: "The group peer did not answer in time. Try again.",
   synchronization_unauthorized: "This device is no longer authorized to synchronize the group.",
   synchronization_unavailable: "Group synchronization is temporarily unavailable.",
@@ -219,6 +223,14 @@ function expiryDescription(expiresAtUnix: number) {
   if (hours < 48) return `Expires in ${hours} ${hours === 1 ? "hour" : "hours"}`;
   const days = Math.ceil(hours / 24);
   return `Expires in ${days} days`;
+}
+
+function synchronizationDescription(synchronizedAtUnix: number | null) {
+  if (synchronizedAtUnix === null) return "Not yet";
+  return new Date(synchronizedAtUnix * 1000).toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 function peerSearchDescription(result: PeerSearchResult | null) {
@@ -913,6 +925,9 @@ function App() {
         groupId,
       });
       setSynchronizationResult(result);
+      setJoinedGroup((group) => group?.groupId === groupId
+        ? { ...group, lastSynchronizedAtUnix: result.synchronizedAtUnix }
+        : group);
       const page = await invoke<StoredMessagePage>("group_messages", { groupId });
       setGroupMessages(page.messages);
       setHasEarlierMessages(page.hasEarlier);
@@ -1249,6 +1264,7 @@ function App() {
                 <div><dt>History</dt><dd>{historyDescription(joinedGroup.historyPolicy)}</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
+                <div><dt>Last synchronized</dt><dd>{synchronizationDescription(joinedGroup.lastSynchronizedAtUnix)}</dd></div>
               </dl>
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}

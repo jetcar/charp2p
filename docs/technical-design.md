@@ -215,6 +215,8 @@ the group screen: it loads the protected derived discovery key, rediscovers the
 invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
 pull. While the joined-group screen is loaded, the client performs an initial
 automatic pull and retries once per minute. Manual retry remains available.
+Each successful pull/push session records its completion time in joined-group
+metadata so the interface can restore the last synchronization time.
 After each verified batch commits, the client authenticates and decrypts any
 new MLS application messages it can read, binds the MLS sender credential to
 the signed event author, and adds event-bound encrypted local display copies.
@@ -503,8 +505,9 @@ Each client stores:
   cancellation or invitation expiry deletes the KeyPackage material and
   pending index while saving the resulting provider snapshot in the same
   transaction.
-- Non-secret display metadata for joined groups, promoted atomically from the
-  pending invitation after MLS completion.
+- Non-secret display metadata and last successful synchronization time for
+  joined groups, promoted atomically from the pending invitation after MLS
+  completion.
 - One opaque derived discovery key per joined group in platform-protected
   storage. It supports later peer lookup but carries no join authorization.
 - Owner-side rendezvous keys retained in platform-protected storage after

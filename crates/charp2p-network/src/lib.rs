@@ -334,11 +334,7 @@ impl NetworkNode {
                 } => {
                     return NetworkEvent::PeerConnected {
                         peer_id,
-                        path: if endpoint.is_relayed() {
-                            ConnectionPath::Relayed
-                        } else {
-                            ConnectionPath::Direct
-                        },
+                        path: connection_path(&endpoint),
                     };
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -678,8 +674,34 @@ pub enum NetworkEvent {
 pub enum ConnectionPath {
     /// The endpoints established a direct connection.
     Direct,
+    /// The endpoints established a direct connection over a local address.
+    Lan,
     /// The endpoints connected through Circuit Relay v2.
     Relayed,
+}
+
+fn connection_path(endpoint: &libp2p::core::ConnectedPoint) -> ConnectionPath {
+    if endpoint.is_relayed() {
+        return ConnectionPath::Relayed;
+    }
+
+    if is_lan_address(endpoint.get_remote_address()) {
+        ConnectionPath::Lan
+    } else {
+        ConnectionPath::Direct
+    }
+}
+
+fn is_lan_address(address: &Multiaddr) -> bool {
+    address.iter().any(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::Ip4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        libp2p::multiaddr::Protocol::Ip6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+        _ => false,
+    })
 }
 
 /// Stable membership transport failure categories.
@@ -798,6 +820,19 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn local_ip_addresses_are_classified_as_lan() {
+        assert!(super::is_lan_address(
+            &"/ip4/192.168.1.8/udp/4001/quic-v1".parse().unwrap()
+        ));
+        assert!(super::is_lan_address(
+            &"/ip6/fd00::8/udp/4001/quic-v1".parse().unwrap()
+        ));
+        assert!(!super::is_lan_address(
+            &"/ip4/203.0.113.8/udp/4001/quic-v1".parse().unwrap()
+        ));
+    }
 
     #[tokio::test]
     async fn two_nodes_establish_an_authenticated_quic_connection() {
@@ -972,9 +1007,9 @@ mod tests {
             .expect("loopback QUIC connection should complete");
 
         assert_eq!(listener_peer, dialer_id);
-        assert_eq!(listener_path, ConnectionPath::Direct);
+        assert_eq!(listener_path, ConnectionPath::Lan);
         assert_eq!(dialer_peer, listener_id);
-        assert_eq!(dialer_path, ConnectionPath::Direct);
+        assert_eq!(dialer_path, ConnectionPath::Lan);
 
         (listener, dialer, listener_id, dialer_id)
     }

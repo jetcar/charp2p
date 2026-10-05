@@ -37,7 +37,7 @@ type PeerSearchResult = {
   status: "bootstrapRequired" | "peerReachable" | "peersFound" | "noPeers" | "unavailable";
   discoveredPeers: number;
   reachablePeers: number;
-  connectionType: "direct" | "relayed" | null;
+  connectionType: "direct" | "lan" | "relayed" | null;
 };
 type AdvertisementResult = {
   status: "advertising" | "bootstrapRequired" | "inactive";
@@ -225,7 +225,11 @@ function peerSearchDescription(result: PeerSearchResult | null) {
   if (!result) return "Not searched";
   if (result.status === "bootstrapRequired") return "Bootstrap node needed";
   if (result.status === "peerReachable") {
-    const route = result.connectionType === "relayed" ? "through relay" : "directly";
+    const route = result.connectionType === "relayed"
+      ? "through relay"
+      : result.connectionType === "lan"
+        ? "on local network"
+        : "directly";
     return `Reached ${result.reachablePeers} ${result.reachablePeers === 1 ? "peer" : "peers"} ${route}`;
   }
   if (result.status === "peersFound") {

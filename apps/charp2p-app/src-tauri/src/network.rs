@@ -1065,6 +1065,7 @@ fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str
 fn connection_type_name(path: ConnectionPath) -> &'static str {
     match path {
         ConnectionPath::Direct => "direct",
+        ConnectionPath::Lan => "lan",
         ConnectionPath::Relayed => "relayed",
     }
 }
@@ -1845,7 +1846,7 @@ mod tests {
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
         assert_eq!(result.reachable_peers, 1);
-        assert_eq!(result.connection_type, Some("direct"));
+        assert_eq!(result.connection_type, Some("lan"));
     }
 
     #[test]
@@ -2199,7 +2200,7 @@ mod tests {
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
         assert_eq!(result.reachable_peers, 1);
-        assert_eq!(result.connection_type, Some("direct"));
+        assert_eq!(result.connection_type, Some("lan"));
     }
 
     #[test]

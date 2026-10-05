@@ -31,9 +31,9 @@ register the scheme at startup. Installed release builds use the bundle's
 protocol registration.
 
 The pending-group screen can run a bounded Kademlia provider search and an
-authenticated direct or relayed reachability check with the restored device
-identity. An owner with an active invitation advertises its opaque rendezvous
-key while the app is
+authenticated direct, local-network, or relayed reachability check with the
+restored device identity. An owner with an active invitation advertises its
+opaque rendezvous key while the app is
 running, through the invitation expiry. Release builds will use the versioned
 built-in bootstrap list. During local development, set
 `CHARP2P_BOOTSTRAP_NODES` to up to 16 semicolon-separated QUIC multiaddresses
@@ -120,9 +120,9 @@ is replaced by its opaque derived discovery key in protected storage, and an
 interrupted post-join cleanup can resume without repeating the network
 exchange. The derived key supports later peer discovery but cannot authorize
 another join. The pending-group screen exposes the secure join action,
-shows availability separately, labels authenticated reachability as direct or
-relayed, and restores the completed joined-group card after restart. The
-joined-group card can use that protected key to rediscover
+shows availability separately, labels authenticated reachability as direct,
+local-network, or relayed, and restores the completed joined-group card after
+restart. The joined-group card can use that protected key to rediscover
 the pinned owner and retry a bounded authorized synchronization without keeping
 the bearer invitation. It synchronizes once after loading, continues once per
 minute while the app runs, and keeps manual retry available. Readable MLS

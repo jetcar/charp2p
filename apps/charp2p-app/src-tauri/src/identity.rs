@@ -5,6 +5,7 @@ use keyring_core::{Entry, Error as KeyringError};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
+#[cfg(any(test, windows, target_os = "android"))]
 const CREDENTIAL_SERVICE: &str = "chat.charp2p.client";
 const CREDENTIAL_USER: &str = "device-identity-v1";
 const RECORD_VERSION: u8 = 1;
@@ -134,7 +135,10 @@ pub(crate) fn protected_entry(user: &str) -> Result<Entry, &'static str> {
     let entry = Entry::new(CREDENTIAL_SERVICE, user);
 
     #[cfg(all(not(test), not(any(windows, target_os = "android"))))]
-    return Err("identity_store_unsupported");
+    {
+        let _ = user;
+        Err("identity_store_unsupported")
+    }
 
     #[cfg(any(test, windows, target_os = "android"))]
     entry.map_err(|_| "identity_store_unavailable")

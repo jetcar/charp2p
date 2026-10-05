@@ -51,6 +51,7 @@ type SynchronizeGroupResult = {
   synchronizedEvents: number;
   uploadedEvents: number;
   synchronizedAtUnix: number;
+  connectionType: "direct" | "lan" | "relayed";
 };
 
 type CreatedMessage = {
@@ -231,6 +232,12 @@ function synchronizationDescription(synchronizedAtUnix: number | null) {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+function connectionTypeDescription(connectionType: "direct" | "lan" | "relayed") {
+  if (connectionType === "relayed") return "Relay";
+  if (connectionType === "lan") return "Local network";
+  return "Direct";
 }
 
 function peerSearchDescription(result: PeerSearchResult | null) {
@@ -1255,7 +1262,7 @@ function App() {
                   {synchronizingGroup
                     ? "○ Synchronizing…"
                     : synchronizationResult
-                      ? `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared`
+                      ? `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
                       : "○ Sync not checked"}
                 </span>
               </div>

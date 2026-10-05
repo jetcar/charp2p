@@ -204,6 +204,7 @@ pub struct SynchronizeGroupResult {
     pub synchronized_events: usize,
     pub uploaded_events: usize,
     pub synchronized_at_unix: u64,
+    pub connection_type: &'static str,
 }
 
 struct ActiveAdvertisement {
@@ -648,7 +649,7 @@ impl NetworkService {
             .pending_join
             .prepare_join_request(local_peer, invitation)?;
         let key = DiscoveryKey::from_invitation(invitation);
-        let mut node = self
+        let (mut node, _) = self
             .connect_to_group_provider(identity, key, expected_inviter)
             .await?;
 
@@ -708,7 +709,7 @@ impl NetworkService {
         if local_peer == expected_peer {
             return Err("synchronization_peer_invalid");
         }
-        let mut node = self
+        let (mut node, connection_path) = self
             .connect_to_group_provider(identity, key, expected_peer)
             .await?;
         let synchronized_events = self
@@ -726,6 +727,7 @@ impl NetworkService {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| "system_clock_invalid")?
                 .as_secs(),
+            connection_type: connection_type_name(connection_path),
         })
     }
 
@@ -734,7 +736,7 @@ impl NetworkService {
         identity: DeviceIdentity,
         key: DiscoveryKey,
         expected_peer: PeerId,
-    ) -> Result<NetworkNode, &'static str> {
+    ) -> Result<(NetworkNode, ConnectionPath), &'static str> {
         if self.bootstrap_peers.is_empty() {
             return Err("network_bootstrap_required");
         }
@@ -752,11 +754,11 @@ impl NetworkService {
         node.find_group_peers(key);
 
         let already_connected = timeout(PROVIDER_SEARCH_TIMEOUT, async {
-            let mut connected = false;
+            let mut connected = None;
             loop {
                 match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id, .. } if peer_id == expected_peer => {
-                        connected = true;
+                    NetworkEvent::PeerConnected { peer_id, path } if peer_id == expected_peer => {
+                        connected = Some(path);
                     }
                     NetworkEvent::GroupPeersFound {
                         key: found_key,
@@ -779,22 +781,24 @@ impl NetworkService {
         .await
         .map_err(|_| "network_search_timed_out")??;
 
-        if !already_connected {
+        let connection_path = if let Some(path) = already_connected {
+            path
+        } else {
             node.dial_peer(expected_peer)
                 .map_err(|_| "network_peer_unreachable")?;
             timeout(CONNECT_TIMEOUT, async {
                 loop {
-                    if let NetworkEvent::PeerConnected { peer_id, .. } = node.next_event().await {
+                    if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
                         if peer_id == expected_peer {
-                            break;
+                            break path;
                         }
                     }
                 }
             })
             .await
-            .map_err(|_| "network_peer_unreachable")?;
-        }
-        Ok(node)
+            .map_err(|_| "network_peer_unreachable")?
+        };
+        Ok((node, connection_path))
     }
 
     async fn pull_from_connected_peer(
@@ -1655,6 +1659,7 @@ mod tests {
             assert_eq!(result.synchronized_events, 3);
             assert_eq!(result.uploaded_events, 0);
             assert!(result.synchronized_at_unix >= now);
+            assert_eq!(result.connection_type, "lan");
         });
     }
 

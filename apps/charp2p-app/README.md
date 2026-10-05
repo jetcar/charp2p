@@ -18,6 +18,9 @@ The current shell implements device onboarding and a local invitation preview.
 Its group switcher restores every joined membership, keeps owner and member
 groups accessible in one session, and opens another invitation without hiding
 existing groups.
+The footer privacy and identity pages explain local message storage, observable
+network metadata, relay limits, device-key continuity, and the current recovery
+limitation from inside the Windows and Android interface.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted

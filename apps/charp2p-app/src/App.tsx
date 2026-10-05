@@ -399,6 +399,70 @@ function MembersView({
   );
 }
 
+function InformationView({
+  view,
+  onClose,
+}: {
+  view: "privacy" | "identity";
+  onClose: () => void;
+}) {
+  const privacy = view === "privacy";
+
+  return (
+    <section className="setup-form information-card">
+      <header>
+        <p className="eyebrow">CharP2P</p>
+        <h2>{privacy ? "Privacy" : "How identity works"}</h2>
+        <p>
+          {privacy
+            ? "What the app stores and what other peers can observe."
+            : "Your identity represents this installation and its cryptographic keys."}
+        </p>
+      </header>
+      {privacy ? (
+        <div className="information-sections">
+          <section>
+            <h3>Messages stay with group devices</h3>
+            <p>Message contents are protected for authorized group devices and stored on participating devices. CharP2P has no central message archive.</p>
+          </section>
+          <section>
+            <h3>Network metadata is visible</h3>
+            <p>Peers, bootstrap nodes, and relays can observe connection metadata such as peer identifiers, network addresses, timing, and traffic volume. Relays forward encrypted streams without group keys.</p>
+          </section>
+          <section>
+            <h3>Groups control their copies</h3>
+            <p>Group owners can remove a device from future access. Removal cannot erase messages already stored by that device or by other members.</p>
+          </section>
+          <section>
+            <h3>No account directory</h3>
+            <p>The MVP does not use telephone numbers, email discovery, public group search, or a central identity account.</p>
+          </section>
+        </div>
+      ) : (
+        <div className="information-sections">
+          <section>
+            <h3>One key identity per installation</h3>
+            <p>This device creates an Ed25519 key with the operating system’s secure random source. Its peer identifier is derived from the public key.</p>
+          </section>
+          <section>
+            <h3>Private keys remain protected</h3>
+            <p>Private identity and group material stays in platform-protected storage and is never returned to the app interface.</p>
+          </section>
+          <section>
+            <h3>Membership verifies devices</h3>
+            <p>MLS membership binds group access to cryptographic device credentials. A verified device identity proves key continuity, not a person’s legal identity.</p>
+          </section>
+          <section>
+            <h3>Keep this installation</h3>
+            <p>Reinstalling without a recovery copy creates a different identity. Encrypted recovery export and restore are not available in this MVP build yet.</p>
+          </section>
+        </div>
+      )}
+      <button className="secondary-button" onClick={onClose} type="button">Back</button>
+    </section>
+  );
+}
+
 function App() {
   const [step, setStep] = useState<SetupStep>(1);
   const [deviceName, setDeviceName] = useState("");
@@ -406,6 +470,7 @@ function App() {
   const [loading, setLoading] = useState(isTauri());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [informationView, setInformationView] = useState<"privacy" | "identity" | null>(null);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
@@ -1174,7 +1239,11 @@ function App() {
 
       <section className="setup-panel">
         <div className="setup-content">
-          <Stepper step={step} />
+          {informationView ? (
+            <InformationView view={informationView} onClose={() => setInformationView(null)} />
+          ) : (
+            <>
+              <Stepper step={step} />
 
           {loading && (
             <div className="loading-state" role="status">
@@ -1714,11 +1783,13 @@ function App() {
               </button>
             </section>
           )}
+            </>
+          )}
         </div>
 
         <footer className="setup-footer">
-          <button type="button">Privacy</button>
-          <button type="button">How identity works</button>
+          <button onClick={() => setInformationView("privacy")} type="button">Privacy</button>
+          <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
         </footer>
       </section>
     </main>

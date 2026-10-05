@@ -146,6 +146,12 @@ button { cursor: pointer; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }
 .members-button { min-height: 58px; margin: 0 0 26px; font-size: 18px; }
+.information-card { align-items: stretch; }
+.information-card header { margin-bottom: 28px; }
+.information-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.information-sections section { padding: 19px; border: 1px solid #dce4ec; border-radius: 15px; background: white; }
+.information-sections h3 { margin: 0 0 8px; color: #172044; font-size: 17px; }
+.information-sections p { margin: 0; color: #64718c; font-size: 14px; line-height: 1.55; }
 .members-card { align-items: stretch; }
 .members-card .members-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .members-card .members-header h2 { margin-bottom: 9px; font-size: clamp(36px, 3.8vw, 52px); }
@@ -264,6 +270,7 @@ button { cursor: pointer; }
   .member-row { grid-template-columns: 46px minmax(0, 1fr); }
   .member-actions { grid-column: 2; justify-items: start; }
   .member-avatar { width: 46px; height: 46px; }
+  .information-sections { grid-template-columns: 1fr; }
   .join-options { grid-template-columns: 1fr; }
   .segmented-options { grid-template-columns: 1fr; }
   .segmented-options button + button { border-top: 1px solid #dbe2ea; border-left: 0; }

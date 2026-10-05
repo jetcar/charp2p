@@ -27,10 +27,10 @@ invitation and compare every SQLite metadata field with its authenticated
 claims. Fail closed on a missing, damaged, or mismatched record. Remove expired
 pending invitations from both stores after successful verification.
 
-User cancellation first removes any retained MLS pending-join material, then
-deletes the protected bearer and its SQLite metadata. If the metadata write
-fails after bearer deletion, the remaining index keeps cancellation retryable
-without restoring the join capability.
+User cancellation and expiry cleanup first remove any retained MLS pending-join
+material, then delete the protected bearer and its SQLite metadata. If the
+metadata write fails after bearer deletion, the remaining index keeps cleanup
+retryable without restoring the join capability.
 
 Before a completed join deletes the bearer invitation, derive its opaque
 32-byte DHT discovery key and store that key under a separate versioned

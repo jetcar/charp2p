@@ -57,9 +57,20 @@ fn accept_invitation(
 
 #[tauri::command]
 fn pending_invitations(
-    service: tauri::State<'_, PendingInvitationService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<Vec<PendingGroup>, String> {
-    service.list().map_err(str::to_owned)
+    let (pending, expired) = pending_service.inspect().map_err(str::to_owned)?;
+    for group_id in expired {
+        mls_service
+            .cancel_pending_join(group_id)
+            .map_err(str::to_owned)?;
+        match pending_service.cancel(group_id) {
+            Ok(()) | Err("pending_invitation_not_found") => {}
+            Err(error) => return Err(error.to_owned()),
+        }
+    }
+    Ok(pending)
 }
 
 #[tauri::command]

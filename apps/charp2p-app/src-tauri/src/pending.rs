@@ -132,12 +132,12 @@ impl PendingInvitationService {
         self.accept_at(input, now_unix)
     }
 
-    pub fn list(&self) -> Result<Vec<PendingGroup>, &'static str> {
+    pub(crate) fn inspect(&self) -> Result<(Vec<PendingGroup>, Vec<PeerId>), &'static str> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system_clock_invalid")?
             .as_secs();
-        self.list_at(now_unix)
+        self.inspect_at(now_unix)
     }
 
     pub fn joined(&self) -> Result<Vec<JoinedGroup>, &'static str> {
@@ -328,7 +328,19 @@ impl PendingInvitationService {
         Ok((discovery, joined.inviter_device_id))
     }
 
+    #[cfg(test)]
     fn list_at(&self, now_unix: u64) -> Result<Vec<PendingGroup>, &'static str> {
+        let (pending, expired) = self.inspect_at(now_unix)?;
+        for group_id in expired {
+            self.cancel(group_id)?;
+        }
+        Ok(pending)
+    }
+
+    fn inspect_at(
+        &self,
+        now_unix: u64,
+    ) -> Result<(Vec<PendingGroup>, Vec<PeerId>), &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -340,6 +352,7 @@ impl PendingInvitationService {
             .pending_invitations()
             .map_err(|_| "pending_invitation_store_unavailable")?;
         let mut pending = Vec::with_capacity(metadata.len());
+        let mut expired = Vec::new();
         for stored in metadata {
             let encoded = self
                 .secrets
@@ -350,12 +363,7 @@ impl PendingInvitationService {
                 return Err("pending_invitation_record_invalid");
             }
             if invitation.expires_at_unix() <= now_unix {
-                self.secrets.remove(stored.group_id)?;
-                self.metadata
-                    .lock()
-                    .map_err(|_| "pending_invitation_service_unavailable")?
-                    .remove_pending_invitation(stored.group_id)
-                    .map_err(|_| "pending_invitation_store_unavailable")?;
+                expired.push(stored.group_id);
                 continue;
             }
             pending.push(PendingGroup::from_metadata(
@@ -363,7 +371,7 @@ impl PendingInvitationService {
                 invitation.inviter_device_id(),
             ));
         }
-        Ok(pending)
+        Ok((pending, expired))
     }
 
     fn accept_at(&self, input: &str, now_unix: u64) -> Result<PendingGroup, &'static str> {
@@ -743,8 +751,23 @@ mod tests {
     #[test]
     fn expired_invitation_is_removed_from_both_stores() {
         let service = service();
-        let (encoded, _) = invitation();
+        let (encoded, group_id) = invitation();
         service.accept_at(&encoded, NOW).unwrap();
+
+        let (active, expired) = service.inspect_at(NOW + 3_600).unwrap();
+        assert!(active.is_empty());
+        assert_eq!(expired, vec![group_id]);
+        assert!(service.secrets.get_optional(group_id).unwrap().is_some());
+        assert_eq!(
+            service
+                .metadata
+                .lock()
+                .unwrap()
+                .pending_invitations()
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert!(service.list_at(NOW + 3_600).unwrap().is_empty());
         assert!(service

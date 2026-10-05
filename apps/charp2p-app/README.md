@@ -74,7 +74,9 @@ join responses are deleted so active reusable invitations cannot restore the
 removed device. Removing a device prevents future access but cannot erase
 messages it already stored. Until the groups list is
 implemented, the backend enforces one locally created group so extra protected
-roots cannot become hidden from the interface.
+roots cannot become hidden from the interface. Expired pending joins also
+remove their retained one-time MLS key material before the invitation is
+discarded.
 
 The owner and joined-group screens can create bounded text messages as MLS
 private application messages and persist each signed `MessageCreated` event

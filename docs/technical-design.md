@@ -499,8 +499,9 @@ Each client stores:
   in platform-protected storage.
 - One bounded public MLS KeyPackage for each pending join, transactionally
   paired with the provider snapshot that contains its private material. User
-  cancellation deletes the KeyPackage material and pending index while saving
-  the resulting provider snapshot in the same transaction.
+  cancellation or invitation expiry deletes the KeyPackage material and
+  pending index while saving the resulting provider snapshot in the same
+  transaction.
 - Non-secret display metadata for joined groups, promoted atomically from the
   pending invitation after MLS completion.
 - One opaque derived discovery key per joined group in platform-protected

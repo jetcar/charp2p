@@ -15,6 +15,9 @@ installing Tauri's Android prerequisites. Windows build hosts must allow
 symbolic-link creation, normally through Developer Mode.
 
 The current shell implements device onboarding and a local invitation preview.
+Its group switcher restores every joined membership, keeps owner and member
+groups accessible in one session, and opens another invitation without hiding
+existing groups.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
 are parsed and authenticated in Rust before any network access. Encrypted
@@ -78,9 +81,9 @@ device from the Members & devices view. The signed `MemberRemoved` event,
 advanced MLS state, and durable re-admission block commit atomically; cached
 join responses are deleted so active reusable invitations cannot restore the
 removed device. Removing a device prevents future access but cannot erase
-messages it already stored. Until the groups list is
-implemented, the backend enforces one locally created group so extra protected
-roots cannot become hidden from the interface. Expired pending joins also
+messages it already stored. The backend still enforces one locally created
+group while owner-root key management remains device-scoped; the interface can
+also display multiple joined groups. Expired pending joins also
 remove their retained one-time MLS key material before the invitation is
 discarded.
 

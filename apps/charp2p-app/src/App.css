@@ -136,6 +136,13 @@ button { cursor: pointer; }
 .join-button { background: linear-gradient(100deg, #ff7463, #ea584e); box-shadow: 0 13px 26px rgba(219, 77, 67, .18); }
 
 .group-ready-card, .joined-card { align-items: stretch; }
+.group-switcher { width: min(100%, 900px); display: grid; gap: 12px; margin: -30px auto 28px; }
+.group-switcher-list { display: flex; gap: 10px; overflow-x: auto; padding: 3px; }
+.group-switcher-list button { min-width: 150px; display: grid; gap: 3px; padding: 12px 15px; border: 1px solid #d8e1ea; border-radius: 13px; color: #172044; background: white; text-align: left; }
+.group-switcher-list button.active { border-color: #0ba69d; background: #effaf8; box-shadow: 0 0 0 1px #0ba69d; }
+.group-switcher-list strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.group-switcher-list span { color: #68748f; font-size: 12px; font-weight: 650; }
+.group-switcher-join { justify-self: start; padding: 7px 3px; border: 0; color: #087d75; background: transparent; font-weight: 700; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }
 .members-button { min-height: 58px; margin: 0 0 26px; font-size: 18px; }
@@ -247,6 +254,8 @@ button { cursor: pointer; }
   .setup-form h2 { font-size: 36px; letter-spacing: -1.7px; }
   .setup-form header { margin-bottom: 36px; }
   .setup-form header > p:last-child { font-size: 18px; }
+  .group-switcher { margin-top: -20px; }
+  .group-switcher-list button { min-width: 132px; }
   .setup-form input, .primary-button, .secondary-button, .danger-button { min-height: 64px; height: 64px; font-size: 18px; }
   .setup-form input { margin-bottom: 28px; }
   .join-form textarea { margin-bottom: 28px; }

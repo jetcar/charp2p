@@ -411,7 +411,7 @@ function App() {
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
   const [verifyingInvite, setVerifyingInvite] = useState(false);
   const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
-  const [joinedGroup, setJoinedGroup] = useState<JoinedGroup | null>(null);
+  const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([]);
   const [synchronizingGroup, setSynchronizingGroup] = useState(false);
   const [synchronizationResult, setSynchronizationResult] =
     useState<SynchronizeGroupResult | null>(null);
@@ -436,7 +436,9 @@ function App() {
   const pendingExpiryCleanupRef = useRef("");
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
-  const [localGroup, setLocalGroup] = useState<LocalGroup | null>(null);
+  const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState("");
+  const activeGroupIdRef = useRef("");
   const [issuedInvitation, setIssuedInvitation] = useState<IssuedInvitation | null>(null);
   const [createGroupMode, setCreateGroupMode] = useState(false);
   const [groupName, setGroupName] = useState("");
@@ -455,6 +457,27 @@ function App() {
     () => (/Android/i.test(navigator.userAgent) ? "My tablet" : "My PC"),
     [],
   );
+  const joinedGroup = joinedGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
+  const localGroup = localGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
+  const availableGroups = useMemo(
+    () => [
+      ...localGroups.map((group) => ({
+        groupId: group.groupId,
+        groupName: group.groupName,
+        role: "Owner",
+      })),
+      ...joinedGroups.map((group) => ({
+        groupId: group.groupId,
+        groupName: group.groupName,
+        role: "Member",
+      })),
+    ],
+    [joinedGroups, localGroups],
+  );
+
+  useEffect(() => {
+    activeGroupIdRef.current = activeGroupId;
+  }, [activeGroupId]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -483,12 +506,12 @@ function App() {
           setError(errorMessage(pendingResult.reason));
         }
         if (joinedResult.status === "fulfilled") {
-          setJoinedGroup(joinedResult.value[0] ?? null);
+          setJoinedGroups(joinedResult.value);
         } else {
           setError(errorMessage(joinedResult.reason));
         }
         if (groupsResult.status === "fulfilled") {
-          setLocalGroup(groupsResult.value[0] ?? null);
+          setLocalGroups(groupsResult.value);
         } else {
           setError(errorMessage(groupsResult.reason));
         }
@@ -496,6 +519,11 @@ function App() {
           setIssuedInvitation(invitationsResult.value[0] ?? null);
         } else {
           setError(errorMessage(invitationsResult.reason));
+        }
+        if (joinedResult.status === "fulfilled" && groupsResult.status === "fulfilled") {
+          setActiveGroupId(
+            joinedResult.value[0]?.groupId ?? groupsResult.value[0]?.groupId ?? "",
+          );
         }
       })
       .finally(() => {
@@ -846,7 +874,6 @@ function App() {
       });
       pendingExpiryCleanupRef.current = "";
       setPendingGroup(accepted);
-      setJoinedGroup(null);
       setPeerSearchResult(null);
       setInvitationPreview(null);
       setInviteInput("");
@@ -884,7 +911,11 @@ function App() {
       const joined = await invoke<JoinedGroup>("join_group", {
         groupId: pendingGroup.groupId,
       });
-      setJoinedGroup(joined);
+      setJoinedGroups((groups) => [
+        ...groups.filter(({ groupId }) => groupId !== joined.groupId),
+        joined,
+      ]);
+      setActiveGroupId(joined.groupId);
       setSynchronizationResult(null);
       pendingExpiryCleanupRef.current = "";
       setPendingGroup(null);
@@ -922,27 +953,31 @@ function App() {
     if (synchronizationInFlight.current || !isTauri()) return;
 
     synchronizationInFlight.current = true;
-    if (reportErrors) {
+    if (reportErrors && activeGroupIdRef.current === groupId) {
       setError("");
       setSynchronizationResult(null);
     }
-    setSynchronizingGroup(true);
+    if (activeGroupIdRef.current === groupId) setSynchronizingGroup(true);
     try {
       const result = await invoke<SynchronizeGroupResult>("synchronize_group", {
         groupId,
       });
-      setSynchronizationResult(result);
-      setJoinedGroup((group) => group?.groupId === groupId
+      setJoinedGroups((groups) => groups.map((group) => group.groupId === groupId
         ? { ...group, lastSynchronizedAtUnix: result.synchronizedAtUnix }
-        : group);
-      const page = await invoke<StoredMessagePage>("group_messages", { groupId });
-      setGroupMessages(page.messages);
-      setHasEarlierMessages(page.hasEarlier);
+        : group));
+      if (activeGroupIdRef.current === groupId) {
+        setSynchronizationResult(result);
+        const page = await invoke<StoredMessagePage>("group_messages", { groupId });
+        if (activeGroupIdRef.current === groupId) {
+          setGroupMessages(page.messages);
+          setHasEarlierMessages(page.hasEarlier);
+        }
+      }
     } catch (reason) {
-      if (reportErrors) setError(errorMessage(reason));
+      if (reportErrors && activeGroupIdRef.current === groupId) setError(errorMessage(reason));
     } finally {
       synchronizationInFlight.current = false;
-      setSynchronizingGroup(false);
+      if (activeGroupIdRef.current === groupId) setSynchronizingGroup(false);
     }
   }
 
@@ -1056,7 +1091,11 @@ function App() {
         invitationLifetimeSeconds: invitationLifetime,
         reusableInvitation: true,
       });
-      setLocalGroup(created);
+      setLocalGroups((groups) => [
+        ...groups.filter(({ groupId }) => groupId !== created.groupId),
+        created,
+      ]);
+      setActiveGroupId(created.groupId);
       setIssuedInvitation(null);
       setGroupName(created.groupName);
       setCreateGroupMode(false);
@@ -1200,7 +1239,7 @@ function App() {
             </section>
           )}
 
-          {step === 3 && pendingGroup && !joinMode && !joinedGroup && (
+          {step === 3 && pendingGroup && !joinMode && (
             <section className="setup-form pending-card">
               <div className="pending-icon" aria-hidden="true">⌁</div>
               <header>
@@ -1231,6 +1270,41 @@ function App() {
                 {cancellingPending ? "Removing…" : "Remove invitation"}
               </button>
             </section>
+          )}
+
+          {step === 3 && !pendingGroup && !joinMode && !createGroupMode && !showMembers && availableGroups.length > 0 && (
+            <nav className="group-switcher" aria-label="Your groups">
+              <div className="group-switcher-list">
+                {availableGroups.map((group) => (
+                  <button
+                    aria-current={group.groupId === activeGroupId ? "page" : undefined}
+                    className={group.groupId === activeGroupId ? "active" : ""}
+                    key={group.groupId}
+                    onClick={() => {
+                      setActiveGroupId(group.groupId);
+                      setError("");
+                      setSynchronizationResult(null);
+                      setSynchronizingGroup(false);
+                      setCreatedMessage(null);
+                    }}
+                    type="button"
+                  >
+                    <strong>{group.groupName}</strong>
+                    <span>{group.role}</span>
+                  </button>
+                ))}
+              </div>
+              <button
+                className="group-switcher-join"
+                onClick={() => {
+                  setJoinMode(true);
+                  setError("");
+                }}
+                type="button"
+              >
+                ＋ Join another group
+              </button>
+            </nav>
           )}
 
           {step === 3 && showMembers && !pendingGroup && !joinMode && !createGroupMode && (joinedGroup || localGroup) && (
@@ -1546,7 +1620,7 @@ function App() {
             </form>
           )}
 
-          {step === 3 && !pendingGroup && !joinedGroup && !localGroup && !joinMode && !createGroupMode && (
+          {step === 3 && !pendingGroup && availableGroups.length === 0 && !joinMode && !createGroupMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>

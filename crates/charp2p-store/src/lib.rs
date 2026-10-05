@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -358,11 +358,16 @@ impl EventStore {
         if unread && materialized == 1 {
             transaction.execute(
                 "INSERT INTO unread_local_messages (event_id, group_id)
-                 VALUES (?1, ?2)
+                 SELECT ?1, ?2
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM blocked_local_devices
+                     WHERE group_id = ?2 AND device_id = ?3
+                 )
                  ON CONFLICT(event_id) DO NOTHING",
                 params![
                     event.id().as_bytes().as_slice(),
-                    event.group_id().to_bytes()
+                    event.group_id().to_bytes(),
+                    event.author_id().to_bytes()
                 ],
             )?;
         }
@@ -378,6 +383,10 @@ impl EventStore {
              FROM materialized_messages m
              JOIN events e ON e.event_id = m.event_id
              WHERE m.group_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM blocked_local_devices b
+                   WHERE b.group_id = m.group_id AND b.device_id = m.author_id
+               )
              ORDER BY m.created_at_unix_ms DESC, m.event_id DESC
              LIMIT ?2",
         )?;
@@ -528,6 +537,10 @@ impl EventStore {
              FROM unread_local_messages u
              JOIN materialized_messages m ON m.event_id = u.event_id
              WHERE m.group_id = u.group_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM blocked_local_devices b
+                   WHERE b.group_id = m.group_id AND b.device_id = m.author_id
+               )
              GROUP BY u.group_id
              ORDER BY u.group_id",
         )?;
@@ -551,6 +564,59 @@ impl EventStore {
             [group_id.to_bytes()],
         )?;
         Ok(cleared as u64)
+    }
+
+    /// Blocks one device's messages from display on this device. Its signed
+    /// events stay stored and keep advancing MLS state. Returns false when the
+    /// device was already blocked.
+    pub fn block_device_locally(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO blocked_local_devices (group_id, device_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(group_id, device_id) DO NOTHING",
+            params![group_id.to_bytes(), device_id.to_bytes()],
+        )?;
+        transaction.execute(
+            "DELETE FROM unread_local_messages
+             WHERE group_id = ?1 AND event_id IN (
+                 SELECT event_id FROM materialized_messages
+                 WHERE group_id = ?1 AND author_id = ?2
+             )",
+            params![group_id.to_bytes(), device_id.to_bytes()],
+        )?;
+        transaction.commit()?;
+        Ok(inserted == 1)
+    }
+
+    /// Shows a locally blocked device's retained messages again. Returns
+    /// false when the device was not blocked.
+    pub fn unblock_device_locally(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        let deleted = self.connection.execute(
+            "DELETE FROM blocked_local_devices WHERE group_id = ?1 AND device_id = ?2",
+            params![group_id.to_bytes(), device_id.to_bytes()],
+        )?;
+        Ok(deleted == 1)
+    }
+
+    /// Lists devices blocked on this device for one group.
+    pub fn blocked_devices(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT device_id FROM blocked_local_devices
+             WHERE group_id = ?1
+             ORDER BY device_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| PeerId::from_bytes(&row?).map_err(|_| StoreError::CorruptIndex))
+            .collect()
     }
 
     /// Returns at most `limit` verified message events that do not yet have a
@@ -1444,7 +1510,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=15 => {}
+            6..=16 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1633,6 +1699,19 @@ impl EventStore {
 
                  CREATE INDEX IF NOT EXISTS unread_local_messages_by_group
                     ON unread_local_messages(group_id, event_id);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 16 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS blocked_local_devices (
+                    group_id BLOB NOT NULL,
+                    device_id BLOB NOT NULL,
+                    PRIMARY KEY(group_id, device_id)
+                 ) STRICT;",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -2834,6 +2913,123 @@ mod tests {
                 .messages
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn locally_blocked_device_messages_are_hidden_until_unblocked() {
+        let mut store = EventStore::in_memory().unwrap();
+        let blocked = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let first = message_event(&blocked, &group, 1, b"first MLS ciphertext");
+        let second = message_event(&blocked, &group, 2, b"second MLS ciphertext");
+        let kept = message_event(&other, &group, 1, b"kept MLS ciphertext");
+        let elsewhere = message_event(&blocked, &other_group, 1, b"elsewhere ciphertext");
+        for event in [&first, &kept, &elsewhere] {
+            store
+                .put_received_message_and_encrypted_mls_provider_snapshot(
+                    event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .block_device_locally(group.group_id(), blocked.peer_id())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .block_device_locally(group.group_id(), blocked.peer_id())
+                .unwrap()
+        );
+        store
+            .put_received_message_and_encrypted_mls_provider_snapshot(
+                &second,
+                b"advanced encrypted provider",
+                b"encrypted local message",
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.blocked_devices(group.group_id()).unwrap(),
+            vec![blocked.peer_id()]
+        );
+        assert!(
+            store
+                .blocked_devices(other_group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+        let visible = store.encrypted_messages(group.group_id()).unwrap().messages;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].author_id, other.peer_id());
+        assert_eq!(
+            store.unread_message_counts().unwrap().len(),
+            2,
+            "the other group keeps its unread message"
+        );
+        assert!(store.get_event(second.id()).unwrap().is_some());
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .unblock_device_locally(group.group_id(), blocked.peer_id())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .unblock_device_locally(group.group_id(), blocked.peer_id())
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .len(),
+            3
+        );
+        assert!(
+            store
+                .unread_message_counts()
+                .unwrap()
+                .contains(&(group.group_id(), 1)),
+            "blocked messages do not become unread after unblocking"
+        );
+    }
+
+    #[test]
+    fn version_sixteen_database_adds_local_device_blocks() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE blocked_local_devices;
+                     PRAGMA user_version = 16;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let device = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        assert!(
+            store
+                .block_device_locally(group.group_id(), device.peer_id())
+                .unwrap()
         );
     }
 

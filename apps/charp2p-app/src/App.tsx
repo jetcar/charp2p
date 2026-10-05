@@ -175,6 +175,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   member_owner_cannot_remove: "The owner device cannot remove itself.",
   member_removal_failed: "The device could not be removed securely.",
   member_removal_not_allowed: "Only this group's owner can remove devices.",
+  device_block_failed: "The block setting could not be saved on this device.",
+  device_block_self: "This device cannot block itself.",
+  device_block_unavailable: "Blocked devices could not be loaded.",
   member_removal_store_unavailable: "The removal could not be saved securely.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
@@ -326,6 +329,9 @@ function MembersView({
   canManageMembers,
   removingDeviceId,
   onRemove,
+  blockedDeviceIds,
+  blockingDeviceId,
+  onToggleBlock,
   onClose,
 }: {
   groupName: string;
@@ -337,6 +343,9 @@ function MembersView({
   canManageMembers: boolean;
   removingDeviceId: string;
   onRemove: (deviceId: string) => void;
+  blockedDeviceIds: string[];
+  blockingDeviceId: string;
+  onToggleBlock: (deviceId: string, blocked: boolean) => void;
   onClose: () => void;
 }) {
   const ordered = [...members].sort((left, right) => {
@@ -363,6 +372,7 @@ function MembersView({
         {ordered.map((member) => {
           const isOwner = member.deviceId === ownerDeviceId;
           const isLocal = member.deviceId === profile?.peerId;
+          const isBlocked = blockedDeviceIds.includes(member.deviceId);
           const name = isLocal
             ? `${profile?.deviceName ?? "This device"} (You)`
             : isOwner
@@ -378,6 +388,17 @@ function MembersView({
               </div>
               <div className="member-actions">
                 <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
+                {isBlocked && <span className="status-chip blocked-chip">Blocked here</span>}
+                {!isLocal && (
+                  <button
+                    className="member-block"
+                    disabled={Boolean(blockingDeviceId)}
+                    onClick={() => onToggleBlock(member.deviceId, !isBlocked)}
+                    type="button"
+                  >
+                    {blockingDeviceId === member.deviceId ? "Saving…" : isBlocked ? "Unblock" : "Block on this device"}
+                  </button>
+                )}
                 {canManageMembers && !isOwner && (
                   <button
                     className="member-remove"
@@ -394,6 +415,7 @@ function MembersView({
         })}
       </div>
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
+      <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
       {canManageMembers && <p className="preview-note">Removing a device blocks future group messages and invitation reuse. Messages already saved on that device cannot be erased.</p>}
       <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
     </section>
@@ -492,6 +514,8 @@ function App() {
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
   const [removingMember, setRemovingMember] = useState("");
+  const [blockedDevices, setBlockedDevices] = useState<string[]>([]);
+  const [blockingDevice, setBlockingDevice] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
@@ -851,6 +875,7 @@ function App() {
     setShowMembers(false);
     if (!isTauri() || !groupId) {
       setGroupMembers([]);
+      setBlockedDevices([]);
       setMembersError("");
       return;
     }
@@ -861,9 +886,13 @@ function App() {
 
     async function refreshMembers() {
       try {
-        const members = await invoke<GroupMemberDevice[]>("group_members", { groupId });
+        const [members, blocked] = await Promise.all([
+          invoke<GroupMemberDevice[]>("group_members", { groupId }),
+          invoke<string[]>("blocked_group_devices", { groupId }),
+        ]);
         if (active) {
           setGroupMembers(members);
+          setBlockedDevices(blocked);
           setMembersError("");
         }
       } catch (reason) {
@@ -1101,6 +1130,21 @@ function App() {
       setMembersError(errorMessage(reason));
     } finally {
       setRemovingMember("");
+    }
+  }
+
+  async function setDeviceBlocked(deviceId: string, blocked: boolean) {
+    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    if (!groupId || blockingDevice || !isTauri()) return;
+    if (blocked && !window.confirm("Block this device on this device only? Its messages will be hidden here, but it stays a member and others still see its messages.")) return;
+    setMembersError("");
+    setBlockingDevice(deviceId);
+    try {
+      setBlockedDevices(await invoke<string[]>("set_group_device_blocked", { groupId, deviceId, blocked }));
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setBlockingDevice("");
     }
   }
 
@@ -1429,6 +1473,9 @@ function App() {
               canManageMembers={Boolean(localGroup)}
               removingDeviceId={removingMember}
               onRemove={removeGroupMember}
+              blockedDeviceIds={blockedDevices}
+              blockingDeviceId={blockingDevice}
+              onToggleBlock={setDeviceBlocked}
               onClose={() => setShowMembers(false)}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}

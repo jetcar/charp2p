@@ -311,6 +311,36 @@ fn group_members(
 }
 
 #[tauri::command]
+fn blocked_group_devices(
+    group_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    mls_service.blocked_devices(group_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn set_group_device_blocked(
+    group_id: String,
+    device_id: String,
+    blocked: bool,
+    identity_service: tauri::State<'_, IdentityService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let device_id = parse_group_id(&device_id, "member_not_found")?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    if device_id == identity.peer_id() {
+        return Err("device_block_self".to_owned());
+    }
+    mls_service
+        .set_device_blocked_locally(group_id, device_id, blocked)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn remove_group_member(
     group_id: String,
     member_device_id: String,
@@ -451,6 +481,8 @@ pub fn run() {
             unread_message_counts,
             group_members,
             remove_group_member,
+            blocked_group_devices,
+            set_group_device_blocked,
             advertise_group
         ])
         .run(tauri::generate_context!())

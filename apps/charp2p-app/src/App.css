@@ -171,6 +171,10 @@ button { cursor: pointer; }
 .member-remove { padding: 7px 11px; border: 1px solid #e4a4ac; border-radius: 9px; color: #9e2838; background: #fff5f6; font-size: 13px; font-weight: 700; }
 .member-remove:hover:not(:disabled) { border-color: #c84959; background: #ffe8eb; }
 .member-remove:disabled { cursor: wait; opacity: .65; }
+.member-block { padding: 7px 11px; border: 1px solid #cad5e2; border-radius: 9px; color: #39445f; background: #f5f8fb; font-size: 13px; font-weight: 700; }
+.member-block:hover:not(:disabled) { border-color: #8d9ab0; background: #edf2f7; }
+.member-block:disabled { cursor: wait; opacity: .65; }
+.status-chip.blocked-chip { color: #9e2838; background: #fff5f6; }
 .message-composer { display: grid; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #f5f8fb; }
 .message-composer textarea { width: 100%; min-height: 96px; margin: 10px 0 0; padding: 14px 16px; resize: vertical; border: 1px solid #cad5e2; border-radius: 11px; outline: none; color: #172044; background: white; line-height: 1.5; }
 .message-composer textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }

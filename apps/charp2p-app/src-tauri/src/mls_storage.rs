@@ -532,6 +532,43 @@ impl MlsProviderService {
         Ok(())
     }
 
+    /// Blocks or unblocks one device's messages on this device only and
+    /// returns the group's locally blocked devices.
+    pub(crate) fn set_device_blocked_locally(
+        &self,
+        group_id: PeerId,
+        device_id: PeerId,
+        blocked: bool,
+    ) -> Result<Vec<String>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        if blocked {
+            store.block_device_locally(group_id, device_id)
+        } else {
+            store.unblock_device_locally(group_id, device_id)
+        }
+        .map_err(|_| "device_block_failed")?;
+        blocked_device_ids(&store, group_id)
+    }
+
+    pub(crate) fn blocked_devices(&self, group_id: PeerId) -> Result<Vec<String>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        blocked_device_ids(&store, group_id)
+    }
+
     fn create_message_at(
         &self,
         group_id: PeerId,
@@ -1496,6 +1533,15 @@ fn map_removal_preparation_error(error: PrepareMemberRemovalError) -> &'static s
         PrepareMemberRemovalError::OwnLeaf => "member_owner_cannot_remove",
         _ => "member_removal_failed",
     }
+}
+
+fn blocked_device_ids(store: &EventStore, group_id: PeerId) -> Result<Vec<String>, &'static str> {
+    Ok(store
+        .blocked_devices(group_id)
+        .map_err(|_| "device_block_unavailable")?
+        .into_iter()
+        .map(|device_id| device_id.to_string())
+        .collect())
 }
 
 fn group_member_devices(group: &MlsGroup) -> Result<Vec<GroupMemberDevice>, &'static str> {
@@ -2875,6 +2921,83 @@ mod tests {
         assert_eq!(
             store.get_event(event_ids[2]).unwrap().unwrap().kind(),
             EventKind::MemberAdded
+        );
+    }
+
+    #[test]
+    fn locally_blocked_device_still_advances_sync_but_stays_hidden() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let owner_service = MlsProviderService::open_with_key_store(
+            directory.path().join("owner.sqlite3"),
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = MlsProviderService::open_with_key_store(
+            directory.path().join("member.sqlite3"),
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        owner_service
+            .create_message_at(group_id, &owner, "Blocked text", 43)
+            .unwrap();
+
+        assert_eq!(
+            member_service
+                .set_device_blocked_locally(group_id, owner.peer_id(), true)
+                .unwrap(),
+            vec![owner.peer_id().to_string()]
+        );
+        let (mut session, mut request) = PullSession::start(group_id);
+        loop {
+            let response = owner_service.answer_sync_request(member_id, &request);
+            let progress = member_service
+                .advance_pull_session(&mut session, &response)
+                .unwrap();
+            if progress.complete {
+                break;
+            }
+            request = progress.next_request.unwrap();
+        }
+
+        assert!(member_service.unread_message_counts().unwrap().is_empty());
+        assert!(member_service
+            .messages(group_id, member_id)
+            .unwrap()
+            .messages
+            .is_empty());
+        assert!(member_service
+            .set_device_blocked_locally(group_id, owner.peer_id(), false)
+            .unwrap()
+            .is_empty());
+        assert!(member_service.blocked_devices(group_id).unwrap().is_empty());
+        assert_eq!(
+            member_service
+                .messages(group_id, member_id)
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Blocked text"]
         );
     }
 

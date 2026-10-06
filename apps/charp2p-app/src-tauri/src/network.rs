@@ -19,6 +19,7 @@ use tokio::{
     time::{interval, interval_at, timeout, Instant, MissedTickBehavior},
 };
 
+use crate::bandwidth::BandwidthService;
 use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
@@ -1033,7 +1034,7 @@ impl NetworkService {
         self.pending_join
             .complete_join(invitation.group_id(), welcome)?;
         let synchronized_events = self
-            .pull_from_connected_peer(&mut node, expected_inviter, invitation.group_id())
+            .pull_from_connected_peer(&mut node, expected_inviter, invitation.group_id(), None)
             .await
             .unwrap_or(0);
         Ok(JoinGroupResult {
@@ -1049,9 +1050,10 @@ impl NetworkService {
         key: DiscoveryKey,
         group_id: PeerId,
         expected_peer: PeerId,
+        bandwidth: &BandwidthService,
     ) -> Result<SynchronizeGroupResult, &'static str> {
         let result = self
-            .synchronize_with_peer(identity, key, group_id, expected_peer)
+            .synchronize_with_peer(identity, key, group_id, expected_peer, bandwidth)
             .await;
         self.observe_group_synchronization(group_id, result, |synchronized| {
             synchronized.connection_type
@@ -1064,19 +1066,23 @@ impl NetworkService {
         key: DiscoveryKey,
         group_id: PeerId,
         expected_peer: PeerId,
+        bandwidth: &BandwidthService,
     ) -> Result<SynchronizeGroupResult, &'static str> {
         let local_peer = identity.peer_id();
         if local_peer == expected_peer {
             return Err("synchronization_peer_invalid");
         }
+        // Skip discovery while the synchronization data limit is spent
+        // (ADR-033).
+        bandwidth.ensure_sync_budget()?;
         let (mut node, connection_path) = self
             .connect_to_group_provider(identity, key, expected_peer)
             .await?;
         let synchronized_events = self
-            .pull_from_connected_peer(&mut node, expected_peer, group_id)
+            .pull_from_connected_peer(&mut node, expected_peer, group_id, Some(bandwidth))
             .await?;
         let uploaded_events = self
-            .push_to_connected_peer(&mut node, expected_peer, group_id, local_peer)
+            .push_to_connected_peer(&mut node, expected_peer, group_id, local_peer, bandwidth)
             .await?;
         self.exchange_observed_heads(&mut node, expected_peer, group_id, local_peer)
             .await?;
@@ -1178,10 +1184,14 @@ impl NetworkService {
         node: &mut NetworkNode,
         peer_id: PeerId,
         group_id: PeerId,
+        bandwidth: Option<&BandwidthService>,
     ) -> Result<usize, &'static str> {
         let (mut session, mut request) = PullSession::start(group_id);
         let mut inserted = 0_usize;
         for _ in 0..MAX_SYNC_EXCHANGES {
+            if let Some(bandwidth) = bandwidth {
+                bandwidth.ensure_sync_budget()?;
+            }
             let request_id = node
                 .send_sync_request(peer_id, request)
                 .map_err(|_| "synchronization_failed")?;
@@ -1208,6 +1218,9 @@ impl NetworkService {
             })
             .await
             .map_err(|_| "synchronization_timed_out")??;
+            if let Some(bandwidth) = bandwidth {
+                bandwidth.charge_sync_bytes(response_event_bytes(&response));
+            }
             if let SyncResponse::Rejected { reason } = response {
                 return Err(match reason {
                     SyncRejectReason::Unauthorized => "synchronization_unauthorized",
@@ -1233,6 +1246,7 @@ impl NetworkService {
         peer_id: PeerId,
         group_id: PeerId,
         author_id: PeerId,
+        bandwidth: &BandwidthService,
     ) -> Result<usize, &'static str> {
         let mut after_sequence = 0_u64;
         let mut inserted = 0_usize;
@@ -1252,6 +1266,9 @@ impl NetworkService {
             if last_sequence <= after_sequence {
                 return Err("synchronization_failed");
             }
+            bandwidth.ensure_sync_budget()?;
+            // Pushed events are charged once sent, whatever the answer.
+            let pushed_bytes = request_event_bytes(&request);
             let request_id = node
                 .send_sync_request(peer_id, request)
                 .map_err(|_| "synchronization_failed")?;
@@ -1278,6 +1295,7 @@ impl NetworkService {
             })
             .await
             .map_err(|_| "synchronization_timed_out")??;
+            bandwidth.charge_sync_bytes(pushed_bytes);
             match response {
                 SyncResponse::EventsAccepted {
                     group_id: response_group,
@@ -1350,6 +1368,26 @@ impl NetworkService {
             _ => Err("synchronization_failed"),
         }
     }
+}
+
+/// Signed event bytes a synchronization request pushes (ADR-033).
+fn request_event_bytes(request: &SyncRequest) -> u64 {
+    match request {
+        SyncRequest::PushEvents { encoded_events, .. } => encoded_bytes(encoded_events),
+        _ => 0,
+    }
+}
+
+/// Signed event bytes a synchronization response delivers (ADR-033).
+fn response_event_bytes(response: &SyncResponse) -> u64 {
+    match response {
+        SyncResponse::Events { encoded_events, .. } => encoded_bytes(encoded_events),
+        _ => 0,
+    }
+}
+
+fn encoded_bytes(encoded_events: &[Vec<u8>]) -> u64 {
+    encoded_events.iter().map(|event| event.len() as u64).sum()
 }
 
 fn join_response(
@@ -1553,6 +1591,8 @@ mod tests {
     use openmls::prelude::{tls_codec::Serialize, CredentialWithKey, KeyPackage, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
     use tokio::time::timeout;
+
+    use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
         join_response, parse_bootstrap_peer, AdvertisementResult, BootstrapNodeStatus,
@@ -1987,6 +2027,34 @@ mod tests {
     }
 
     #[test]
+    fn spent_synchronization_budget_skips_discovery_and_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        bandwidth
+            .set(BandwidthPreference {
+                sync_limit_mib_per_hour: Some(1),
+            })
+            .unwrap();
+        bandwidth.charge_sync_bytes(2 * 1024 * 1024);
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let group_id = DeviceIdentity::generate().peer_id();
+
+        let result = tauri::async_runtime::block_on(service.synchronize(
+            DeviceIdentity::generate(),
+            DiscoveryKey::from_bytes([7; 32]),
+            group_id,
+            DeviceIdentity::generate().peer_id(),
+            &bandwidth,
+        ));
+
+        assert_eq!(result.unwrap_err(), "synchronization_bandwidth_limited");
+        assert_eq!(
+            service.group_connection_states(&[group_id])[0].state,
+            "waiting"
+        );
+    }
+
+    #[test]
     fn group_connection_states_follow_the_latest_synchronization_attempt() {
         let service = NetworkService::from_sources(&[], "").unwrap();
         let first = DeviceIdentity::generate().peer_id();
@@ -2307,6 +2375,9 @@ mod tests {
             .expect("advertisement should complete")
             .unwrap();
 
+            let bandwidth_directory = tempfile::tempdir().unwrap();
+            let bandwidth =
+                BandwidthService::new(bandwidth_directory.path().join("bandwidth.json"));
             let member_service = NetworkService::from_sources_with_authorizer(
                 &[],
                 &bootstrap,
@@ -2324,6 +2395,7 @@ mod tests {
                 discovery_key,
                 invitation.group_id(),
                 owner_id,
+                &bandwidth,
             );
             tokio::pin!(synchronize);
             let result = timeout(Duration::from_secs(15), async {

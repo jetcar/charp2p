@@ -74,6 +74,8 @@ type EvidenceExport = {
 };
 type BackgroundPreference = { keepRunningWhenClosed: boolean; launchAtLogin: boolean };
 type BackgroundStatus = { available: boolean; preference: BackgroundPreference };
+type BandwidthPreference = { syncLimitMibPerHour: number | null };
+type BandwidthStatus = { preference: BandwidthPreference; remainingSyncBytes: number | null };
 type AppInformation = {
   appVersion: string;
   os: string;
@@ -211,6 +213,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   join_unauthorized: "The group owner did not accept this invitation.",
   join_unsupported_profile: "The group uses an unsupported security profile.",
   synchronization_busy: "The group peer is busy. Try again shortly.",
+  synchronization_bandwidth_limited: "The synchronization data limit for this hour is used. Synchronization resumes as it refills.",
+  bandwidth_limit_invalid: "Enter a synchronization limit between 1 and 1024 MiB per hour.",
+  bandwidth_preference_invalid: "The saved bandwidth limit is damaged. Save a new limit to resume synchronization.",
+  bandwidth_preference_unavailable: "The bandwidth limit could not be read or saved on this device.",
   synchronization_failed: "Group synchronization failed. Try again.",
   synchronization_limit_exceeded: "Group synchronization exceeded its safe exchange limit.",
   synchronization_peer_invalid: "The saved synchronization peer is invalid.",
@@ -991,6 +997,99 @@ function BackgroundSection() {
   );
 }
 
+const MAX_SYNC_LIMIT_MIB_PER_HOUR = 1024;
+
+function BandwidthSection() {
+  const [status, setStatus] = useState<BandwidthStatus | null>(null);
+  const [limited, setLimited] = useState(false);
+  const [limitMib, setLimitMib] = useState(64);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function show(next: BandwidthStatus) {
+    setStatus(next);
+    setLimited(next.preference.syncLimitMibPerHour !== null);
+    if (next.preference.syncLimitMibPerHour !== null) setLimitMib(next.preference.syncLimitMibPerHour);
+  }
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<BandwidthStatus>("bandwidth_status")
+      .then((next) => {
+        if (active) show(next);
+      })
+      .catch((caught) => {
+        if (active) setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const limitValid = Number.isInteger(limitMib) && limitMib >= 1 && limitMib <= MAX_SYNC_LIMIT_MIB_PER_HOUR;
+  const stored = status?.preference.syncLimitMibPerHour ?? null;
+  const changed = !status || (limited ? stored !== limitMib : stored !== null);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      const preference: BandwidthPreference = { syncLimitMibPerHour: limited ? limitMib : null };
+      show(await invoke<BandwidthStatus>("set_bandwidth_preference", { preference }));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3>Bandwidth</h3>
+      <p>
+        Limits how much message data this device downloads and uploads when synchronizing groups. Network contribution
+        has its own limits on the Network page.
+      </p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <form onSubmit={(event) => void save(event)}>
+        <label className="contribution-option">
+          <input
+            checked={limited}
+            disabled={saving}
+            onChange={(event) => setLimited(event.target.checked)}
+            type="checkbox"
+          />
+          Limit synchronization data
+        </label>
+        {limited && (
+          <div className="contribution-limits">
+            <label>
+              MiB per hour (1–{MAX_SYNC_LIMIT_MIB_PER_HOUR})
+              <input
+                disabled={saving}
+                max={MAX_SYNC_LIMIT_MIB_PER_HOUR}
+                min={1}
+                onChange={(event) => setLimitMib(event.target.valueAsNumber)}
+                type="number"
+                value={Number.isNaN(limitMib) ? "" : limitMib}
+              />
+            </label>
+            {!limitValid && <p>Enter a whole number within the limit shown.</p>}
+          </div>
+        )}
+        {status?.remainingSyncBytes != null && !changed && (
+          <p>{formatStorageBytes(status.remainingSyncBytes)} available now. Unused allowance refills over the hour.</p>
+        )}
+        <button className="secondary-button" disabled={saving || !changed || (limited && !limitValid)} type="submit">
+          {saving ? "Saving…" : "Save bandwidth limit"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function SettingsView({ onClose }: { onClose: () => void }) {
   const [information, setInformation] = useState<AppInformation | null>(null);
   const [error, setError] = useState("");
@@ -1029,6 +1128,7 @@ function SettingsView({ onClose }: { onClose: () => void }) {
           <p>Messages are kept on this device until you hide them or leave the group. Hiding affects only this device.</p>
         </section>
         <BackgroundSection />
+        <BandwidthSection />
         <section>
           <h3>Node policy</h3>
           <p>

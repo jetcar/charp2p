@@ -1,4 +1,5 @@
 mod background;
+mod bandwidth;
 mod contribution;
 pub mod groups;
 mod identity;
@@ -12,6 +13,7 @@ mod settings;
 use std::sync::{Arc, Mutex};
 
 use background::{BackgroundPreference, BackgroundService, BackgroundStatus};
+use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
@@ -337,6 +339,7 @@ async fn synchronize_group(
     pending_service: tauri::State<'_, PendingInvitationService>,
     network_service: tauri::State<'_, NetworkService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    bandwidth_service: tauri::State<'_, BandwidthService>,
 ) -> Result<SynchronizeGroupResult, String> {
     let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
     if !mls_service.has_group(group_id).map_err(str::to_owned)? {
@@ -349,7 +352,13 @@ async fn synchronize_group(
         .joined_sync_target(group_id)
         .map_err(str::to_owned)?;
     let result = network_service
-        .synchronize(identity, discovery_key, group_id, inviter_device_id)
+        .synchronize(
+            identity,
+            discovery_key,
+            group_id,
+            inviter_device_id,
+            &bandwidth_service,
+        )
         .await
         .map_err(str::to_owned)?;
     pending_service
@@ -632,6 +641,25 @@ fn set_launch_at_login(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), &'
     Err("launch_at_login_unavailable")
 }
 
+/// Reports the device-local synchronization data limit and the budget left
+/// now (ADR-033).
+#[tauri::command]
+fn bandwidth_status(
+    service: tauri::State<'_, BandwidthService>,
+) -> Result<BandwidthStatus, String> {
+    service.status().map_err(str::to_owned)
+}
+
+/// Stores the device-local synchronization data limit; the next
+/// synchronization exchange is metered against it.
+#[tauri::command]
+fn set_bandwidth_preference(
+    preference: BandwidthPreference,
+    service: tauri::State<'_, BandwidthService>,
+) -> Result<BandwidthStatus, String> {
+    service.set(preference).map_err(str::to_owned)
+}
+
 /// Exits the application, including when closing the window would only hide
 /// it.
 #[tauri::command]
@@ -798,6 +826,7 @@ pub fn run() {
             app.manage(ContributionService::new(
                 data_directory.join("contribution.json"),
             ));
+            app.manage(BandwidthService::new(data_directory.join("bandwidth.json")));
             app.manage(SettingsService::new(database_path));
 
             // Resume an opted-in contribution from the stored preference; a
@@ -870,6 +899,8 @@ pub fn run() {
             background_status,
             set_background_preference,
             quit_app,
+            bandwidth_status,
+            set_bandwidth_preference,
             contribution_status,
             set_contribution_preference
         ])

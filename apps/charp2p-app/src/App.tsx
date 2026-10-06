@@ -52,6 +52,10 @@ type NetworkStatus = {
   advertisingStatus: "advertising" | "bootstrapRequired" | "inactive";
   advertisedDiscoveryKeys: number;
 };
+type NetworkDiagnostics = {
+  format: string;
+  generatedAtUnix: number;
+};
 type UnreadMessageCount = { groupId: string; count: number };
 type SynchronizeGroupResult = {
   status: "synchronized";
@@ -569,6 +573,35 @@ function networkConnectionDescription(status: NetworkStatus) {
 function NetworkView({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
   const [error, setError] = useState("");
+  const [diagnosticsText, setDiagnosticsText] = useState("");
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+
+  async function exportDiagnostics() {
+    setError("");
+    setDiagnosticsCopied(false);
+    try {
+      const diagnostics = await invoke<NetworkDiagnostics>("network_diagnostics");
+      const text = JSON.stringify(diagnostics, null, 2);
+      const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `charp2p-diagnostics-${diagnostics.generatedAtUnix}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      setDiagnosticsText(text);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    }
+  }
+
+  async function copyDiagnostics() {
+    try {
+      await navigator.clipboard.writeText(diagnosticsText);
+      setDiagnosticsCopied(true);
+    } catch {
+      setError("The report could not be copied. Select the text and copy it manually.");
+    }
+  }
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -630,6 +663,21 @@ function NetworkView({ onClose }: { onClose: () => void }) {
             </ul>
           ) : (
             <p>No nodes configured. Set CHARP2P_BOOTSTRAP_NODES to connect beyond the local network.</p>
+          )}
+        </section>
+        <section>
+          <h3>Diagnostics</h3>
+          <p>Exports connection state, node addresses, app version and group counts. Keys, invitations, group names and messages are never included.</p>
+          <button className="secondary-button" disabled={!isTauri()} onClick={() => void exportDiagnostics()} type="button">
+            Export diagnostics
+          </button>
+          {diagnosticsText && (
+            <>
+              <textarea aria-label="Diagnostic report" className="backup-text" readOnly rows={8} value={diagnosticsText} />
+              <button className="secondary-button" onClick={() => void copyDiagnostics()} type="button">
+                {diagnosticsCopied ? "Copied" : "Copy report"}
+              </button>
+            </>
           )}
         </section>
       </div>

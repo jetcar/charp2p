@@ -13,7 +13,8 @@ use mls_storage::{
     CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage, UnreadMessageCount,
 };
 use network::{
-    AdvertisementResult, NetworkService, NetworkStatus, PeerSearchResult, SynchronizeGroupResult,
+    AdvertisementResult, NetworkDiagnostics, NetworkService, NetworkStatus, PeerSearchResult,
+    SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
@@ -497,6 +498,21 @@ async fn network_status(
     Ok(network_service.status().await)
 }
 
+/// Builds the Network page diagnostic export. Groups are reported only as
+/// counts; identity, invitation and discovery secrets are never read.
+#[tauri::command]
+async fn network_diagnostics(
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<NetworkDiagnostics, String> {
+    let owned_groups = group_service.list().map_err(str::to_owned)?.len();
+    let joined_groups = pending_service.joined().map_err(str::to_owned)?.len();
+    Ok(network_service
+        .diagnostics(owned_groups, joined_groups)
+        .await)
+}
+
 /// Advertises every owned group from one background provider, independent of
 /// the group currently open in the interface.
 #[tauri::command]
@@ -620,7 +636,8 @@ pub fn run() {
             blocked_group_devices,
             set_group_device_blocked,
             advertise_owned_groups,
-            network_status
+            network_status,
+            network_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

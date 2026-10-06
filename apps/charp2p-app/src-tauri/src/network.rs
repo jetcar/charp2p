@@ -191,6 +191,24 @@ pub struct NetworkStatus {
     pub advertised_discovery_keys: usize,
 }
 
+/// Diagnostic report a user can export from the Network page. It is built
+/// only from non-secret state: no identity keys, own peer id, group ids or
+/// names, invitations, discovery keys or message content.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDiagnostics {
+    pub format: &'static str,
+    pub app_version: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub generated_at_unix: u64,
+    pub network: NetworkStatus,
+    pub owned_groups: usize,
+    pub joined_groups: usize,
+}
+
+pub const DIAGNOSTICS_FORMAT: &str = "charp2p-diagnostics-v1";
+
 #[derive(Clone, Copy)]
 struct ObservedConnection {
     connection_type: &'static str,
@@ -375,6 +393,27 @@ impl NetworkService {
                 .collect(),
             advertising_status,
             advertised_discovery_keys,
+        }
+    }
+
+    /// Builds the secret-free diagnostic report; callers pass only group
+    /// counts so identifiers never reach it.
+    pub async fn diagnostics(
+        &self,
+        owned_groups: usize,
+        joined_groups: usize,
+    ) -> NetworkDiagnostics {
+        NetworkDiagnostics {
+            format: DIAGNOSTICS_FORMAT,
+            app_version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            generated_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+            network: self.status().await,
+            owned_groups,
+            joined_groups,
         }
     }
 
@@ -1233,7 +1272,7 @@ mod tests {
         JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, NetworkService,
         NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
         SynchronizationService, UnavailableJoinRequestAuthorizer,
-        UnavailableMemberAdmissionService, UnavailablePendingJoinService,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -1582,6 +1621,47 @@ mod tests {
         let status = tauri::async_runtime::block_on(service.status());
         assert_eq!(status.connection_type, Some("offline"));
         assert!(status.connection_observed_at_unix > 0);
+    }
+
+    #[test]
+    fn diagnostics_contain_counts_and_status_but_no_identifiers() {
+        let bootstrap_peer = DeviceIdentity::generate().peer_id();
+        let configured = format!("/ip4/10.0.0.2/udp/9001/quic-v1/p2p/{bootstrap_peer}");
+        let service = NetworkService::from_sources(&[], &configured).unwrap();
+        let _ = service.observe_connection(Ok("relayed"), |path| Some(*path));
+
+        let diagnostics = tauri::async_runtime::block_on(service.diagnostics(2, 3));
+
+        assert_eq!(diagnostics.format, DIAGNOSTICS_FORMAT);
+        assert_eq!(diagnostics.app_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(diagnostics.os, std::env::consts::OS);
+        assert!(diagnostics.generated_at_unix > 0);
+        assert_eq!(diagnostics.network.connection_type, Some("relayed"));
+        assert_eq!(diagnostics.network.bootstrap_nodes.len(), 1);
+        assert_eq!(
+            (diagnostics.owned_groups, diagnostics.joined_groups),
+            (2, 3)
+        );
+        let json = serde_json::to_value(&diagnostics).unwrap();
+        let keys = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "appVersion",
+                "arch",
+                "format",
+                "generatedAtUnix",
+                "joinedGroups",
+                "network",
+                "os",
+                "ownedGroups",
+            ]
+        );
     }
 
     #[test]

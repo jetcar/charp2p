@@ -9,6 +9,7 @@ mod group_metadata;
 mod identity;
 mod invitation;
 mod join;
+mod message_edit;
 mod sync;
 
 pub use discovery::DiscoveryKey;
@@ -25,6 +26,7 @@ pub use join::{
     MAX_JOIN_REQUEST_WIRE_BYTES, MAX_JOIN_RESPONSE_WIRE_BYTES,
 };
 pub use libp2p_identity::{PeerId, PublicKey, SigningError};
+pub use message_edit::{MAX_MESSAGE_EDIT_TEXT_BYTES, MessageEdit, MessageEditError};
 pub use sync::{
     MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_EVENT_BYTES, MAX_SYNC_RESPONSE_BYTES,
     SyncAuthorHead, SyncError, SyncRejectReason, SyncRequest, SyncResponse,

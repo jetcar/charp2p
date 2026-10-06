@@ -353,6 +353,13 @@ admitted them, and the change with the owner's highest author sequence is the
 current name. Metadata changes are delivered by pull synchronization and are
 never accepted through member pushes.
 
+A `MessageEdited` event carries a versioned edit (target `MessageCreated`
+event identifier and replacement text, at most 16 KiB) as an MLS application
+message. Clients display an edit only when its author is the target message's
+author, and the edit with that author's highest sequence is shown with an
+"edited" marker. The original signed event is retained. Members may push their
+own edits in the same way as their own messages.
+
 Deletion is a signed tombstone request. It hides content in conforming clients
 but cannot guarantee erasure from devices that already received it.
 

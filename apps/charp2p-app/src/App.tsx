@@ -65,6 +65,7 @@ type CreatedMessage = {
 
 type StoredMessage = CreatedMessage & {
   text: string;
+  edited: boolean;
   deliveryState: "local" | "sharedWithPeer" | "received";
 };
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
@@ -148,6 +149,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_delete_failed: "The local message copy could not be deleted.",
   message_delivery_state_unavailable: "The message was shared, but its delivery state could not be saved.",
   message_not_found: "That message is no longer stored on this device.",
+  message_not_own: "Only messages sent from this device can be edited.",
   message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",
   message_store_unavailable: "The encrypted message could not be saved.",
@@ -554,6 +556,8 @@ function App() {
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [deletingMessage, setDeletingMessage] = useState("");
+  const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
   const [removingMember, setRemovingMember] = useState("");
@@ -1239,6 +1243,7 @@ function App() {
           authorSequence: created.authorSequence,
           createdAtUnixMs: created.createdAtUnixMs,
           text,
+          edited: false,
           deliveryState: "local",
         },
       ]);
@@ -1259,6 +1264,60 @@ function App() {
     } catch {
       setError("The message could not be copied.");
     }
+  }
+
+  async function saveMessageEdit(message: StoredMessage) {
+    if (!editingMessage || editingMessage.eventId !== message.eventId || savingEdit || !isTauri()) return;
+    const text = editingMessage.text;
+    if (!text.trim() || new TextEncoder().encode(text).length > MESSAGE_TEXT_LIMIT_BYTES) {
+      setError(errorMessage("message_invalid"));
+      return;
+    }
+    if (text === message.text) {
+      setEditingMessage(null);
+      return;
+    }
+
+    setError("");
+    setSavingEdit(true);
+    try {
+      await invoke("edit_group_message", {
+        groupId: message.groupId,
+        eventId: message.eventId,
+        message: text,
+      });
+      setGroupMessages((messages) => messages.map((candidate) => (
+        candidate.eventId === message.eventId ? { ...candidate, text, edited: true } : candidate
+      )));
+      setEditingMessage(null);
+      if (joinedGroup?.groupId === message.groupId) {
+        void performJoinedGroupSynchronization(message.groupId, false);
+      }
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  function renderMessageText(message: StoredMessage) {
+    if (editingMessage?.eventId !== message.eventId) return <p>{message.text}</p>;
+    return (
+      <form className="message-edit" onSubmit={(event) => { event.preventDefault(); void saveMessageEdit(message); }}>
+        <textarea
+          aria-label="Edit message"
+          maxLength={16384}
+          onChange={(event) => setEditingMessage({ eventId: message.eventId, text: event.target.value })}
+          value={editingMessage.text}
+        />
+        <div className="message-actions">
+          <button disabled={savingEdit} onClick={() => setEditingMessage(null)} type="button">Cancel</button>
+          <button disabled={savingEdit || !editingMessage.text.trim()} type="submit">
+            {savingEdit ? "Saving…" : "Save edit"}
+          </button>
+        </div>
+      </form>
+    );
   }
 
   async function hideMessage(message: StoredMessage) {
@@ -1596,16 +1655,26 @@ function App() {
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
-                      <p>{message.text}</p>
+                      {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile, joinedGroup)}
                         {" · "}{messageTime(message.createdAtUnixMs)}
+                        {message.edited && " · Edited"}
                         {message.authorId === profile?.peerId && (
                           <>{" · "}{messageDeliveryLabel(message)}</>
                         )}
                       </time>
                       <div className="message-actions">
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>
+                        {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
+                          <button
+                            disabled={savingEdit}
+                            onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                        )}
                         <button
                           disabled={Boolean(deletingMessage)}
                           onClick={() => void hideMessage(message)}
@@ -1730,15 +1799,25 @@ function App() {
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
-                      <p>{message.text}</p>
+                      {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
+                        {message.edited && " · Edited"}
                         {message.authorId === profile?.peerId && (
                           <>{" · "}{messageDeliveryLabel(message)}</>
                         )}
                       </time>
                       <div className="message-actions">
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>
+                        {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
+                          <button
+                            disabled={savingEdit}
+                            onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                        )}
                         <button
                           disabled={Boolean(deletingMessage)}
                           onClick={() => void hideMessage(message)}

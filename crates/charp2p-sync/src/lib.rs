@@ -83,7 +83,8 @@ pub fn build_authorized_response(
 
 /// Validates and atomically stores events uploaded by an authenticated group member.
 ///
-/// Uploads are restricted to messages signed by the connected device. Membership
+/// Uploads are restricted to messages and message edits signed by the connected
+/// device. Membership
 /// authorization remains the caller's responsibility.
 pub fn accept_pushed_events(
     store: &mut EventStore,
@@ -101,7 +102,10 @@ pub fn accept_pushed_events(
         if event.author_id() != authenticated_peer {
             return Err(SynchronizationError::PushedAuthorMismatch);
         }
-        if event.kind() != EventKind::MessageCreated {
+        if !matches!(
+            event.kind(),
+            EventKind::MessageCreated | EventKind::MessageEdited
+        ) {
             return Err(SynchronizationError::UnsupportedPushedEvent);
         }
         events.push(event);
@@ -365,7 +369,7 @@ pub enum SynchronizationError {
     /// An uploaded event was not authored by the authenticated connection.
     #[error("uploaded event author does not match the authenticated peer")]
     PushedAuthorMismatch,
-    /// Only group messages can be uploaded by a member.
+    /// Only group messages and message edits can be uploaded by a member.
     #[error("uploaded event kind is not supported")]
     UnsupportedPushedEvent,
 }
@@ -513,6 +517,54 @@ mod tests {
                 .already_present,
             1
         );
+    }
+
+    #[test]
+    fn push_accepts_message_edits_and_rejects_membership_events() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let event_of = |sequence, kind| {
+            SignedEvent::create(
+                &author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"protected",
+                },
+            )
+            .unwrap()
+        };
+        let mut store = EventStore::in_memory().unwrap();
+        let edits = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![
+                message_event(&author, &group, 1, b"message")
+                    .encode()
+                    .unwrap(),
+                event_of(2, EventKind::MessageEdited).encode().unwrap(),
+            ],
+        };
+        assert_eq!(
+            accept_pushed_events(&mut store, author.peer_id(), &edits)
+                .unwrap()
+                .inserted,
+            2
+        );
+        let metadata = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![
+                event_of(3, EventKind::GroupMetadataChanged)
+                    .encode()
+                    .unwrap(),
+            ],
+        };
+        assert!(matches!(
+            accept_pushed_events(&mut store, author.peer_id(), &metadata),
+            Err(SynchronizationError::UnsupportedPushedEvent)
+        ));
     }
 
     #[test]

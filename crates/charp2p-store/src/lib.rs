@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -119,6 +119,15 @@ pub struct EncryptedMessage {
     pub author_id: PeerId,
     pub author_sequence: u64,
     pub created_at_unix_ms: u64,
+    pub encrypted_body: Vec<u8>,
+    /// Latest applied edit by the same author, if any.
+    pub edit: Option<EncryptedMessageEdit>,
+}
+
+/// Locally encrypted replacement text from a signed `MessageEdited` event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedMessageEdit {
+    pub event_id: [u8; 32],
     pub encrypted_body: Vec<u8>,
 }
 
@@ -379,9 +388,17 @@ impl EventStore {
     pub fn encrypted_messages(&self, group_id: PeerId) -> Result<EncryptedMessagePage, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT e.encoded, m.group_id, m.author_id, m.created_at_unix_ms,
-                    m.encrypted_body
+                    m.encrypted_body, x.event_id, x.encrypted_body
              FROM materialized_messages m
              JOIN events e ON e.event_id = m.event_id
+             LEFT JOIN applied_message_edits x ON x.event_id = (
+                 SELECT latest.event_id FROM applied_message_edits latest
+                 WHERE latest.target_event_id = m.event_id
+                   AND latest.group_id = m.group_id
+                   AND latest.author_id = m.author_id
+                 ORDER BY latest.author_sequence DESC
+                 LIMIT 1
+             )
              WHERE m.group_id = ?1
                AND NOT EXISTS (
                    SELECT 1 FROM blocked_local_devices b
@@ -399,12 +416,22 @@ impl EventStore {
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                 ))
             },
         )?;
         let mut messages = Vec::with_capacity(MAX_RECENT_MESSAGE_EVENTS + 1);
         for row in rows {
-            let (encoded, stored_group, stored_author, stored_created_at, encrypted_body) = row?;
+            let (
+                encoded,
+                stored_group,
+                stored_author,
+                stored_created_at,
+                encrypted_body,
+                edit_event_id,
+                edit_body,
+            ) = row?;
             let event = SignedEvent::decode(&encoded)?;
             let created_at_unix_ms =
                 u64::try_from(stored_created_at).map_err(|_| StoreError::CorruptIndex)?;
@@ -417,6 +444,17 @@ impl EventStore {
             {
                 return Err(StoreError::CorruptIndex);
             }
+            let edit = match (edit_event_id, edit_body) {
+                (Some(event_id), Some(encrypted_body)) => {
+                    validate_encrypted_message_body(&encrypted_body)?;
+                    Some(EncryptedMessageEdit {
+                        event_id: event_id.try_into().map_err(|_| StoreError::CorruptIndex)?,
+                        encrypted_body,
+                    })
+                }
+                (None, None) => None,
+                _ => return Err(StoreError::CorruptIndex),
+            };
             messages.push(EncryptedMessage {
                 event_id: *event.id().as_bytes(),
                 group_id,
@@ -424,6 +462,7 @@ impl EventStore {
                 author_sequence: event.author_sequence(),
                 created_at_unix_ms,
                 encrypted_body,
+                edit,
             });
         }
         let has_earlier = messages.len() > MAX_RECENT_MESSAGE_EVENTS;
@@ -619,6 +658,67 @@ impl EventStore {
             .collect()
     }
 
+    /// Returns the author of a message still readable on this device, or
+    /// `None` when it is unknown or hidden locally.
+    pub fn materialized_message_author(
+        &self,
+        group_id: PeerId,
+        event_id: &[u8; 32],
+    ) -> Result<Option<PeerId>, StoreError> {
+        let author = self
+            .connection
+            .query_row(
+                "SELECT author_id FROM materialized_messages
+                 WHERE event_id = ?1 AND group_id = ?2",
+                params![event_id.as_slice(), group_id.to_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        author
+            .map(|author| PeerId::from_bytes(&author).map_err(|_| StoreError::CorruptIndex))
+            .transpose()
+    }
+
+    /// Atomically stores a decrypted message edit, its locally encrypted
+    /// replacement text, and the advanced encrypted MLS provider state. The
+    /// edit is displayed only for a target message by the same author; the
+    /// edit with the highest author sequence wins.
+    pub fn put_message_edit_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        target_event_id: &[u8; 32],
+        encrypted_body: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MessageEdited {
+            return Err(StoreError::InvalidMessageEditEvent);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        validate_encrypted_message_body(encrypted_body)?;
+        let sequence = i64::try_from(event.author_sequence())
+            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "INSERT INTO applied_message_edits (
+                event_id, group_id, author_id, author_sequence, target_event_id,
+                encrypted_body
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+                sequence,
+                target_event_id.as_slice(),
+                encrypted_body,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Atomically stores a decrypted group-metadata change and the advanced
     /// encrypted MLS provider state. The caller authorizes the author; the
     /// change with the highest author sequence becomes the current name.
@@ -679,7 +779,7 @@ impl EventStore {
         .collect()
     }
 
-    /// Returns at most `limit` verified message and group-metadata events that
+    /// Returns at most `limit` verified message, edit, and group-metadata events that
     /// have not been decrypted locally yet. Events are ordered by author and
     /// sequence so each sender ratchet advances consistently.
     pub fn unmaterialized_message_events(
@@ -696,8 +796,9 @@ impl EventStore {
              LEFT JOIN materialized_messages m ON m.event_id = e.event_id
              LEFT JOIN hidden_local_messages h ON h.event_id = e.event_id
              LEFT JOIN applied_group_metadata g ON g.event_id = e.event_id
+             LEFT JOIN applied_message_edits x ON x.event_id = e.event_id
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
-               AND g.event_id IS NULL
+               AND g.event_id IS NULL AND x.event_id IS NULL
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
@@ -710,6 +811,7 @@ impl EventStore {
             if matches!(
                 event.kind(),
                 charp2p_core::EventKind::MessageCreated
+                    | charp2p_core::EventKind::MessageEdited
                     | charp2p_core::EventKind::GroupMetadataChanged
             ) {
                 events.push(event);
@@ -1576,7 +1678,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=17 => {}
+            6..=18 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1803,6 +1905,28 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 18 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS applied_message_edits (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    target_event_id BLOB NOT NULL CHECK(length(target_event_id) = 32),
+                    encrypted_body BLOB NOT NULL
+                        CHECK(length(encrypted_body) BETWEEN 1 AND 16426)
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS applied_message_edits_by_target
+                    ON applied_message_edits(target_event_id, author_sequence);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -1991,6 +2115,9 @@ pub enum StoreError {
     /// Only a signed message-creation event can materialize a message body.
     #[error("event is not a message creation")]
     InvalidMessageEvent,
+    /// Only a signed message-edit event can replace message text.
+    #[error("event is not a message edit")]
+    InvalidMessageEditEvent,
     /// Only a signed metadata-change event can update group metadata.
     #[error("event is not a group metadata change")]
     InvalidGroupMetadataEvent,
@@ -2850,6 +2977,7 @@ mod tests {
                     author_sequence: event.author_sequence(),
                     created_at_unix_ms: event.created_at_unix_ms(),
                     encrypted_body: b"encrypted local message".to_vec(),
+                    edit: None,
                 }],
                 has_earlier: false,
             }
@@ -3169,6 +3297,137 @@ mod tests {
         assert_eq!(
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"snapshot one"
+        );
+    }
+
+    #[test]
+    fn latest_same_author_edit_replaces_message_text() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let edit_event = |device: &DeviceIdentity, sequence| {
+            SignedEvent::create(
+                device,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::MessageEdited,
+                    protected_payload: b"protected edit",
+                },
+            )
+            .unwrap()
+        };
+        let message = message_event(&author, &group, 1, b"protected message");
+        let first_edit = edit_event(&author, 2);
+        let second_edit = edit_event(&author, 3);
+        let foreign_edit = edit_event(&other, 1);
+        for event in [&message, &first_edit, &second_edit, &foreign_edit] {
+            store.put_event(event).unwrap();
+        }
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(matches!(
+            store.put_message_edit_and_encrypted_mls_provider_snapshot(
+                &message,
+                b"snapshot",
+                message.id().as_bytes(),
+                b"edit body",
+            ),
+            Err(StoreError::InvalidMessageEditEvent)
+        ));
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(&message, b"snapshot", b"original")
+            .unwrap();
+        let target = *message.id().as_bytes();
+        assert_eq!(
+            store
+                .materialized_message_author(group.group_id(), &target)
+                .unwrap(),
+            Some(author.peer_id())
+        );
+        assert_eq!(
+            store
+                .materialized_message_author(group.group_id(), second_edit.id().as_bytes())
+                .unwrap(),
+            None
+        );
+        store
+            .put_message_edit_and_encrypted_mls_provider_snapshot(
+                &foreign_edit,
+                b"snapshot",
+                &target,
+                b"forged",
+            )
+            .unwrap();
+        let page = store.encrypted_messages(group.group_id()).unwrap();
+        assert_eq!(page.messages[0].edit, None, "other devices cannot edit");
+
+        store
+            .put_message_edit_and_encrypted_mls_provider_snapshot(
+                &second_edit,
+                b"snapshot",
+                &target,
+                b"second",
+            )
+            .unwrap();
+        store
+            .put_message_edit_and_encrypted_mls_provider_snapshot(
+                &first_edit,
+                b"snapshot",
+                &target,
+                b"first",
+            )
+            .unwrap();
+        let page = store.encrypted_messages(group.group_id()).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].encrypted_body, b"original");
+        assert_eq!(
+            page.messages[0].edit,
+            Some(super::EncryptedMessageEdit {
+                event_id: *second_edit.id().as_bytes(),
+                encrypted_body: b"second".to_vec(),
+            })
+        );
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.unread_message_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_eighteen_database_adds_message_edits() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_message_edits;
+                     PRAGMA user_version = 18;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let group = GroupIdentity::generate();
+        assert!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
         );
     }
 

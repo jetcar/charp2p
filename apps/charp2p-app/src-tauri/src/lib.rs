@@ -309,6 +309,24 @@ fn send_group_message(
 }
 
 #[tauri::command]
+fn edit_group_message(
+    group_id: String,
+    event_id: String,
+    message: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let event_id = parse_event_id(&event_id)?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .edit_message(group_id, &identity, &event_id, &message)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn group_messages(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -519,6 +537,7 @@ pub fn run() {
             join_group,
             synchronize_group,
             send_group_message,
+            edit_group_message,
             group_messages,
             hide_group_message,
             unread_message_counts,

@@ -595,14 +595,41 @@ fn background_status(
     service.status().map_err(str::to_owned)
 }
 
-/// Stores the device-local background preference. It applies to the next
+/// Registers or removes the operating system login entry, then stores the
+/// device-local background preference. Keeping running applies to the next
 /// window close request. Refused on builds without background running.
 #[tauri::command]
 fn set_background_preference(
+    app: tauri::AppHandle,
     preference: BackgroundPreference,
     service: tauri::State<'_, BackgroundService>,
 ) -> Result<BackgroundStatus, String> {
+    if service.is_available() {
+        set_launch_at_login(&app, preference.launch_at_login).map_err(str::to_owned)?;
+    }
     service.set(preference).map_err(str::to_owned)
+}
+
+/// The login entry passes [`background::LOGIN_LAUNCH_ARGUMENT`] so the app can
+/// tell a login launch from one the user started.
+#[cfg(desktop)]
+fn set_launch_at_login(app: &tauri::AppHandle, enabled: bool) -> Result<(), &'static str> {
+    use tauri_plugin_autostart::ManagerExt;
+
+    let launcher = app.autolaunch();
+    let result = if enabled {
+        launcher.enable()
+    } else if launcher.is_enabled().unwrap_or(true) {
+        launcher.disable()
+    } else {
+        Ok(())
+    };
+    result.map_err(|_| "launch_at_login_unavailable")
+}
+
+#[cfg(mobile)]
+fn set_launch_at_login(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), &'static str> {
+    Err("launch_at_login_unavailable")
 }
 
 /// Exits the application, including when closing the window would only hide
@@ -698,6 +725,13 @@ pub fn run() {
         }
     }));
 
+    #[cfg(desktop)]
+    let builder = builder.plugin(
+        tauri_plugin_autostart::Builder::new()
+            .arg(background::LOGIN_LAUNCH_ARGUMENT)
+            .build(),
+    );
+
     builder
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
@@ -749,6 +783,18 @@ pub fn run() {
             app.manage(BackgroundService::new(
                 data_directory.join("background.json"),
             ));
+            // A launch at login starts hidden only when closing the window
+            // would keep running too (ADR-032); a later launch shows it.
+            let launched_at_login =
+                std::env::args().any(|argument| argument == background::LOGIN_LAUNCH_ARGUMENT);
+            if app
+                .state::<BackgroundService>()
+                .starts_hidden(launched_at_login)
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             app.manage(ContributionService::new(
                 data_directory.join("contribution.json"),
             ));

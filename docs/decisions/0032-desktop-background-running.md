@@ -31,7 +31,12 @@ holds no secrets and is not synchronized. A missing file means closing the
 window exits; an unreadable or invalid file is reported on the Settings page
 and closing the window exits.
 
-Launch at login is a separate opt-in recorded in a later increment.
+Launch at login is a separate opt-in in the same preference file, off by
+default and also offered only on Windows. Enabling it registers a per-user
+login entry through the Tauri autostart plugin that passes a launch argument;
+disabling it removes the entry. A launch at login starts with the window
+hidden only when background running is also enabled, so a hidden start always
+behaves like a closed window that a second launch shows again.
 
 ## Consequences
 
@@ -46,3 +51,4 @@ Launch at login is a separate opt-in recorded in a later increment.
 
 - https://v2.tauri.app/plugin/single-instance/
 - https://docs.rs/tauri/2/tauri/enum.WindowEvent.html
+- https://v2.tauri.app/plugin/autostart/

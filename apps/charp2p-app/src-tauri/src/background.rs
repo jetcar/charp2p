@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::preference_file::{self, PreferenceReadError};
 
+/// Passed by the operating system login entry so a launch at login can start
+/// with the window hidden.
+pub const LOGIN_LAUNCH_ARGUMENT: &str = "--launched-at-login";
+
 /// Device-local background behavior (ADR-032). Holds no secrets and is never
 /// synchronized.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -13,6 +17,10 @@ pub struct BackgroundPreference {
     /// Closing the window hides it and keeps advertising and synchronizing
     /// until the user quits or launches the app again to show it.
     pub keep_running_when_closed: bool,
+    /// The operating system starts the app when the user signs in. Missing in
+    /// files written before this option existed.
+    #[serde(default)]
+    pub launch_at_login: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -44,6 +52,10 @@ impl BackgroundService {
             available,
             lock: Mutex::new(()),
         }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available
     }
 
     pub fn status(&self) -> Result<BackgroundStatus, &'static str> {
@@ -85,6 +97,16 @@ impl BackgroundService {
             .is_ok_and(|status| status.preference.keep_running_when_closed)
     }
 
+    /// Whether a launch at login should start with the window hidden: only
+    /// when closing the window would also keep the app running, so a hidden
+    /// start never leaves an app the user cannot reach by its window.
+    pub fn starts_hidden(&self, launched_at_login: bool) -> bool {
+        launched_at_login
+            && self.status().is_ok_and(|status| {
+                status.preference.launch_at_login && status.preference.keep_running_when_closed
+            })
+    }
+
     /// A missing file means the app exits when its window closes; an
     /// unreadable or invalid file is reported instead of enabling anything.
     fn read(&self) -> Result<BackgroundPreference, &'static str> {
@@ -122,6 +144,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory is available");
         let preference = BackgroundPreference {
             keep_running_when_closed: true,
+            launch_at_login: true,
         };
 
         let stored = service(&directory)
@@ -166,11 +189,58 @@ mod tests {
         assert!(!status.available);
         assert_eq!(status.preference, BackgroundPreference::default());
         assert!(!service.keeps_running_when_closed());
+        assert!(!service.starts_hidden(true));
         assert_eq!(
             service.set(BackgroundPreference {
                 keep_running_when_closed: true,
+                launch_at_login: true,
             }),
             Err("background_unavailable")
         );
+    }
+
+    #[test]
+    fn preference_without_launch_at_login_reads_as_disabled() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        std::fs::write(
+            directory.path().join("background.json"),
+            br#"{"keepRunningWhenClosed":true}"#,
+        )
+        .expect("file is written");
+
+        let status = service(&directory).status().expect("status is available");
+
+        assert_eq!(
+            status.preference,
+            BackgroundPreference {
+                keep_running_when_closed: true,
+                launch_at_login: false,
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_login_launch_with_background_running_starts_hidden() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let service = service(&directory);
+        assert!(!service.starts_hidden(true));
+
+        for (keep_running_when_closed, launch_at_login, launched_at_login, hidden) in [
+            (true, true, true, true),
+            (true, true, false, false),
+            (false, true, true, false),
+            (true, false, true, false),
+        ] {
+            service
+                .set(BackgroundPreference {
+                    keep_running_when_closed,
+                    launch_at_login,
+                })
+                .expect("preference is stored");
+            assert_eq!(service.starts_hidden(launched_at_login), hidden);
+        }
+
+        std::fs::write(directory.path().join("background.json"), b"{").expect("file is written");
+        assert!(!service.starts_hidden(true));
     }
 }

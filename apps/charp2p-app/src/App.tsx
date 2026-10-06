@@ -72,7 +72,7 @@ type EvidenceExport = {
   generatedAtUnixMs: number;
   events: { eventId: string }[];
 };
-type BackgroundPreference = { keepRunningWhenClosed: boolean };
+type BackgroundPreference = { keepRunningWhenClosed: boolean; launchAtLogin: boolean };
 type BackgroundStatus = { available: boolean; preference: BackgroundPreference };
 type AppInformation = {
   appVersion: string;
@@ -928,12 +928,15 @@ function BackgroundSection() {
     };
   }, []);
 
-  async function save(keepRunningWhenClosed: boolean) {
+  async function save(change: Partial<BackgroundPreference>) {
+    if (!status) return;
     setSaving(true);
     setError("");
     try {
       setStatus(
-        await invoke<BackgroundStatus>("set_background_preference", { preference: { keepRunningWhenClosed } }),
+        await invoke<BackgroundStatus>("set_background_preference", {
+          preference: { ...status.preference, ...change },
+        }),
       );
     } catch (caught) {
       setError(errorMessage(caught));
@@ -954,7 +957,7 @@ function BackgroundSection() {
             <input
               checked={status?.preference.keepRunningWhenClosed ?? false}
               disabled={!status || saving}
-              onChange={(event) => void save(event.target.checked)}
+              onChange={(event) => void save({ keepRunningWhenClosed: event.target.checked })}
               type="checkbox"
             />
             Keep running when the window is closed
@@ -962,6 +965,20 @@ function BackgroundSection() {
           <p>
             Keeps advertising your groups and synchronizing while the window is hidden. Open CharP2P again to show it.
             Messages still arrive only while a group member is reachable.
+          </p>
+          <label className="contribution-option">
+            <input
+              checked={status?.preference.launchAtLogin ?? false}
+              disabled={!status || saving}
+              onChange={(event) => void save({ launchAtLogin: event.target.checked })}
+              type="checkbox"
+            />
+            Start CharP2P when you sign in
+          </label>
+          <p>
+            {status?.preference.keepRunningWhenClosed
+              ? "Starts with the window hidden. Open CharP2P to show it."
+              : "Opens the window when you sign in. Turn on keeping running when closed to start hidden."}
           </p>
           {status?.preference.keepRunningWhenClosed && (
             <button className="secondary-button" onClick={() => void invoke("quit_app")} type="button">

@@ -56,6 +56,11 @@ Android, an app-private preferences vault encrypted by Android Keystore. Secret
 bytes remain in Rust, are zeroized after protected-storage operations, and are
 never returned to the webview. ADR-007 records the adapter and record format.
 
+An encrypted identity backup holds the display name and encoded device key,
+sealed with XChaCha20-Poly1305 under a key derived from a user passphrase with
+Argon2id at fixed per-version parameters. It excludes group state. ADR-028
+records the format.
+
 A group has a root public key. Its stable identifier is a versioned hash of
 that key:
 

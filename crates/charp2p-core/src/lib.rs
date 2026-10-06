@@ -7,6 +7,7 @@ mod event;
 mod group_identity;
 mod group_metadata;
 mod identity;
+mod identity_backup;
 mod invitation;
 mod join;
 mod message_body;
@@ -18,6 +19,11 @@ pub use event::{EventError, EventId, EventKind, EventSpec, SignedEvent};
 pub use group_identity::{GroupIdentity, GroupIdentityError, GroupIdentitySecret};
 pub use group_metadata::{GroupMetadata, GroupMetadataError, MAX_GROUP_NAME_BYTES};
 pub use identity::{DeviceIdentity, DeviceIdentityError, DeviceIdentitySecret};
+pub use identity_backup::{
+    IdentityBackupError, MAX_BACKUP_PASSPHRASE_BYTES, MAX_IDENTITY_BACKUP_BYTES,
+    MIN_BACKUP_PASSPHRASE_CHARS, RestoredIdentityBackup, open_identity_backup,
+    seal_identity_backup,
+};
 pub use invitation::{
     HistoryPolicy, Invitation, InvitationError, InvitationId, InvitationSpec,
     MAX_INVITATION_ENCODED_BYTES,

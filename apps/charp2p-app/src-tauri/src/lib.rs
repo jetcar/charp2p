@@ -4,6 +4,7 @@ mod invitation;
 mod mls_storage;
 mod network;
 mod pending;
+mod settings;
 
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,7 @@ use network::{
     SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
+use settings::{AppInformation, SettingsService};
 use tauri::Manager;
 
 const MAX_GROUP_ID_TEXT_BYTES: usize = 256;
@@ -513,6 +515,12 @@ async fn network_diagnostics(
         .await)
 }
 
+/// Reports version and local storage use for the Settings page.
+#[tauri::command]
+fn app_information(service: tauri::State<'_, SettingsService>) -> Result<AppInformation, String> {
+    service.information().map_err(str::to_owned)
+}
+
 /// Advertises every owned group from one background provider, independent of
 /// the group currently open in the interface.
 #[tauri::command]
@@ -604,6 +612,7 @@ pub fn run() {
             app.manage(groups);
             app.manage(mls);
             app.manage(network);
+            app.manage(SettingsService::new(database_path));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -637,7 +646,8 @@ pub fn run() {
             set_group_device_blocked,
             advertise_owned_groups,
             network_status,
-            network_diagnostics
+            network_diagnostics,
+            app_information
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

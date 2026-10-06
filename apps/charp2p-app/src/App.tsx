@@ -56,6 +56,12 @@ type NetworkDiagnostics = {
   format: string;
   generatedAtUnix: number;
 };
+type AppInformation = {
+  appVersion: string;
+  os: string;
+  arch: string;
+  storage: { databaseBytes: number };
+};
 type UnreadMessageCount = { groupId: string; count: number };
 type SynchronizeGroupResult = {
   status: "synchronized";
@@ -686,6 +692,74 @@ function NetworkView({ onClose }: { onClose: () => void }) {
   );
 }
 
+function formatStorageBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function SettingsView({ onClose }: { onClose: () => void }) {
+  const [information, setInformation] = useState<AppInformation | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<AppInformation>("app_information")
+      .then((next) => {
+        if (active) setInformation(next);
+      })
+      .catch((caught) => {
+        if (active) setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <section className="setup-form information-card">
+      <header>
+        <p className="eyebrow">CharP2P</p>
+        <h2>Settings</h2>
+        <p>Information about this installation. Group contents stay on your devices.</p>
+      </header>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="information-sections">
+        <section>
+          <h3>Local storage</h3>
+          <p>
+            {information
+              ? `${formatStorageBytes(information.storage.databaseBytes)} used by groups, messages and invitations on this device`
+              : "Unavailable outside the app"}
+          </p>
+          <p>Messages are kept on this device until you hide them or leave the group. Hiding affects only this device.</p>
+        </section>
+        <section>
+          <h3>Node policy</h3>
+          <p>
+            Bootstrap and relay nodes store only bounded routing records and relay reservations. They never store group
+            events or message contents, reject group synchronization, and cannot remove groups or messages from your
+            devices.
+          </p>
+        </section>
+        <section>
+          <h3>Licences and security contact</h3>
+          <p>
+            Licence terms, node operator details and a security contact will be published before project nodes accept
+            public traffic.
+          </p>
+        </section>
+        <section>
+          <h3>Version</h3>
+          <p>{information ? `CharP2P ${information.appVersion} · ${information.os} ${information.arch}` : "Unavailable outside the app"}</p>
+        </section>
+      </div>
+      <button className="secondary-button" onClick={onClose} type="button">Back</button>
+    </section>
+  );
+}
+
 const MIN_BACKUP_PASSPHRASE_CHARS = 12;
 
 function backupFileName(profile: DeviceProfile) {
@@ -924,6 +998,7 @@ function App() {
   const [informationView, setInformationView] = useState<"privacy" | "identity" | null>(null);
   const [backupView, setBackupView] = useState(false);
   const [networkView, setNetworkView] = useState(false);
+  const [settingsView, setSettingsView] = useState(false);
   const [restoreView, setRestoreView] = useState(false);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
@@ -1886,6 +1961,8 @@ function App() {
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
           ) : networkView ? (
             <NetworkView onClose={() => setNetworkView(false)} />
+          ) : settingsView ? (
+            <SettingsView onClose={() => setSettingsView(false)} />
           ) : backupView && profile ? (
             <IdentityBackupView profile={profile} onClose={() => setBackupView(false)} />
           ) : restoreView && !profile ? (
@@ -2503,11 +2580,23 @@ function App() {
             onClick={() => {
               setInformationView(null);
               setBackupView(false);
+              setSettingsView(false);
               setNetworkView(true);
             }}
             type="button"
           >
             Network
+          </button>
+          <button
+            onClick={() => {
+              setInformationView(null);
+              setBackupView(false);
+              setNetworkView(false);
+              setSettingsView(true);
+            }}
+            type="button"
+          >
+            Settings
           </button>
           <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
           {profile && (
@@ -2515,6 +2604,7 @@ function App() {
               onClick={() => {
                 setInformationView(null);
                 setNetworkView(false);
+                setSettingsView(false);
                 setBackupView(true);
               }}
               type="button"

@@ -16,7 +16,7 @@
 - [x] Welcome: restore identity from encrypted backup.
 - [x] Network page: connection type, known bootstrap/community nodes, current advertising state.
 - [x] Network page: diagnostic export with secrets removed.
-- [ ] Settings page: local storage use, version, licences, security contact, node policy.
+- [x] Settings page: local storage use, version, licences, security contact, node policy.
 - [ ] Evidence export of user-selected signed events.
 - [ ] Delivery state "observed by all currently known members" from per-peer acknowledgements.
 
@@ -25,6 +25,7 @@
 - [ ] Android emulator and physical-device validation of the arm64 build (implementation gate 1).
 - [ ] Manual UI testing of cold-start and running-instance deep links on Windows and Android.
 - [ ] Decide supported Windows and Android versions (implementation gate 6).
+- [ ] Choose the project licence, third-party licence notice process, and security contact to show on the Settings page.
 - [ ] Measure worst-case Welcome size to set the product group-size limit.
 
 ## Blocked
@@ -44,3 +45,4 @@
 2026-10-06T05:33:18Z restore identity from encrypted backup: IdentityService::restore stores a record opened by open_backup only when no identity exists (identity_already_exists otherwise), re-validating the record round-trip; async restore_identity_backup command opens the backup in spawn_blocking (backup_decryption_failed / backup_unrecognized / backup_passphrase_invalid / identity_backup_invalid); Welcome 'Restore from backup' opens RestoreBackupView accepting a .charp2p-backup file or pasted base64 text, warns to stop using the original device, then continues to step 3. Added a test lock for the process-wide mock keyring store (identity tests raced). Workspace fmt/clippy/test, npm build, src-tauri fmt/clippy pass; src-tauri tests pass except the pre-existing container network failure (routing node). Installed webkit2gtk/gtk dev libs via apt-get.
 2026-10-06T06:34:11Z network page status: NetworkService::status reports the latest observed connection type (direct/lan/relayed from search and provider dials, offline on network_unavailable), bootstrap nodes with built-in/configured source, and background advertising state with key count; network_status command (no keys/invitations/group ids); NetworkView opened from a 'Network' footer action, refreshing every 5 s. Workspace fmt/clippy/test, npm build, src-tauri fmt/clippy pass; src-tauri tests pass except the pre-existing container network failure joined_member_rediscovers_the_owner_and_synchronizes (connection_type not "lan"). Installed webkit2gtk/gtk dev libs via apt-get.
 2026-10-06T07:30:36Z network diagnostic export: NetworkService::diagnostics builds a charp2p-diagnostics-v1 report (app version, os/arch, generated time, network status with bootstrap node addresses, owned/joined group counts only; no own peer id, keys, group ids/names, invitations or messages); network_diagnostics command; Network page 'Export diagnostics' downloads JSON with a copy-text fallback. Workspace fmt/clippy/test, npm build, src-tauri fmt/clippy pass; src-tauri tests pass except the pre-existing container network failure advertised_invitation_is_discoverable_through_a_routing_node. Installed webkit2gtk/gtk dev libs via apt-get.
+2026-10-06T08:32:25Z settings page: src-tauri settings module reports app version, os/arch and local storage use (sqlite db + -wal/-shm sizes only, no paths); app_information command; SettingsView from a 'Settings' footer action shows storage/retention, node policy summary (technical-design), licences/security contact as pending publication (none chosen in repo; added to Needs human), and version. Workspace fmt/clippy/test, npm build, src-tauri fmt/clippy pass; src-tauri tests pass except the pre-existing container network failure joined_member_rediscovers_the_owner_and_synchronizes. Installed webkit2gtk/gtk dev libs via apt-get.

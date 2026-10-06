@@ -35,6 +35,9 @@ to answer routing queries for unrelated peers.
 Used by opted-in desktop or server installations. It maintains a Kademlia
 routing table, answers DHT queries, and stores bounded, expiring provider
 records.
+Desktop contribution is off by default; relay capacity is a separate opt-in
+with user-chosen circuit and byte limits within the routing node limits
+(ADR-031).
 
 ### Relay peer
 

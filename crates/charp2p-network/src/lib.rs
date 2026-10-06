@@ -34,6 +34,8 @@ const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024)
 const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(60 * 60);
 const RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(5 * 60);
 const RELAY_CIRCUIT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RELAY_CIRCUITS: u32 = 32;
+const MEBIBYTE: u64 = 1024 * 1024;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -51,7 +53,7 @@ impl Behaviour {
         identity: &Keypair,
         dht_mode: kad::Mode,
         relay_client: relay::client::Behaviour,
-        relay_server: bool,
+        relay_server: Option<relay::Config>,
     ) -> Self {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
@@ -91,7 +93,7 @@ impl Behaviour {
             sync,
             relay_client,
             relay_server: Toggle::from(
-                relay_server.then(|| relay::Behaviour::new(peer_id, relay_server_config())),
+                relay_server.map(|config| relay::Behaviour::new(peer_id, config)),
             ),
         }
     }
@@ -110,6 +112,54 @@ fn relay_server_config() -> relay::Config {
     }
 }
 
+/// User-chosen relay capacity for an opted-in desktop contributor. Both
+/// limits stay within the routing node's fixed limits (ADR-026, ADR-031).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayLimits {
+    max_circuits: u32,
+    max_circuit_bytes: u64,
+}
+
+impl RelayLimits {
+    /// Validates the simultaneous circuit count and the per-circuit byte limit
+    /// in whole MiB.
+    pub fn new(max_circuits: u32, max_circuit_mib: u32) -> Result<Self, NetworkError> {
+        let max_circuit_bytes = u64::from(max_circuit_mib) * MEBIBYTE;
+        if !(1..=MAX_RELAY_CIRCUITS).contains(&max_circuits)
+            || !(MEBIBYTE..=RELAY_CIRCUIT_BYTES).contains(&max_circuit_bytes)
+        {
+            return Err(NetworkError::RelayLimits);
+        }
+        Ok(Self {
+            max_circuits,
+            max_circuit_bytes,
+        })
+    }
+
+    /// Returns the most relayed bytes these limits allow per circuit duration.
+    pub fn max_bytes_per_circuit_period(&self) -> u64 {
+        u64::from(self.max_circuits) * self.max_circuit_bytes
+    }
+
+    /// Returns how long one relayed circuit may stay open.
+    pub fn circuit_duration() -> Duration {
+        RELAY_CIRCUIT_DURATION
+    }
+
+    fn server_config(&self) -> relay::Config {
+        relay::Config {
+            max_reservations: self.max_circuits as usize,
+            max_reservations_per_peer: 1,
+            reservation_duration: RELAY_RESERVATION_DURATION,
+            max_circuits: self.max_circuits as usize,
+            max_circuits_per_peer: self.max_circuits.min(4) as usize,
+            max_circuit_duration: RELAY_CIRCUIT_DURATION,
+            max_circuit_bytes: self.max_circuit_bytes,
+            ..Default::default()
+        }
+    }
+}
+
 /// A client-mode CharP2P node using authenticated direct and relayed transport.
 pub struct NetworkNode {
     swarm: Swarm<Behaviour>,
@@ -124,15 +174,30 @@ pub struct NetworkNode {
 impl NetworkNode {
     /// Builds a node from its persistent libp2p device identity.
     pub fn new(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Client, false)
+        Self::with_dht_mode(identity, kad::Mode::Client, None)
     }
 
     /// Builds a routing node that answers Kademlia queries from other peers.
     pub fn new_routing(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Server, true)
+        Self::with_dht_mode(identity, kad::Mode::Server, Some(relay_server_config()))
     }
 
-    fn with_dht_mode(identity: Keypair, dht_mode: kad::Mode, relay_server: bool) -> Self {
+    /// Builds an opted-in desktop contributor that answers Kademlia queries
+    /// and, when relay limits are given, relays circuits within them.
+    pub fn new_contributing(identity: Keypair, relay: Option<RelayLimits>) -> Self {
+        Self::with_dht_mode(
+            identity,
+            kad::Mode::Server,
+            relay.map(|limits| limits.server_config()),
+        )
+    }
+
+    fn with_dht_mode(
+        identity: Keypair,
+        dht_mode: kad::Mode,
+        relay_server: Option<relay::Config>,
+    ) -> Self {
+        let relay_server_enabled = relay_server.is_some();
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_quic()
@@ -149,7 +214,7 @@ impl NetworkNode {
 
         Self {
             swarm,
-            relay_server,
+            relay_server: relay_server_enabled,
             discovery_queries: HashMap::new(),
             pending_sync_responses: HashMap::new(),
             pending_join_responses: HashMap::new(),
@@ -785,6 +850,9 @@ pub enum NetworkError {
     /// A locally created synchronization message violated protocol limits.
     #[error("invalid synchronization message")]
     Sync(#[from] SyncError),
+    /// Relay contribution limits fall outside the supported bounds.
+    #[error("relay limits are outside the supported bounds")]
+    RelayLimits,
     /// The inbound request token is no longer pending.
     #[error("synchronization request is no longer awaiting a response")]
     UnknownSyncRequest,
@@ -814,7 +882,7 @@ mod tests {
     use libp2p::{Multiaddr, identity::Keypair, multiaddr::Protocol};
     use tokio::time::timeout;
 
-    use super::{ConnectionPath, NetworkEvent, NetworkNode};
+    use super::{ConnectionPath, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION, RelayLimits};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
@@ -915,9 +983,41 @@ mod tests {
         assert_eq!(response.welcome(), Some([4, 5, 6].as_slice()));
     }
 
+    #[test]
+    fn relay_limits_stay_within_routing_node_bounds() {
+        assert!(RelayLimits::new(0, 8).is_err());
+        assert!(RelayLimits::new(33, 8).is_err());
+        assert!(RelayLimits::new(4, 0).is_err());
+        assert!(RelayLimits::new(4, 33).is_err());
+
+        let limits = RelayLimits::new(4, 8).unwrap();
+        assert_eq!(limits.max_bytes_per_circuit_period(), 32 * 1024 * 1024);
+        let config = limits.server_config();
+        assert_eq!(config.max_circuits, 4);
+        assert_eq!(config.max_reservations, 4);
+        assert_eq!(config.max_circuit_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.max_circuit_duration, RELAY_CIRCUIT_DURATION);
+
+        let single = RelayLimits::new(1, 32).unwrap().server_config();
+        assert_eq!(single.max_circuits_per_peer, 1);
+    }
+
     #[tokio::test]
     async fn routing_node_relays_an_authenticated_connection() {
-        let mut relay = NetworkNode::new_routing(Keypair::generate_ed25519());
+        relays_an_authenticated_connection(NetworkNode::new_routing(Keypair::generate_ed25519()))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn desktop_contributor_relays_within_its_limits() {
+        relays_an_authenticated_connection(NetworkNode::new_contributing(
+            Keypair::generate_ed25519(),
+            Some(RelayLimits::new(2, 1).unwrap()),
+        ))
+        .await;
+    }
+
+    async fn relays_an_authenticated_connection(mut relay: NetworkNode) {
         let relay_id = relay.peer_id();
         relay
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())

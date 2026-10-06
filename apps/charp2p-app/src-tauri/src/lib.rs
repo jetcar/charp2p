@@ -1,3 +1,4 @@
+mod contribution;
 pub mod groups;
 mod identity;
 mod invitation;
@@ -8,6 +9,7 @@ mod settings;
 
 use std::sync::{Arc, Mutex};
 
+use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::{
@@ -582,6 +584,25 @@ fn app_information(service: tauri::State<'_, SettingsService>) -> Result<AppInfo
     service.information().map_err(str::to_owned)
 }
 
+/// Reports the device-local contribution preference and its worst-case
+/// relayed volume (ADR-031).
+#[tauri::command]
+fn contribution_status(
+    service: tauri::State<'_, ContributionService>,
+) -> Result<ContributionStatus, String> {
+    service.status().map_err(str::to_owned)
+}
+
+/// Stores the device-local contribution preference after validating the relay
+/// limits. Refused on builds that keep the light-peer role.
+#[tauri::command]
+fn set_contribution_preference(
+    preference: ContributionPreference,
+    service: tauri::State<'_, ContributionService>,
+) -> Result<ContributionStatus, String> {
+    service.set(preference).map_err(str::to_owned)
+}
+
 /// Advertises every owned group from one background provider, independent of
 /// the group currently open in the interface.
 #[tauri::command]
@@ -673,6 +694,9 @@ pub fn run() {
             app.manage(groups);
             app.manage(mls);
             app.manage(network);
+            app.manage(ContributionService::new(
+                data_directory.join("contribution.json"),
+            ));
             app.manage(SettingsService::new(database_path));
             Ok(())
         })
@@ -711,7 +735,9 @@ pub fn run() {
             network_status,
             group_connection_states,
             network_diagnostics,
-            app_information
+            app_information,
+            contribution_status,
+            set_contribution_preference
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

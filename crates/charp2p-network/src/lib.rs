@@ -14,8 +14,13 @@ use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
     identity::Keypair,
-    kad, noise, ping, relay, request_response,
-    swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle},
+    kad,
+    multiaddr::Protocol,
+    noise, ping, relay, request_response,
+    swarm::{
+        NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle,
+        dial_opts::DialOpts,
+    },
     yamux,
 };
 use thiserror::Error;
@@ -257,6 +262,18 @@ impl NetworkNode {
         Ok(())
     }
 
+    /// Dials a peer at previously remembered addresses. The connection only
+    /// completes when the remote authenticates as `peer_id`.
+    pub fn dial_peer_at(
+        &mut self,
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+    ) -> Result<(), NetworkError> {
+        self.swarm
+            .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())?;
+        Ok(())
+    }
+
     /// Registers a known bootstrap peer address with the routing table.
     pub fn add_bootstrap_peer(&mut self, peer_id: PeerId, address: Multiaddr) {
         self.swarm
@@ -398,6 +415,7 @@ impl NetworkNode {
                     return NetworkEvent::PeerConnected {
                         peer_id,
                         path: connection_path(&endpoint),
+                        remote_address: transport_address(endpoint.get_remote_address()),
                     };
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -639,6 +657,9 @@ pub enum NetworkEvent {
         peer_id: PeerId,
         /// Whether this connection reached the peer directly or through a relay.
         path: ConnectionPath,
+        /// Remote transport address without a trailing peer id; for dialled
+        /// connections this is the address that reached the peer.
+        remote_address: Multiaddr,
     },
     /// An authenticated connection ended.
     PeerDisconnected {
@@ -753,6 +774,14 @@ fn connection_path(endpoint: &libp2p::core::ConnectedPoint) -> ConnectionPath {
     } else {
         ConnectionPath::Direct
     }
+}
+
+fn transport_address(address: &Multiaddr) -> Multiaddr {
+    let mut address = address.clone();
+    if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
+        address.pop();
+    }
+    address
 }
 
 fn is_lan_address(address: &Multiaddr) -> bool {
@@ -1059,6 +1088,7 @@ mod tests {
                             NetworkEvent::PeerConnected {
                                 peer_id,
                                 path: ConnectionPath::Relayed,
+                                ..
                             } if peer_id == destination_id
                         );
                     }
@@ -1068,6 +1098,7 @@ mod tests {
                             NetworkEvent::PeerConnected {
                                 peer_id,
                                 path: ConnectionPath::Relayed,
+                                ..
                             } if peer_id == source_id
                         );
                     }
@@ -1077,6 +1108,69 @@ mod tests {
         })
         .await
         .expect("peers should connect through the routing node relay");
+    }
+
+    #[tokio::test]
+    async fn remembered_address_dial_reports_the_address_that_reached_the_peer() {
+        let mut listener = NetworkNode::new(Keypair::generate_ed25519());
+        let mut dialer = NetworkNode::new(Keypair::generate_ed25519());
+        let listener_id = listener.peer_id();
+        listener
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_address = next_listen_address(&mut listener).await;
+
+        dialer
+            .dial_peer_at(listener_id, vec![listen_address.clone()])
+            .unwrap();
+        let (peer_id, path, remote_address) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = dialer.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, path, remote_address } = event {
+                            break (peer_id, path, remote_address);
+                        }
+                    }
+                    _ = listener.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("remembered address dial should connect");
+
+        assert_eq!(peer_id, listener_id);
+        assert_eq!(path, ConnectionPath::Lan);
+        assert_eq!(remote_address, listen_address);
+    }
+
+    #[tokio::test]
+    async fn remembered_address_dial_rejects_another_peer_at_that_address() {
+        let mut listener = NetworkNode::new(Keypair::generate_ed25519());
+        let mut dialer = NetworkNode::new(Keypair::generate_ed25519());
+        listener
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_address = next_listen_address(&mut listener).await;
+        let expected_peer = Keypair::generate_ed25519().public().to_peer_id();
+
+        dialer
+            .dial_peer_at(expected_peer, vec![listen_address])
+            .unwrap();
+        let connected = timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    event = dialer.next_event() => {
+                        if matches!(event, NetworkEvent::PeerConnected { .. }) {
+                            break;
+                        }
+                    }
+                    _ = listener.next_event() => {}
+                }
+            }
+        })
+        .await;
+
+        assert!(connected.is_err(), "a different peer must not connect");
     }
 
     async fn connected_nodes() -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {
@@ -1148,7 +1242,7 @@ mod tests {
 
     async fn next_connected_peer(node: &mut NetworkNode) -> (libp2p::PeerId, ConnectionPath) {
         loop {
-            if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
+            if let NetworkEvent::PeerConnected { peer_id, path, .. } = node.next_event().await {
                 return (peer_id, path);
             }
         }

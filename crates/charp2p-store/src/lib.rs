@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -27,6 +27,10 @@ pub const MAX_ENCRYPTED_MESSAGE_BODY_BYTES: usize = 16 * 1024 + 42;
 pub const MAX_ENCRYPTED_JOIN_RESPONSE_BYTES: usize = MAX_JOIN_RESPONSE_WIRE_BYTES + 42;
 /// Largest recent-message page exposed to an application view.
 pub const MAX_RECENT_MESSAGE_EVENTS: usize = 256;
+/// Maximum encoded length of one remembered peer address.
+pub const MAX_PEER_ADDRESS_BYTES: usize = 512;
+/// Remembered successful addresses per group peer; older ones are dropped.
+pub const MAX_PEER_ADDRESSES: usize = 4;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,6 +145,15 @@ pub struct MlsJoinAdmission {
 }
 
 /// SQLite-backed storage for signed events and non-secret application metadata.
+/// One address a group peer was last reached at successfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerAddress {
+    /// Opaque encoded transport address.
+    pub address: Vec<u8>,
+    /// When synchronization through this address last completed.
+    pub last_success_at_unix: u64,
+}
+
 pub struct EventStore {
     connection: Connection,
 }
@@ -1296,9 +1309,80 @@ impl EventStore {
         )? > 0)
     }
 
+    /// Remembers that synchronization with a group peer completed through
+    /// this address, keeping only the most recent successful addresses.
+    pub fn record_peer_address_success(
+        &mut self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        address: &[u8],
+        succeeded_at_unix: u64,
+    ) -> Result<(), StoreError> {
+        if address.is_empty() || address.len() > MAX_PEER_ADDRESS_BYTES {
+            return Err(StoreError::InvalidPeerAddressSize(address.len()));
+        }
+        let succeeded_at_unix = i64::try_from(succeeded_at_unix)
+            .map_err(|_| StoreError::TimestampTooLarge(succeeded_at_unix))?;
+        let limit = i64::try_from(MAX_PEER_ADDRESSES).expect("peer address limit fits in i64");
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO peer_addresses (group_id, peer_id, address, last_success_at_unix)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(group_id, peer_id, address)
+             DO UPDATE SET last_success_at_unix = max(last_success_at_unix, excluded.last_success_at_unix)",
+            params![
+                group_id.to_bytes(),
+                peer_id.to_bytes(),
+                address,
+                succeeded_at_unix
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM peer_addresses
+             WHERE group_id = ?1 AND peer_id = ?2 AND address NOT IN (
+                 SELECT address FROM peer_addresses
+                 WHERE group_id = ?1 AND peer_id = ?2
+                 ORDER BY last_success_at_unix DESC, address
+                 LIMIT ?3
+             )",
+            params![group_id.to_bytes(), peer_id.to_bytes(), limit],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Lists the remembered successful addresses of a group peer, most
+    /// recent first.
+    pub fn peer_addresses(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+    ) -> Result<Vec<PeerAddress>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT address, last_success_at_unix FROM peer_addresses
+             WHERE group_id = ?1 AND peer_id = ?2
+             ORDER BY last_success_at_unix DESC, address
+             LIMIT ?3",
+        )?;
+        let limit = i64::try_from(MAX_PEER_ADDRESSES).expect("peer address limit fits in i64");
+        let rows = statement.query_map(
+            params![group_id.to_bytes(), peer_id.to_bytes(), limit],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        rows.map(|row| {
+            let (address, last_success_at_unix) = row?;
+            Ok(PeerAddress {
+                address,
+                last_success_at_unix: u64::try_from(last_success_at_unix)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+            })
+        })
+        .collect()
+    }
+
     /// Atomically forgets a joined group on this device: its display metadata,
-    /// signed events with every dependent local record, peer acknowledgements
-    /// and local blocks, together with the provider state that no longer
+    /// signed events with every dependent local record, peer acknowledgements,
+    /// remembered peer addresses and local blocks, together with the provider state that no longer
     /// contains the MLS group.
     pub fn leave_joined_group_and_put_encrypted_mls_provider_snapshot(
         &mut self,
@@ -1317,6 +1401,7 @@ impl EventStore {
             "DELETE FROM events WHERE group_id = ?1",
             "DELETE FROM peer_acknowledged_author_heads WHERE group_id = ?1",
             "DELETE FROM blocked_local_devices WHERE group_id = ?1",
+            "DELETE FROM peer_addresses WHERE group_id = ?1",
         ] {
             transaction.execute(statement, [&group_id])?;
         }
@@ -1830,7 +1915,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=19 => {}
+            6..=20 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2093,6 +2178,21 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 20 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_addresses (
+                    group_id BLOB NOT NULL,
+                    peer_id BLOB NOT NULL,
+                    address BLOB NOT NULL CHECK(length(address) BETWEEN 1 AND 512),
+                    last_success_at_unix INTEGER NOT NULL CHECK(last_success_at_unix >= 0),
+                    PRIMARY KEY(group_id, peer_id, address)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -2287,6 +2387,9 @@ pub enum StoreError {
     /// Only a signed metadata-change event can update group metadata.
     #[error("event is not a group metadata change")]
     InvalidGroupMetadataEvent,
+    /// A remembered peer address is empty or above the local bound.
+    #[error("invalid peer address size {0}")]
+    InvalidPeerAddressSize(usize),
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -2315,7 +2418,7 @@ mod tests {
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
         MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_SYNC_BATCH_EVENTS,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_PEER_ADDRESS_BYTES, MAX_SYNC_BATCH_EVENTS,
         OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome, StoreError,
     };
 
@@ -2735,6 +2838,9 @@ mod tests {
             store
                 .block_device_locally(group.group_id(), blocked_device_id)
                 .unwrap();
+            store
+                .record_peer_address_success(group.group_id(), inviter_device_id, b"address", 1)
+                .unwrap();
         }
 
         assert!(
@@ -2768,6 +2874,19 @@ mod tests {
                 .is_empty()
         );
         assert!(store.blocked_devices(left.group_id()).unwrap().is_empty());
+        assert!(
+            store
+                .peer_addresses(left.group_id(), inviter_device_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .peer_addresses(kept.group_id(), inviter_device_id)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             store
                 .max_acknowledged_author_head(left.group_id(), author.peer_id())
@@ -3824,6 +3943,73 @@ mod tests {
             store.unread_message_counts().unwrap(),
             vec![(group.group_id(), 1)]
         );
+    }
+
+    #[test]
+    fn peer_addresses_keep_the_most_recent_successes() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate().group_id();
+        let other_group = GroupIdentity::generate().group_id();
+        let peer = DeviceIdentity::generate().peer_id();
+        assert!(store.peer_addresses(group, peer).unwrap().is_empty());
+
+        for (index, at) in [(1_u8, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
+            store
+                .record_peer_address_success(group, peer, &[index], at)
+                .unwrap();
+        }
+        // Refreshing an existing address moves it forward; an older report
+        // never moves it back.
+        store
+            .record_peer_address_success(group, peer, &[2], 60)
+            .unwrap();
+        store
+            .record_peer_address_success(group, peer, &[2], 15)
+            .unwrap();
+        store
+            .record_peer_address_success(other_group, peer, &[9], 70)
+            .unwrap();
+
+        let addresses = store.peer_addresses(group, peer).unwrap();
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|address| (address.address.clone(), address.last_success_at_unix))
+                .collect::<Vec<_>>(),
+            vec![(vec![2], 60), (vec![5], 50), (vec![4], 40), (vec![3], 30)]
+        );
+        assert!(matches!(
+            store.record_peer_address_success(group, peer, &[], 1),
+            Err(StoreError::InvalidPeerAddressSize(0))
+        ));
+        assert!(matches!(
+            store.record_peer_address_success(group, peer, &[0; MAX_PEER_ADDRESS_BYTES + 1], 1),
+            Err(StoreError::InvalidPeerAddressSize(_))
+        ));
+    }
+
+    #[test]
+    fn version_twenty_database_adds_peer_addresses() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE peer_addresses;
+                     PRAGMA user_version = 20;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let group = GroupIdentity::generate().group_id();
+        let peer = DeviceIdentity::generate().peer_id();
+        store
+            .record_peer_address_success(group, peer, &[1], 1)
+            .unwrap();
+        assert_eq!(store.peer_addresses(group, peer).unwrap().len(), 1);
     }
 
     #[test]

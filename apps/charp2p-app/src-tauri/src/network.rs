@@ -30,6 +30,7 @@ const MAX_DISCOVERED_PEERS: usize = 32;
 const MAX_OWNER_DISCOVERY_KEYS: usize = crate::groups::MAX_ADVERTISED_DISCOVERY_KEYS;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const KNOWN_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_SYNC_EXCHANGES: usize = 4_096;
@@ -306,6 +307,20 @@ pub struct SynchronizeGroupResult {
     pub uploaded_events: usize,
     pub synchronized_at_unix: u64,
     pub connection_type: &'static str,
+    /// Address that reached the group provider, remembered for the next
+    /// synchronization; never sent to the frontend.
+    #[serde(skip)]
+    pub peer_address: Multiaddr,
+}
+
+/// Authenticated connection to a group provider and how it was reached.
+struct ProviderConnection {
+    node: NetworkNode,
+    path: ConnectionPath,
+    address: Multiaddr,
+    /// Whether the provider was found through a DHT lookup rather than a
+    /// remembered address.
+    looked_up: bool,
 }
 
 struct ActiveAdvertisement {
@@ -951,7 +966,7 @@ impl NetworkService {
             let mut connected = BTreeMap::new();
             loop {
                 match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id, path } => {
+                    NetworkEvent::PeerConnected { peer_id, path, .. } => {
                         connected.insert(peer_id, path);
                     }
                     NetworkEvent::GroupPeersFound {
@@ -1012,7 +1027,7 @@ impl NetworkService {
         }
         let reachable = timeout(CONNECT_TIMEOUT, async {
             loop {
-                if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
+                if let NetworkEvent::PeerConnected { peer_id, path, .. } = node.next_event().await {
                     if discovered.contains(&peer_id) {
                         return path;
                     }
@@ -1051,8 +1066,8 @@ impl NetworkService {
             .pending_join
             .prepare_join_request(local_peer, invitation)?;
         let key = DiscoveryKey::from_invitation(invitation);
-        let (mut node, _) = self
-            .connect_to_group_provider(identity, key, expected_inviter)
+        let ProviderConnection { mut node, .. } = self
+            .connect_to_group_provider(identity, key, expected_inviter, &[])
             .await?;
 
         let request_id = node.send_join_request(expected_inviter, request);
@@ -1106,6 +1121,7 @@ impl NetworkService {
         key: DiscoveryKey,
         group_id: PeerId,
         expected_peer: PeerId,
+        known_addresses: &[Multiaddr],
         bandwidth: &BandwidthService,
     ) -> Result<SynchronizeGroupResult, &'static str> {
         let mut discovery = None;
@@ -1115,6 +1131,7 @@ impl NetworkService {
                 key,
                 group_id,
                 expected_peer,
+                known_addresses,
                 bandwidth,
                 &mut discovery,
             )
@@ -1124,12 +1141,14 @@ impl NetworkService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn synchronize_with_peer(
         &self,
         identity: DeviceIdentity,
         key: DiscoveryKey,
         group_id: PeerId,
         expected_peer: PeerId,
+        known_addresses: &[Multiaddr],
         bandwidth: &BandwidthService,
         discovery: &mut Option<&'static str>,
     ) -> Result<SynchronizeGroupResult, &'static str> {
@@ -1141,10 +1160,19 @@ impl NetworkService {
         // (ADR-033).
         bandwidth.ensure_sync_budget()?;
         let connected = self
-            .connect_to_group_provider(identity, key, expected_peer)
+            .connect_to_group_provider(identity, key, expected_peer, known_addresses)
             .await;
-        *discovery = discovery_outcome(&connected);
-        let (mut node, connection_path) = connected?;
+        // A remembered address says nothing about the discovery record.
+        *discovery = match &connected {
+            Ok(connection) if !connection.looked_up => None,
+            _ => discovery_outcome(&connected),
+        };
+        let ProviderConnection {
+            mut node,
+            path: connection_path,
+            address: peer_address,
+            ..
+        } = connected?;
         let synchronized_events = self
             .pull_from_connected_peer(&mut node, expected_peer, group_id, Some(bandwidth))
             .await?;
@@ -1163,6 +1191,7 @@ impl NetworkService {
                 .map_err(|_| "system_clock_invalid")?
                 .as_secs(),
             connection_type: connection_type_name(connection_path),
+            peer_address,
         })
     }
 
@@ -1171,9 +1200,14 @@ impl NetworkService {
         identity: DeviceIdentity,
         key: DiscoveryKey,
         expected_peer: PeerId,
-    ) -> Result<(NetworkNode, ConnectionPath), &'static str> {
-        let result = self.dial_group_provider(identity, key, expected_peer).await;
-        self.observe_connection(result, |(_, path)| Some(connection_type_name(*path)))
+        known_addresses: &[Multiaddr],
+    ) -> Result<ProviderConnection, &'static str> {
+        let result = self
+            .dial_group_provider(identity, key, expected_peer, known_addresses)
+            .await;
+        self.observe_connection(result, |connection| {
+            Some(connection_type_name(connection.path))
+        })
     }
 
     async fn dial_group_provider(
@@ -1181,8 +1215,9 @@ impl NetworkService {
         identity: DeviceIdentity,
         key: DiscoveryKey,
         expected_peer: PeerId,
-    ) -> Result<(NetworkNode, ConnectionPath), &'static str> {
-        if self.bootstrap_peers.is_empty() {
+        known_addresses: &[Multiaddr],
+    ) -> Result<ProviderConnection, &'static str> {
+        if self.bootstrap_peers.is_empty() && known_addresses.is_empty() {
             return Err("network_bootstrap_required");
         }
         let mut node = NetworkNode::new(identity.into_network_keypair());
@@ -1192,6 +1227,41 @@ impl NetworkService {
                 .map_err(|_| "network_configuration_invalid")?,
         )
         .map_err(|_| "network_unavailable")?;
+        // Remembered addresses of the last successful synchronizations are
+        // tried before a DHT lookup; the transport still authenticates the
+        // provider as `expected_peer`.
+        if !known_addresses.is_empty()
+            && node
+                .dial_peer_at(expected_peer, known_addresses.to_vec())
+                .is_ok()
+        {
+            let connected = timeout(KNOWN_ADDRESS_CONNECT_TIMEOUT, async {
+                loop {
+                    if let NetworkEvent::PeerConnected {
+                        peer_id,
+                        path,
+                        remote_address,
+                    } = node.next_event().await
+                    {
+                        if peer_id == expected_peer {
+                            break (path, remote_address);
+                        }
+                    }
+                }
+            })
+            .await;
+            if let Ok((path, address)) = connected {
+                return Ok(ProviderConnection {
+                    node,
+                    path,
+                    address,
+                    looked_up: false,
+                });
+            }
+        }
+        if self.bootstrap_peers.is_empty() {
+            return Err("network_bootstrap_required");
+        }
         for bootstrap in &self.bootstrap_peers {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
@@ -1202,8 +1272,12 @@ impl NetworkService {
             let mut connected = None;
             loop {
                 match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id, path } if peer_id == expected_peer => {
-                        connected = Some(path);
+                    NetworkEvent::PeerConnected {
+                        peer_id,
+                        path,
+                        remote_address,
+                    } if peer_id == expected_peer => {
+                        connected = Some((path, remote_address));
                     }
                     NetworkEvent::GroupPeersFound {
                         key: found_key,
@@ -1226,16 +1300,21 @@ impl NetworkService {
         .await
         .map_err(|_| "network_search_timed_out")??;
 
-        let connection_path = if let Some(path) = already_connected {
-            path
+        let (path, address) = if let Some(connected) = already_connected {
+            connected
         } else {
             node.dial_peer(expected_peer)
                 .map_err(|_| "network_peer_unreachable")?;
             timeout(CONNECT_TIMEOUT, async {
                 loop {
-                    if let NetworkEvent::PeerConnected { peer_id, path } = node.next_event().await {
+                    if let NetworkEvent::PeerConnected {
+                        peer_id,
+                        path,
+                        remote_address,
+                    } = node.next_event().await
+                    {
                         if peer_id == expected_peer {
-                            break path;
+                            break (path, remote_address);
                         }
                     }
                 }
@@ -1243,7 +1322,12 @@ impl NetworkService {
             .await
             .map_err(|_| "network_peer_unreachable")?
         };
-        Ok((node, connection_path))
+        Ok(ProviderConnection {
+            node,
+            path,
+            address,
+            looked_up: true,
+        })
     }
 
     async fn pull_from_connected_peer(
@@ -2122,6 +2206,7 @@ mod tests {
             DiscoveryKey::from_bytes([7; 32]),
             group_id,
             DeviceIdentity::generate().peer_id(),
+            &[],
             &bandwidth,
         ));
 
@@ -2481,7 +2566,7 @@ mod tests {
         let discovery_key = DiscoveryKey::from_invitation(&invitation);
 
         tauri::async_runtime::block_on(async {
-            let member_identity = DeviceIdentity::generate();
+            let (member_identity, remembering_member_identity) = identity_pair();
             let member_id = member_identity.peer_id();
             let mut routing =
                 NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
@@ -2541,6 +2626,7 @@ mod tests {
                 discovery_key,
                 invitation.group_id(),
                 owner_id,
+                &[],
                 &bandwidth,
             );
             tokio::pin!(synchronize);
@@ -2562,7 +2648,65 @@ mod tests {
             assert_eq!(result.uploaded_events, 0);
             assert!(result.synchronized_at_unix >= now);
             assert_eq!(result.connection_type, "lan");
+            assert_eq!(
+                member_service.group_connection_states(&[invitation.group_id()])[0].discovery,
+                Some("found")
+            );
+
+            // Without any bootstrap node, the remembered address alone
+            // reaches the owner again and no lookup outcome is reported.
+            let offline_member_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                "",
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let remembered = timeout(
+                Duration::from_secs(15),
+                offline_member_service.synchronize(
+                    remembering_member_identity,
+                    discovery_key,
+                    invitation.group_id(),
+                    owner_id,
+                    std::slice::from_ref(&result.peer_address),
+                    &bandwidth,
+                ),
+            )
+            .await
+            .expect("remembered address synchronization should complete")
+            .unwrap();
+            assert_eq!(remembered.status, "synchronized");
+            assert_eq!(remembered.peer_address, result.peer_address);
+            assert_eq!(
+                offline_member_service.group_connection_states(&[invitation.group_id()])[0]
+                    .discovery,
+                None
+            );
         });
+    }
+
+    #[test]
+    fn synchronization_without_bootstrap_or_remembered_address_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        let service = NetworkService::from_sources(&[], "").unwrap();
+
+        let result = tauri::async_runtime::block_on(service.synchronize(
+            DeviceIdentity::generate(),
+            DiscoveryKey::from_bytes([7; 32]),
+            DeviceIdentity::generate().peer_id(),
+            DeviceIdentity::generate().peer_id(),
+            &[],
+            &bandwidth,
+        ));
+
+        assert_eq!(result.unwrap_err(), "network_bootstrap_required");
     }
 
     #[test]

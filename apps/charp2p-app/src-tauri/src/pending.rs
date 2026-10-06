@@ -371,6 +371,44 @@ impl PendingInvitationService {
         Ok(())
     }
 
+    /// Returns the encoded addresses a joined group's provider was last
+    /// reached at, most recent first.
+    pub(crate) fn known_peer_addresses(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+    ) -> Result<Vec<Vec<u8>>, &'static str> {
+        Ok(self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .peer_addresses(group_id, peer_id)
+            .map_err(|_| "synchronization_state_store_unavailable")?
+            .into_iter()
+            .map(|known| known.address)
+            .collect())
+    }
+
+    /// Remembers the address a successful synchronization reached the
+    /// group provider at.
+    pub(crate) fn record_peer_address(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        address: &[u8],
+        synchronized_at_unix: u64,
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        self.metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .record_peer_address_success(group_id, peer_id, address, synchronized_at_unix)
+            .map_err(|_| "synchronization_state_store_unavailable")
+    }
+
     #[cfg(test)]
     fn list_at(&self, now_unix: u64) -> Result<Vec<PendingGroup>, &'static str> {
         let (pending, expired) = self.inspect_at(now_unix)?;

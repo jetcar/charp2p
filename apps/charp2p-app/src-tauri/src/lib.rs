@@ -17,6 +17,7 @@ use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
+use libp2p::Multiaddr;
 use mls_storage::{
     CreatedMessage, EvidenceExport, GroupMemberDevice, MemberActivity, MlsProviderService,
     StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
@@ -351,12 +352,20 @@ async fn synchronize_group(
     let (discovery_key, inviter_device_id) = pending_service
         .joined_sync_target(group_id)
         .map_err(str::to_owned)?;
+    // Unparsable remembered addresses are skipped; the DHT lookup still runs.
+    let known_addresses = pending_service
+        .known_peer_addresses(group_id, inviter_device_id)
+        .map_err(str::to_owned)?
+        .into_iter()
+        .filter_map(|address| Multiaddr::try_from(address).ok())
+        .collect::<Vec<_>>();
     let result = network_service
         .synchronize(
             identity,
             discovery_key,
             group_id,
             inviter_device_id,
+            &known_addresses,
             &bandwidth_service,
         )
         .await
@@ -364,6 +373,17 @@ async fn synchronize_group(
     pending_service
         .record_synchronization(group_id, result.synchronized_at_unix)
         .map_err(str::to_owned)?;
+    let peer_address = result.peer_address.to_vec();
+    if !peer_address.is_empty() && peer_address.len() <= charp2p_store::MAX_PEER_ADDRESS_BYTES {
+        pending_service
+            .record_peer_address(
+                group_id,
+                inviter_device_id,
+                &peer_address,
+                result.synchronized_at_unix,
+            )
+            .map_err(str::to_owned)?;
+    }
     Ok(result)
 }
 

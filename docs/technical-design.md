@@ -632,8 +632,8 @@ Before protocol implementation:
    and discovery keys.~~ Fixed-seed vectors live in
    `crates/charp2p-core/tests/protocol_vectors.rs`; changing one requires a new
    protocol version.
-5. Threat-model joins, removal, conflicting membership events, and lost owner
-   keys.
+5. ~~Threat-model joins, removal, conflicting membership events, and lost owner
+   keys.~~ See `docs/threat-model.md`.
 6. Decide supported Windows and Android versions.
 
 Before public node deployment:

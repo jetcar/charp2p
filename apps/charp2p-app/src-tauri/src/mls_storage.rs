@@ -178,6 +178,13 @@ pub(crate) struct GroupMemberDevice {
     pub device_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemberActivity {
+    pub device_id: String,
+    pub last_signed_at_unix_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemberAdmissionError {
     Unauthorized,
@@ -756,6 +763,31 @@ impl MlsProviderService {
         }
         .map_err(|_| "device_block_failed")?;
         blocked_device_ids(&store, group_id)
+    }
+
+    /// Reports each author's latest signed event time held for a group. The
+    /// time is the author's own signed claim, not presence or a verified clock.
+    pub(crate) fn member_activity(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<MemberActivity>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        Ok(store
+            .latest_author_activity(group_id)
+            .map_err(|_| "member_activity_unavailable")?
+            .into_iter()
+            .map(|(device_id, last_signed_at_unix_ms)| MemberActivity {
+                device_id: device_id.to_string(),
+                last_signed_at_unix_ms,
+            })
+            .collect())
     }
 
     pub(crate) fn blocked_devices(&self, group_id: PeerId) -> Result<Vec<String>, &'static str> {
@@ -2448,8 +2480,8 @@ mod tests {
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
         encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash, GroupMemberDevice,
-        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
-        WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
+        MemberActivity, MemberAdmissionError, MlsProviderMutationError, MlsProviderService,
+        UnreadMessageCount, WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::{EventStore, PendingInvitationMetadata};
 
@@ -2603,6 +2635,13 @@ mod tests {
         let created = store.get_event(event_ids[0]).unwrap().unwrap();
         assert_eq!(created.kind(), EventKind::GroupCreated);
         assert_eq!(created.author_sequence(), 1);
+        assert_eq!(
+            service.member_activity(group_id).unwrap(),
+            vec![MemberActivity {
+                device_id: device_id.to_string(),
+                last_signed_at_unix_ms: created.created_at_unix_ms(),
+            }]
+        );
         drop(store);
         drop(service);
 

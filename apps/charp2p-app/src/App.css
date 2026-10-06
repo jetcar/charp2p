@@ -176,6 +176,7 @@ button { cursor: pointer; }
 .member-identity strong { color: #172044; font-size: 18px; }
 .member-identity span { color: #68748f; font-size: 14px; }
 .member-identity code { overflow: hidden; color: #50617c; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.member-identity .member-activity { font-size: 12px; }
 .member-actions { display: grid; justify-items: end; gap: 8px; }
 .member-remove { padding: 7px 11px; border: 1px solid #e4a4ac; border-radius: 9px; color: #9e2838; background: #fff5f6; font-size: 13px; font-weight: 700; }
 .member-remove:hover:not(:disabled) { border-color: #c84959; background: #ffe8eb; }

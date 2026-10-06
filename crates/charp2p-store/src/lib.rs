@@ -1046,6 +1046,35 @@ impl EventStore {
         Ok(summary)
     }
 
+    /// Returns each author's latest signed creation time among stored events.
+    ///
+    /// The time comes from the author's highest stored sequence and is the
+    /// author's own signed claim, not a locally observed clock.
+    pub fn latest_author_activity(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<(PeerId, u64)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT encoded FROM events AS latest
+             WHERE group_id = ?1
+               AND author_sequence = (
+                   SELECT MAX(author_sequence) FROM events
+                   WHERE group_id = latest.group_id AND author_id = latest.author_id
+               )",
+        )?;
+        let encoded = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut activity = Vec::new();
+        for bytes in encoded {
+            let event = SignedEvent::decode(&bytes?)?;
+            if event.group_id() != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            activity.push((event.author_id(), event.created_at_unix_ms()));
+        }
+        activity.sort_by_key(|(author_id, _)| author_id.to_bytes());
+        Ok(activity)
+    }
+
     /// Returns an ordered, bounded page of event IDs after an author sequence.
     pub fn event_ids_after(
         &self,
@@ -2413,6 +2442,54 @@ mod tests {
             .find(|head| head.author_id == first_author.peer_id())
             .unwrap();
         assert_eq!(first_head.contiguous_sequence, 3);
+    }
+
+    #[test]
+    fn latest_author_activity_uses_each_authors_highest_sequence() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let first_author = DeviceIdentity::generate();
+        let second_author = DeviceIdentity::generate();
+        let timed = |author: &DeviceIdentity, group: &GroupIdentity, sequence, created_at| {
+            SignedEvent::create(
+                author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: created_at,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"message",
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(
+            store
+                .latest_author_activity(group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .put_events(&[
+                timed(&first_author, &group, 1, 1_800_000_000_000),
+                timed(&first_author, &group, 3, 1_800_000_003_000),
+                timed(&second_author, &group, 1, 1_800_000_001_000),
+                timed(&second_author, &other_group, 1, 1_900_000_000_000),
+            ])
+            .unwrap();
+
+        let mut expected = vec![
+            (first_author.peer_id(), 1_800_000_003_000),
+            (second_author.peer_id(), 1_800_000_001_000),
+        ];
+        expected.sort_by_key(|(author_id, _)| author_id.to_bytes());
+        assert_eq!(
+            store.latest_author_activity(group.group_id()).unwrap(),
+            expected
+        );
     }
 
     #[test]

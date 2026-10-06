@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::{
-    CreatedMessage, EvidenceExport, GroupMemberDevice, MlsProviderService, StoredMessagePage,
-    UnreadMessageCount, MAX_EVIDENCE_EVENTS,
+    CreatedMessage, EvidenceExport, GroupMemberDevice, MemberActivity, MlsProviderService,
+    StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
 };
 use network::{
     AdvertisementResult, NetworkDiagnostics, NetworkService, NetworkStatus, PeerSearchResult,
@@ -472,6 +472,15 @@ fn group_members(
 }
 
 #[tauri::command]
+fn group_member_activity(
+    group_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<MemberActivity>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    mls_service.member_activity(group_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn blocked_group_devices(
     group_id: String,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
@@ -679,6 +688,7 @@ pub fn run() {
             unread_message_counts,
             group_members,
             remove_group_member,
+            group_member_activity,
             blocked_group_devices,
             set_group_device_blocked,
             advertise_owned_groups,

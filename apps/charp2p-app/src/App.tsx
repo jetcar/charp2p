@@ -182,6 +182,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   device_block_self: "This device cannot block itself.",
   device_block_unavailable: "Blocked devices could not be loaded.",
   member_removal_store_unavailable: "The removal could not be saved securely.",
+  backup_passphrase_invalid: "Use a backup passphrase of at least 12 characters.",
+  identity_backup_failed: "The encrypted backup could not be created.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -535,10 +537,125 @@ function InformationView({
           </section>
           <section>
             <h3>Keep this installation</h3>
-            <p>Reinstalling without a recovery copy creates a different identity. Encrypted recovery export and restore are not available in this MVP build yet.</p>
+            <p>Reinstalling without a recovery copy creates a different identity. Export an encrypted identity backup and keep its passphrase; losing every authorized device and backup can permanently lose access.</p>
           </section>
         </div>
       )}
+      <button className="secondary-button" onClick={onClose} type="button">Back</button>
+    </section>
+  );
+}
+
+const MIN_BACKUP_PASSPHRASE_CHARS = 12;
+
+function backupFileName(profile: DeviceProfile) {
+  const suffix = profile.peerId.slice(-8).replace(/[^A-Za-z0-9]/g, "");
+  return `charp2p-identity-${suffix}.charp2p-backup`;
+}
+
+function bytesToBase64(bytes: number[]) {
+  return btoa(String.fromCharCode(...bytes));
+}
+
+function IdentityBackupView({
+  profile,
+  onClose,
+}: {
+  profile: DeviceProfile;
+  onClose: () => void;
+}) {
+  const [passphrase, setPassphrase] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [backupText, setBackupText] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+  const tooShort = Array.from(passphrase).length < MIN_BACKUP_PASSPHRASE_CHARS;
+  const mismatch = confirmation.length > 0 && confirmation !== passphrase;
+
+  async function exportBackup(event: FormEvent) {
+    event.preventDefault();
+    if (tooShort || passphrase !== confirmation || exporting) return;
+    setExporting(true);
+    setError("");
+    setCopied(false);
+    try {
+      const bytes = await invoke<number[]>("export_identity_backup", { passphrase });
+      const blob = new Blob([new Uint8Array(bytes)], { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = backupFileName(profile);
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      setBackupText(bytesToBase64(bytes));
+      setPassphrase("");
+      setConfirmation("");
+    } catch (exportError) {
+      setError(errorMessage(exportError));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function copyBackup() {
+    try {
+      await navigator.clipboard.writeText(backupText);
+      setCopied(true);
+    } catch {
+      setError("The backup could not be copied. Select the text and copy it manually.");
+    }
+  }
+
+  return (
+    <section className="setup-form information-card">
+      <header>
+        <p className="eyebrow">Identity backup</p>
+        <h2>Create an encrypted recovery copy</h2>
+        <p>The copy contains this device's name and private identity key, encrypted with your passphrase. Group memberships and messages are not included.</p>
+      </header>
+      {backupText ? (
+        <>
+          <p className="preview-note">The backup file was offered for download. If no file was saved, copy the text below and store it somewhere safe outside this device.</p>
+          <textarea aria-label="Encrypted backup text" className="backup-text" readOnly rows={6} value={backupText} />
+          <button className="secondary-button" onClick={copyBackup} type="button">
+            {copied ? "Copied" : "Copy backup text"}
+          </button>
+          <p className="preview-note">Anyone with this copy and your passphrase can act as this device. Restore it on only one installation and stop using the original afterwards.</p>
+        </>
+      ) : (
+        <form className="setup-form" onSubmit={exportBackup}>
+          <label htmlFor="backup-passphrase">Passphrase</label>
+          <input
+            autoComplete="new-password"
+            id="backup-passphrase"
+            onChange={(event) => setPassphrase(event.target.value)}
+            type="password"
+            value={passphrase}
+          />
+          <label htmlFor="backup-confirmation">Repeat passphrase</label>
+          <input
+            autoComplete="new-password"
+            id="backup-confirmation"
+            onChange={(event) => setConfirmation(event.target.value)}
+            type="password"
+            value={confirmation}
+          />
+          <p className="preview-note">
+            {mismatch
+              ? "The passphrases do not match."
+              : `Use at least ${MIN_BACKUP_PASSPHRASE_CHARS} characters. A lost passphrase cannot be recovered.`}
+          </p>
+          <button
+            className="primary-button"
+            disabled={tooShort || passphrase !== confirmation || exporting || !isTauri()}
+            type="submit"
+          >
+            {exporting ? "Encrypting backup…" : "Export encrypted backup"}
+          </button>
+        </form>
+      )}
+      {error && <p className="form-error" role="alert">{error}</p>}
       <button className="secondary-button" onClick={onClose} type="button">Back</button>
     </section>
   );
@@ -552,6 +669,7 @@ function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [informationView, setInformationView] = useState<"privacy" | "identity" | null>(null);
+  const [backupView, setBackupView] = useState(false);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
@@ -1511,6 +1629,8 @@ function App() {
         <div className="setup-content">
           {informationView ? (
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
+          ) : backupView && profile ? (
+            <IdentityBackupView profile={profile} onClose={() => setBackupView(false)} />
           ) : (
             <>
               <Stepper step={step} />
@@ -1569,7 +1689,7 @@ function App() {
                   {profile && <code>{shortPeerId(profile.peerId)}</code>}
                 </div>
               </div>
-              <button className="primary-button" disabled title="Encrypted recovery export is not available yet" type="button">
+              <button className="primary-button" disabled={!profile} onClick={() => setBackupView(true)} type="button">
                 Create recovery copy
               </button>
               <button className="text-button" onClick={() => setStep(3)} type="button">
@@ -2113,6 +2233,17 @@ function App() {
         <footer className="setup-footer">
           <button onClick={() => setInformationView("privacy")} type="button">Privacy</button>
           <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
+          {profile && (
+            <button
+              onClick={() => {
+                setInformationView(null);
+                setBackupView(true);
+              }}
+              type="button"
+            >
+              Identity backup
+            </button>
+          )}
         </footer>
       </section>
     </main>

@@ -148,6 +148,7 @@ button { cursor: pointer; }
 .group-ready-card header > p:last-child, .joined-card header > p:last-child { font-size: 20px; }
 .members-button { min-height: 58px; margin: 0 0 26px; font-size: 18px; }
 .information-card { align-items: stretch; }
+.backup-text { width: 100%; min-height: 120px; margin: 0 0 16px; padding: 14px 16px; resize: vertical; border: 2px solid #d6deea; border-radius: 14px; color: #07113d; background: #fff; font-family: "Cascadia Mono", Consolas, monospace; font-size: 14px; line-height: 1.5; word-break: break-all; }
 .information-card header { margin-bottom: 28px; }
 .information-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .information-sections section { padding: 19px; border: 1px solid #dce4ec; border-radius: 15px; background: white; }

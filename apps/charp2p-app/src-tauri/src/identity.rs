@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use charp2p_core::{DeviceIdentity, DeviceIdentitySecret};
+use charp2p_core::{seal_identity_backup, DeviceIdentity, DeviceIdentitySecret};
 use keyring_core::{Entry, Error as KeyringError};
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -62,6 +62,22 @@ impl IdentityService {
         })
     }
 
+    /// Reads the protected identity record for an encrypted backup. Sealing
+    /// is left to the caller so the slow key derivation does not hold the
+    /// identity lock.
+    pub(crate) fn backup_material(&self) -> Result<(String, DeviceIdentitySecret), &'static str> {
+        let _guard = self
+            .operations
+            .lock()
+            .map_err(|_| "identity_service_unavailable")?;
+        let record = match protected_entry(CREDENTIAL_USER)?.get_secret() {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(KeyringError::NoEntry) => return Err("identity_missing"),
+            Err(_) => return Err("identity_store_unavailable"),
+        };
+        decode_record(record.as_slice())
+    }
+
     pub(crate) fn load_network_identity(&self) -> Result<DeviceIdentity, &'static str> {
         let _guard = self
             .operations
@@ -96,6 +112,18 @@ pub fn initialize_platform_store() -> Result<(), &'static str> {
         keyring_core::set_default_store(store);
         Ok(())
     }
+}
+
+/// Seals the device name and key into a passphrase-encrypted backup (ADR-028).
+pub(crate) fn seal_backup(
+    device_name: &str,
+    secret: &DeviceIdentitySecret,
+    passphrase: &str,
+) -> Result<Vec<u8>, &'static str> {
+    seal_identity_backup(device_name, secret, passphrase).map_err(|error| match error {
+        charp2p_core::IdentityBackupError::InvalidPassphrase => "backup_passphrase_invalid",
+        _ => "identity_backup_failed",
+    })
 }
 
 fn load_profile() -> Result<Option<DeviceProfile>, &'static str> {
@@ -296,6 +324,7 @@ mod tests {
         let service = IdentityService::default();
 
         assert!(service.status().unwrap().is_none());
+        assert_eq!(service.backup_material().err(), Some("identity_missing"));
         let created = service.create("Alex's PC").expect("identity is created");
         let restored = service.status().unwrap().expect("identity is restored");
 
@@ -304,6 +333,20 @@ mod tests {
             service.create("Replacement").unwrap_err(),
             "identity_already_exists"
         );
+
+        let (device_name, secret) = service.backup_material().expect("record is readable");
+        assert_eq!(
+            super::seal_backup(&device_name, &secret, "short").unwrap_err(),
+            "backup_passphrase_invalid"
+        );
+        let backup = super::seal_backup(&device_name, &secret, "correct horse battery")
+            .expect("backup is sealed");
+        let opened = charp2p_core::open_identity_backup(&backup, "correct horse battery")
+            .expect("backup opens");
+        let reopened =
+            DeviceIdentity::from_persisted_secret(&opened.secret).expect("identity restores");
+        assert_eq!(opened.device_name, "Alex's PC");
+        assert_eq!(reopened.peer_id().to_string(), created.peer_id);
         keyring_core::unset_default_store();
     }
 }

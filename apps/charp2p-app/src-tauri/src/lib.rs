@@ -34,6 +34,23 @@ fn create_identity(
     service.create(&device_name).map_err(str::to_owned)
 }
 
+/// Exports the device identity as a passphrase-encrypted backup (ADR-028).
+/// Only the sealed bytes leave Rust; key derivation runs off the UI thread.
+#[tauri::command]
+async fn export_identity_backup(
+    passphrase: String,
+    service: tauri::State<'_, IdentityService>,
+) -> Result<Vec<u8>, String> {
+    let passphrase = zeroize::Zeroizing::new(passphrase);
+    let (device_name, secret) = service.backup_material().map_err(str::to_owned)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        identity::seal_backup(&device_name, &secret, &passphrase)
+    })
+    .await
+    .map_err(|_| "identity_backup_failed".to_owned())?
+    .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn preview_invitation(input: String) -> Result<invitation::InvitationPreview, String> {
     invitation::preview_invitation(&input).map_err(str::to_owned)
@@ -548,6 +565,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             identity_status,
             create_identity,
+            export_identity_backup,
             preview_invitation,
             accept_invitation,
             pending_invitations,

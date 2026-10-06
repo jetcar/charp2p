@@ -87,7 +87,13 @@ type GroupConnectionStateName = "online" | "relayed" | "waiting" | "offline";
 type GroupConnectionState = {
   groupId: string;
   state: GroupConnectionStateName;
+  discovery: GroupDiscoveryName | null;
   observedAtUnix: number;
+};
+type GroupDiscoveryName = "found" | "missing";
+type OwnedGroupDiscoveryStatus = {
+  status: "advertising" | "inactive" | "bootstrapRequired" | "noInvitation";
+  discoveryKeys: number;
 };
 type SynchronizeGroupResult = {
   status: "synchronized";
@@ -320,6 +326,22 @@ function groupConnectionDescription(state: GroupConnectionStateName) {
   if (state === "relayed") return "Relayed";
   if (state === "offline") return "Offline";
   return "Waiting for peers";
+}
+
+function joinedDiscoveryDescription(discovery: GroupDiscoveryName | null | undefined) {
+  if (discovery === "found") return "Discovery record available";
+  if (discovery === "missing") return "Discovery record missing";
+  return "Not checked";
+}
+
+function ownedDiscoveryDescription(status: OwnedGroupDiscoveryStatus | null) {
+  if (!status) return "Not checked";
+  if (status.status === "advertising") {
+    return `Advertising ${status.discoveryKeys} rendezvous ${status.discoveryKeys === 1 ? "key" : "keys"}`;
+  }
+  if (status.status === "bootstrapRequired") return "Bootstrap node needed";
+  if (status.status === "noInvitation") return "No invitation issued yet";
+  return "Not advertising";
 }
 
 function peerSearchDescription(result: PeerSearchResult | null) {
@@ -1437,6 +1459,8 @@ function App() {
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [connectionStates, setConnectionStates] = useState<Record<string, GroupConnectionStateName>>({});
+  const [discoveryStates, setDiscoveryStates] = useState<Record<string, GroupDiscoveryName | null>>({});
+  const [ownedDiscovery, setOwnedDiscovery] = useState<OwnedGroupDiscoveryStatus | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
@@ -1699,6 +1723,36 @@ function App() {
     };
   }, [ownedAdvertisementKey]);
 
+  const localGroupId = localGroup?.groupId ?? "";
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    if (!localGroupId) {
+      setOwnedDiscovery(null);
+      return;
+    }
+
+    async function refreshOwnedDiscovery() {
+      try {
+        const status = await invoke<OwnedGroupDiscoveryStatus>("owned_group_discovery_status", {
+          groupId: localGroupId,
+        });
+        if (active) setOwnedDiscovery(status);
+      } catch {
+        // Discovery status is advisory; advertising reports its own errors.
+        if (active) setOwnedDiscovery(null);
+      } finally {
+        if (active) timer = window.setTimeout(refreshOwnedDiscovery, ADVERTISEMENT_STATUS_INTERVAL_MS);
+      }
+    }
+
+    void refreshOwnedDiscovery();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [localGroupId, advertisement]);
+
   useEffect(() => {
     if (!isTauri() || !joinedGroup) return;
 
@@ -1811,6 +1865,9 @@ function App() {
         if (active) {
           setConnectionStates(
             Object.fromEntries(states.map(({ groupId, state }) => [groupId, state])),
+          );
+          setDiscoveryStates(
+            Object.fromEntries(states.map(({ groupId, discovery }) => [groupId, discovery])),
           );
         }
       } catch {
@@ -2075,6 +2132,9 @@ function App() {
         const states = await invoke<GroupConnectionState[]>("group_connection_states");
         setConnectionStates(
           Object.fromEntries(states.map(({ groupId: id, state }) => [id, state])),
+        );
+        setDiscoveryStates(
+          Object.fromEntries(states.map(({ groupId: id, discovery }) => [id, discovery])),
         );
       } catch {
         // Connection states are advisory and refreshed periodically.
@@ -2738,6 +2798,7 @@ function App() {
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
                 <div><dt>Last synchronized</dt><dd>{synchronizationDescription(joinedGroup.lastSynchronizedAtUnix)}</dd></div>
                 <div><dt>Connection</dt><dd>{connectionStates[joinedGroup.groupId] ? groupConnectionDescription(connectionStates[joinedGroup.groupId]) : "Not checked"}</dd></div>
+                <div><dt>Discovery</dt><dd>{joinedDiscoveryDescription(discoveryStates[joinedGroup.groupId])}</dd></div>
               </dl>
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
@@ -2846,6 +2907,7 @@ function App() {
                 <div><dt>Join mode</dt><dd>Valid invitation grants access</dd></div>
                 <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
+                <div><dt>Discovery</dt><dd>{ownedDiscoveryDescription(ownedDiscovery)}</dd></div>
               </dl>
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}

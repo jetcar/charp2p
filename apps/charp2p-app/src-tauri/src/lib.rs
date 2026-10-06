@@ -23,7 +23,7 @@ use mls_storage::{
 };
 use network::{
     AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
-    PeerSearchResult, SynchronizeGroupResult,
+    OwnedGroupDiscoveryStatus, PeerSearchResult, SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use settings::{AppInformation, SettingsService};
@@ -575,6 +575,21 @@ fn group_connection_states(
     Ok(network_service.group_connection_states(&group_ids))
 }
 
+/// Reports whether the background provider advertises an owned group's
+/// retained rendezvous keys, for its group details.
+#[tauri::command]
+async fn owned_group_discovery_status(
+    group_id: String,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<OwnedGroupDiscoveryStatus, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let keys = group_service
+        .owner_discovery_keys(group_id)
+        .map_err(str::to_owned)?;
+    Ok(network_service.owned_group_discovery_status(&keys).await)
+}
+
 /// Builds the Network page diagnostic export. Groups are reported only as
 /// counts; identity, invitation and discovery secrets are never read.
 #[tauri::command]
@@ -894,6 +909,7 @@ pub fn run() {
             advertise_owned_groups,
             network_status,
             group_connection_states,
+            owned_group_discovery_status,
             network_diagnostics,
             app_information,
             background_status,

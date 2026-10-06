@@ -245,7 +245,26 @@ const MAX_GROUP_CONNECTION_STATES: usize = 256;
 pub struct GroupConnectionState {
     pub group_id: String,
     pub state: &'static str,
+    /// Whether the latest discovery lookup found the group provider's record
+    /// ("found") or not ("missing"); absent until a lookup completed.
+    pub discovery: Option<&'static str>,
     pub observed_at_unix: u64,
+}
+
+/// Background advertising state of one owned group's retained rendezvous
+/// keys, shown in its group details.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedGroupDiscoveryStatus {
+    pub status: &'static str,
+    pub discovery_keys: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedGroupSynchronization {
+    state: &'static str,
+    discovery: Option<&'static str>,
+    observed_at_unix: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -319,7 +338,7 @@ pub struct NetworkService {
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     contribution: Mutex<Option<ActiveContribution>>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
-    group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedConnection>>,
+    group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedGroupSynchronization>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
@@ -518,6 +537,7 @@ impl NetworkService {
         &self,
         group_id: PeerId,
         result: Result<T, &'static str>,
+        discovery: Option<&'static str>,
         connection_type: impl FnOnce(&T) -> &'static str,
     ) -> Result<T, &'static str> {
         let state = match &result {
@@ -544,10 +564,18 @@ impl NetworkService {
                 states.remove(&oldest);
             }
         }
+        // An attempt that stopped before the lookup completed keeps the
+        // previously observed discovery outcome.
+        let discovery = discovery.or_else(|| {
+            states
+                .get(&group_id)
+                .and_then(|observed| observed.discovery)
+        });
         states.insert(
             group_id,
-            ObservedConnection {
-                connection_type: state,
+            ObservedGroupSynchronization {
+                state,
+                discovery,
                 observed_at_unix,
             },
         );
@@ -566,11 +594,39 @@ impl NetworkService {
             .filter_map(|group_id| {
                 states.get(group_id).map(|observed| GroupConnectionState {
                     group_id: group_id.to_string(),
-                    state: observed.connection_type,
+                    state: observed.state,
+                    discovery: observed.discovery,
                     observed_at_unix: observed.observed_at_unix,
                 })
             })
             .collect()
+    }
+
+    /// Reports whether the background provider currently advertises every
+    /// retained rendezvous key of one owned group.
+    pub async fn owned_group_discovery_status(
+        &self,
+        keys: &[DiscoveryKey],
+    ) -> OwnedGroupDiscoveryStatus {
+        let status = if keys.is_empty() {
+            "noInvitation"
+        } else if self.bootstrap_peers.is_empty() {
+            "bootstrapRequired"
+        } else {
+            match self.advertisement.lock().await.as_ref() {
+                Some(active)
+                    if !active.task.is_finished()
+                        && keys.iter().all(|key| active.keys.contains(key)) =>
+                {
+                    "advertising"
+                }
+                _ => "inactive",
+            }
+        };
+        OwnedGroupDiscoveryStatus {
+            status,
+            discovery_keys: keys.len(),
+        }
     }
 
     pub async fn advertise_owner_group(
@@ -1052,10 +1108,18 @@ impl NetworkService {
         expected_peer: PeerId,
         bandwidth: &BandwidthService,
     ) -> Result<SynchronizeGroupResult, &'static str> {
+        let mut discovery = None;
         let result = self
-            .synchronize_with_peer(identity, key, group_id, expected_peer, bandwidth)
+            .synchronize_with_peer(
+                identity,
+                key,
+                group_id,
+                expected_peer,
+                bandwidth,
+                &mut discovery,
+            )
             .await;
-        self.observe_group_synchronization(group_id, result, |synchronized| {
+        self.observe_group_synchronization(group_id, result, discovery, |synchronized| {
             synchronized.connection_type
         })
     }
@@ -1067,6 +1131,7 @@ impl NetworkService {
         group_id: PeerId,
         expected_peer: PeerId,
         bandwidth: &BandwidthService,
+        discovery: &mut Option<&'static str>,
     ) -> Result<SynchronizeGroupResult, &'static str> {
         let local_peer = identity.peer_id();
         if local_peer == expected_peer {
@@ -1075,9 +1140,11 @@ impl NetworkService {
         // Skip discovery while the synchronization data limit is spent
         // (ADR-033).
         bandwidth.ensure_sync_budget()?;
-        let (mut node, connection_path) = self
+        let connected = self
             .connect_to_group_provider(identity, key, expected_peer)
-            .await?;
+            .await;
+        *discovery = discovery_outcome(&connected);
+        let (mut node, connection_path) = connected?;
         let synchronized_events = self
             .pull_from_connected_peer(&mut node, expected_peer, group_id, Some(bandwidth))
             .await?;
@@ -1554,6 +1621,17 @@ fn connection_type_name(path: ConnectionPath) -> &'static str {
     }
 }
 
+/// Classifies a group provider lookup by what it shows about the provider's
+/// discovery record: a dial failure after the record was found still implies
+/// "found", and failures before the lookup completed say nothing.
+fn discovery_outcome<T>(result: &Result<T, &'static str>) -> Option<&'static str> {
+    match result {
+        Ok(_) | Err("network_peer_unreachable") => Some("found"),
+        Err("network_peer_not_found" | "network_search_timed_out") => Some("missing"),
+        Err(_) => None,
+    }
+}
+
 fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
     let mut address: Multiaddr = input.parse().map_err(|_| "network_configuration_invalid")?;
     let Some(Protocol::P2p(peer_id)) = address.pop() else {
@@ -1595,12 +1673,12 @@ mod tests {
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
-        join_response, parse_bootstrap_peer, AdvertisementResult, BootstrapNodeStatus,
-        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, NetworkService,
-        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
-        SynchronizationService, UnavailableJoinRequestAuthorizer,
-        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
-        MAX_GROUP_CONNECTION_STATES,
+        discovery_outcome, join_response, parse_bootstrap_peer, AdvertisementResult,
+        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
+        MemberAdmissionService, NetworkService, NetworkStatus, PeerSearchResult,
+        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
+        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
+        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -2055,6 +2133,69 @@ mod tests {
     }
 
     #[test]
+    fn group_discovery_outcome_keeps_the_last_completed_lookup() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let group = DeviceIdentity::generate().peer_id();
+        let discovery = || service.group_connection_states(&[group])[0].discovery;
+
+        let not_found = Err::<&str, _>("network_peer_not_found");
+        let _ = service.observe_group_synchronization(
+            group,
+            not_found,
+            discovery_outcome(&not_found),
+            |path| path,
+        );
+        assert_eq!(discovery(), Some("missing"));
+        let unreachable = Err::<&str, _>("network_peer_unreachable");
+        let _ = service.observe_group_synchronization(
+            group,
+            unreachable,
+            discovery_outcome(&unreachable),
+            |path| path,
+        );
+        assert_eq!(discovery(), Some("found"));
+        let offline = Err::<&str, _>("network_unavailable");
+        let _ = service.observe_group_synchronization(
+            group,
+            offline,
+            discovery_outcome(&offline),
+            |path| path,
+        );
+        assert_eq!(
+            service.group_connection_states(&[group])[0].state,
+            "offline"
+        );
+        assert_eq!(discovery(), Some("found"));
+        let timed_out = Err::<&str, _>("network_search_timed_out");
+        assert_eq!(discovery_outcome(&timed_out), Some("missing"));
+        assert_eq!(discovery_outcome(&Ok::<_, &str>(())), Some("found"));
+        assert_eq!(
+            discovery_outcome(&Err::<(), _>("synchronization_bandwidth_limited")),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_group_discovery_status_reports_background_advertising() {
+        let without_bootstrap = NetworkService::from_sources(&[], "").unwrap();
+        let key = DiscoveryKey::from_bytes([3; 32]);
+        let status =
+            tauri::async_runtime::block_on(without_bootstrap.owned_group_discovery_status(&[]));
+        assert_eq!(status.status, "noInvitation");
+        assert_eq!(status.discovery_keys, 0);
+        let status =
+            tauri::async_runtime::block_on(without_bootstrap.owned_group_discovery_status(&[key]));
+        assert_eq!(status.status, "bootstrapRequired");
+        assert_eq!(status.discovery_keys, 1);
+
+        let bootstrap_peer = DeviceIdentity::generate().peer_id();
+        let configured = format!("/ip4/127.0.0.1/udp/9/quic-v1/p2p/{bootstrap_peer}");
+        let service = NetworkService::from_sources(&[], &configured).unwrap();
+        let status = tauri::async_runtime::block_on(service.owned_group_discovery_status(&[key]));
+        assert_eq!(status.status, "inactive");
+    }
+
+    #[test]
     fn group_connection_states_follow_the_latest_synchronization_attempt() {
         let service = NetworkService::from_sources(&[], "").unwrap();
         let first = DeviceIdentity::generate().peer_id();
@@ -2067,18 +2208,23 @@ mod tests {
                 .map(|observed| observed.state)
         };
 
-        let _ = service.observe_group_synchronization(first, Ok("direct"), |path| path);
-        let _ = service.observe_group_synchronization(second, Ok("relayed"), |path| path);
+        let _ = service.observe_group_synchronization(first, Ok("direct"), None, |path| path);
+        let _ = service.observe_group_synchronization(second, Ok("relayed"), None, |path| path);
         assert_eq!(state(first), Some("online"));
         assert_eq!(state(second), Some("relayed"));
-        let _ = service.observe_group_synchronization(first, Ok("lan"), |path| path);
+        let _ = service.observe_group_synchronization(first, Ok("lan"), None, |path| path);
         assert_eq!(state(first), Some("online"));
-        let _ =
-            service.observe_group_synchronization::<&str>(first, Err("network_unavailable"), |p| p);
+        let _ = service.observe_group_synchronization::<&str>(
+            first,
+            Err("network_unavailable"),
+            None,
+            |p| p,
+        );
         assert_eq!(state(first), Some("offline"));
         let _ = service.observe_group_synchronization::<&str>(
             second,
             Err("network_peer_not_found"),
+            None,
             |path| path,
         );
         assert_eq!(state(second), Some("waiting"));
@@ -2102,7 +2248,7 @@ mod tests {
             .map(|_| DeviceIdentity::generate().peer_id())
             .collect::<Vec<_>>();
         for group in &groups {
-            let _ = service.observe_group_synchronization(*group, Ok("direct"), |path| path);
+            let _ = service.observe_group_synchronization(*group, Ok("direct"), None, |path| path);
         }
 
         assert_eq!(

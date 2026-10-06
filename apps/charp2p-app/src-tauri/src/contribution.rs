@@ -1,12 +1,10 @@
-use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use charp2p_network::RelayLimits;
 use serde::{Deserialize, Serialize};
 
-/// Larger preference files are rejected rather than parsed.
-const MAX_PREFERENCE_FILE_BYTES: u64 = 4 * 1024;
+use crate::preference_file::{self, PreferenceReadError};
 
 /// Device-local opt-in to routing and relay contribution (ADR-031). Holds no
 /// secrets and is never synchronized.
@@ -118,40 +116,20 @@ impl ContributionService {
     /// Reads the stored preference. A missing file means contribution is off;
     /// an unreadable or invalid file is reported instead of enabling anything.
     fn read(&self) -> Result<ContributionPreference, &'static str> {
-        let file = match std::fs::File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(ContributionPreference::default());
-            }
-            Err(_) => return Err("contribution_preference_unavailable"),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_PREFERENCE_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "contribution_preference_unavailable")?;
-        if bytes.len() as u64 > MAX_PREFERENCE_FILE_BYTES {
-            return Err("contribution_preference_invalid");
-        }
-        let preference: ContributionPreference =
-            serde_json::from_slice(&bytes).map_err(|_| "contribution_preference_invalid")?;
+        let preference: ContributionPreference = preference_file::read(&self.path)
+            .map_err(|error| match error {
+                PreferenceReadError::Unavailable => "contribution_preference_unavailable",
+                PreferenceReadError::Invalid => "contribution_preference_invalid",
+            })?
+            .unwrap_or_default();
         preference
             .relay_limits()
             .map_err(|_| "contribution_preference_invalid")?;
         Ok(preference)
     }
 
-    /// Replaces the file through a temporary sibling so a crash never leaves
-    /// a partially written preference.
-    fn write(&self, preference: &ContributionPreference) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec(preference).map_err(io::Error::other)?;
-        let mut temporary = self.path.as_os_str().to_owned();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(&temporary, &self.path)
+    fn write(&self, preference: &ContributionPreference) -> std::io::Result<()> {
+        preference_file::write(&self.path, preference)
     }
 }
 

@@ -72,6 +72,8 @@ type EvidenceExport = {
   generatedAtUnixMs: number;
   events: { eventId: string }[];
 };
+type BackgroundPreference = { keepRunningWhenClosed: boolean };
+type BackgroundStatus = { available: boolean; preference: BackgroundPreference };
 type AppInformation = {
   appVersion: string;
   os: string;
@@ -906,6 +908,72 @@ function formatStorageBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
+function BackgroundSection() {
+  const [status, setStatus] = useState<BackgroundStatus | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<BackgroundStatus>("background_status")
+      .then((next) => {
+        if (active) setStatus(next);
+      })
+      .catch((caught) => {
+        if (active) setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function save(keepRunningWhenClosed: boolean) {
+    setSaving(true);
+    setError("");
+    try {
+      setStatus(
+        await invoke<BackgroundStatus>("set_background_preference", { preference: { keepRunningWhenClosed } }),
+      );
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3>Background and startup</h3>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {status && !status.available ? (
+        <p>The operating system decides when this device can synchronize in the background.</p>
+      ) : (
+        <>
+          <label className="contribution-option">
+            <input
+              checked={status?.preference.keepRunningWhenClosed ?? false}
+              disabled={!status || saving}
+              onChange={(event) => void save(event.target.checked)}
+              type="checkbox"
+            />
+            Keep running when the window is closed
+          </label>
+          <p>
+            Keeps advertising your groups and synchronizing while the window is hidden. Open CharP2P again to show it.
+            Messages still arrive only while a group member is reachable.
+          </p>
+          {status?.preference.keepRunningWhenClosed && (
+            <button className="secondary-button" onClick={() => void invoke("quit_app")} type="button">
+              Quit CharP2P
+            </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 function SettingsView({ onClose }: { onClose: () => void }) {
   const [information, setInformation] = useState<AppInformation | null>(null);
   const [error, setError] = useState("");
@@ -943,6 +1011,7 @@ function SettingsView({ onClose }: { onClose: () => void }) {
           </p>
           <p>Messages are kept on this device until you hide them or leave the group. Hiding affects only this device.</p>
         </section>
+        <BackgroundSection />
         <section>
           <h3>Node policy</h3>
           <p>

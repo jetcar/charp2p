@@ -1,3 +1,4 @@
+mod background;
 mod contribution;
 pub mod groups;
 mod identity;
@@ -5,10 +6,12 @@ mod invitation;
 mod mls_storage;
 mod network;
 mod pending;
+mod preference_file;
 mod settings;
 
 use std::sync::{Arc, Mutex};
 
+use background::{BackgroundPreference, BackgroundService, BackgroundStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
@@ -584,6 +587,31 @@ fn app_information(service: tauri::State<'_, SettingsService>) -> Result<AppInfo
     service.information().map_err(str::to_owned)
 }
 
+/// Reports the device-local background preference (ADR-032).
+#[tauri::command]
+fn background_status(
+    service: tauri::State<'_, BackgroundService>,
+) -> Result<BackgroundStatus, String> {
+    service.status().map_err(str::to_owned)
+}
+
+/// Stores the device-local background preference. It applies to the next
+/// window close request. Refused on builds without background running.
+#[tauri::command]
+fn set_background_preference(
+    preference: BackgroundPreference,
+    service: tauri::State<'_, BackgroundService>,
+) -> Result<BackgroundStatus, String> {
+    service.set(preference).map_err(str::to_owned)
+}
+
+/// Exits the application, including when closing the window would only hide
+/// it.
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 /// Reports the device-local contribution preference and its worst-case
 /// relayed volume (ADR-031).
 #[tauri::command]
@@ -718,6 +746,9 @@ pub fn run() {
             app.manage(groups);
             app.manage(mls);
             app.manage(network);
+            app.manage(BackgroundService::new(
+                data_directory.join("background.json"),
+            ));
             app.manage(ContributionService::new(
                 data_directory.join("contribution.json"),
             ));
@@ -740,6 +771,19 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Keep advertising and synchronizing while the window is hidden
+            // when the user chose to; a second launch shows it again.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window
+                    .state::<BackgroundService>()
+                    .keeps_running_when_closed()
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             identity_status,
@@ -777,6 +821,9 @@ pub fn run() {
             group_connection_states,
             network_diagnostics,
             app_information,
+            background_status,
+            set_background_preference,
+            quit_app,
             contribution_status,
             set_contribution_preference
         ])

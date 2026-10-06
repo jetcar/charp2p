@@ -18,6 +18,12 @@ const MAX_CAUSAL_PARENTS: usize = 16;
 pub struct EventId([u8; 32]);
 
 impl EventId {
+    /// Wraps identifier bytes, e.g. from a local index or user selection.
+    /// Lookups must still check the identifier against a verified event.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Returns the identifier bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0

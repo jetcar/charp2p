@@ -299,3 +299,9 @@ button { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; scroll-behavior: auto !important; transition: none !important; }
 }
+.evidence-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: #52607d; font-size: 13px; }
+.evidence-controls button { padding: 0; border: 0; color: #2f5bd3; background: transparent; font: inherit; cursor: pointer; }
+.evidence-controls button:hover { text-decoration: underline; }
+.evidence-controls button:disabled { opacity: .48; cursor: default; }
+.evidence-select { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; }
+.evidence-result { display: grid; gap: 8px; }

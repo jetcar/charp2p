@@ -56,6 +56,11 @@ type NetworkDiagnostics = {
   format: string;
   generatedAtUnix: number;
 };
+type EvidenceExport = {
+  format: string;
+  generatedAtUnixMs: number;
+  events: { eventId: string }[];
+};
 type AppInformation = {
   appVersion: string;
   os: string;
@@ -97,6 +102,7 @@ const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
+const EVIDENCE_EVENT_LIMIT = 64;
 
 const ERROR_MESSAGES: Record<string, string> = {
   identity_already_exists: "This device already has an identity.",
@@ -205,6 +211,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   backup_unrecognized: "This is not a CharP2P identity backup this version can open.",
   backup_text_invalid: "The backup text is not valid. Paste the complete text copied from the backup screen.",
   identity_backup_invalid: "The backup does not contain a valid device identity.",
+  evidence_selection_invalid: "Select between 1 and 64 messages to export as evidence.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -1019,6 +1026,9 @@ function App() {
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
   const [replyingTo, setReplyingTo] = useState<StoredMessage | null>(null);
+  const [evidenceSelection, setEvidenceSelection] = useState<string[] | null>(null);
+  const [evidenceText, setEvidenceText] = useState("");
+  const [exportingEvidence, setExportingEvidence] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
@@ -1317,6 +1327,11 @@ function App() {
       active = false;
     };
   }, [issuedInvitation]);
+
+  useEffect(() => {
+    setEvidenceSelection(null);
+    setEvidenceText("");
+  }, [localGroup?.groupId, joinedGroup?.groupId]);
 
   useEffect(() => {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -1855,6 +1870,98 @@ function App() {
     }
   }
 
+  function toggleEvidenceMessage(eventId: string) {
+    setEvidenceSelection((selection) => {
+      if (!selection) return selection;
+      if (selection.includes(eventId)) return selection.filter((candidate) => candidate !== eventId);
+      return selection.length >= EVIDENCE_EVENT_LIMIT ? selection : [...selection, eventId];
+    });
+  }
+
+  async function exportEvidence(groupId: string) {
+    if (!evidenceSelection?.length || exportingEvidence || !isTauri()) return;
+    setError("");
+    setExportingEvidence(true);
+    try {
+      const evidence = await invoke<EvidenceExport>("export_message_evidence", {
+        groupId,
+        eventIds: evidenceSelection,
+      });
+      const text = JSON.stringify(evidence, null, 2);
+      const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `charp2p-evidence-${evidence.generatedAtUnixMs}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setEvidenceText(text);
+      setEvidenceSelection(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setExportingEvidence(false);
+    }
+  }
+
+  function renderEvidenceControls(groupId: string) {
+    return (
+      <div className="evidence-controls">
+        {evidenceSelection ? (
+          <>
+            <span>{evidenceSelection.length} selected (up to {EVIDENCE_EVENT_LIMIT})</span>
+            <button onClick={() => setEvidenceSelection(null)} type="button">Cancel</button>
+            <button
+              disabled={!evidenceSelection.length || exportingEvidence || !isTauri()}
+              onClick={() => void exportEvidence(groupId)}
+              type="button"
+            >
+              {exportingEvidence ? "Exporting…" : "Export evidence"}
+            </button>
+          </>
+        ) : (
+          <button onClick={() => { setEvidenceSelection([]); setEvidenceText(""); }} type="button">
+            Select messages for evidence
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  function renderEvidenceCheckbox(message: StoredMessage) {
+    if (!evidenceSelection) return null;
+    return (
+      <label className="evidence-select">
+        <input
+          checked={evidenceSelection.includes(message.eventId)}
+          onChange={() => toggleEvidenceMessage(message.eventId)}
+          type="checkbox"
+        />
+        Include in evidence
+      </label>
+    );
+  }
+
+  function renderEvidenceResult() {
+    if (!evidenceText) return null;
+    return (
+      <div className="evidence-result">
+        <p className="preview-note">
+          The export contains the signed events and the text shown here. Signatures prove which device sent each
+          event; the readable text is your copy and is not covered by them. Share it only with people you choose.
+        </p>
+        <textarea aria-label="Evidence export" className="backup-text" readOnly rows={6} value={evidenceText} />
+        <button
+          className="secondary-button"
+          onClick={() => void navigator.clipboard.writeText(evidenceText).catch(() => setError("The evidence could not be copied."))}
+          type="button"
+        >
+          Copy evidence
+        </button>
+        <button className="secondary-button" onClick={() => setEvidenceText("")} type="button">Close</button>
+      </div>
+    );
+  }
+
   async function createGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!groupName.trim() || creatingGroup || !isTauri()) return;
@@ -2183,11 +2290,14 @@ function App() {
               {groupMessages.length > 0 && (
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
+                  {renderEvidenceControls(joinedGroup.groupId)}
+                  {renderEvidenceResult()}
                   {groupMessages.map((message) => (
                     <article
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
+                      {renderEvidenceCheckbox(message)}
                       {renderReplyQuote(message)}
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
@@ -2331,11 +2441,14 @@ function App() {
               {groupMessages.length > 0 && (
                 <section className="message-timeline" aria-label="Messages saved on this device">
                   <h3>Messages</h3>
+                  {renderEvidenceControls(localGroup.groupId)}
+                  {renderEvidenceResult()}
                   {groupMessages.map((message) => (
                     <article
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
+                      {renderEvidenceCheckbox(message)}
                       {renderReplyQuote(message)}
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>

@@ -53,6 +53,9 @@ const MESSAGE_AAD: &[u8] = b"charp2p-local-message-v1\0";
 const JOIN_RESPONSE_AAD: &[u8] = b"charp2p-join-response-v1\0";
 const JOIN_REQUEST_HASH_DOMAIN: &[u8] = b"charp2p-join-request-v1\0";
 const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_EVIDENCE_EVENTS: usize = 64;
+const EVIDENCE_FORMAT: &str = "charp2p-evidence-v1";
+const EVIDENCE_NOTICE: &str = "Each signed event proves which device signed it and when it claims to have been created. Event payloads are end-to-end encrypted; displayedText is the text shown on the exporting device and is not covered by the signatures.";
 
 trait WrappingKeyStore: Send + Sync {
     fn get_optional(&self) -> Result<Option<Zeroizing<[u8; WRAPPING_KEY_BYTES]>>, &'static str>;
@@ -123,6 +126,41 @@ pub(crate) struct StoredMessage {
 pub(crate) struct StoredMessagePage {
     pub messages: Vec<StoredMessage>,
     pub has_earlier: bool,
+}
+
+/// User-selected signed events exported for review outside the app (ADR-029).
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvidenceExport {
+    pub format: &'static str,
+    pub notice: &'static str,
+    pub generated_at_unix_ms: u64,
+    pub exported_by_device_id: String,
+    pub group_id: String,
+    pub events: Vec<EvidenceEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvidenceEvent {
+    pub event_id: String,
+    pub kind: &'static str,
+    pub author_id: String,
+    pub author_sequence: u64,
+    pub created_at_unix_ms: u64,
+    /// Canonical signed envelope; its payload stays MLS ciphertext.
+    pub signed_event_hex: String,
+    /// Text this device shows, asserted by the exporter, not by a signature.
+    pub displayed_text: String,
+    pub edit: Option<EvidenceEdit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvidenceEdit {
+    pub event_id: String,
+    pub kind: &'static str,
+    pub signed_event_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
@@ -444,21 +482,8 @@ impl MlsProviderService {
             .messages
             .into_iter()
             .map(|message| {
-                let plaintext = match &message.edit {
-                    Some(edit) => {
-                        decrypt_local_message(&edit.encrypted_body, &key, &edit.event_id)?
-                    }
-                    None => {
-                        decrypt_local_message(&message.encrypted_body, &key, &message.event_id)?
-                    }
-                };
-                let text = std::str::from_utf8(&plaintext)
-                    .map_err(|_| "message_record_invalid")?
-                    .to_owned();
-                if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
-                    return Err("message_record_invalid");
-                }
-                Ok(StoredMessage {
+                let text = displayed_message_text(&message, &key)?;
+                Ok::<_, &'static str>(StoredMessage {
                     event_id: hex_bytes(&message.event_id),
                     group_id: message.group_id.to_string(),
                     author_id: message.author_id.to_string(),
@@ -480,6 +505,93 @@ impl MlsProviderService {
         Ok(StoredMessagePage {
             messages,
             has_earlier: encrypted_page.has_earlier,
+        })
+    }
+
+    /// Builds an evidence export of user-selected readable messages: their
+    /// signed event envelopes (and the latest applied edit's envelope) with
+    /// the text shown on this device (ADR-029). Selection is limited to the
+    /// messages the timeline currently shows.
+    pub(crate) fn evidence(
+        &self,
+        group_id: PeerId,
+        local_device_id: PeerId,
+        event_ids: &[[u8; 32]],
+        generated_at_unix_ms: u64,
+    ) -> Result<EvidenceExport, &'static str> {
+        if event_ids.is_empty() || event_ids.len() > MAX_EVIDENCE_EVENTS {
+            return Err("evidence_selection_invalid");
+        }
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let page = store
+            .encrypted_messages(group_id)
+            .map_err(|_| "message_list_unavailable")?;
+        let selected = page
+            .messages
+            .into_iter()
+            .filter(|message| event_ids.contains(&message.event_id))
+            .collect::<Vec<_>>();
+        let mut requested = event_ids.to_vec();
+        requested.sort_unstable();
+        requested.dedup();
+        if selected.len() != requested.len() {
+            return Err("message_not_found");
+        }
+        let key = self
+            .wrapping_keys
+            .get_optional()?
+            .ok_or("mls_wrapping_key_missing")?;
+        let signed_envelope = |event_id: &[u8; 32]| -> Result<String, &'static str> {
+            let event = store
+                .get_event(EventId::from_bytes(*event_id))
+                .map_err(|_| "message_store_unavailable")?
+                .ok_or("message_not_found")?;
+            if event.group_id() != group_id {
+                return Err("message_not_found");
+            }
+            Ok(hex_bytes(
+                &event.encode().map_err(|_| "message_record_invalid")?,
+            ))
+        };
+        let events = selected
+            .iter()
+            .map(|message| {
+                Ok(EvidenceEvent {
+                    event_id: hex_bytes(&message.event_id),
+                    kind: "MessageCreated",
+                    author_id: message.author_id.to_string(),
+                    author_sequence: message.author_sequence,
+                    created_at_unix_ms: message.created_at_unix_ms,
+                    signed_event_hex: signed_envelope(&message.event_id)?,
+                    displayed_text: displayed_message_text(message, &key)?,
+                    edit: message
+                        .edit
+                        .as_ref()
+                        .map(|edit| {
+                            Ok::<_, &'static str>(EvidenceEdit {
+                                event_id: hex_bytes(&edit.event_id),
+                                kind: "MessageEdited",
+                                signed_event_hex: signed_envelope(&edit.event_id)?,
+                            })
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        Ok(EvidenceExport {
+            format: EVIDENCE_FORMAT,
+            notice: EVIDENCE_NOTICE,
+            generated_at_unix_ms,
+            exported_by_device_id: local_device_id.to_string(),
+            group_id: group_id.to_string(),
+            events,
         })
     }
 
@@ -1756,6 +1868,25 @@ impl MlsProviderService {
     }
 }
 
+/// Decrypts the text this device shows for a message: its latest applied edit,
+/// otherwise the original body.
+fn displayed_message_text(
+    message: &charp2p_store::EncryptedMessage,
+    key: &[u8; WRAPPING_KEY_BYTES],
+) -> Result<String, &'static str> {
+    let plaintext = match &message.edit {
+        Some(edit) => decrypt_local_message(&edit.encrypted_body, key, &edit.event_id)?,
+        None => decrypt_local_message(&message.encrypted_body, key, &message.event_id)?,
+    };
+    let text = std::str::from_utf8(&plaintext)
+        .map_err(|_| "message_record_invalid")?
+        .to_owned();
+    if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
+        return Err("message_record_invalid");
+    }
+    Ok(text)
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
 
@@ -2191,9 +2322,9 @@ mod tests {
 
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
-        encrypt_local_message, encrypt_snapshot, join_request_hash, GroupMemberDevice,
+        encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash, GroupMemberDevice,
         MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
-        WrappingKeyStore, WRAPPING_KEY_BYTES,
+        WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::{EventStore, PendingInvitationMetadata};
 
@@ -3577,6 +3708,97 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn evidence_exports_selected_signed_envelopes_with_displayed_text() {
+        let directory = tempdir().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let other_group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let service = test_service(directory.path().join("owner.sqlite3"));
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        service
+            .initialize_owner_group(other_group_id, &owner)
+            .unwrap();
+        let first = service
+            .create_message_at(group_id, &owner, "First", 43)
+            .unwrap();
+        let second = service
+            .create_message_at(group_id, &owner, "Second typo", 44)
+            .unwrap();
+        let foreign = service
+            .create_message_at(other_group_id, &owner, "Elsewhere", 45)
+            .unwrap();
+        let second_id = *second.id().as_bytes();
+        service
+            .edit_message(group_id, &owner, &second_id, "Second fixed")
+            .unwrap();
+
+        let export = service
+            .evidence(
+                group_id,
+                owner.peer_id(),
+                &[second_id, *first.id().as_bytes(), second_id],
+                99,
+            )
+            .unwrap();
+        assert_eq!(export.format, "charp2p-evidence-v1");
+        assert_eq!(export.generated_at_unix_ms, 99);
+        assert_eq!(export.group_id, group_id.to_string());
+        assert_eq!(export.exported_by_device_id, owner.peer_id().to_string());
+        assert_eq!(
+            export
+                .events
+                .iter()
+                .map(|event| (event.displayed_text.as_str(), event.edit.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("First", false), ("Second fixed", true)]
+        );
+        for event in &export.events {
+            let envelope = SignedEvent::decode(&decode_hex(&event.signed_event_hex)).unwrap();
+            assert_eq!(hex_bytes(envelope.id().as_bytes()), event.event_id);
+            assert_eq!(envelope.author_id().to_string(), event.author_id);
+            assert_eq!(envelope.kind(), EventKind::MessageCreated);
+        }
+        let edit = export.events[1].edit.as_ref().unwrap();
+        let edit_envelope = SignedEvent::decode(&decode_hex(&edit.signed_event_hex)).unwrap();
+        assert_eq!(hex_bytes(edit_envelope.id().as_bytes()), edit.event_id);
+        assert_eq!(edit_envelope.kind(), EventKind::MessageEdited);
+
+        assert_eq!(
+            service.evidence(group_id, owner.peer_id(), &[], 99),
+            Err("evidence_selection_invalid")
+        );
+        assert_eq!(
+            service.evidence(
+                group_id,
+                owner.peer_id(),
+                &[[7; 32]; MAX_EVIDENCE_EVENTS + 1],
+                99
+            ),
+            Err("evidence_selection_invalid")
+        );
+        assert_eq!(
+            service.evidence(group_id, owner.peer_id(), &[*foreign.id().as_bytes()], 99),
+            Err("message_not_found")
+        );
+        assert_eq!(
+            service.evidence(
+                group_id,
+                owner.peer_id(),
+                &[*edit_envelope.id().as_bytes()],
+                99
+            ),
+            Err("message_not_found")
+        );
+    }
+
+    fn decode_hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&text[offset..offset + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]

@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use mls_storage::{
-    CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage, UnreadMessageCount,
+    CreatedMessage, EvidenceExport, GroupMemberDevice, MlsProviderService, StoredMessagePage,
+    UnreadMessageCount, MAX_EVIDENCE_EVENTS,
 };
 use network::{
     AdvertisementResult, NetworkDiagnostics, NetworkService, NetworkStatus, PeerSearchResult,
@@ -406,6 +407,41 @@ fn group_messages(
         .map_err(str::to_owned)
 }
 
+/// Exports the signed envelopes of user-selected messages with the text shown
+/// on this device (ADR-029).
+#[tauri::command]
+fn export_message_evidence(
+    group_id: String,
+    event_ids: Vec<String>,
+    identity_service: tauri::State<'_, IdentityService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<EvidenceExport, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    if event_ids.is_empty() || event_ids.len() > MAX_EVIDENCE_EVENTS {
+        return Err("evidence_selection_invalid".to_owned());
+    }
+    let event_ids = event_ids
+        .iter()
+        .map(|event_id| parse_event_id(event_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    let generated_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or("system_clock_invalid")?;
+    mls_service
+        .evidence(
+            group_id,
+            identity.peer_id(),
+            &event_ids,
+            generated_at_unix_ms,
+        )
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn unread_message_counts(
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
@@ -638,6 +674,7 @@ pub fn run() {
             send_group_message,
             edit_group_message,
             group_messages,
+            export_message_evidence,
             hide_group_message,
             unread_message_counts,
             group_members,

@@ -507,6 +507,12 @@ a device-local hidden-message table. The signed event remains available for
 synchronization and audit, while future materialization queries skip the hidden
 event. This action never creates a group-wide `MessageDeleted` event.
 
+An evidence export (ADR-029) contains the re-verified signed envelopes of up to
+64 user-selected readable messages and their latest same-author edits, with
+the text shown on the exporting device. The signatures authenticate the author
+device and event fields; the displayed text is the exporter's assertion
+because event payloads remain MLS ciphertext.
+
 Whichever construction is selected must provide:
 
 - Authentication of the sending device.

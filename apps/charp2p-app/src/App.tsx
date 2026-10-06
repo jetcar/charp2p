@@ -45,6 +45,13 @@ type AdvertisementResult = {
   status: "advertising" | "bootstrapRequired" | "inactive";
   expiresAtUnix: number;
 };
+type NetworkStatus = {
+  connectionType: "direct" | "lan" | "relayed" | "offline" | null;
+  connectionObservedAtUnix: number;
+  bootstrapNodes: { peerId: string; address: string; source: "builtIn" | "configured" }[];
+  advertisingStatus: "advertising" | "bootstrapRequired" | "inactive";
+  advertisedDiscoveryKeys: number;
+};
 type UnreadMessageCount = { groupId: string; count: number };
 type SynchronizeGroupResult = {
   status: "synchronized";
@@ -550,6 +557,87 @@ function InformationView({
   );
 }
 
+const NETWORK_STATUS_REFRESH_MS = 5_000;
+
+function networkConnectionDescription(status: NetworkStatus) {
+  if (status.connectionType === null) return "Not connected yet";
+  if (status.connectionType === "offline") return "Offline";
+  const observed = new Date(status.connectionObservedAtUnix * 1000).toLocaleTimeString();
+  return `${connectionTypeDescription(status.connectionType)} · last seen ${observed}`;
+}
+
+function NetworkView({ onClose }: { onClose: () => void }) {
+  const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const next = await invoke<NetworkStatus>("network_status");
+        if (active) {
+          setStatus(next);
+          setError("");
+        }
+      } catch (caught) {
+        if (active) setError(errorMessage(caught));
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), NETWORK_STATUS_REFRESH_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return (
+    <section className="setup-form information-card">
+      <header>
+        <p className="eyebrow">CharP2P</p>
+        <h2>Network</h2>
+        <p>How this device currently reaches peers. Group contents are never sent to bootstrap nodes.</p>
+      </header>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="information-sections">
+        <section>
+          <h3>Connection type</h3>
+          <p>{status ? networkConnectionDescription(status) : "Unavailable outside the app"}</p>
+        </section>
+        <section>
+          <h3>Group advertising</h3>
+          <p>
+            {status?.advertisingStatus === "advertising"
+              ? `Advertising ${status.advertisedDiscoveryKeys} invitation ${status.advertisedDiscoveryKeys === 1 ? "key" : "keys"} for owned groups`
+              : status?.advertisingStatus === "bootstrapRequired"
+                ? "Paused until a bootstrap node is configured"
+                : "Not advertising"}
+          </p>
+        </section>
+        <section className="network-nodes">
+          <h3>Bootstrap and community nodes</h3>
+          {status && status.bootstrapNodes.length > 0 ? (
+            <ul>
+              {status.bootstrapNodes.map((node) => (
+                <li key={`${node.peerId}-${node.address}`}>
+                  <code>{node.address}</code>
+                  <span>
+                    {node.source === "builtIn" ? "Built in" : "Configured on this device"} · {node.peerId.slice(0, 12)}…{node.peerId.slice(-6)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p>No nodes configured. Set CHARP2P_BOOTSTRAP_NODES to connect beyond the local network.</p>
+          )}
+        </section>
+      </div>
+      <button className="secondary-button" onClick={onClose} type="button">Back</button>
+    </section>
+  );
+}
+
 const MIN_BACKUP_PASSPHRASE_CHARS = 12;
 
 function backupFileName(profile: DeviceProfile) {
@@ -787,6 +875,7 @@ function App() {
   const [error, setError] = useState("");
   const [informationView, setInformationView] = useState<"privacy" | "identity" | null>(null);
   const [backupView, setBackupView] = useState(false);
+  const [networkView, setNetworkView] = useState(false);
   const [restoreView, setRestoreView] = useState(false);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
@@ -1747,6 +1836,8 @@ function App() {
         <div className="setup-content">
           {informationView ? (
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
+          ) : networkView ? (
+            <NetworkView onClose={() => setNetworkView(false)} />
           ) : backupView && profile ? (
             <IdentityBackupView profile={profile} onClose={() => setBackupView(false)} />
           ) : restoreView && !profile ? (
@@ -2360,11 +2451,22 @@ function App() {
 
         <footer className="setup-footer">
           <button onClick={() => setInformationView("privacy")} type="button">Privacy</button>
+          <button
+            onClick={() => {
+              setInformationView(null);
+              setBackupView(false);
+              setNetworkView(true);
+            }}
+            type="button"
+          >
+            Network
+          </button>
           <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
           {profile && (
             <button
               onClick={() => {
                 setInformationView(null);
+                setNetworkView(false);
                 setBackupView(true);
               }}
               type="button"

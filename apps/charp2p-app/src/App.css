@@ -154,6 +154,11 @@ button { cursor: pointer; }
 .information-sections section { padding: 19px; border: 1px solid #dce4ec; border-radius: 15px; background: white; }
 .information-sections h3 { margin: 0 0 8px; color: #172044; font-size: 17px; }
 .information-sections p { margin: 0; color: #64718c; font-size: 14px; line-height: 1.55; }
+.network-nodes { grid-column: 1 / -1; }
+.network-nodes ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.network-nodes li { display: grid; gap: 3px; min-width: 0; }
+.network-nodes code { overflow-wrap: anywhere; color: #172044; font-size: 13px; }
+.network-nodes span { color: #64718c; font-size: 13px; }
 .members-card { align-items: stretch; }
 .members-card .members-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .members-card .members-header h2 { margin-bottom: 9px; font-size: clamp(36px, 3.8vw, 52px); }

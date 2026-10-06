@@ -170,6 +170,31 @@ impl SynchronizationService for MlsProviderService {
 struct BootstrapPeer {
     peer_id: PeerId,
     address: Multiaddr,
+    source: &'static str,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapNodeStatus {
+    pub peer_id: String,
+    pub address: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStatus {
+    pub connection_type: Option<&'static str>,
+    pub connection_observed_at_unix: u64,
+    pub bootstrap_nodes: Vec<BootstrapNodeStatus>,
+    pub advertising_status: &'static str,
+    pub advertised_discovery_keys: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedConnection {
+    connection_type: &'static str,
+    observed_at_unix: u64,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -222,6 +247,7 @@ impl Drop for ActiveAdvertisement {
 pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
+    last_connection: std::sync::Mutex<Option<ObservedConnection>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
@@ -264,24 +290,28 @@ impl NetworkService {
         pending_join: Arc<dyn PendingJoinService>,
         synchronization: Arc<dyn SynchronizationService>,
     ) -> Result<Self, &'static str> {
-        let configured = built_in.iter().copied().chain(
+        let configured = built_in.iter().map(|address| (*address, "builtIn")).chain(
             environment
                 .split(';')
                 .map(str::trim)
-                .filter(|item| !item.is_empty()),
+                .filter(|item| !item.is_empty())
+                .map(|address| (address, "configured")),
         );
         let mut bootstrap_peers = Vec::new();
-        for configured_address in configured {
+        for (configured_address, source) in configured {
             if bootstrap_peers.len() == MAX_BOOTSTRAP_PEERS
                 || configured_address.len() > MAX_BOOTSTRAP_ADDRESS_BYTES
             {
                 return Err("network_configuration_invalid");
             }
-            bootstrap_peers.push(parse_bootstrap_peer(configured_address)?);
+            let mut peer = parse_bootstrap_peer(configured_address)?;
+            peer.source = source;
+            bootstrap_peers.push(peer);
         }
         Ok(Self {
             bootstrap_peers,
             advertisement: Mutex::new(None),
+            last_connection: std::sync::Mutex::new(None),
             join_authorizer,
             member_admission,
             pending_join,
@@ -314,6 +344,67 @@ impl NetworkService {
     /// Advertises retained rendezvous keys of all owned groups for existing
     /// members without tying synchronization availability to bearer-invitation
     /// expiry.
+    /// Reports the network state shown on the Network page: the most recent
+    /// observed connection path, the configured bootstrap nodes and whether
+    /// the background provider is currently advertising.
+    pub async fn status(&self) -> NetworkStatus {
+        let observed = *self
+            .last_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (advertising_status, advertised_discovery_keys) = if self.bootstrap_peers.is_empty() {
+            ("bootstrapRequired", 0)
+        } else {
+            match self.advertisement.lock().await.as_ref() {
+                Some(active) if !active.task.is_finished() => ("advertising", active.keys.len()),
+                _ => ("inactive", 0),
+            }
+        };
+        NetworkStatus {
+            connection_type: observed.map(|connection| connection.connection_type),
+            connection_observed_at_unix: observed
+                .map_or(0, |connection| connection.observed_at_unix),
+            bootstrap_nodes: self
+                .bootstrap_peers
+                .iter()
+                .map(|peer| BootstrapNodeStatus {
+                    peer_id: peer.peer_id.to_string(),
+                    address: peer.address.to_string(),
+                    source: peer.source,
+                })
+                .collect(),
+            advertising_status,
+            advertised_discovery_keys,
+        }
+    }
+
+    /// Remembers the outcome of the latest peer connection attempt; network
+    /// failures are reported as offline, other failures leave it unchanged.
+    fn observe_connection<T>(
+        &self,
+        result: Result<T, &'static str>,
+        connection_type: impl FnOnce(&T) -> Option<&'static str>,
+    ) -> Result<T, &'static str> {
+        let connection_type = match &result {
+            Ok(value) => connection_type(value),
+            Err("network_unavailable") => Some("offline"),
+            Err(_) => None,
+        };
+        if let Some(connection_type) = connection_type {
+            let observed_at_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            *self
+                .last_connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ObservedConnection {
+                connection_type,
+                observed_at_unix,
+            });
+        }
+        result
+    }
+
     pub async fn advertise_owner_group(
         &self,
         network_identity: DeviceIdentity,
@@ -517,6 +608,15 @@ impl NetworkService {
     }
 
     pub async fn search(
+        &self,
+        identity: DeviceIdentity,
+        invitation: &Invitation,
+    ) -> Result<PeerSearchResult, &'static str> {
+        let result = self.search_providers(identity, invitation).await;
+        self.observe_connection(result, |found| found.connection_type)
+    }
+
+    async fn search_providers(
         &self,
         identity: DeviceIdentity,
         invitation: &Invitation,
@@ -733,6 +833,16 @@ impl NetworkService {
     }
 
     async fn connect_to_group_provider(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        expected_peer: PeerId,
+    ) -> Result<(NetworkNode, ConnectionPath), &'static str> {
+        let result = self.dial_group_provider(identity, key, expected_peer).await;
+        self.observe_connection(result, |(_, path)| Some(connection_type_name(*path)))
+    }
+
+    async fn dial_group_provider(
         &self,
         identity: DeviceIdentity,
         key: DiscoveryKey,
@@ -1088,7 +1198,11 @@ fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
     if address.is_empty() {
         return Err("network_configuration_invalid");
     }
-    Ok(BootstrapPeer { peer_id, address })
+    Ok(BootstrapPeer {
+        peer_id,
+        address,
+        source: "configured",
+    })
 }
 
 #[cfg(test)]
@@ -1115,11 +1229,11 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        join_response, parse_bootstrap_peer, AdvertisementResult, JoinRequestAuthorization,
-        JoinRequestAuthorizer, MemberAdmissionService, NetworkService, PeerSearchResult,
-        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
-        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
-        UnavailablePendingJoinService,
+        join_response, parse_bootstrap_peer, AdvertisementResult, BootstrapNodeStatus,
+        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, NetworkService,
+        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
+        SynchronizationService, UnavailableJoinRequestAuthorizer,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -1405,6 +1519,69 @@ mod tests {
         let oversized = std::iter::repeat_n(entry, 17).collect::<Vec<_>>().join(";");
 
         assert!(NetworkService::from_sources(&[], &oversized).is_err());
+    }
+
+    #[test]
+    fn status_lists_bootstrap_nodes_with_their_source() {
+        let built_in_peer = DeviceIdentity::generate().peer_id();
+        let configured_peer = DeviceIdentity::generate().peer_id();
+        let built_in = format!("/ip4/127.0.0.1/udp/9000/quic-v1/p2p/{built_in_peer}");
+        let configured = format!(" /ip4/10.0.0.2/udp/9001/quic-v1/p2p/{configured_peer} ;");
+        let service = NetworkService::from_sources(&[built_in.as_str()], &configured).unwrap();
+
+        let status = tauri::async_runtime::block_on(service.status());
+
+        assert_eq!(
+            status,
+            NetworkStatus {
+                connection_type: None,
+                connection_observed_at_unix: 0,
+                bootstrap_nodes: vec![
+                    BootstrapNodeStatus {
+                        peer_id: built_in_peer.to_string(),
+                        address: "/ip4/127.0.0.1/udp/9000/quic-v1".to_owned(),
+                        source: "builtIn",
+                    },
+                    BootstrapNodeStatus {
+                        peer_id: configured_peer.to_string(),
+                        address: "/ip4/10.0.0.2/udp/9001/quic-v1".to_owned(),
+                        source: "configured",
+                    },
+                ],
+                advertising_status: "inactive",
+                advertised_discovery_keys: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn status_requires_a_bootstrap_node_to_advertise() {
+        let status =
+            tauri::async_runtime::block_on(NetworkService::from_sources(&[], "").unwrap().status());
+
+        assert!(status.bootstrap_nodes.is_empty());
+        assert_eq!(status.advertising_status, "bootstrapRequired");
+        assert_eq!(status.connection_type, None);
+    }
+
+    #[test]
+    fn status_reports_the_latest_observed_connection() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+
+        let _ = service.observe_connection(Ok("lan"), |path| Some(*path));
+        assert_eq!(
+            tauri::async_runtime::block_on(service.status()).connection_type,
+            Some("lan")
+        );
+        let _ = service.observe_connection::<&str>(Err("network_peer_not_found"), |_| None);
+        assert_eq!(
+            tauri::async_runtime::block_on(service.status()).connection_type,
+            Some("lan")
+        );
+        let _ = service.observe_connection::<&str>(Err("network_unavailable"), |_| None);
+        let status = tauri::async_runtime::block_on(service.status());
+        assert_eq!(status.connection_type, Some("offline"));
+        assert!(status.connection_observed_at_unix > 0);
     }
 
     #[test]

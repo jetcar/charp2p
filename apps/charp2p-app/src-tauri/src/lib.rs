@@ -12,7 +12,9 @@ use identity::{DeviceProfile, IdentityService};
 use mls_storage::{
     CreatedMessage, GroupMemberDevice, MlsProviderService, StoredMessagePage, UnreadMessageCount,
 };
-use network::{AdvertisementResult, NetworkService, PeerSearchResult, SynchronizeGroupResult};
+use network::{
+    AdvertisementResult, NetworkService, NetworkStatus, PeerSearchResult, SynchronizeGroupResult,
+};
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use tauri::Manager;
 
@@ -486,6 +488,15 @@ fn remove_group_member(
         .map_err(str::to_owned)
 }
 
+/// Reports connection type, bootstrap nodes and advertising state for the
+/// Network page. Contains no keys, invitations or group identifiers.
+#[tauri::command]
+async fn network_status(
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<NetworkStatus, String> {
+    Ok(network_service.status().await)
+}
+
 /// Advertises every owned group from one background provider, independent of
 /// the group currently open in the interface.
 #[tauri::command]
@@ -608,7 +619,8 @@ pub fn run() {
             remove_group_member,
             blocked_group_devices,
             set_group_device_blocked,
-            advertise_owned_groups
+            advertise_owned_groups,
+            network_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

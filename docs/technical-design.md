@@ -247,6 +247,13 @@ from one shared with at least one peer. A partial or failed exchange does not
 advance the acknowledgement. This state does not imply that every member has
 observed the message or that a permanent copy exists.
 
+After pulling and pushing, a member reports its gap-free author heads to the
+owner, which records them per peer and answers with the heads of the member's
+own events reported by every other current member (ADR-030). A message whose
+sequence every other current member has reported storing is shown as observed
+by all currently known members. This remains a display state, not a delivery
+guarantee.
+
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
 Welcome. Invitation payloads are limited to 8 KiB; KeyPackages and Welcomes are

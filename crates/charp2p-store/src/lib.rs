@@ -541,6 +541,63 @@ impl EventStore {
         Ok(())
     }
 
+    /// Records several author heads reported by one peer in one transaction.
+    /// Each head only moves forward, as with [`Self::acknowledge_author_head`].
+    pub fn acknowledge_author_heads(
+        &mut self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        heads: &[AuthorHead],
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO peer_acknowledged_author_heads
+                    (group_id, peer_id, author_id, contiguous_sequence)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(group_id, peer_id, author_id) DO UPDATE SET
+                    contiguous_sequence = MAX(contiguous_sequence, excluded.contiguous_sequence)",
+            )?;
+            for head in heads.iter().filter(|head| head.contiguous_sequence > 0) {
+                let sequence = i64::try_from(head.contiguous_sequence)
+                    .map_err(|_| StoreError::SequenceTooLarge(head.contiguous_sequence))?;
+                statement.execute(params![
+                    group_id.to_bytes(),
+                    peer_id.to_bytes(),
+                    head.author_id.to_bytes(),
+                    sequence,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns each peer's acknowledged head for one author.
+    pub fn acknowledged_author_heads(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<HashMap<PeerId, u64>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT peer_id, contiguous_sequence
+             FROM peer_acknowledged_author_heads
+             WHERE group_id = ?1 AND author_id = ?2",
+        )?;
+        let rows = statement
+            .query_map(params![group_id.to_bytes(), author_id.to_bytes()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+        let mut heads = HashMap::new();
+        for row in rows {
+            let (peer_id, sequence) = row?;
+            let peer_id = PeerId::from_bytes(&peer_id).map_err(|_| StoreError::CorruptIndex)?;
+            let sequence = u64::try_from(sequence).map_err(|_| StoreError::CorruptIndex)?;
+            heads.insert(peer_id, sequence);
+        }
+        Ok(heads)
+    }
+
     /// Returns the highest sequence for an author accepted by any peer.
     pub fn max_acknowledged_author_head(
         &self,
@@ -3221,6 +3278,47 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn reported_author_heads_are_recorded_per_peer_and_never_move_back() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let other_author = DeviceIdentity::generate();
+        let peer = DeviceIdentity::generate();
+        let other_peer = DeviceIdentity::generate();
+        let head = |author: &DeviceIdentity, sequence| AuthorHead {
+            author_id: author.peer_id(),
+            contiguous_sequence: sequence,
+        };
+
+        store
+            .acknowledge_author_heads(
+                group.group_id(),
+                peer.peer_id(),
+                &[head(&author, 5), head(&other_author, 0)],
+            )
+            .unwrap();
+        store
+            .acknowledge_author_heads(group.group_id(), peer.peer_id(), &[head(&author, 3)])
+            .unwrap();
+        store
+            .acknowledge_author_head(group.group_id(), other_peer.peer_id(), author.peer_id(), 2)
+            .unwrap();
+
+        let heads = store
+            .acknowledged_author_heads(group.group_id(), author.peer_id())
+            .unwrap();
+        assert_eq!(heads.len(), 2);
+        assert_eq!(heads[&peer.peer_id()], 5);
+        assert_eq!(heads[&other_peer.peer_id()], 2);
+        assert!(
+            store
+                .acknowledged_author_heads(group.group_id(), other_author.peer_id())
+                .unwrap()
+                .is_empty()
         );
     }
 

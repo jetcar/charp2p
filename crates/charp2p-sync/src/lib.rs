@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 
 use charp2p_core::{
     EventError, EventKind, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId, SignedEvent,
-    SyncAuthorHead, SyncError, SyncRequest, SyncResponse,
+    SyncAuthorHead, SyncError, SyncPeerHead, SyncRequest, SyncResponse,
 };
 use charp2p_store::{EventStore, PutEventsOutcome, StoreError};
 use thiserror::Error;
@@ -73,9 +73,48 @@ pub fn build_authorized_response(
                 encoded_events,
             }
         }
-        SyncRequest::PushEvents { .. } => {
+        SyncRequest::PushEvents { .. } | SyncRequest::ReportHeads { .. } => {
             return Err(SynchronizationError::UnexpectedRequest);
         }
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+/// Records the author heads an authenticated group member reported storing
+/// and answers with the heads of that member's own events reported by every
+/// other current member. This device's head comes from its own event store.
+///
+/// The caller authorizes the peer and supplies the current membership.
+pub fn record_reported_heads(
+    store: &mut EventStore,
+    local_device_id: PeerId,
+    authenticated_peer: PeerId,
+    current_members: &[PeerId],
+    request: &SyncRequest,
+) -> Result<SyncResponse, SynchronizationError> {
+    request.validate()?;
+    let SyncRequest::ReportHeads { group_id, heads } = request else {
+        return Err(SynchronizationError::UnexpectedRequest);
+    };
+    store.acknowledge_author_heads(*group_id, authenticated_peer, heads)?;
+    let acknowledged = store.acknowledged_author_heads(*group_id, authenticated_peer)?;
+    let local_head = local_author_head(store, *group_id, authenticated_peer)?;
+    let peers = current_members
+        .iter()
+        .filter(|member| **member != authenticated_peer)
+        .map(|member| SyncPeerHead {
+            peer_id: *member,
+            contiguous_sequence: if *member == local_device_id {
+                local_head
+            } else {
+                acknowledged.get(member).copied().unwrap_or(0)
+            },
+        })
+        .collect();
+    let response = SyncResponse::ObservedHeads {
+        group_id: *group_id,
+        peers,
     };
     response.validate()?;
     Ok(response)
@@ -399,13 +438,14 @@ fn local_author_head(
 #[cfg(test)]
 mod tests {
     use charp2p_core::{
-        DeviceIdentity, EventKind, EventSpec, GroupIdentity, SignedEvent, SyncRequest, SyncResponse,
+        DeviceIdentity, EventKind, EventSpec, GroupIdentity, SignedEvent, SyncAuthorHead,
+        SyncPeerHead, SyncRequest, SyncResponse,
     };
     use charp2p_store::EventStore;
 
     use super::{
         ApplyOutcome, PullSession, SynchronizationError, accept_pushed_events, apply_response,
-        build_authorized_response,
+        build_authorized_response, record_reported_heads,
     };
 
     #[test]
@@ -492,6 +532,71 @@ mod tests {
                 .already_present,
             1
         );
+    }
+
+    #[test]
+    fn reported_heads_answer_with_every_other_members_observation() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let sender = DeviceIdentity::generate();
+        let reader = DeviceIdentity::generate();
+        let removed = DeviceIdentity::generate();
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_events(&[
+                message_event(&sender, &group, 1, b"first"),
+                message_event(&sender, &group, 2, b"second"),
+            ])
+            .unwrap();
+        let members = [owner.peer_id(), sender.peer_id(), reader.peer_id()];
+        let report = |heads| SyncRequest::ReportHeads {
+            group_id: group.group_id(),
+            heads,
+        };
+
+        record_reported_heads(
+            &mut store,
+            owner.peer_id(),
+            reader.peer_id(),
+            &members,
+            &report(vec![SyncAuthorHead {
+                author_id: sender.peer_id(),
+                contiguous_sequence: 1,
+            }]),
+        )
+        .unwrap();
+        store
+            .acknowledge_author_head(group.group_id(), removed.peer_id(), sender.peer_id(), 2)
+            .unwrap();
+
+        let response = record_reported_heads(
+            &mut store,
+            owner.peer_id(),
+            sender.peer_id(),
+            &members,
+            &report(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            SyncResponse::ObservedHeads {
+                group_id: group.group_id(),
+                peers: vec![
+                    SyncPeerHead {
+                        peer_id: owner.peer_id(),
+                        contiguous_sequence: 2,
+                    },
+                    SyncPeerHead {
+                        peer_id: reader.peer_id(),
+                        contiguous_sequence: 1,
+                    },
+                ],
+            }
+        );
+        assert!(matches!(
+            build_authorized_response(&store, &report(Vec::new())),
+            Err(SynchronizationError::UnexpectedRequest)
+        ));
     }
 
     #[test]

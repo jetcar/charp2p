@@ -6,7 +6,7 @@ use std::{
 
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, JoinResponse,
-    SyncRejectReason, SyncRequest, SyncResponse,
+    SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode};
@@ -93,6 +93,15 @@ trait SynchronizationService: Send + Sync {
         author_id: PeerId,
         sequence: u64,
     ) -> Result<(), &'static str>;
+
+    fn report_heads_request(&self, group_id: PeerId) -> Result<SyncRequest, &'static str>;
+
+    fn record_observed_heads(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        peers: &[SyncPeerHead],
+    ) -> Result<(), &'static str>;
 }
 
 impl MemberAdmissionService for MlsProviderService {
@@ -163,6 +172,19 @@ impl SynchronizationService for MlsProviderService {
         MlsProviderService::acknowledge_messages_shared(
             self, group_id, peer_id, author_id, sequence,
         )
+    }
+
+    fn report_heads_request(&self, group_id: PeerId) -> Result<SyncRequest, &'static str> {
+        MlsProviderService::report_heads_request(self, group_id)
+    }
+
+    fn record_observed_heads(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        peers: &[SyncPeerHead],
+    ) -> Result<(), &'static str> {
+        MlsProviderService::record_observed_heads(self, group_id, author_id, peers)
     }
 }
 
@@ -858,6 +880,8 @@ impl NetworkService {
         let uploaded_events = self
             .push_to_connected_peer(&mut node, expected_peer, group_id, local_peer)
             .await?;
+        self.exchange_observed_heads(&mut node, expected_peer, group_id, local_peer)
+            .await?;
         Ok(SynchronizeGroupResult {
             status: "synchronized",
             group_id: group_id.to_string(),
@@ -1076,6 +1100,58 @@ impl NetworkService {
         }
         Err("synchronization_limit_exceeded")
     }
+
+    /// Reports this device's stored heads to the peer and records which of
+    /// its own events every other member the peer knows has stored (ADR-030).
+    async fn exchange_observed_heads(
+        &self,
+        node: &mut NetworkNode,
+        peer_id: PeerId,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<(), &'static str> {
+        let request = self.synchronization.report_heads_request(group_id)?;
+        let request_id = node
+            .send_sync_request(peer_id, request)
+            .map_err(|_| "synchronization_failed")?;
+        let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::SyncResponseReceived {
+                        peer_id: response_peer,
+                        request_id: response_id,
+                        response,
+                    } if response_peer == peer_id && response_id == request_id => {
+                        return Ok(response);
+                    }
+                    NetworkEvent::SyncRequestFailed {
+                        peer_id: failed_peer,
+                        request_id: failed_id,
+                        ..
+                    } if failed_peer == peer_id && failed_id == request_id => {
+                        return Err("synchronization_failed");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "synchronization_timed_out")??;
+        match response {
+            SyncResponse::ObservedHeads {
+                group_id: response_group,
+                peers,
+            } if response_group == group_id => self
+                .synchronization
+                .record_observed_heads(group_id, author_id, &peers),
+            SyncResponse::Rejected { reason } => Err(match reason {
+                SyncRejectReason::Unauthorized => "synchronization_unauthorized",
+                SyncRejectReason::InvalidRequest => "synchronization_failed",
+                SyncRejectReason::Busy => "synchronization_busy",
+            }),
+            _ => Err("synchronization_failed"),
+        }
+    }
 }
 
 fn join_response(
@@ -1210,6 +1286,19 @@ impl SynchronizationService for UnavailableSynchronizationService {
     ) -> Result<(), &'static str> {
         Err("synchronization_unavailable")
     }
+
+    fn report_heads_request(&self, _group_id: PeerId) -> Result<SyncRequest, &'static str> {
+        Err("synchronization_unavailable")
+    }
+
+    fn record_observed_heads(
+        &self,
+        _group_id: PeerId,
+        _author_id: PeerId,
+        _peers: &[SyncPeerHead],
+    ) -> Result<(), &'static str> {
+        Err("synchronization_unavailable")
+    }
 }
 
 fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str> {
@@ -1256,8 +1345,8 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncRejectReason, SyncRequest,
-        SyncResponse,
+        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncPeerHead, SyncRejectReason,
+        SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
@@ -1311,20 +1400,27 @@ mod tests {
             authenticated_peer: PeerId,
             request: &SyncRequest,
         ) -> SyncResponse {
-            if authenticated_peer == self.expected_peer
-                && matches!(
-                    request,
-                    SyncRequest::Summary { group_id } if *group_id == self.group_id
-                )
-            {
-                SyncResponse::Summary {
-                    group_id: self.group_id,
-                    heads: Vec::new(),
-                }
-            } else {
-                SyncResponse::Rejected {
+            if authenticated_peer != self.expected_peer {
+                return SyncResponse::Rejected {
                     reason: SyncRejectReason::Unauthorized,
+                };
+            }
+            match request {
+                SyncRequest::Summary { group_id } if *group_id == self.group_id => {
+                    SyncResponse::Summary {
+                        group_id: self.group_id,
+                        heads: Vec::new(),
+                    }
                 }
+                SyncRequest::ReportHeads { group_id, .. } if *group_id == self.group_id => {
+                    SyncResponse::ObservedHeads {
+                        group_id: self.group_id,
+                        peers: Vec::new(),
+                    }
+                }
+                _ => SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                },
             }
         }
 
@@ -1358,6 +1454,22 @@ mod tests {
             _peer_id: PeerId,
             _author_id: PeerId,
             _sequence: u64,
+        ) -> Result<(), &'static str> {
+            Ok(())
+        }
+
+        fn report_heads_request(&self, group_id: PeerId) -> Result<SyncRequest, &'static str> {
+            Ok(SyncRequest::ReportHeads {
+                group_id,
+                heads: Vec::new(),
+            })
+        }
+
+        fn record_observed_heads(
+            &self,
+            _group_id: PeerId,
+            _author_id: PeerId,
+            _peers: &[SyncPeerHead],
         ) -> Result<(), &'static str> {
             Ok(())
         }

@@ -89,7 +89,7 @@ type StoredMessage = CreatedMessage & {
   text: string;
   edited: boolean;
   replyToEventId: string | null;
-  deliveryState: "local" | "sharedWithPeer" | "received";
+  deliveryState: "local" | "sharedWithPeer" | "observedByAll" | "received";
 };
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
 type GroupMemberDevice = { deviceId: string };
@@ -245,6 +245,9 @@ function messageAuthorLabel(
 }
 
 function messageDeliveryLabel(message: StoredMessage) {
+  if (message.deliveryState === "observedByAll") {
+    return "Observed by all known members";
+  }
   return message.deliveryState === "sharedWithPeer"
     ? "Shared with a peer"
     : "Saved on this device";
@@ -2362,7 +2365,7 @@ function App() {
                 </button>
                 {createdMessage && (
                   <p className="message-receipt" role="status">
-                    {groupMessages.find(({ eventId }) => eventId === createdMessage.eventId)?.deliveryState === "sharedWithPeer"
+                    {(groupMessages.find(({ eventId }) => eventId === createdMessage.eventId)?.deliveryState ?? "local") !== "local"
                       ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
                       : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`}
                   </p>

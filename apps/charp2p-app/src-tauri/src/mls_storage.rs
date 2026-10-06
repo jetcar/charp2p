@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,8 +11,9 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, JoinRequest,
-    JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncRejectReason, SyncRequest,
-    SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncPeerHead, SyncRejectReason,
+    SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS,
+    MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -26,8 +28,8 @@ use charp2p_store::{
     MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
 use charp2p_sync::{
-    accept_pushed_events, build_authorized_response, PullSession, SessionProgress,
-    SynchronizationError,
+    accept_pushed_events, build_authorized_response, record_reported_heads, PullSession,
+    SessionProgress, SynchronizationError,
 };
 use keyring_core::Error as KeyringError;
 use openmls::prelude::{
@@ -455,6 +457,28 @@ impl MlsProviderService {
             .operations
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
+        let other_members = {
+            let provider = self
+                .provider
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            match MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&group_id.to_bytes()),
+            )
+            .map_err(|_| "mls_group_storage_unavailable")?
+            {
+                Some(group) => group
+                    .members()
+                    .map(|member| {
+                        device_id_from_credential(&member.credential)
+                            .map_err(|_| "mls_group_members_invalid")
+                    })
+                    .filter(|member| *member != Ok(local_device_id))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            }
+        };
         let mut store = self
             .store
             .lock()
@@ -465,9 +489,11 @@ impl MlsProviderService {
         store
             .mark_messages_read(group_id)
             .map_err(|_| "message_list_unavailable")?;
-        let acknowledged_head = store
-            .max_acknowledged_author_head(group_id, local_device_id)
+        let acknowledged_heads = store
+            .acknowledged_author_heads(group_id, local_device_id)
             .map_err(|_| "message_list_unavailable")?;
+        let acknowledged_head = acknowledged_heads.values().copied().max().unwrap_or(0);
+        let observed_by_all_head = observed_by_all_head(&other_members, &acknowledged_heads);
         if encrypted_page.messages.is_empty() {
             return Ok(StoredMessagePage {
                 messages: Vec::new(),
@@ -494,6 +520,8 @@ impl MlsProviderService {
                     reply_to_event_id: message.reply_to.as_ref().map(|id| hex_bytes(id)),
                     delivery_state: if message.author_id != local_device_id {
                         "received"
+                    } else if message.author_sequence <= observed_by_all_head {
+                        "observedByAll"
                     } else if message.author_sequence <= acknowledged_head {
                         "sharedWithPeer"
                     } else {
@@ -632,6 +660,55 @@ impl MlsProviderService {
             .map_err(|_| "mls_provider_service_unavailable")?
             .acknowledge_author_head(group_id, peer_id, author_id, sequence)
             .map_err(|_| "message_delivery_state_unavailable")
+    }
+
+    /// Builds the report of this device's gap-free author heads sent after
+    /// a completed exchange (ADR-030).
+    pub(crate) fn report_heads_request(
+        &self,
+        group_id: PeerId,
+    ) -> Result<SyncRequest, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut heads = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?
+            .synchronization_summary(group_id)
+            .map_err(|_| "synchronization_unavailable")?;
+        heads.truncate(MAX_SYNC_AUTHORS);
+        Ok(SyncRequest::ReportHeads { group_id, heads })
+    }
+
+    /// Records the heads of this device's own events that the peer reported
+    /// for every other member it knows.
+    pub(crate) fn record_observed_heads(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+        peers: &[SyncPeerHead],
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        for peer in peers.iter().filter(|peer| peer.peer_id != author_id) {
+            store
+                .acknowledge_author_head(
+                    group_id,
+                    peer.peer_id,
+                    author_id,
+                    peer.contiguous_sequence,
+                )
+                .map_err(|_| "message_delivery_state_unavailable")?;
+        }
+        Ok(())
     }
 
     pub(crate) fn hide_message_locally(
@@ -983,12 +1060,48 @@ impl MlsProviderService {
                 reason: SyncRejectReason::Unauthorized,
             };
         }
+        let membership = if matches!(request, SyncRequest::ReportHeads { .. }) {
+            let Some(own_leaf) = group.own_leaf_node() else {
+                return SyncResponse::Rejected {
+                    reason: SyncRejectReason::Busy,
+                };
+            };
+            let (Ok(local_device_id), Ok(members)) = (
+                device_id_from_credential(own_leaf.credential()),
+                group
+                    .members()
+                    .map(|member| device_id_from_credential(&member.credential))
+                    .collect::<Result<Vec<_>, _>>(),
+            ) else {
+                return SyncResponse::Rejected {
+                    reason: SyncRejectReason::Busy,
+                };
+            };
+            Some((local_device_id, members))
+        } else {
+            None
+        };
         drop(group);
         let Ok(mut store) = self.store.lock() else {
             return SyncResponse::Rejected {
                 reason: SyncRejectReason::Busy,
             };
         };
+        if let Some((local_device_id, members)) = membership {
+            return record_reported_heads(
+                &mut store,
+                local_device_id,
+                authenticated_peer,
+                &members,
+                request,
+            )
+            .unwrap_or_else(|error| SyncResponse::Rejected {
+                reason: match error {
+                    SynchronizationError::Protocol(_) => SyncRejectReason::InvalidRequest,
+                    _ => SyncRejectReason::Busy,
+                },
+            });
+        }
         if let SyncRequest::PushEvents { group_id, .. } = request {
             return match accept_pushed_events(&mut store, authenticated_peer, request) {
                 Ok(outcome) => {
@@ -2065,8 +2178,19 @@ fn sync_request_group_id(request: &SyncRequest) -> PeerId {
         SyncRequest::Summary { group_id }
         | SyncRequest::EventIds { group_id, .. }
         | SyncRequest::Events { group_id, .. }
-        | SyncRequest::PushEvents { group_id, .. } => *group_id,
+        | SyncRequest::PushEvents { group_id, .. }
+        | SyncRequest::ReportHeads { group_id, .. } => *group_id,
     }
+}
+
+/// Highest own sequence every other current member reported storing. With no
+/// other member nothing can be observed by all of them.
+fn observed_by_all_head(other_members: &[PeerId], acknowledged: &HashMap<PeerId, u64>) -> u64 {
+    other_members
+        .iter()
+        .map(|member| acknowledged.get(member).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(0)
 }
 
 /// Only the owner device that issued this device's invitation may change a
@@ -2304,7 +2428,8 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        PeerId, SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
+        PeerId, SignedEvent, SyncAuthorHead, SyncPeerHead, SyncRejectReason, SyncRequest,
+        SyncResponse,
     };
     use charp2p_mls::{
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -2975,11 +3100,50 @@ mod tests {
         assert_eq!(messages.messages[0].delivery_state, "local");
         assert_eq!(messages.messages[1].text, "After restart");
         restored
-            .acknowledge_messages_shared(group_id, member_id, owner.peer_id(), 3)
+            .acknowledge_messages_shared(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                owner.peer_id(),
+                3,
+            )
             .unwrap();
         let messages = restored.messages(group_id, owner.peer_id()).unwrap();
         assert_eq!(messages.messages[0].delivery_state, "sharedWithPeer");
         assert_eq!(messages.messages[1].delivery_state, "local");
+        assert_eq!(
+            restored.answer_sync_request(
+                member_id,
+                &SyncRequest::ReportHeads {
+                    group_id,
+                    heads: vec![SyncAuthorHead {
+                        author_id: owner.peer_id(),
+                        contiguous_sequence: 3,
+                    }],
+                },
+            ),
+            SyncResponse::ObservedHeads {
+                group_id,
+                peers: vec![SyncPeerHead {
+                    peer_id: owner.peer_id(),
+                    contiguous_sequence: 0,
+                }],
+            }
+        );
+        let messages = restored.messages(group_id, owner.peer_id()).unwrap();
+        assert_eq!(messages.messages[0].delivery_state, "observedByAll");
+        assert_eq!(messages.messages[1].delivery_state, "local");
+        restored
+            .record_observed_heads(
+                group_id,
+                owner.peer_id(),
+                &[SyncPeerHead {
+                    peer_id: member_id,
+                    contiguous_sequence: 4,
+                }],
+            )
+            .unwrap();
+        let messages = restored.messages(group_id, owner.peer_id()).unwrap();
+        assert_eq!(messages.messages[1].delivery_state, "observedByAll");
         restored
             .hide_message_locally(group_id, first.id().as_bytes())
             .unwrap();

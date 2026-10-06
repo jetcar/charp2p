@@ -39,5 +39,5 @@ pub use message_body::{
 pub use message_edit::{MAX_MESSAGE_EDIT_TEXT_BYTES, MessageEdit, MessageEditError};
 pub use sync::{
     MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_EVENT_BYTES, MAX_SYNC_RESPONSE_BYTES,
-    SyncAuthorHead, SyncError, SyncRejectReason, SyncRequest, SyncResponse,
+    SyncAuthorHead, SyncError, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
 };

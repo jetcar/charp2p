@@ -24,6 +24,15 @@ pub struct SyncAuthorHead {
     pub contiguous_sequence: u64,
 }
 
+/// Highest gap-free sequence of one author that a peer reported storing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncPeerHead {
+    /// Device whose stored sequence this is.
+    pub peer_id: PeerId,
+    /// Highest sequence for which every event from one is stored on the peer.
+    pub contiguous_sequence: u64,
+}
+
 /// Bounded synchronization request sent over an authenticated peer stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SyncRequest {
@@ -46,6 +55,12 @@ pub enum SyncRequest {
         group_id: PeerId,
         encoded_events: Vec<Vec<u8>>,
     },
+    /// Reports the sender's gap-free author heads after a completed exchange
+    /// and asks which heads of its own events other devices reported.
+    ReportHeads {
+        group_id: PeerId,
+        heads: Vec<SyncAuthorHead>,
+    },
 }
 
 impl SyncRequest {
@@ -67,6 +82,7 @@ impl SyncRequest {
                 }
                 validate_events(group_id, encoded_events)
             }
+            Self::ReportHeads { heads, .. } => validate_heads(heads),
         }
     }
 }
@@ -96,6 +112,11 @@ pub enum SyncResponse {
     EventsAccepted { group_id: PeerId, inserted: u16 },
     /// The peer refused the request without disclosing group state.
     Rejected { reason: SyncRejectReason },
+    /// Heads of the requester's own events last reported by each other device.
+    ObservedHeads {
+        group_id: PeerId,
+        peers: Vec<SyncPeerHead>,
+    },
 }
 
 impl SyncResponse {
@@ -125,6 +146,7 @@ impl SyncResponse {
                 Err(SyncError::InvalidAcceptedCount(*inserted))
             }
             Self::Rejected { .. } => Ok(()),
+            Self::ObservedHeads { peers, .. } => validate_peer_heads(peers),
         }
     }
 }
@@ -161,6 +183,12 @@ pub enum SyncError {
     /// The same author appears more than once in a summary.
     #[error("synchronization summary repeats an author")]
     DuplicateAuthor,
+    /// A response carries too many peer heads.
+    #[error("synchronization receipt contains too many peers")]
+    TooManyPeers,
+    /// The same peer appears more than once in a receipt.
+    #[error("synchronization receipt repeats a peer")]
+    DuplicatePeer,
     /// The same event identifier appears more than once.
     #[error("synchronization payload repeats an event identifier")]
     DuplicateEventId,
@@ -204,6 +232,17 @@ fn validate_heads(heads: &[SyncAuthorHead]) -> Result<(), SyncError> {
     Ok(())
 }
 
+fn validate_peer_heads(peers: &[SyncPeerHead]) -> Result<(), SyncError> {
+    if peers.len() > MAX_SYNC_AUTHORS {
+        return Err(SyncError::TooManyPeers);
+    }
+    let unique: HashSet<_> = peers.iter().map(|head| head.peer_id).collect();
+    if unique.len() != peers.len() {
+        return Err(SyncError::DuplicatePeer);
+    }
+    Ok(())
+}
+
 fn validate_events(group_id: &PeerId, encoded_events: &[Vec<u8>]) -> Result<(), SyncError> {
     if encoded_events.len() > MAX_SYNC_BATCH_ITEMS {
         return Err(SyncError::TooManyEventIds);
@@ -238,8 +277,8 @@ mod tests {
     use crate::{DeviceIdentity, EventKind, EventSpec, GroupIdentity};
 
     use super::{
-        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncRequest,
-        SyncResponse,
+        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncPeerHead,
+        SyncRequest, SyncResponse,
     };
 
     #[test]
@@ -298,6 +337,57 @@ mod tests {
             }
             .validate(),
             Err(SyncError::TooManyAuthors)
+        ));
+    }
+
+    #[test]
+    fn head_reports_and_observed_heads_are_bounded_and_unique() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let head = SyncAuthorHead {
+            author_id: author.peer_id(),
+            contiguous_sequence: 3,
+        };
+        SyncRequest::ReportHeads {
+            group_id: group.group_id(),
+            heads: vec![head.clone()],
+        }
+        .validate()
+        .unwrap();
+        assert!(matches!(
+            SyncRequest::ReportHeads {
+                group_id: group.group_id(),
+                heads: vec![head.clone(), head],
+            }
+            .validate(),
+            Err(SyncError::DuplicateAuthor)
+        ));
+
+        let peer = SyncPeerHead {
+            peer_id: author.peer_id(),
+            contiguous_sequence: 2,
+        };
+        assert!(matches!(
+            SyncResponse::ObservedHeads {
+                group_id: group.group_id(),
+                peers: vec![peer.clone(), peer],
+            }
+            .validate(),
+            Err(SyncError::DuplicatePeer)
+        ));
+        let peers = (0..=MAX_SYNC_AUTHORS)
+            .map(|_| SyncPeerHead {
+                peer_id: DeviceIdentity::generate().peer_id(),
+                contiguous_sequence: 0,
+            })
+            .collect();
+        assert!(matches!(
+            SyncResponse::ObservedHeads {
+                group_id: group.group_id(),
+                peers,
+            }
+            .validate(),
+            Err(SyncError::TooManyPeers)
         ));
     }
 

@@ -628,8 +628,10 @@ Before protocol implementation:
    validation remain part of the application integration gate.
 2. Select the portable core and UI stack.
 3. Define canonical binary serialization and size limits.
-4. Write protocol test vectors for identities, invitations, event signatures,
-   and discovery keys.
+4. ~~Write protocol test vectors for identities, invitations, event signatures,
+   and discovery keys.~~ Fixed-seed vectors live in
+   `crates/charp2p-core/tests/protocol_vectors.rs`; changing one requires a new
+   protocol version.
 5. Threat-model joins, removal, conflicting membership events, and lost owner
    keys.
 6. Decide supported Windows and Android versions.

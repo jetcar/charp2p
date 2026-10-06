@@ -51,6 +51,17 @@ type NetworkStatus = {
   bootstrapNodes: { peerId: string; address: string; source: "builtIn" | "configured" }[];
   advertisingStatus: "advertising" | "bootstrapRequired" | "inactive";
   advertisedDiscoveryKeys: number;
+  contributionStatus: "routing" | "routingAndRelay" | "inactive";
+};
+type ContributionPreference = {
+  routing: boolean;
+  relay: { maxCircuits: number; maxCircuitMib: number } | null;
+};
+type ContributionStatus = {
+  available: boolean;
+  preference: ContributionPreference;
+  worstCaseRelayedBytes: number;
+  circuitDurationSeconds: number;
 };
 type NetworkDiagnostics = {
   format: string;
@@ -613,6 +624,165 @@ function networkConnectionDescription(status: NetworkStatus) {
   return `${connectionTypeDescription(status.connectionType)} · last seen ${observed}`;
 }
 
+const DEFAULT_RELAY_CIRCUITS = 4;
+const DEFAULT_RELAY_CIRCUIT_MIB = 8;
+const MAX_RELAY_CIRCUITS = 32;
+const MAX_RELAY_CIRCUIT_MIB = 32;
+
+function ContributionSection({ networkStatus }: { networkStatus: NetworkStatus | null }) {
+  const [status, setStatus] = useState<ContributionStatus | null>(null);
+  const [routing, setRouting] = useState(false);
+  const [relay, setRelay] = useState(false);
+  const [circuits, setCircuits] = useState(DEFAULT_RELAY_CIRCUITS);
+  const [circuitMib, setCircuitMib] = useState(DEFAULT_RELAY_CIRCUIT_MIB);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function showPreference(next: ContributionStatus) {
+    setStatus(next);
+    setRouting(next.preference.routing);
+    setRelay(next.preference.relay !== null);
+    if (next.preference.relay) {
+      setCircuits(next.preference.relay.maxCircuits);
+      setCircuitMib(next.preference.relay.maxCircuitMib);
+    }
+  }
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<ContributionStatus>("contribution_status")
+      .then((next) => {
+        if (active) showPreference(next);
+      })
+      .catch((caught) => {
+        if (active) setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const limitsValid =
+    Number.isInteger(circuits) && circuits >= 1 && circuits <= MAX_RELAY_CIRCUITS &&
+    Number.isInteger(circuitMib) && circuitMib >= 1 && circuitMib <= MAX_RELAY_CIRCUIT_MIB;
+  const relayEnabled = routing && relay;
+  const worstCaseMib = relayEnabled && limitsValid ? circuits * circuitMib : 0;
+  const circuitMinutes = Math.round((status?.circuitDurationSeconds ?? 300) / 60);
+  const changed =
+    status !== null &&
+    (routing !== status.preference.routing ||
+      relayEnabled !== (status.preference.relay !== null) ||
+      (relayEnabled &&
+        (circuits !== status.preference.relay?.maxCircuits || circuitMib !== status.preference.relay?.maxCircuitMib)));
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      const preference: ContributionPreference = {
+        routing,
+        relay: relayEnabled ? { maxCircuits: circuits, maxCircuitMib: circuitMib } : null,
+      };
+      showPreference(await invoke<ContributionStatus>("set_contribution_preference", { preference }));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (status && !status.available) {
+    return (
+      <section>
+        <h3>Network contribution</h3>
+        <p>This device stays a light peer. Routing and relay contribution are offered on desktop installations.</p>
+      </section>
+    );
+  }
+
+  const running = networkStatus?.contributionStatus ?? "inactive";
+  return (
+    <section className="contribution-section">
+      <h3>Network contribution</h3>
+      <p>
+        Optional. Helps other peers find each other and, if enabled, relays encrypted traffic for peers that cannot
+        connect directly. Contributing never gives access to group keys or messages, but relayed peers can see this
+        device's address and traffic volume.
+      </p>
+      <p>
+        {running === "routingAndRelay"
+          ? "Contributing routing and relay capacity"
+          : running === "routing"
+            ? "Contributing routing"
+            : status?.preference.routing && networkStatus?.bootstrapNodes.length === 0
+              ? "Paused until a bootstrap node is configured"
+              : "Not contributing"}
+      </p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <form onSubmit={(event) => void save(event)}>
+        <label className="contribution-option">
+          <input
+            checked={routing}
+            disabled={!status || saving}
+            onChange={(event) => setRouting(event.target.checked)}
+            type="checkbox"
+          />
+          Help route peer discovery
+        </label>
+        <label className="contribution-option">
+          <input
+            checked={relayEnabled}
+            disabled={!status || saving || !routing}
+            onChange={(event) => setRelay(event.target.checked)}
+            type="checkbox"
+          />
+          Relay connections for other peers
+        </label>
+        {relayEnabled && (
+          <div className="contribution-limits">
+            <label>
+              Simultaneous relayed connections (1–{MAX_RELAY_CIRCUITS})
+              <input
+                disabled={saving}
+                max={MAX_RELAY_CIRCUITS}
+                min={1}
+                onChange={(event) => setCircuits(event.target.valueAsNumber)}
+                type="number"
+                value={Number.isNaN(circuits) ? "" : circuits}
+              />
+            </label>
+            <label>
+              Limit per connection in MiB (1–{MAX_RELAY_CIRCUIT_MIB})
+              <input
+                disabled={saving}
+                max={MAX_RELAY_CIRCUIT_MIB}
+                min={1}
+                onChange={(event) => setCircuitMib(event.target.valueAsNumber)}
+                type="number"
+                value={Number.isNaN(circuitMib) ? "" : circuitMib}
+              />
+            </label>
+            <p>
+              {limitsValid
+                ? `Worst case: ${worstCaseMib} MiB relayed every ${circuitMinutes} minutes (up to ${Math.round((worstCaseMib * 60) / circuitMinutes / 1024 * 10) / 10} GiB per hour).`
+                : "Enter whole numbers within the limits shown."}
+            </p>
+          </div>
+        )}
+        <button
+          className="secondary-button"
+          disabled={!status || saving || !changed || (relayEnabled && !limitsValid)}
+          type="submit"
+        >
+          {saving ? "Saving…" : "Save contribution settings"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function NetworkView({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
   const [error, setError] = useState("");
@@ -708,6 +878,7 @@ function NetworkView({ onClose }: { onClose: () => void }) {
             <p>No nodes configured. Set CHARP2P_BOOTSTRAP_NODES to connect beyond the local network.</p>
           )}
         </section>
+        <ContributionSection networkStatus={status} />
         <section>
           <h3>Diagnostics</h3>
           <p>Exports connection state, node addresses, app version and group counts. Keys, invitations, group names and messages are never included.</p>

@@ -312,3 +312,6 @@ button { cursor: pointer; }
 .evidence-controls button:disabled { opacity: .48; cursor: default; }
 .evidence-select { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; }
 .evidence-result { display: grid; gap: 8px; }
+.setup-form .contribution-option { display: flex; align-items: center; gap: 10px; font-size: 16px; }
+.setup-form .contribution-option input { width: auto; height: auto; margin: 0; }
+.setup-form .contribution-limits input { height: 52px; margin: 6px 0 16px; font-size: 18px; }

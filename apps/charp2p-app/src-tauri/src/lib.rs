@@ -594,13 +594,37 @@ fn contribution_status(
 }
 
 /// Stores the device-local contribution preference after validating the relay
-/// limits. Refused on builds that keep the light-peer role.
+/// limits, then starts, restarts or stops the contribution node to match it.
+/// Refused on builds that keep the light-peer role.
 #[tauri::command]
-fn set_contribution_preference(
+async fn set_contribution_preference(
     preference: ContributionPreference,
     service: tauri::State<'_, ContributionService>,
+    identity_service: tauri::State<'_, IdentityService>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<ContributionStatus, String> {
-    service.set(preference).map_err(str::to_owned)
+    let status = service.set(preference).map_err(str::to_owned)?;
+    apply_contribution(preference, &identity_service, &network_service)
+        .await
+        .map_err(str::to_owned)?;
+    Ok(status)
+}
+
+/// Runs the contribution node when routing contribution is enabled and stops
+/// it otherwise (ADR-031).
+async fn apply_contribution(
+    preference: ContributionPreference,
+    identity_service: &IdentityService,
+    network_service: &NetworkService,
+) -> Result<(), &'static str> {
+    if !preference.routing {
+        network_service.stop_contribution().await;
+        return Ok(());
+    }
+    let relay = preference.relay_limits()?;
+    let identity = identity_service.load_network_identity()?;
+    network_service.start_contribution(identity, relay).await?;
+    Ok(())
 }
 
 /// Advertises every owned group from one background provider, independent of
@@ -698,6 +722,23 @@ pub fn run() {
                 data_directory.join("contribution.json"),
             ));
             app.manage(SettingsService::new(database_path));
+
+            // Resume an opted-in contribution from the stored preference; a
+            // missing identity or invalid preference leaves contribution off.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let Ok(status) = handle.state::<ContributionService>().status() else {
+                    return;
+                };
+                if status.available && status.preference.routing {
+                    let _ = apply_contribution(
+                        status.preference,
+                        &handle.state::<IdentityService>(),
+                        &handle.state::<NetworkService>(),
+                    )
+                    .await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

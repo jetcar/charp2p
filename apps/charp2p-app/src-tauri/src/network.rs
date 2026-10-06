@@ -9,7 +9,7 @@ use charp2p_core::{
     SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
-use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode};
+use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode, RelayLimits};
 use charp2p_sync::{PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -34,6 +34,7 @@ const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_SYNC_EXCHANGES: usize = 4_096;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CONTRIBUTION_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JoinRequestAuthorization {
@@ -211,6 +212,7 @@ pub struct NetworkStatus {
     pub bootstrap_nodes: Vec<BootstrapNodeStatus>,
     pub advertising_status: &'static str,
     pub advertised_discovery_keys: usize,
+    pub contribution_status: &'static str,
 }
 
 /// Diagnostic report a user can export from the Network page. It is built
@@ -298,9 +300,23 @@ impl Drop for ActiveAdvertisement {
     }
 }
 
+/// Running opted-in contribution node (ADR-031) and the relay limits it was
+/// started with.
+struct ActiveContribution {
+    relay: Option<RelayLimits>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for ActiveContribution {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
+    contribution: Mutex<Option<ActiveContribution>>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
     group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedConnection>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
@@ -366,6 +382,7 @@ impl NetworkService {
         Ok(Self {
             bootstrap_peers,
             advertisement: Mutex::new(None),
+            contribution: Mutex::new(None),
             last_connection: std::sync::Mutex::new(None),
             group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
@@ -416,6 +433,16 @@ impl NetworkService {
                 _ => ("inactive", 0),
             }
         };
+        let contribution_status = match self.contribution.lock().await.as_ref() {
+            Some(active) if !active.task.is_finished() => {
+                if active.relay.is_some() {
+                    "routingAndRelay"
+                } else {
+                    "routing"
+                }
+            }
+            _ => "inactive",
+        };
         NetworkStatus {
             connection_type: observed.map(|connection| connection.connection_type),
             connection_observed_at_unix: observed
@@ -431,6 +458,7 @@ impl NetworkService {
                 .collect(),
             advertising_status,
             advertised_discovery_keys,
+            contribution_status,
         }
     }
 
@@ -738,6 +766,83 @@ impl NetworkService {
             status: "advertising",
             expires_at_unix: reported_expiry,
         })
+    }
+
+    /// Runs the opted-in contribution node (ADR-031) in Kademlia server mode
+    /// with the given relay limits, restarting it only when the limits
+    /// change. Application join and synchronization requests reaching it are
+    /// rejected, as routing nodes do.
+    pub async fn start_contribution(
+        &self,
+        network_identity: DeviceIdentity,
+        relay: Option<RelayLimits>,
+    ) -> Result<&'static str, &'static str> {
+        let status = if relay.is_some() {
+            "routingAndRelay"
+        } else {
+            "routing"
+        };
+        let mut active = self.contribution.lock().await;
+        if self.bootstrap_peers.is_empty() {
+            active.take();
+            return Ok("bootstrapRequired");
+        }
+        if let Some(existing) = active.as_ref() {
+            if existing.relay == relay && !existing.task.is_finished() {
+                return Ok(status);
+            }
+        }
+        active.take();
+
+        let mut node =
+            NetworkNode::new_contributing(network_identity.into_network_keypair(), relay);
+        node.listen_on(
+            "/ip4/0.0.0.0/udp/0/quic-v1"
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+        for bootstrap in &self.bootstrap_peers {
+            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+        }
+        node.bootstrap().map_err(|_| "network_unavailable")?;
+
+        let task = tokio::spawn(async move {
+            let mut refresh = interval_at(
+                Instant::now() + CONTRIBUTION_BOOTSTRAP_INTERVAL,
+                CONTRIBUTION_BOOTSTRAP_INTERVAL,
+            );
+            refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = refresh.tick() => {
+                        let _ = node.bootstrap();
+                    }
+                    event = node.next_event() => match event {
+                        NetworkEvent::SyncRequestReceived { request_id, .. } => {
+                            let _ = node.reject_sync_request(
+                                request_id,
+                                SyncRejectReason::Unauthorized,
+                            );
+                        }
+                        NetworkEvent::JoinRequestReceived { request_id, .. } => {
+                            let _ = node.reject_join_request(
+                                request_id,
+                                JoinRejectReason::Unauthorized,
+                            );
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        });
+        *active = Some(ActiveContribution { relay, task });
+        Ok(status)
+    }
+
+    /// Stops the contribution node, if one is running.
+    pub async fn stop_contribution(&self) {
+        self.contribution.lock().await.take();
     }
 
     /// Stops the local provider and request listener for the active invitation.
@@ -1795,6 +1900,7 @@ mod tests {
                 ],
                 advertising_status: "inactive",
                 advertised_discovery_keys: 0,
+                contribution_status: "inactive",
             }
         );
     }
@@ -1807,6 +1913,57 @@ mod tests {
         assert!(status.bootstrap_nodes.is_empty());
         assert_eq!(status.advertising_status, "bootstrapRequired");
         assert_eq!(status.connection_type, None);
+    }
+
+    #[test]
+    fn contribution_requires_a_bootstrap_node() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+
+        let started = tauri::async_runtime::block_on(
+            service.start_contribution(DeviceIdentity::generate(), None),
+        );
+
+        assert_eq!(started, Ok("bootstrapRequired"));
+        assert_eq!(
+            tauri::async_runtime::block_on(service.status()).contribution_status,
+            "inactive"
+        );
+    }
+
+    #[test]
+    fn contribution_follows_the_preference_until_stopped() {
+        let bootstrap_peer = DeviceIdentity::generate().peer_id();
+        let configured = format!("/ip4/127.0.0.1/udp/9/quic-v1/p2p/{bootstrap_peer}");
+        let service = NetworkService::from_sources(&[], &configured).unwrap();
+        let relay = charp2p_network::RelayLimits::new(2, 1).unwrap();
+
+        tauri::async_runtime::block_on(async {
+            assert_eq!(
+                service
+                    .start_contribution(DeviceIdentity::generate(), None)
+                    .await,
+                Ok("routing")
+            );
+            assert_eq!(service.status().await.contribution_status, "routing");
+            assert_eq!(
+                service
+                    .start_contribution(DeviceIdentity::generate(), Some(relay))
+                    .await,
+                Ok("routingAndRelay")
+            );
+            assert_eq!(
+                service.status().await.contribution_status,
+                "routingAndRelay"
+            );
+            assert_eq!(
+                service
+                    .start_contribution(DeviceIdentity::generate(), Some(relay))
+                    .await,
+                Ok("routingAndRelay")
+            );
+            service.stop_contribution().await;
+            assert_eq!(service.status().await.contribution_status, "inactive");
+        });
     }
 
     #[test]

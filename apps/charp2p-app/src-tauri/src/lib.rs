@@ -15,8 +15,8 @@ use mls_storage::{
     StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
 };
 use network::{
-    AdvertisementResult, NetworkDiagnostics, NetworkService, NetworkStatus, PeerSearchResult,
-    SynchronizeGroupResult,
+    AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
+    PeerSearchResult, SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use settings::{AppInformation, SettingsService};
@@ -545,6 +545,22 @@ async fn network_status(
     Ok(network_service.status().await)
 }
 
+/// Reports the Groups page connection state of each joined group from its
+/// latest synchronization attempt in this session.
+#[tauri::command]
+fn group_connection_states(
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<Vec<GroupConnectionState>, String> {
+    let group_ids = pending_service
+        .joined()
+        .map_err(str::to_owned)?
+        .iter()
+        .filter_map(|group| group.group_id.parse().ok())
+        .collect::<Vec<_>>();
+    Ok(network_service.group_connection_states(&group_ids))
+}
+
 /// Builds the Network page diagnostic export. Groups are reported only as
 /// counts; identity, invitation and discovery secrets are never read.
 #[tauri::command]
@@ -693,6 +709,7 @@ pub fn run() {
             set_group_device_blocked,
             advertise_owned_groups,
             network_status,
+            group_connection_states,
             network_diagnostics,
             app_information
         ])

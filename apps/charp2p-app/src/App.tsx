@@ -68,6 +68,12 @@ type AppInformation = {
   storage: { databaseBytes: number };
 };
 type UnreadMessageCount = { groupId: string; count: number };
+type GroupConnectionStateName = "online" | "relayed" | "waiting" | "offline";
+type GroupConnectionState = {
+  groupId: string;
+  state: GroupConnectionStateName;
+  observedAtUnix: number;
+};
 type SynchronizeGroupResult = {
   status: "synchronized";
   groupId: string;
@@ -288,6 +294,13 @@ function connectionTypeDescription(connectionType: "direct" | "lan" | "relayed")
   if (connectionType === "relayed") return "Relay";
   if (connectionType === "lan") return "Local network";
   return "Direct";
+}
+
+function groupConnectionDescription(state: GroupConnectionStateName) {
+  if (state === "online") return "Online";
+  if (state === "relayed") return "Relayed";
+  if (state === "offline") return "Offline";
+  return "Waiting for peers";
 }
 
 function peerSearchDescription(result: PeerSearchResult | null) {
@@ -1039,6 +1052,7 @@ function App() {
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  const [connectionStates, setConnectionStates] = useState<Record<string, GroupConnectionStateName>>({});
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
@@ -1390,6 +1404,7 @@ function App() {
   useEffect(() => {
     if (!isTauri() || availableGroups.length === 0) {
       setUnreadCounts({});
+      setConnectionStates({});
       return;
     }
 
@@ -1406,6 +1421,16 @@ function App() {
         }
       } catch {
         // Unread badges are advisory; the active timeline reports its own errors.
+      }
+      try {
+        const states = await invoke<GroupConnectionState[]>("group_connection_states");
+        if (active) {
+          setConnectionStates(
+            Object.fromEntries(states.map(({ groupId, state }) => [groupId, state])),
+          );
+        }
+      } catch {
+        // Connection states are advisory; synchronization reports its own errors.
       } finally {
         if (active) {
           timer = window.setTimeout(refreshUnreadCounts, MESSAGE_REFRESH_INTERVAL_MS);
@@ -1662,6 +1687,14 @@ function App() {
     } catch (reason) {
       if (reportErrors && activeGroupIdRef.current === groupId) setError(errorMessage(reason));
     } finally {
+      try {
+        const states = await invoke<GroupConnectionState[]>("group_connection_states");
+        setConnectionStates(
+          Object.fromEntries(states.map(({ groupId: id, state }) => [id, state])),
+        );
+      } catch {
+        // Connection states are advisory and refreshed periodically.
+      }
       synchronizationInFlight.current = false;
       if (activeGroupIdRef.current === groupId) setSynchronizingGroup(false);
     }
@@ -2224,6 +2257,11 @@ function App() {
                     <strong>{group.groupName}</strong>
                     <span>
                       {group.role}
+                      {connectionStates[group.groupId] && (
+                        <i className={`group-connection ${connectionStates[group.groupId]}`}>
+                          {groupConnectionDescription(connectionStates[group.groupId])}
+                        </i>
+                      )}
                       {group.groupId !== activeGroupId && (unreadCounts[group.groupId] ?? 0) > 0 && (
                         <em
                           aria-label={`${unreadCounts[group.groupId]} unread`}
@@ -2305,6 +2343,7 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
                 <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
                 <div><dt>Last synchronized</dt><dd>{synchronizationDescription(joinedGroup.lastSynchronizedAtUnix)}</dd></div>
+                <div><dt>Connection</dt><dd>{connectionStates[joinedGroup.groupId] ? groupConnectionDescription(connectionStates[joinedGroup.groupId]) : "Not checked"}</dd></div>
               </dl>
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}

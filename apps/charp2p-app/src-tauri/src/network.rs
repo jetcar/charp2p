@@ -231,6 +231,20 @@ pub struct NetworkDiagnostics {
 
 pub const DIAGNOSTICS_FORMAT: &str = "charp2p-diagnostics-v1";
 
+/// Upper bound on remembered per-group synchronization outcomes; older
+/// entries are dropped first so the in-memory map stays bounded.
+const MAX_GROUP_CONNECTION_STATES: usize = 256;
+
+/// Connection state of one group shown on the Groups page, derived from the
+/// latest synchronization attempt made by this device in this session.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupConnectionState {
+    pub group_id: String,
+    pub state: &'static str,
+    pub observed_at_unix: u64,
+}
+
 #[derive(Clone, Copy)]
 struct ObservedConnection {
     connection_type: &'static str,
@@ -288,6 +302,7 @@ pub struct NetworkService {
     bootstrap_peers: Vec<BootstrapPeer>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
+    group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedConnection>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
@@ -352,6 +367,7 @@ impl NetworkService {
             bootstrap_peers,
             advertisement: Mutex::new(None),
             last_connection: std::sync::Mutex::new(None),
+            group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
             member_admission,
             pending_join,
@@ -464,6 +480,68 @@ impl NetworkService {
             });
         }
         result
+    }
+
+    /// Remembers the outcome of the latest synchronization attempt for a
+    /// group: online (direct or LAN), relayed, offline when the network is
+    /// unavailable, and waiting when the group peer could not be reached yet.
+    fn observe_group_synchronization<T>(
+        &self,
+        group_id: PeerId,
+        result: Result<T, &'static str>,
+        connection_type: impl FnOnce(&T) -> &'static str,
+    ) -> Result<T, &'static str> {
+        let state = match &result {
+            Ok(value) => match connection_type(value) {
+                "relayed" => "relayed",
+                _ => "online",
+            },
+            Err("network_unavailable") => "offline",
+            Err(_) => "waiting",
+        };
+        let observed_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let mut states = self
+            .group_connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !states.contains_key(&group_id) && states.len() >= MAX_GROUP_CONNECTION_STATES {
+            if let Some(oldest) = states
+                .iter()
+                .min_by_key(|(_, observed)| observed.observed_at_unix)
+                .map(|(group, _)| *group)
+            {
+                states.remove(&oldest);
+            }
+        }
+        states.insert(
+            group_id,
+            ObservedConnection {
+                connection_type: state,
+                observed_at_unix,
+            },
+        );
+        result
+    }
+
+    /// Reports the remembered connection state of each requested group;
+    /// groups without a synchronization attempt in this session are omitted.
+    pub fn group_connection_states(&self, group_ids: &[PeerId]) -> Vec<GroupConnectionState> {
+        let states = self
+            .group_connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        group_ids
+            .iter()
+            .filter_map(|group_id| {
+                states.get(group_id).map(|observed| GroupConnectionState {
+                    group_id: group_id.to_string(),
+                    state: observed.connection_type,
+                    observed_at_unix: observed.observed_at_unix,
+                })
+            })
+            .collect()
     }
 
     pub async fn advertise_owner_group(
@@ -861,6 +939,21 @@ impl NetworkService {
     }
 
     pub async fn synchronize(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        group_id: PeerId,
+        expected_peer: PeerId,
+    ) -> Result<SynchronizeGroupResult, &'static str> {
+        let result = self
+            .synchronize_with_peer(identity, key, group_id, expected_peer)
+            .await;
+        self.observe_group_synchronization(group_id, result, |synchronized| {
+            synchronized.connection_type
+        })
+    }
+
+    async fn synchronize_with_peer(
         &self,
         identity: DeviceIdentity,
         key: DiscoveryKey,
@@ -1362,6 +1455,7 @@ mod tests {
         NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
         SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
+        MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -1733,6 +1827,69 @@ mod tests {
         let status = tauri::async_runtime::block_on(service.status());
         assert_eq!(status.connection_type, Some("offline"));
         assert!(status.connection_observed_at_unix > 0);
+    }
+
+    #[test]
+    fn group_connection_states_follow_the_latest_synchronization_attempt() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let first = DeviceIdentity::generate().peer_id();
+        let second = DeviceIdentity::generate().peer_id();
+        let unknown = DeviceIdentity::generate().peer_id();
+        let state = |group: PeerId| {
+            service
+                .group_connection_states(&[group])
+                .pop()
+                .map(|observed| observed.state)
+        };
+
+        let _ = service.observe_group_synchronization(first, Ok("direct"), |path| path);
+        let _ = service.observe_group_synchronization(second, Ok("relayed"), |path| path);
+        assert_eq!(state(first), Some("online"));
+        assert_eq!(state(second), Some("relayed"));
+        let _ = service.observe_group_synchronization(first, Ok("lan"), |path| path);
+        assert_eq!(state(first), Some("online"));
+        let _ =
+            service.observe_group_synchronization::<&str>(first, Err("network_unavailable"), |p| p);
+        assert_eq!(state(first), Some("offline"));
+        let _ = service.observe_group_synchronization::<&str>(
+            second,
+            Err("network_peer_not_found"),
+            |path| path,
+        );
+        assert_eq!(state(second), Some("waiting"));
+        assert_eq!(state(unknown), None);
+
+        let states = service.group_connection_states(&[second, unknown, first]);
+        assert_eq!(
+            states
+                .iter()
+                .map(|observed| observed.group_id.clone())
+                .collect::<Vec<_>>(),
+            vec![second.to_string(), first.to_string()]
+        );
+        assert!(states.iter().all(|observed| observed.observed_at_unix > 0));
+    }
+
+    #[test]
+    fn group_connection_states_stay_bounded() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let groups = (0..=MAX_GROUP_CONNECTION_STATES)
+            .map(|_| DeviceIdentity::generate().peer_id())
+            .collect::<Vec<_>>();
+        for group in &groups {
+            let _ = service.observe_group_synchronization(*group, Ok("direct"), |path| path);
+        }
+
+        assert_eq!(
+            service.group_connection_states(&groups).len(),
+            MAX_GROUP_CONNECTION_STATES
+        );
+        assert_eq!(
+            service
+                .group_connection_states(&groups[MAX_GROUP_CONNECTION_STATES..])
+                .len(),
+            1
+        );
     }
 
     #[test]

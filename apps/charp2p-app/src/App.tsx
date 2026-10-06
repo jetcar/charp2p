@@ -1090,7 +1090,13 @@ function BandwidthSection() {
   );
 }
 
-function SettingsView({ onClose }: { onClose: () => void }) {
+function SettingsView({
+  onOpenBackup,
+  onClose,
+}: {
+  onOpenBackup: (() => void) | null;
+  onClose: () => void;
+}) {
   const [information, setInformation] = useState<AppInformation | null>(null);
   const [error, setError] = useState("");
 
@@ -1129,6 +1135,27 @@ function SettingsView({ onClose }: { onClose: () => void }) {
         </section>
         <BackgroundSection />
         <BandwidthSection />
+        <section>
+          <h3>Identity backup and device revocation</h3>
+          <p>
+            An encrypted backup lets you restore this device's name and identity key after losing it. Without a backup,
+            losing every authorized device can permanently lose access. Group memberships and messages are not included.
+          </p>
+          {onOpenBackup ? (
+            <button className="secondary-button" onClick={onOpenBackup} type="button">Create encrypted backup</button>
+          ) : (
+            <p className="preview-note">Create a device identity first to make a backup.</p>
+          )}
+          <p>
+            If a device is lost or compromised, ask the owner of each of its groups to remove it under Members &amp; devices
+            in that group. Owners remove a device there themselves. Removal stops future access but cannot erase messages that
+            device or other members already stored.
+          </p>
+          <p>
+            If the identity key itself may be exposed, do not restore it from backup: create a new identity and ask owners
+            to remove the old device and invite the new one.
+          </p>
+        </section>
         <section>
           <h3>Node policy</h3>
           <p>
@@ -2480,7 +2507,17 @@ function App() {
           ) : networkView ? (
             <NetworkView onClose={() => setNetworkView(false)} />
           ) : settingsView ? (
-            <SettingsView onClose={() => setSettingsView(false)} />
+            <SettingsView
+              onClose={() => setSettingsView(false)}
+              onOpenBackup={
+                profile
+                  ? () => {
+                      setSettingsView(false);
+                      setBackupView(true);
+                    }
+                  : null
+              }
+            />
           ) : backupView && profile ? (
             <IdentityBackupView profile={profile} onClose={() => setBackupView(false)} />
           ) : restoreView && !profile ? (

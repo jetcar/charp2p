@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -122,6 +122,8 @@ pub struct EncryptedMessage {
     pub encrypted_body: Vec<u8>,
     /// Latest applied edit by the same author, if any.
     pub edit: Option<EncryptedMessageEdit>,
+    /// Identifier of the message this one replies to, if any.
+    pub reply_to: Option<[u8; 32]>,
 }
 
 /// Locally encrypted replacement text from a signed `MessageEdited` event.
@@ -320,7 +322,7 @@ impl EventStore {
         encrypted_snapshot: &[u8],
         encrypted_body: &[u8],
     ) -> Result<PutEventOutcome, StoreError> {
-        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, false)
+        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, None, false)
     }
 
     /// Atomically persists a message received from another device and marks
@@ -331,7 +333,27 @@ impl EventStore {
         encrypted_snapshot: &[u8],
         encrypted_body: &[u8],
     ) -> Result<PutEventOutcome, StoreError> {
-        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, true)
+        self.put_materialized_message(event, encrypted_snapshot, encrypted_body, None, true)
+    }
+
+    /// Atomically persists a message that replies to another message. The
+    /// reply reference comes from the decrypted protected payload; a message
+    /// received from another device is marked unread.
+    pub fn put_reply_message_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        encrypted_body: &[u8],
+        reply_to: &[u8; 32],
+        received: bool,
+    ) -> Result<PutEventOutcome, StoreError> {
+        self.put_materialized_message(
+            event,
+            encrypted_snapshot,
+            encrypted_body,
+            Some(reply_to),
+            received,
+        )
     }
 
     fn put_materialized_message(
@@ -339,6 +361,7 @@ impl EventStore {
         event: &SignedEvent,
         encrypted_snapshot: &[u8],
         encrypted_body: &[u8],
+        reply_to: Option<&[u8; 32]>,
         unread: bool,
     ) -> Result<PutEventOutcome, StoreError> {
         if event.kind() != charp2p_core::EventKind::MessageCreated {
@@ -364,6 +387,14 @@ impl EventStore {
                 encrypted_body,
             ],
         )?;
+        if let Some(reply_to) = reply_to.filter(|_| materialized == 1) {
+            transaction.execute(
+                "INSERT INTO message_reply_references (event_id, reply_to_event_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(event_id) DO NOTHING",
+                params![event.id().as_bytes().as_slice(), reply_to.as_slice()],
+            )?;
+        }
         if unread && materialized == 1 {
             transaction.execute(
                 "INSERT INTO unread_local_messages (event_id, group_id)
@@ -388,9 +419,10 @@ impl EventStore {
     pub fn encrypted_messages(&self, group_id: PeerId) -> Result<EncryptedMessagePage, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT e.encoded, m.group_id, m.author_id, m.created_at_unix_ms,
-                    m.encrypted_body, x.event_id, x.encrypted_body
+                    m.encrypted_body, x.event_id, x.encrypted_body, r.reply_to_event_id
              FROM materialized_messages m
              JOIN events e ON e.event_id = m.event_id
+             LEFT JOIN message_reply_references r ON r.event_id = m.event_id
              LEFT JOIN applied_message_edits x ON x.event_id = (
                  SELECT latest.event_id FROM applied_message_edits latest
                  WHERE latest.target_event_id = m.event_id
@@ -418,6 +450,7 @@ impl EventStore {
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
                     row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
                 ))
             },
         )?;
@@ -431,6 +464,7 @@ impl EventStore {
                 encrypted_body,
                 edit_event_id,
                 edit_body,
+                reply_to,
             ) = row?;
             let event = SignedEvent::decode(&encoded)?;
             let created_at_unix_ms =
@@ -463,6 +497,9 @@ impl EventStore {
                 created_at_unix_ms,
                 encrypted_body,
                 edit,
+                reply_to: reply_to
+                    .map(|reply_to| reply_to.try_into().map_err(|_| StoreError::CorruptIndex))
+                    .transpose()?,
             });
         }
         let has_earlier = messages.len() > MAX_RECENT_MESSAGE_EVENTS;
@@ -1678,7 +1715,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=18 => {}
+            6..=19 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -1922,6 +1959,20 @@ impl EventStore {
 
                  CREATE INDEX IF NOT EXISTS applied_message_edits_by_target
                     ON applied_message_edits(target_event_id, author_sequence);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 19 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS message_reply_references (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    reply_to_event_id BLOB NOT NULL CHECK(length(reply_to_event_id) = 32)
+                 ) STRICT;",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -2978,6 +3029,7 @@ mod tests {
                     created_at_unix_ms: event.created_at_unix_ms(),
                     encrypted_body: b"encrypted local message".to_vec(),
                     edit: None,
+                    reply_to: None,
                 }],
                 has_earlier: false,
             }
@@ -3403,6 +3455,88 @@ mod tests {
                 .is_empty()
         );
         assert!(store.unread_message_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reply_reference_is_listed_with_its_message() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let original = message_event(&author, &group, 1, b"protected original");
+        let reply = message_event(&other, &group, 1, b"protected reply");
+        assert!(matches!(
+            store.put_reply_message_and_encrypted_mls_provider_snapshot(
+                &SignedEvent::create(
+                    &author,
+                    EventSpec {
+                        group_id: group.group_id(),
+                        author_sequence: 2,
+                        causal_parents: &[],
+                        created_at_unix_ms: 1_800_000_000_000,
+                        kind: EventKind::MessageEdited,
+                        protected_payload: b"protected edit",
+                    },
+                )
+                .unwrap(),
+                b"snapshot",
+                b"body",
+                original.id().as_bytes(),
+                true,
+            ),
+            Err(StoreError::InvalidMessageEvent)
+        ));
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(&original, b"snapshot", b"original")
+            .unwrap();
+        store
+            .put_reply_message_and_encrypted_mls_provider_snapshot(
+                &reply,
+                b"snapshot",
+                b"reply",
+                original.id().as_bytes(),
+                true,
+            )
+            .unwrap();
+
+        let page = store.encrypted_messages(group.group_id()).unwrap();
+        let references = page
+            .messages
+            .iter()
+            .map(|message| (message.event_id, message.reply_to))
+            .collect::<Vec<_>>();
+        assert!(references.contains(&(*original.id().as_bytes(), None)));
+        assert!(references.contains(&(*reply.id().as_bytes(), Some(*original.id().as_bytes()))));
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
+    }
+
+    #[test]
+    fn version_nineteen_database_adds_reply_references() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE message_reply_references;
+                     PRAGMA user_version = 19;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let group = GroupIdentity::generate();
+        assert!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     #[test]

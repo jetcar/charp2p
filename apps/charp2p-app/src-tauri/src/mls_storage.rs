@@ -10,8 +10,8 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, JoinRequest,
-    JoinResponse, MessageEdit, PeerId, SignedEvent, SyncRejectReason, SyncRequest, SyncResponse,
-    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncRejectReason, SyncRequest,
+    SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -114,6 +114,7 @@ pub(crate) struct StoredMessage {
     pub created_at_unix_ms: u64,
     pub text: String,
     pub edited: bool,
+    pub reply_to_event_id: Option<String>,
     pub delivery_state: &'static str,
 }
 
@@ -389,13 +390,15 @@ impl MlsProviderService {
         group_id: PeerId,
         author: &DeviceIdentity,
         message: &str,
+        reply_to: Option<&[u8; 32]>,
     ) -> Result<CreatedMessage, &'static str> {
         let created_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .ok_or("system_clock_invalid")?;
-        let event = self.create_message_at(group_id, author, message, created_at_unix_ms)?;
+        let body = MessageBody::new(message, reply_to.copied()).map_err(|_| "message_invalid")?;
+        let event = self.create_body_at(group_id, author, &body, created_at_unix_ms)?;
         Ok(CreatedMessage {
             event_id: hex_bytes(event.id().as_bytes()),
             group_id: event.group_id().to_string(),
@@ -463,6 +466,7 @@ impl MlsProviderService {
                     created_at_unix_ms: message.created_at_unix_ms,
                     text,
                     edited: message.edit.is_some(),
+                    reply_to_event_id: message.reply_to.as_ref().map(|id| hex_bytes(id)),
                     delivery_state: if message.author_id != local_device_id {
                         "received"
                     } else if message.author_sequence <= acknowledged_head {
@@ -577,6 +581,7 @@ impl MlsProviderService {
         blocked_device_ids(&store, group_id)
     }
 
+    #[cfg(test)]
     fn create_message_at(
         &self,
         group_id: PeerId,
@@ -584,25 +589,54 @@ impl MlsProviderService {
         message: &str,
         created_at_unix_ms: u64,
     ) -> Result<SignedEvent, &'static str> {
-        if message.trim().is_empty() || message.len() > MAX_MESSAGE_TEXT_BYTES {
-            return Err("message_invalid");
+        let body = MessageBody::new(message, None).map_err(|_| "message_invalid")?;
+        self.create_body_at(group_id, author, &body, created_at_unix_ms)
+    }
+
+    /// Protects a message body, including any reply reference, as an MLS
+    /// application message. A reply must target a message readable here.
+    fn create_body_at(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        body: &MessageBody,
+        created_at_unix_ms: u64,
+    ) -> Result<SignedEvent, &'static str> {
+        if let Some(reply_to) = body.reply_to() {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            store
+                .materialized_message_author(group_id, reply_to)
+                .map_err(|_| "message_store_unavailable")?
+                .ok_or("message_not_found")?;
         }
+        let encoded = body.encode().map_err(|_| "message_invalid")?;
         self.create_application_event_at(
             group_id,
             author,
             EventKind::MessageCreated,
-            message.as_bytes(),
+            &encoded,
             created_at_unix_ms,
             |store, event, encrypted_snapshot, key| {
                 let encrypted_body =
-                    encrypt_local_message(message.as_bytes(), key, event.id().as_bytes())?;
-                store
-                    .put_message_and_encrypted_mls_provider_snapshot(
+                    encrypt_local_message(body.text().as_bytes(), key, event.id().as_bytes())?;
+                match body.reply_to() {
+                    Some(reply_to) => store.put_reply_message_and_encrypted_mls_provider_snapshot(
                         event,
                         encrypted_snapshot,
                         &encrypted_body,
-                    )
-                    .map_err(|_| "message_store_unavailable")?;
+                        reply_to,
+                        false,
+                    ),
+                    None => store.put_message_and_encrypted_mls_provider_snapshot(
+                        event,
+                        encrypted_snapshot,
+                        &encrypted_body,
+                    ),
+                }
+                .map_err(|_| "message_store_unavailable")?;
                 Ok(())
             },
         )
@@ -1152,14 +1186,12 @@ impl MlsProviderService {
                 GroupMetadata::decode(&plaintext)
                     .map_err(|_| MaterializeMessageError::Unreadable)?,
             )
-        } else if edit.is_some() {
-            None
         } else {
-            let text =
-                std::str::from_utf8(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?;
-            if text.trim().is_empty() || text.len() > MAX_MESSAGE_TEXT_BYTES {
-                return Err(MaterializeMessageError::Unreadable);
-            }
+            None
+        };
+        let body = if edit.is_none() && metadata.is_none() {
+            Some(MessageBody::decode(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?)
+        } else {
             None
         };
         let snapshot = provider
@@ -1194,15 +1226,25 @@ impl MlsProviderService {
                 .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
             return Ok(());
         }
-        let encrypted_body = encrypt_local_message(&plaintext, &key, event.id().as_bytes())
-            .map_err(MaterializeMessageError::Unavailable)?;
-        store
-            .put_received_message_and_encrypted_mls_provider_snapshot(
+        let body = body.ok_or(MaterializeMessageError::Unreadable)?;
+        let encrypted_body =
+            encrypt_local_message(body.text().as_bytes(), &key, event.id().as_bytes())
+                .map_err(MaterializeMessageError::Unavailable)?;
+        match body.reply_to() {
+            Some(reply_to) => store.put_reply_message_and_encrypted_mls_provider_snapshot(
                 event,
                 &encrypted_snapshot,
                 &encrypted_body,
-            )
-            .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
+                reply_to,
+                true,
+            ),
+            None => store.put_received_message_and_encrypted_mls_provider_snapshot(
+                event,
+                &encrypted_snapshot,
+                &encrypted_body,
+            ),
+        }
+        .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
         Ok(())
     }
 
@@ -3410,6 +3452,93 @@ mod tests {
                 vec![
                     ("Member fixed".to_owned(), true),
                     ("Owner fixed".to_owned(), true)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn reply_reference_reaches_peers_inside_the_protected_payload() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        let question = owner_service
+            .create_message_at(group_id, &owner, "Lunch at noon?", 43)
+            .unwrap();
+        let target = *question.id().as_bytes();
+        assert!(matches!(
+            member_service.create_body_at(
+                group_id,
+                &member,
+                &super::MessageBody::new("Yes", Some(target)).unwrap(),
+                44,
+            ),
+            Err("message_not_found")
+        ));
+        pull_all(&owner_service, &member_service, member_id, group_id);
+
+        let reply = member_service
+            .create_body_at(
+                group_id,
+                &member,
+                &super::MessageBody::new("Yes", Some(target)).unwrap(),
+                44,
+            )
+            .unwrap();
+        assert!(
+            !reply
+                .protected_payload()
+                .windows(target.len())
+                .any(|window| window == target),
+            "reply reference is MLS-protected"
+        );
+        let (push, _) = member_service
+            .next_push_request(group_id, member_id, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_service.answer_sync_request(member_id, &push),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 1,
+            }
+        );
+
+        let target_hex = super::hex_bytes(&target);
+        for (service, local) in [
+            (&owner_service, owner.peer_id()),
+            (&member_service, member_id),
+        ] {
+            let messages = service
+                .messages(group_id, local)
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|message| (message.text, message.reply_to_event_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages,
+                vec![
+                    ("Lunch at noon?".to_owned(), None),
+                    ("Yes".to_owned(), Some(target_hex.clone())),
                 ]
             );
         }

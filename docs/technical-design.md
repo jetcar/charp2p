@@ -360,6 +360,13 @@ author, and the edit with that author's highest sequence is shown with an
 "edited" marker. The original signed event is retained. Members may push their
 own edits in the same way as their own messages.
 
+A `MessageCreated` payload is plain UTF-8 message text, or, for a reply, a
+marker byte `0xFF` (never valid leading UTF-8) followed by a versioned body
+carrying the replied-to `MessageCreated` event identifier and the text. The
+reply reference is therefore MLS-protected like the text. A reply may only be
+created for a message readable on the sending device; receivers display a
+reply whose target is not available locally as a reply to an unseen message.
+
 Deletion is a signed tombstone request. It hides content in conforming clients
 but cannot guarantee erasure from devices that already received it.
 

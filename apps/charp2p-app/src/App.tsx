@@ -66,6 +66,7 @@ type CreatedMessage = {
 type StoredMessage = CreatedMessage & {
   text: string;
   edited: boolean;
+  replyToEventId: string | null;
   deliveryState: "local" | "sharedWithPeer" | "received";
 };
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
@@ -557,6 +558,7 @@ function App() {
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
+  const [replyingTo, setReplyingTo] = useState<StoredMessage | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
   const [membersError, setMembersError] = useState("");
@@ -1228,10 +1230,12 @@ function App() {
     setCreatedMessage(null);
     setSendingMessage(true);
     const text = outgoingMessage;
+    const replyToEventId = replyingTo?.groupId === groupId ? replyingTo.eventId : null;
     try {
       const created = await invoke<CreatedMessage>("send_group_message", {
         groupId,
         message: text,
+        replyToEventId,
       });
       setCreatedMessage(created);
       setGroupMessages((messages) => [
@@ -1244,10 +1248,12 @@ function App() {
           createdAtUnixMs: created.createdAtUnixMs,
           text,
           edited: false,
+          replyToEventId,
           deliveryState: "local",
         },
       ]);
       setOutgoingMessage("");
+      setReplyingTo(null);
       if (joinedGroup?.groupId === groupId) {
         void performJoinedGroupSynchronization(groupId, false);
       }
@@ -1300,6 +1306,30 @@ function App() {
     }
   }
 
+  function messageSnippet(text: string) {
+    return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  }
+
+  function renderReplyQuote(message: StoredMessage) {
+    if (!message.replyToEventId) return null;
+    const target = groupMessages.find((candidate) => candidate.eventId === message.replyToEventId);
+    return (
+      <blockquote className="message-reply-quote">
+        {target ? messageSnippet(target.text) : "Reply to a message not shown on this device"}
+      </blockquote>
+    );
+  }
+
+  function renderReplyDraft(groupId: string) {
+    if (replyingTo?.groupId !== groupId) return null;
+    return (
+      <div className="message-reply-draft">
+        <blockquote className="message-reply-quote">Replying to: {messageSnippet(replyingTo.text)}</blockquote>
+        <button disabled={sendingMessage} onClick={() => setReplyingTo(null)} type="button">Cancel reply</button>
+      </div>
+    );
+  }
+
   function renderMessageText(message: StoredMessage) {
     if (editingMessage?.eventId !== message.eventId) return <p>{message.text}</p>;
     return (
@@ -1333,6 +1363,7 @@ function App() {
       });
       setGroupMessages((messages) => messages.filter(({ eventId }) => eventId !== message.eventId));
       if (createdMessage?.eventId === message.eventId) setCreatedMessage(null);
+      if (replyingTo?.eventId === message.eventId) setReplyingTo(null);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -1655,6 +1686,7 @@ function App() {
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
+                      {renderReplyQuote(message)}
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile, joinedGroup)}
@@ -1665,6 +1697,7 @@ function App() {
                         )}
                       </time>
                       <div className="message-actions">
+                        <button onClick={() => setReplyingTo(message)} type="button">Reply</button>
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>
                         {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
                           <button
@@ -1691,6 +1724,7 @@ function App() {
                 </section>
               )}
               <form className="message-composer" onSubmit={sendGroupMessage}>
+                {renderReplyDraft(joinedGroup.groupId)}
                 <label htmlFor="joined-outgoing-message">Protected message</label>
                 <textarea
                   aria-describedby="joined-message-size"
@@ -1762,6 +1796,7 @@ function App() {
               </div>
               {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
               <form className="message-composer" onSubmit={sendGroupMessage}>
+                {renderReplyDraft(localGroup.groupId)}
                 <label htmlFor="outgoing-message">Protected message</label>
                 <textarea
                   aria-describedby="owner-message-size"
@@ -1799,6 +1834,7 @@ function App() {
                       className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
                       key={message.eventId}
                     >
+                      {renderReplyQuote(message)}
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
@@ -1808,6 +1844,7 @@ function App() {
                         )}
                       </time>
                       <div className="message-actions">
+                        <button onClick={() => setReplyingTo(message)} type="button">Reply</button>
                         <button onClick={() => void copyMessage(message)} type="button">Copy</button>
                         {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
                           <button

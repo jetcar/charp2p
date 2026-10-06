@@ -296,15 +296,20 @@ async fn synchronize_group(
 fn send_group_message(
     group_id: String,
     message: String,
+    reply_to_event_id: Option<String>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<CreatedMessage, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let reply_to = reply_to_event_id
+        .as_deref()
+        .map(parse_event_id)
+        .transpose()?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
     mls_service
-        .create_message(group_id, &identity, &message)
+        .create_message(group_id, &identity, &message, reply_to.as_ref())
         .map_err(str::to_owned)
 }
 

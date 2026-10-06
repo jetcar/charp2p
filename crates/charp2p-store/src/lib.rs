@@ -1210,6 +1210,35 @@ impl EventStore {
         )? > 0)
     }
 
+    /// Atomically forgets a joined group on this device: its display metadata,
+    /// signed events with every dependent local record, peer acknowledgements
+    /// and local blocks, together with the provider state that no longer
+    /// contains the MLS group.
+    pub fn leave_joined_group_and_put_encrypted_mls_provider_snapshot(
+        &mut self,
+        group_id: PeerId,
+        encrypted: &[u8],
+    ) -> Result<bool, StoreError> {
+        validate_encrypted_mls_provider_snapshot(encrypted)?;
+        let transaction = self.connection.transaction()?;
+        let group_id = group_id.to_bytes();
+        let removed =
+            transaction.execute("DELETE FROM joined_groups WHERE group_id = ?1", [&group_id])? != 0;
+        if !removed {
+            return Ok(false);
+        }
+        for statement in [
+            "DELETE FROM events WHERE group_id = ?1",
+            "DELETE FROM peer_acknowledged_author_heads WHERE group_id = ?1",
+            "DELETE FROM blocked_local_devices WHERE group_id = ?1",
+        ] {
+            transaction.execute(statement, [&group_id])?;
+        }
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Adds the non-secret index for a newly issued bearer invitation.
     pub fn put_issued_invitation(
         &mut self,
@@ -2534,6 +2563,115 @@ mod tests {
             .joined_groups()
             .unwrap();
         assert_eq!(restored[0].last_synchronized_at_unix, Some(1_800_000_123));
+    }
+
+    #[test]
+    fn leaving_a_joined_group_removes_only_its_local_state() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let blocked_device_id = DeviceIdentity::generate().peer_id();
+        let left = GroupIdentity::generate();
+        let kept = GroupIdentity::generate();
+        for group in [&left, &kept] {
+            store
+                .put_pending_invitation(&PendingInvitationMetadata {
+                    group_id: group.group_id(),
+                    group_name: "Design Crew".to_owned(),
+                    inviter_name: "Maya".to_owned(),
+                    expires_at_unix: 1_800_003_600,
+                    history_policy: HistoryPolicy::FromInvitation,
+                    reusable: false,
+                })
+                .unwrap();
+            store
+                .promote_pending_invitation_to_joined_group(group.group_id(), inviter_device_id)
+                .unwrap();
+            let message = message_event(&author, group, 1, b"protected message");
+            store
+                .put_received_message_and_encrypted_mls_provider_snapshot(
+                    &message,
+                    b"snapshot",
+                    b"encrypted body",
+                )
+                .unwrap();
+            store
+                .acknowledge_author_head(group.group_id(), inviter_device_id, author.peer_id(), 1)
+                .unwrap();
+            store
+                .block_device_locally(group.group_id(), blocked_device_id)
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .leave_joined_group_and_put_encrypted_mls_provider_snapshot(
+                    left.group_id(),
+                    b"snapshot without the group",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .joined_groups()
+                .unwrap()
+                .into_iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            vec![kept.group_id()]
+        );
+        assert!(
+            store
+                .synchronization_summary(left.group_id())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .encrypted_messages(left.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(store.blocked_devices(left.group_id()).unwrap().is_empty());
+        assert_eq!(
+            store
+                .max_acknowledged_author_head(left.group_id(), author.peer_id())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(kept.group_id(), 1)]
+        );
+        assert_eq!(
+            store
+                .encrypted_messages(kept.group_id())
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.blocked_devices(kept.group_id()).unwrap(),
+            vec![blocked_device_id]
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"snapshot without the group"
+        );
+        assert!(
+            !store
+                .leave_joined_group_and_put_encrypted_mls_provider_snapshot(
+                    left.group_id(),
+                    b"unchanged snapshot",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"snapshot without the group"
+        );
     }
 
     #[test]

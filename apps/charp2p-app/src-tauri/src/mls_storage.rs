@@ -1617,6 +1617,56 @@ impl MlsProviderService {
         result
     }
 
+    /// Forgets a joined group on this device: the MLS group state leaves the
+    /// provider snapshot in the same transaction that removes the group's
+    /// local records. The owner still lists this device until it removes it.
+    pub(crate) fn leave_joined_group(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            if let Some(mut group) = MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&group_id.to_bytes()),
+            )
+            .map_err(|_| "mls_group_storage_unavailable")?
+            {
+                group
+                    .delete(provider.storage())
+                    .map_err(|_| "mls_group_storage_unavailable")?;
+            }
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            if !store
+                .leave_joined_group_and_put_encrypted_mls_provider_snapshot(group_id, &encrypted)
+                .map_err(|_| "mls_provider_store_unavailable")?
+            {
+                return Err("joined_group_not_found");
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
+    }
+
     #[cfg(test)]
     fn read<T>(&self, operation: impl FnOnce(&ProfileProvider) -> T) -> Result<T, &'static str> {
         let _operation = self
@@ -2145,7 +2195,7 @@ mod tests {
         MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
         WrappingKeyStore, WRAPPING_KEY_BYTES,
     };
-    use charp2p_store::EventStore;
+    use charp2p_store::{EventStore, PendingInvitationMetadata};
 
     #[derive(Clone, Default)]
     struct MemoryWrappingKeyStore {
@@ -2477,6 +2527,78 @@ mod tests {
             .unwrap();
         assert!(members.contains(&owner_id));
         assert!(members.contains(&joiner_id));
+    }
+
+    #[test]
+    fn leaving_a_joined_group_removes_it_from_the_persisted_provider() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let key_store = MemoryWrappingKeyStore::default();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let joiner_id = DeviceIdentity::generate().peer_id();
+        let owner_service = MlsProviderService::open_with_key_store(
+            directory.path().join("owner.sqlite3"),
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store.clone()),
+        )
+        .unwrap();
+        let request = service
+            .prepare_join_request(joiner_id, &invitation)
+            .unwrap();
+        let response = owner_service
+            .admit_member_at(group_id, &owner, joiner_id, request.key_package(), 42)
+            .unwrap();
+        service
+            .complete_join(group_id, response.welcome().unwrap())
+            .unwrap();
+        let mut store = EventStore::open(&path).unwrap();
+        store
+            .put_pending_invitation(&PendingInvitationMetadata {
+                group_id,
+                group_name: "Design Crew".to_owned(),
+                inviter_name: "Maya".to_owned(),
+                expires_at_unix: 1_800_003_600,
+                history_policy: HistoryPolicy::FromInvitation,
+                reusable: false,
+            })
+            .unwrap();
+        store
+            .promote_pending_invitation_to_joined_group(group_id, owner.peer_id())
+            .unwrap();
+
+        assert_eq!(
+            owner_service.leave_joined_group(group_id),
+            Err("joined_group_not_found")
+        );
+        assert!(owner_service.has_group(group_id).unwrap());
+        service.leave_joined_group(group_id).unwrap();
+        assert!(!service.has_group(group_id).unwrap());
+        assert!(store.joined_groups().unwrap().is_empty());
+        assert_eq!(
+            service.leave_joined_group(group_id),
+            Err("joined_group_not_found")
+        );
+        drop(service);
+
+        let restored = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(key_store),
+        )
+        .unwrap();
+        assert!(!restored.has_group(group_id).unwrap());
     }
 
     #[test]

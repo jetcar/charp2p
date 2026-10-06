@@ -195,6 +195,27 @@ impl PendingInvitationService {
         Ok(())
     }
 
+    /// Removes a left group's protected discovery key. It is idempotent so an
+    /// interrupted leave can be retried after the group metadata is gone.
+    pub(crate) fn forget_joined_discovery(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let joined = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .iter()
+            .any(|joined| joined.group_id == group_id);
+        if joined {
+            return Err("joined_group_still_present");
+        }
+        self.discovery.remove(group_id)
+    }
+
     pub(crate) fn ensure_pending(&self, group_id: PeerId) -> Result<(), &'static str> {
         let _operation = self
             .operations
@@ -683,6 +704,38 @@ mod tests {
         assert_eq!(
             service.accept_at(&encoded, NOW),
             Err("group_already_joined")
+        );
+    }
+
+    #[test]
+    fn left_group_discovery_is_forgotten_only_after_its_metadata() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        service.accept_at(&encoded, NOW).unwrap();
+        service.complete_join(group_id).unwrap();
+
+        assert_eq!(
+            service.forget_joined_discovery(group_id),
+            Err("joined_group_still_present")
+        );
+        assert!(service.discovery.get_optional(group_id).unwrap().is_some());
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .leave_joined_group_and_put_encrypted_mls_provider_snapshot(group_id, b"snapshot")
+            .unwrap());
+        service.forget_joined_discovery(group_id).unwrap();
+        service.forget_joined_discovery(group_id).unwrap();
+        assert!(service.discovery.get_optional(group_id).unwrap().is_none());
+        assert!(service.joined().unwrap().is_empty());
+        assert_eq!(
+            service.joined_sync_target(group_id),
+            Err("joined_group_not_found")
+        );
+        assert_eq!(
+            service.accept_at(&encoded, NOW).unwrap().group_id,
+            group_id.to_string()
         );
     }
 

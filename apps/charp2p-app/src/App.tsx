@@ -336,6 +336,8 @@ function MembersView({
   blockingDeviceId,
   onToggleBlock,
   onRename,
+  onLeave,
+  leaving,
   onClose,
 }: {
   groupName: string;
@@ -351,6 +353,8 @@ function MembersView({
   blockingDeviceId: string;
   onToggleBlock: (deviceId: string, blocked: boolean) => void;
   onRename: (groupName: string) => Promise<void>;
+  onLeave: (() => void) | null;
+  leaving: boolean;
   onClose: () => void;
 }) {
   const [renameInput, setRenameInput] = useState(groupName);
@@ -463,6 +467,14 @@ function MembersView({
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
       <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
       {canManageMembers && <p className="preview-note">Removing a device blocks future group messages and invitation reuse. Messages already saved on that device cannot be erased.</p>}
+      {onLeave && (
+        <div className="leave-group">
+          <button className="member-remove" disabled={leaving} onClick={onLeave} type="button">
+            {leaving ? "Leaving…" : "Leave group"}
+          </button>
+          <p className="preview-note">Leaving deletes this group's messages, keys, and discovery record from this device only. The owner still lists this device until it removes it, and other members keep their copies.</p>
+        </div>
+      )}
       <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
     </section>
   );
@@ -573,6 +585,7 @@ function App() {
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [cancellingPending, setCancellingPending] = useState(false);
+  const [leavingGroup, setLeavingGroup] = useState(false);
   const pendingExpiryCleanupRef = useRef("");
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
@@ -1208,6 +1221,29 @@ function App() {
     }
   }
 
+  async function leaveJoinedGroup() {
+    if (!joinedGroup || leavingGroup || !isTauri()) return;
+    if (!window.confirm(`Leave ${joinedGroup.groupName}? Its messages and keys will be deleted from this device. You need a new invitation to join again.`)) return;
+    const groupId = joinedGroup.groupId;
+    setMembersError("");
+    setLeavingGroup(true);
+    try {
+      await invoke("leave_joined_group", { groupId });
+      const remaining = joinedGroups.filter((group) => group.groupId !== groupId);
+      setJoinedGroups(remaining);
+      setUnreadCounts((counts) => {
+        const { [groupId]: _left, ...rest } = counts;
+        return rest;
+      });
+      setShowMembers(false);
+      setActiveGroupId(remaining[0]?.groupId ?? localGroups[0]?.groupId ?? "");
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setLeavingGroup(false);
+    }
+  }
+
   async function renameLocalGroup(requested: string) {
     const groupId = localGroup?.groupId;
     if (!groupId || !isTauri()) return;
@@ -1643,6 +1679,8 @@ function App() {
               blockingDeviceId={blockingDevice}
               onToggleBlock={setDeviceBlocked}
               onRename={renameLocalGroup}
+              onLeave={joinedGroup ? leaveJoinedGroup : null}
+              leaving={leavingGroup}
               onClose={() => setShowMembers(false)}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}

@@ -307,6 +307,12 @@ an exact retry cannot re-admit the removed device. Remaining members apply the
 removal commit through the synchronized membership-commit path. The new epoch
 protects future messages; removal cannot erase data already received.
 
+A member leaves a joined group only on its own device (ADR-027): one
+transaction deletes the group's metadata, signed events, dependent local
+records, and OpenMLS state from the provider snapshot, and the protected
+discovery key is removed afterwards. The owner keeps the device as a member
+until it removes it.
+
 ## Group protocol
 
 Group state is an authenticated append-only event graph. A canonical event

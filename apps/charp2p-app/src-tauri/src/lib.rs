@@ -104,6 +104,27 @@ fn joined_groups(
     Ok(groups)
 }
 
+/// Leaves a joined group on this device only. Group state goes first so a
+/// failed protected-storage cleanup is retried by leaving again.
+#[tauri::command]
+fn leave_joined_group(
+    group_id: String,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
+    let left = mls_service.leave_joined_group(group_id);
+    if let Err(error) = left {
+        if error != "joined_group_not_found" {
+            return Err(error.to_owned());
+        }
+    }
+    pending_service
+        .forget_joined_discovery(group_id)
+        .map_err(str::to_owned)?;
+    left.map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn local_groups(
     service: tauri::State<'_, Arc<GroupService>>,
@@ -532,6 +553,7 @@ pub fn run() {
             pending_invitations,
             cancel_pending_invitation,
             joined_groups,
+            leave_joined_group,
             local_groups,
             rename_group,
             issued_invitations,

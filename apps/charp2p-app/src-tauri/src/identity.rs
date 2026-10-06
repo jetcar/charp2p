@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use charp2p_core::{seal_identity_backup, DeviceIdentity, DeviceIdentitySecret};
+use charp2p_core::{
+    open_identity_backup, seal_identity_backup, DeviceIdentity, DeviceIdentitySecret,
+    IdentityBackupError, RestoredIdentityBackup,
+};
 use keyring_core::{Entry, Error as KeyringError};
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -58,6 +61,38 @@ impl IdentityService {
 
         Ok(DeviceProfile {
             device_name,
+            peer_id: identity.peer_id().to_string(),
+        })
+    }
+
+    /// Stores a device identity recovered from an encrypted backup (ADR-028).
+    /// Restore is only allowed before this installation has an identity.
+    pub(crate) fn restore(
+        &self,
+        restored: RestoredIdentityBackup,
+    ) -> Result<DeviceProfile, &'static str> {
+        let _guard = self
+            .operations
+            .lock()
+            .map_err(|_| "identity_service_unavailable")?;
+
+        if load_profile()?.is_some() {
+            return Err("identity_already_exists");
+        }
+
+        let identity = DeviceIdentity::from_persisted_secret(&restored.secret)
+            .map_err(|_| "identity_backup_invalid")?;
+        let record = encode_record(&restored.device_name, &restored.secret)
+            .map_err(|_| "identity_backup_invalid")?;
+        // Backups may carry legacy names; accept exactly what a stored record
+        // accepts so the restored record always loads again.
+        decode_record(record.as_slice()).map_err(|_| "identity_backup_invalid")?;
+        protected_entry(CREDENTIAL_USER)?
+            .set_secret(record.as_slice())
+            .map_err(|_| "identity_store_unavailable")?;
+
+        Ok(DeviceProfile {
+            device_name: restored.device_name.clone(),
             peer_id: identity.peer_id().to_string(),
         })
     }
@@ -121,8 +156,24 @@ pub(crate) fn seal_backup(
     passphrase: &str,
 ) -> Result<Vec<u8>, &'static str> {
     seal_identity_backup(device_name, secret, passphrase).map_err(|error| match error {
-        charp2p_core::IdentityBackupError::InvalidPassphrase => "backup_passphrase_invalid",
+        IdentityBackupError::InvalidPassphrase => "backup_passphrase_invalid",
         _ => "identity_backup_failed",
+    })
+}
+
+/// Opens a passphrase-encrypted backup. Wrong passphrases and tampering share
+/// one error; files that are not version-1 backups are reported separately.
+pub(crate) fn open_backup(
+    backup: &[u8],
+    passphrase: &str,
+) -> Result<RestoredIdentityBackup, &'static str> {
+    open_identity_backup(backup, passphrase).map_err(|error| match error {
+        IdentityBackupError::InvalidPassphrase => "backup_passphrase_invalid",
+        IdentityBackupError::DecryptionFailed => "backup_decryption_failed",
+        IdentityBackupError::InvalidSize
+        | IdentityBackupError::UnrecognizedFormat
+        | IdentityBackupError::UnsupportedVersion(_) => "backup_unrecognized",
+        _ => "identity_backup_invalid",
     })
 }
 
@@ -256,6 +307,9 @@ mod tests {
     };
     use charp2p_core::{DeviceIdentity, DeviceIdentitySecret};
 
+    /// Serializes tests that replace the process-wide keyring store.
+    static DEFAULT_STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn identity_record_round_trips_without_changing_peer_id() {
         let (identity, secret) = DeviceIdentity::generate_persistable().expect("identity encodes");
@@ -318,6 +372,9 @@ mod tests {
 
     #[test]
     fn identity_service_creates_once_and_restores_the_profile() {
+        let _store = DEFAULT_STORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         keyring_core::set_default_store(
             keyring_core::mock::Store::new().expect("mock store initializes"),
         );
@@ -347,6 +404,54 @@ mod tests {
             DeviceIdentity::from_persisted_secret(&opened.secret).expect("identity restores");
         assert_eq!(opened.device_name, "Alex's PC");
         assert_eq!(reopened.peer_id().to_string(), created.peer_id);
+        keyring_core::unset_default_store();
+    }
+
+    #[test]
+    fn identity_service_restores_a_backup_only_without_an_identity() {
+        let (identity, secret) = DeviceIdentity::generate_persistable().unwrap();
+        let backup =
+            charp2p_core::seal_identity_backup("Alex's PC", &secret, "correct horse battery")
+                .expect("backup is sealed");
+        assert_eq!(
+            super::open_backup(&backup, "wrong horse battery").err(),
+            Some("backup_decryption_failed")
+        );
+        assert_eq!(
+            super::open_backup(b"not a backup", "correct horse battery").err(),
+            Some("backup_unrecognized")
+        );
+        assert_eq!(
+            super::open_backup(&backup, "short").err(),
+            Some("backup_passphrase_invalid")
+        );
+
+        let _store = DEFAULT_STORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().expect("mock store initializes"),
+        );
+        let service = IdentityService::default();
+        let restored = service
+            .restore(super::open_backup(&backup, "correct horse battery").unwrap())
+            .expect("identity is restored");
+        assert_eq!(restored.device_name, "Alex's PC");
+        assert_eq!(restored.peer_id, identity.peer_id().to_string());
+        assert_eq!(service.status().unwrap(), Some(restored));
+        assert_eq!(
+            service
+                .load_network_identity()
+                .expect("network identity loads")
+                .peer_id(),
+            identity.peer_id()
+        );
+        assert_eq!(
+            service
+                .restore(super::open_backup(&backup, "correct horse battery").unwrap())
+                .unwrap_err(),
+            "identity_already_exists"
+        );
         keyring_core::unset_default_store();
     }
 }

@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import QRCode from "qrcode";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
@@ -184,6 +184,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   member_removal_store_unavailable: "The removal could not be saved securely.",
   backup_passphrase_invalid: "Use a backup passphrase of at least 12 characters.",
   identity_backup_failed: "The encrypted backup could not be created.",
+  backup_decryption_failed: "The backup could not be opened. Check the passphrase and that the backup is complete.",
+  backup_unrecognized: "This is not a CharP2P identity backup this version can open.",
+  backup_text_invalid: "The backup text is not valid. Paste the complete text copied from the backup screen.",
+  identity_backup_invalid: "The backup does not contain a valid device identity.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
 };
 
@@ -557,6 +561,119 @@ function bytesToBase64(bytes: number[]) {
   return btoa(String.fromCharCode(...bytes));
 }
 
+const MAX_BACKUP_BYTES = 1024;
+
+function base64ToBytes(text: string) {
+  const compact = text.replace(/\s+/g, "");
+  if (!compact || compact.length > Math.ceil(MAX_BACKUP_BYTES / 3) * 4) {
+    throw "backup_text_invalid";
+  }
+  try {
+    return Array.from(atob(compact), (character) => character.charCodeAt(0));
+  } catch {
+    throw "backup_text_invalid";
+  }
+}
+
+function RestoreBackupView({
+  onRestored,
+  onClose,
+}: {
+  onRestored: (profile: DeviceProfile) => void;
+  onClose: () => void;
+}) {
+  const [fileBytes, setFileBytes] = useState<number[] | null>(null);
+  const [fileName, setFileName] = useState("");
+  const [backupText, setBackupText] = useState("");
+  const [passphrase, setPassphrase] = useState("");
+  const [restoring, setRestoring] = useState(false);
+  const [error, setError] = useState("");
+  const hasBackup = fileBytes !== null || backupText.trim().length > 0;
+  const tooShort = Array.from(passphrase).length < MIN_BACKUP_PASSPHRASE_CHARS;
+
+  async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    setError("");
+    if (!file) {
+      setFileBytes(null);
+      setFileName("");
+      return;
+    }
+    if (file.size > MAX_BACKUP_BYTES) {
+      setFileBytes(null);
+      setFileName("");
+      setError(errorMessage("backup_unrecognized"));
+      return;
+    }
+    setFileBytes(Array.from(new Uint8Array(await file.arrayBuffer())));
+    setFileName(file.name);
+  }
+
+  async function restoreBackup(event: FormEvent) {
+    event.preventDefault();
+    if (!hasBackup || tooShort || restoring) return;
+    setRestoring(true);
+    setError("");
+    try {
+      const backup = fileBytes ?? base64ToBytes(backupText);
+      const restored = await invoke<DeviceProfile>("restore_identity_backup", { backup, passphrase });
+      setPassphrase("");
+      onRestored(restored);
+    } catch (restoreError) {
+      setError(errorMessage(restoreError));
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  return (
+    <section className="setup-form information-card">
+      <header>
+        <p className="eyebrow">Identity backup</p>
+        <h2>Restore from an encrypted backup</h2>
+        <p>Restoring brings back this device's name and identity key. Group memberships and messages are not included; groups must re-admit or resynchronize this device.</p>
+      </header>
+      <form className="setup-form" onSubmit={restoreBackup}>
+        <label htmlFor="restore-file">Backup file</label>
+        <input accept=".charp2p-backup,application/octet-stream" id="restore-file" onChange={chooseFile} type="file" />
+        {fileName ? (
+          <p className="preview-note">Selected {fileName}.</p>
+        ) : (
+          <>
+            <label htmlFor="restore-text">Or paste the backup text</label>
+            <textarea
+              className="backup-text"
+              id="restore-text"
+              onChange={(event) => setBackupText(event.target.value)}
+              rows={5}
+              spellCheck={false}
+              value={backupText}
+            />
+          </>
+        )}
+        <label htmlFor="restore-passphrase">Passphrase</label>
+        <input
+          autoComplete="current-password"
+          id="restore-passphrase"
+          onChange={(event) => setPassphrase(event.target.value)}
+          type="password"
+          value={passphrase}
+        />
+        <p className="preview-note">Stop using the original device after restoring. Two installations with one identity will conflict.</p>
+        <button
+          className="primary-button"
+          disabled={!hasBackup || tooShort || restoring || !isTauri()}
+          type="submit"
+        >
+          {restoring ? "Decrypting backup…" : "Restore identity"}
+        </button>
+      </form>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <button className="secondary-button" disabled={restoring} onClick={onClose} type="button">Back</button>
+    </section>
+  );
+}
+
 function IdentityBackupView({
   profile,
   onClose,
@@ -670,6 +787,7 @@ function App() {
   const [error, setError] = useState("");
   const [informationView, setInformationView] = useState<"privacy" | "identity" | null>(null);
   const [backupView, setBackupView] = useState(false);
+  const [restoreView, setRestoreView] = useState(false);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
@@ -1631,6 +1749,16 @@ function App() {
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
           ) : backupView && profile ? (
             <IdentityBackupView profile={profile} onClose={() => setBackupView(false)} />
+          ) : restoreView && !profile ? (
+            <RestoreBackupView
+              onClose={() => setRestoreView(false)}
+              onRestored={(restored) => {
+                setProfile(restored);
+                setDeviceName(restored.deviceName);
+                setRestoreView(false);
+                setStep(3);
+              }}
+            />
           ) : (
             <>
               <Stepper step={step} />
@@ -1667,7 +1795,7 @@ function App() {
                 <span aria-hidden="true">＋</span>
                 {saving ? "Creating identity…" : "Create identity"}
               </button>
-              <button className="secondary-button" disabled title="Encrypted backup restore is not available yet" type="button">
+              <button className="secondary-button" disabled={saving} onClick={() => { setError(""); setRestoreView(true); }} type="button">
                 <span aria-hidden="true">↶</span>
                 Restore from backup
               </button>

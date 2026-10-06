@@ -51,6 +51,23 @@ async fn export_identity_backup(
     .map_err(str::to_owned)
 }
 
+/// Restores the device identity from a passphrase-encrypted backup (ADR-028)
+/// on an installation that has none. Key derivation runs off the UI thread.
+#[tauri::command]
+async fn restore_identity_backup(
+    backup: Vec<u8>,
+    passphrase: String,
+    service: tauri::State<'_, IdentityService>,
+) -> Result<DeviceProfile, String> {
+    let passphrase = zeroize::Zeroizing::new(passphrase);
+    let restored =
+        tauri::async_runtime::spawn_blocking(move || identity::open_backup(&backup, &passphrase))
+            .await
+            .map_err(|_| "identity_backup_invalid".to_owned())?
+            .map_err(str::to_owned)?;
+    service.restore(restored).map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn preview_invitation(input: String) -> Result<invitation::InvitationPreview, String> {
     invitation::preview_invitation(&input).map_err(str::to_owned)
@@ -566,6 +583,7 @@ pub fn run() {
             identity_status,
             create_identity,
             export_identity_backup,
+            restore_identity_backup,
             preview_invitation,
             accept_invitation,
             pending_invitations,

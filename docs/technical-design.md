@@ -189,7 +189,13 @@ mDNS only supplies addresses: group membership and synchronization still need
 invitation-bound discovery and authenticated protocols. A connection reached
 through an mDNS-announced address is reported as LAN even when the address is
 outside private ranges. When the multicast socket cannot be opened the node
-continues without LAN discovery.
+continues without LAN discovery. The app's owner advertising node and its
+join and synchronization nodes enable LAN discovery. While looking up a group
+provider, a client that hears the expected provider peer ID over mDNS dials it
+alongside the DHT lookup and uses whichever connection completes first; a DHT
+lookup that ends without a record waits up to two seconds after the node
+starts for an mDNS answer. A bootstrap node or remembered address is still
+required to start the lookup.
 
 ## Connectivity
 

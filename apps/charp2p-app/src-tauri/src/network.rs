@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::{
     sync::Mutex,
     task::JoinHandle,
-    time::{interval, interval_at, timeout, Instant, MissedTickBehavior},
+    time::{interval, interval_at, sleep_until, timeout, Instant, MissedTickBehavior},
 };
 
 use crate::bandwidth::BandwidthService;
@@ -31,6 +31,9 @@ const MAX_OWNER_DISCOVERY_KEYS: usize = crate::groups::MAX_ADVERTISED_DISCOVERY_
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const KNOWN_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Time after a client node starts during which mDNS may still find the
+/// provider on the local network although the DHT lookup found no record.
+const LAN_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_SYNC_EXCHANGES: usize = 4_096;
@@ -319,8 +322,16 @@ struct ProviderConnection {
     path: ConnectionPath,
     address: Multiaddr,
     /// Whether the provider was found through a DHT lookup rather than a
-    /// remembered address.
+    /// remembered or LAN-announced address.
     looked_up: bool,
+}
+
+/// How a provider search ended successfully.
+enum ProviderFound {
+    /// The DHT record names the provider, possibly already connected.
+    Dht(Option<(ConnectionPath, Multiaddr)>),
+    /// The provider was reached at an address announced over mDNS.
+    Lan(ConnectionPath, Multiaddr),
 }
 
 struct ActiveAdvertisement {
@@ -358,6 +369,8 @@ pub struct NetworkService {
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
     synchronization: Arc<dyn SynchronizationService>,
+    /// Whether owner and member nodes also use mDNS on the local network.
+    lan_discovery: bool,
 }
 
 impl NetworkService {
@@ -424,7 +437,19 @@ impl NetworkService {
             member_admission,
             pending_join,
             synchronization,
+            lan_discovery: true,
         })
+    }
+
+    /// Builds the short-lived client node used to advertise or reach a group
+    /// provider.
+    fn group_client_node(&self, identity: DeviceIdentity) -> NetworkNode {
+        let keypair = identity.into_network_keypair();
+        if self.lan_discovery {
+            NetworkNode::new_with_lan_discovery(keypair)
+        } else {
+            NetworkNode::new(keypair)
+        }
     }
 
     #[cfg(test)]
@@ -704,7 +729,9 @@ impl NetworkService {
             existing.task.abort();
         }
 
-        let mut node = NetworkNode::new(network_identity.into_network_keypair());
+        // The owner device also answers mDNS so members on the same local
+        // network can reach it without a relay.
+        let mut node = self.group_client_node(network_identity);
         node.listen_on(
             "/ip4/0.0.0.0/udp/0/quic-v1"
                 .parse()
@@ -1220,7 +1247,8 @@ impl NetworkService {
         if self.bootstrap_peers.is_empty() && known_addresses.is_empty() {
             return Err("network_bootstrap_required");
         }
-        let mut node = NetworkNode::new(identity.into_network_keypair());
+        let lan_deadline = Instant::now() + LAN_DISCOVERY_WINDOW;
+        let mut node = self.group_client_node(identity);
         node.listen_on(
             "/ip4/0.0.0.0/udp/0/quic-v1"
                 .parse()
@@ -1268,31 +1296,63 @@ impl NetworkService {
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.find_group_peers(key);
 
-        let already_connected = timeout(PROVIDER_SEARCH_TIMEOUT, async {
+        let search = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut connected = None;
+            // Deadline of a dial to the provider at an mDNS-announced address.
+            let mut lan_dial_deadline = None;
+            let mut search_error = None;
             loop {
-                match node.next_event().await {
+                let event = match search_error {
+                    // The DHT has no usable record, but the provider may
+                    // still be announced on, or being dialed over, the LAN.
+                    Some(error) => {
+                        tokio::select! {
+                            event = node.next_event() => event,
+                            _ = sleep_until(lan_dial_deadline.unwrap_or(lan_deadline)) => {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    None => node.next_event().await,
+                };
+                match event {
                     NetworkEvent::PeerConnected {
                         peer_id,
                         path,
                         remote_address,
                     } if peer_id == expected_peer => {
+                        if lan_dial_deadline.is_some() {
+                            return Ok(ProviderFound::Lan(path, remote_address));
+                        }
                         connected = Some((path, remote_address));
+                    }
+                    NetworkEvent::LanPeersDiscovered { peers }
+                        if lan_dial_deadline.is_none()
+                            && connected.is_none()
+                            && peers.iter().any(|(peer_id, _)| *peer_id == expected_peer) =>
+                    {
+                        // The transport still authenticates the provider as
+                        // `expected_peer`; mDNS only supplied its address.
+                        if node.dial_peer(expected_peer).is_ok() {
+                            lan_dial_deadline = Some(Instant::now() + CONNECT_TIMEOUT);
+                        }
                     }
                     NetworkEvent::GroupPeersFound {
                         key: found_key,
                         providers,
                     } if found_key == key && providers.contains(&expected_peer) => {
-                        return Ok(connected);
+                        return Ok(ProviderFound::Dht(connected));
                     }
                     NetworkEvent::GroupPeerSearchFinished { key: found_key }
                         if found_key == key =>
                     {
-                        return Err("network_peer_not_found");
+                        search_error.get_or_insert("network_peer_not_found");
                     }
                     NetworkEvent::DiscoveryFailed {
                         key: failed_key, ..
-                    } if failed_key == key => return Err("network_unavailable"),
+                    } if failed_key == key => {
+                        search_error.get_or_insert("network_unavailable");
+                    }
                     _ => {}
                 }
             }
@@ -1300,6 +1360,17 @@ impl NetworkService {
         .await
         .map_err(|_| "network_search_timed_out")??;
 
+        let already_connected = match search {
+            ProviderFound::Lan(path, address) => {
+                return Ok(ProviderConnection {
+                    node,
+                    path,
+                    address,
+                    looked_up: false,
+                });
+            }
+            ProviderFound::Dht(connected) => connected,
+        };
         let (path, address) = if let Some(connected) = already_connected {
             connected
         } else {
@@ -1976,6 +2047,14 @@ mod tests {
         .unwrap()
     }
 
+    impl NetworkService {
+        /// Keeps tests of DHT discovery independent of mDNS on the host.
+        fn without_lan_discovery(mut self) -> Self {
+            self.lan_discovery = false;
+            self
+        }
+    }
+
     #[test]
     fn join_authorization_uses_stable_public_rejections() {
         let peer_id = DeviceIdentity::generate().peer_id();
@@ -2591,7 +2670,8 @@ mod tests {
                     group_id: invitation.group_id(),
                 }),
             )
-            .unwrap();
+            .unwrap()
+            .without_lan_discovery();
             let advertise = owner_service.advertise(owner, owner_signer, &invitation);
             tokio::pin!(advertise);
             timeout(Duration::from_secs(10), async {
@@ -2620,7 +2700,8 @@ mod tests {
                     group_id: invitation.group_id(),
                 }),
             )
-            .unwrap();
+            .unwrap()
+            .without_lan_discovery();
             let synchronize = member_service.synchronize(
                 member_identity,
                 discovery_key,
@@ -2647,7 +2728,9 @@ mod tests {
             assert_eq!(result.synchronized_events, 3);
             assert_eq!(result.uploaded_events, 0);
             assert!(result.synchronized_at_unix >= now);
-            assert_eq!(result.connection_type, "lan");
+            // The owner listens on every interface; on hosts with a
+            // non-private interface address that address may win the dial.
+            assert!(matches!(result.connection_type, "lan" | "direct"));
             assert_eq!(
                 member_service.group_connection_states(&[invitation.group_id()])[0].discovery,
                 Some("found")
@@ -2666,7 +2749,8 @@ mod tests {
                     group_id: invitation.group_id(),
                 }),
             )
-            .unwrap();
+            .unwrap()
+            .without_lan_discovery();
             let remembered = timeout(
                 Duration::from_secs(15),
                 offline_member_service.synchronize(
@@ -2686,6 +2770,122 @@ mod tests {
             assert_eq!(
                 offline_member_service.group_connection_states(&[invitation.group_id()])[0]
                     .discovery,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn member_reaches_the_owner_over_lan_when_the_dht_has_no_record() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
+        let invitation = Invitation::issue(
+            &group,
+            owner_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        let discovery_key = DiscoveryKey::from_invitation(&invitation);
+
+        tauri::async_runtime::block_on(async {
+            let member_identity = DeviceIdentity::generate();
+            let member_id = member_identity.peer_id();
+            // Owner and member use separate routing nodes, so the member's
+            // DHT lookup cannot find the owner's provider record.
+            let mut owner_routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let mut member_routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let mut bootstraps = Vec::new();
+            for routing in [&mut owner_routing, &mut member_routing] {
+                routing
+                    .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                    .unwrap();
+                let address = loop {
+                    if let NetworkEvent::Listening { address } = routing.next_event().await {
+                        break address;
+                    }
+                };
+                bootstraps.push(format!("{address}/p2p/{}", routing.peer_id()));
+            }
+            let owner_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstraps[0],
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: member_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let advertise = owner_service.advertise(owner, owner_signer, &invitation);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = owner_routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+
+            let bandwidth_directory = tempfile::tempdir().unwrap();
+            let bandwidth =
+                BandwidthService::new(bandwidth_directory.path().join("bandwidth.json"));
+            let member_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstraps[1],
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let synchronize = member_service.synchronize(
+                member_identity,
+                discovery_key,
+                invitation.group_id(),
+                owner_id,
+                &[],
+                &bandwidth,
+            );
+            tokio::pin!(synchronize);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut synchronize => break result,
+                        _ = owner_routing.next_event() => {}
+                        _ = member_routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("LAN synchronization should complete")
+            .unwrap();
+
+            assert_eq!(result.status, "synchronized");
+            assert_eq!(result.synchronized_events, 3);
+            assert_eq!(result.connection_type, "lan");
+            // mDNS says nothing about the discovery record.
+            assert_eq!(
+                member_service.group_connection_states(&[invitation.group_id()])[0].discovery,
                 None
             );
         });
@@ -2835,8 +3035,9 @@ mod tests {
                     break address;
                 }
             };
-            let service =
-                NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
+            let service = NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}"))
+                .unwrap()
+                .without_lan_discovery();
             let advertise = service.advertise(
                 DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
                 DeviceIdentity::from_persisted_secret(&advertiser_secret).unwrap(),
@@ -2903,7 +3104,9 @@ mod tests {
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
         assert_eq!(result.reachable_peers, 1);
-        assert_eq!(result.connection_type, Some("lan"));
+        // The advertiser listens on every interface; on hosts with a
+        // non-private interface address that address may win the dial.
+        assert!(matches!(result.connection_type, Some("lan" | "direct")));
     }
 
     #[test]

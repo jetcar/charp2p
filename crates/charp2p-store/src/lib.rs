@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -87,6 +87,8 @@ pub struct IssuedInvitationMetadata {
     pub invitation_id: InvitationId,
     pub group_id: PeerId,
     pub expires_at_unix: u64,
+    /// Member device whose request made the owner issue it (ADR-036).
+    pub requested_by: Option<PeerId>,
 }
 
 /// Non-secret index for an owner-side rendezvous key retained after join.
@@ -1688,12 +1690,14 @@ impl EventStore {
         let expires_at_unix = i64::try_from(invitation.expires_at_unix)
             .map_err(|_| StoreError::TimestampTooLarge(invitation.expires_at_unix))?;
         self.connection.execute(
-            "INSERT INTO issued_invitations (invitation_id, group_id, expires_at_unix)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO issued_invitations
+                (invitation_id, group_id, expires_at_unix, requested_by_device_id)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 invitation.invitation_id.as_bytes().as_slice(),
                 invitation.group_id.to_bytes(),
                 expires_at_unix,
+                invitation.requested_by.map(|device| device.to_bytes()),
             ],
         )?;
         Ok(())
@@ -1702,7 +1706,7 @@ impl EventStore {
     /// Lists issued invitation indexes without exposing their bearer secrets.
     pub fn issued_invitations(&self) -> Result<Vec<IssuedInvitationMetadata>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT invitation_id, group_id, expires_at_unix
+            "SELECT invitation_id, group_id, expires_at_unix, requested_by_device_id
              FROM issued_invitations
              ORDER BY expires_at_unix DESC, invitation_id",
         )?;
@@ -1711,11 +1715,12 @@ impl EventStore {
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
             ))
         })?;
         let mut invitations = Vec::new();
         for row in rows {
-            let (invitation_id, group_id, expires_at_unix) = row?;
+            let (invitation_id, group_id, expires_at_unix, requested_by) = row?;
             let invitation_id: [u8; 16] = invitation_id
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndex)?;
@@ -1723,6 +1728,10 @@ impl EventStore {
                 invitation_id: InvitationId::from_bytes(invitation_id),
                 group_id: PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?,
                 expires_at_unix: u64::try_from(expires_at_unix)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                requested_by: requested_by
+                    .map(|device| PeerId::from_bytes(&device))
+                    .transpose()
                     .map_err(|_| StoreError::CorruptIndex)?,
             });
         }
@@ -2185,7 +2194,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=22 => {}
+            6..=23 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2496,6 +2505,24 @@ impl EventStore {
                  CREATE INDEX IF NOT EXISTS applied_invite_permissions_by_target
                     ON applied_invite_permissions(group_id, target_device_id, author_sequence);",
             )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 23 {
+            let transaction = connection.transaction()?;
+            // Older stores that never created the index need no column.
+            let (has_index, has_requester): (bool, bool) = transaction.query_row(
+                "SELECT COUNT(*) > 0, COALESCE(SUM(name = 'requested_by_device_id'), 0) > 0
+                 FROM pragma_table_info('issued_invitations')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if has_index && !has_requester {
+                transaction.execute_batch(
+                    "ALTER TABLE issued_invitations ADD COLUMN requested_by_device_id BLOB;",
+                )?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -3384,6 +3411,7 @@ mod tests {
             invitation_id: InvitationId::from_bytes([7; 16]),
             group_id: GroupIdentity::generate().group_id(),
             expires_at_unix: 1_800_003_600,
+            requested_by: None,
         };
         EventStore::open(file.path())
             .unwrap()
@@ -3404,6 +3432,65 @@ mod tests {
     }
 
     #[test]
+    fn issued_invitation_index_keeps_requesting_member_device() {
+        let file = NamedTempFile::new().unwrap();
+        let invitation = IssuedInvitationMetadata {
+            invitation_id: InvitationId::from_bytes([9; 16]),
+            group_id: GroupIdentity::generate().group_id(),
+            expires_at_unix: 1_800_003_600,
+            requested_by: Some(DeviceIdentity::generate().peer_id()),
+        };
+        EventStore::open(file.path())
+            .unwrap()
+            .put_issued_invitation(&invitation)
+            .unwrap();
+
+        let reopened = EventStore::open(file.path()).unwrap();
+        assert_eq!(reopened.issued_invitations().unwrap(), vec![invitation]);
+    }
+
+    #[test]
+    fn version_twenty_three_database_adds_invitation_requesters() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let group_id = GroupIdentity::generate().group_id();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE issued_invitations DROP COLUMN requested_by_device_id;
+                     PRAGMA user_version = 23;",
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO issued_invitations (invitation_id, group_id, expires_at_unix)
+                     VALUES (?1, ?2, 1800003600)",
+                    params![[10_u8; 16].as_slice(), group_id.to_bytes()],
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert_eq!(
+            store.issued_invitations().unwrap(),
+            vec![IssuedInvitationMetadata {
+                invitation_id: InvitationId::from_bytes([10; 16]),
+                group_id,
+                expires_at_unix: 1_800_003_600,
+                requested_by: None,
+            }]
+        );
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
+    }
+
+    #[test]
     fn owner_discovery_key_indexes_survive_invitation_removal() {
         let file = NamedTempFile::new().unwrap();
         let group_id = GroupIdentity::generate().group_id();
@@ -3420,6 +3507,7 @@ mod tests {
                 invitation_id,
                 group_id,
                 expires_at_unix: 1_800_003_600,
+                requested_by: None,
             })
             .unwrap();
         store.remove_issued_invitation(invitation_id).unwrap();

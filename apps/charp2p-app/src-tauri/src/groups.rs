@@ -473,6 +473,43 @@ impl GroupService {
         if invitations.is_empty() {
             return Err("issued_invitation_not_found");
         }
+        self.remove_invitations(&mut store, invitations)
+    }
+
+    /// Revokes the invitations a member device requested from a locally owned
+    /// group, after its invite permission is withdrawn or it is removed
+    /// (ADR-036). Returns how many invitations were revoked.
+    pub fn revoke_requested_invitations(
+        &self,
+        group_id: PeerId,
+        requester: PeerId,
+    ) -> Result<usize, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let invitations = store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .filter(|invitation| {
+                invitation.group_id == group_id && invitation.requested_by == Some(requester)
+            })
+            .collect::<Vec<_>>();
+        let revoked = invitations.len();
+        self.remove_invitations(&mut store, invitations)?;
+        Ok(revoked)
+    }
+
+    fn remove_invitations(
+        &self,
+        store: &mut EventStore,
+        invitations: Vec<IssuedInvitationMetadata>,
+    ) -> Result<(), &'static str> {
         for invitation in invitations {
             if let Some(encoded) = self
                 .invitation_secrets
@@ -485,7 +522,7 @@ impl GroupService {
                 {
                     return Err("issued_invitation_record_invalid");
                 }
-                self.retain_owner_discovery_key(&mut store, &decoded)?;
+                self.retain_owner_discovery_key(store, &decoded)?;
             }
             self.invitation_secrets.remove(invitation.invitation_id)?;
             store
@@ -592,6 +629,25 @@ impl GroupService {
         inviter_name: &str,
         now_unix: u64,
     ) -> Result<IssuedInvitation, &'static str> {
+        self.issue_requested_invitation_at(
+            group_id,
+            inviter_device_id,
+            inviter_name,
+            None,
+            now_unix,
+        )
+    }
+
+    /// Issues an invitation, recording the member device that requested it
+    /// so withdrawing that member's permission can revoke it (ADR-036).
+    fn issue_requested_invitation_at(
+        &self,
+        group_id: PeerId,
+        inviter_device_id: PeerId,
+        inviter_name: &str,
+        requested_by: Option<PeerId>,
+        now_unix: u64,
+    ) -> Result<IssuedInvitation, &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -692,6 +748,7 @@ impl GroupService {
             invitation_id: invitation.invitation_id(),
             group_id,
             expires_at_unix,
+            requested_by,
         };
         store
             .put_issued_invitation(&indexed)
@@ -1250,6 +1307,51 @@ mod tests {
         assert_eq!(
             JoinRequestAuthorizer::authorize_join_request(&service, &request),
             JoinRequestAuthorization::Authorized
+        );
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn requested_invitations_are_revoked_only_for_their_requester() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+        let requester = DeviceIdentity::generate().peer_id();
+        let issued = service
+            .issue_requested_invitation_at(group_id, owner, "Maya's PC", Some(requester), NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        assert!(service.authorize_join_request_at(&request, NOW).is_ok());
+
+        assert_eq!(
+            service
+                .revoke_requested_invitations(group_id, DeviceIdentity::generate().peer_id())
+                .unwrap(),
+            0
+        );
+        assert!(service.authorize_join_request_at(&request, NOW).is_ok());
+        assert_eq!(
+            service
+                .revoke_requested_invitations(group_id, requester)
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            service.authorize_join_request_at(&request, NOW),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+        service
+            .issue_invitation_at(group_id, owner, "Maya's PC", NOW)
+            .unwrap();
+        assert_eq!(
+            service
+                .revoke_requested_invitations(group_id, requester)
+                .unwrap(),
+            0
         );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
     }

@@ -250,6 +250,13 @@ fn set_member_invite_permission(
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
+    if !granted {
+        // Revoke first so a failed change still leaves no invitation the
+        // member requested active (ADR-036).
+        group_service
+            .revoke_requested_invitations(group_id, member_id)
+            .map_err(str::to_owned)?;
+    }
     mls_service
         .change_invite_permission(group_id, &identity, member_id, granted)
         .map(|devices| devices.iter().map(ToString::to_string).collect())
@@ -621,6 +628,9 @@ fn remove_group_member(
     }
     let identity = identity_service
         .load_network_identity()
+        .map_err(str::to_owned)?;
+    group_service
+        .revoke_requested_invitations(group_id, member_id)
         .map_err(str::to_owned)?;
     mls_service
         .remove_member(group_id, &identity, member_id)

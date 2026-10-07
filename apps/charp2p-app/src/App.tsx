@@ -121,6 +121,7 @@ type StoredMessage = CreatedMessage & {
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
 type GroupMemberDevice = { deviceId: string };
 type MemberActivity = { deviceId: string; lastSignedAtUnixMs: number };
+type DeviceSequenceConflict = { deviceId: string; conflictingSequences: number; firstSequence: number };
 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
@@ -199,6 +200,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_encryption_failed: "The local message copy could not be protected.",
   message_invalid: "Enter a message up to 16 KiB.",
   member_activity_unavailable: "Member activity could not be read.",
+  sequence_conflicts_unavailable: "Conflicting signed events could not be read.",
   message_delete_failed: "The local message copy could not be deleted.",
   message_delivery_state_unavailable: "The message was shared, but its delivery state could not be saved.",
   message_not_found: "That message is no longer stored on this device.",
@@ -315,6 +317,11 @@ function signedActivityDescription(lastSignedAtUnixMs: number | undefined) {
   })}`;
 }
 
+function sequenceConflictDescription(conflict: DeviceSequenceConflict) {
+  const count = conflict.conflictingSequences;
+  return `Signed ${count === 1 ? "two different events" : `different events for ${count} sequence numbers`} with the same sequence number (first at ${conflict.firstSequence}). The later copies were rejected; this device may be compromised or cloned.`;
+}
+
 function connectionTypeDescription(connectionType: "direct" | "lan" | "relayed") {
   if (connectionType === "relayed") return "Relay";
   if (connectionType === "lan") return "Local network";
@@ -423,6 +430,7 @@ function MembersView({
   groupName,
   members,
   memberActivity,
+  sequenceConflicts,
   ownerDeviceId,
   ownerName,
   profile,
@@ -441,6 +449,7 @@ function MembersView({
   groupName: string;
   members: GroupMemberDevice[];
   memberActivity: Record<string, number>;
+  sequenceConflicts: Record<string, DeviceSequenceConflict>;
   ownerDeviceId: string;
   ownerName: string;
   profile: DeviceProfile | null;
@@ -535,10 +544,16 @@ function MembersView({
                 <span>{isOwner ? "Owner device" : "Member device"}</span>
                 <code title={member.deviceId}>{shortPeerId(member.deviceId)}</code>
                 <span className="member-activity">{signedActivityDescription(memberActivity[member.deviceId])}</span>
+                {sequenceConflicts[member.deviceId] && (
+                  <span className="member-conflict" role="alert">
+                    {sequenceConflictDescription(sequenceConflicts[member.deviceId])}
+                  </span>
+                )}
               </div>
               <div className="member-actions">
                 <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
                 {isBlocked && <span className="status-chip blocked-chip">Blocked here</span>}
+                {sequenceConflicts[member.deviceId] && <span className="status-chip conflict-chip">Conflicting events</span>}
                 {!isLocal && (
                   <button
                     className="member-block"
@@ -1474,6 +1489,7 @@ function App() {
   const [removingMember, setRemovingMember] = useState("");
   const [blockedDevices, setBlockedDevices] = useState<string[]>([]);
   const [memberActivity, setMemberActivity] = useState<Record<string, number>>({});
+  const [sequenceConflicts, setSequenceConflicts] = useState<Record<string, DeviceSequenceConflict>>({});
   const [blockingDevice, setBlockingDevice] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
@@ -1893,6 +1909,7 @@ function App() {
       setGroupMembers([]);
       setBlockedDevices([]);
       setMemberActivity({});
+      setSequenceConflicts({});
       setMembersError("");
       return;
     }
@@ -1903,15 +1920,17 @@ function App() {
 
     async function refreshMembers() {
       try {
-        const [members, blocked, activity] = await Promise.all([
+        const [members, blocked, activity, conflicts] = await Promise.all([
           invoke<GroupMemberDevice[]>("group_members", { groupId }),
           invoke<string[]>("blocked_group_devices", { groupId }),
           invoke<MemberActivity[]>("group_member_activity", { groupId }),
+          invoke<DeviceSequenceConflict[]>("group_sequence_conflicts", { groupId }),
         ]);
         if (active) {
           setGroupMembers(members);
           setBlockedDevices(blocked);
           setMemberActivity(Object.fromEntries(activity.map((entry) => [entry.deviceId, entry.lastSignedAtUnixMs])));
+          setSequenceConflicts(Object.fromEntries(conflicts.map((entry) => [entry.deviceId, entry])));
           setMembersError("");
         }
       } catch (reason) {
@@ -2756,6 +2775,7 @@ function App() {
               groupName={(joinedGroup ?? localGroup)!.groupName}
               members={groupMembers}
               memberActivity={memberActivity}
+              sequenceConflicts={sequenceConflicts}
               error={membersError}
               canManageMembers={Boolean(localGroup)}
               removingDeviceId={removingMember}

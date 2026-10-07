@@ -72,7 +72,7 @@ can author a membership change that another device will apply.
 | Threat | Control | Residual risk |
 | --- | --- | --- |
 | Two commits for the same epoch | Only the owner device commits, sequentially and transactionally with its snapshot; pending commits are merged or aborted before the next. | A cloned owner device (see below) could fork the epoch; members apply whichever arrives first and fail the other. |
-| Reused author sequence with different content | The event store rejects it as `SequenceConflict`; batches commit atomically. | The equivocating author is not reported to the user. |
+| Reused author sequence with different content | The event store rejects it as `SequenceConflict`; batches commit atomically. The rejected signed event is recorded per author (at most 64 sequences each) and the Members view flags the device as having signed conflicting events. | Only conflicts seen by this device are reported; conflicting copies held by other members are not exchanged. |
 | Member-authored membership event | Owner rejects pushed events other than messages and edits; members apply a commit only when its signed author is the pinned owner device and OpenMLS validates the sender is a member whose credential equals that author. | None known. |
 | Out-of-order or future-epoch commits | Commits are applied in author sequence; future epochs wait for their predecessor; a commit and its snapshot persist atomically (ADR-017). | A missing predecessor stalls the member until the owner serves it. |
 | Past-epoch commits | Commits older than the local epoch are marked applied without replay (the Welcome already includes them). | Such a commit is not re-validated by MLS; its signature, author binding, and pinned-owner author are still checked. |

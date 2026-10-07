@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -31,6 +31,8 @@ pub const MAX_RECENT_MESSAGE_EVENTS: usize = 256;
 pub const MAX_PEER_ADDRESS_BYTES: usize = 512;
 /// Remembered successful addresses per group peer; older ones are dropped.
 pub const MAX_PEER_ADDRESSES: usize = 4;
+/// Most conflicting author sequences recorded per group author.
+pub const MAX_SEQUENCE_CONFLICTS_PER_AUTHOR: usize = 64;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +146,16 @@ pub struct MlsJoinAdmission {
     pub encrypted_response: Vec<u8>,
 }
 
+/// Signed evidence that one author reused sequences for different content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceConflictSummary {
+    pub author_id: PeerId,
+    /// Distinct author sequences seen with conflicting content (bounded).
+    pub conflicting_sequences: u64,
+    /// Lowest author sequence seen with conflicting content.
+    pub first_sequence: u64,
+}
+
 /// SQLite-backed storage for signed events and non-secret application metadata.
 /// One address a group peer was last reached at successfully.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,28 +184,128 @@ impl EventStore {
     /// Persists a verified event transactionally.
     ///
     /// Repeating the same event is idempotent. Reusing one author sequence for
-    /// different content is rejected.
+    /// different content is rejected and recorded as a sequence conflict.
     pub fn put_event(&mut self, event: &SignedEvent) -> Result<PutEventOutcome, StoreError> {
         let transaction = self.connection.transaction()?;
-        let outcome = put_event_in_transaction(&transaction, event)?;
+        let outcome = match put_event_in_transaction(&transaction, event) {
+            Ok(outcome) => outcome,
+            Err(error @ StoreError::SequenceConflict { .. }) => {
+                drop(transaction);
+                self.record_sequence_conflict(event)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         transaction.commit()?;
         Ok(outcome)
     }
 
     /// Persists a batch atomically after checking every author sequence.
+    ///
+    /// A reused author sequence rejects the whole batch and is recorded as a
+    /// sequence conflict of its author.
     pub fn put_events(&mut self, events: &[SignedEvent]) -> Result<PutEventsOutcome, StoreError> {
         let transaction = self.connection.transaction()?;
         let mut outcome = PutEventsOutcome::default();
 
         for event in events {
-            match put_event_in_transaction(&transaction, event)? {
-                PutEventOutcome::Inserted => outcome.inserted += 1,
-                PutEventOutcome::AlreadyPresent => outcome.already_present += 1,
+            match put_event_in_transaction(&transaction, event) {
+                Ok(PutEventOutcome::Inserted) => outcome.inserted += 1,
+                Ok(PutEventOutcome::AlreadyPresent) => outcome.already_present += 1,
+                Err(error @ StoreError::SequenceConflict { .. }) => {
+                    drop(transaction);
+                    self.record_sequence_conflict(event)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
             }
         }
 
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Records that a verified event reuses its author's sequence for content
+    /// other than the stored event. Both events are validly signed by the
+    /// author, so the record is evidence of equivocation. At most
+    /// [`MAX_SEQUENCE_CONFLICTS_PER_AUTHOR`] sequences are kept per author.
+    fn record_sequence_conflict(&mut self, event: &SignedEvent) -> Result<(), StoreError> {
+        let sequence = i64::try_from(event.author_sequence())
+            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+        let group_id = event.group_id().to_bytes();
+        let author_id = event.author_id().to_bytes();
+        let conflicting_id = event.id();
+        let transaction = self.connection.transaction()?;
+        let stored: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT event_id FROM events
+                     WHERE group_id = ?1 AND author_id = ?2 AND author_sequence = ?3",
+                params![group_id, author_id, sequence],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored_id) = stored else {
+            return Ok(());
+        };
+        if stored_id.as_slice() == conflicting_id.as_bytes() {
+            return Ok(());
+        }
+        let recorded: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sequence_conflicts WHERE group_id = ?1 AND author_id = ?2",
+            params![group_id, author_id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(recorded).map_err(|_| StoreError::CorruptIndex)?
+            >= MAX_SEQUENCE_CONFLICTS_PER_AUTHOR
+        {
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO sequence_conflicts (
+                group_id, author_id, author_sequence, stored_event_id, conflicting_event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                group_id,
+                author_id,
+                sequence,
+                stored_id,
+                conflicting_id.as_bytes().as_slice()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Summarizes recorded sequence conflicts per author of a group.
+    pub fn sequence_conflicts(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<SequenceConflictSummary>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT author_id, COUNT(*), MIN(author_sequence) FROM sequence_conflicts
+             WHERE group_id = ?1
+             GROUP BY author_id
+             ORDER BY author_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut conflicts = Vec::new();
+        for row in rows {
+            let (author_id, count, first_sequence) = row?;
+            conflicts.push(SequenceConflictSummary {
+                author_id: PeerId::from_bytes(&author_id).map_err(|_| StoreError::CorruptIndex)?,
+                conflicting_sequences: u64::try_from(count)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+                first_sequence: u64::try_from(first_sequence)
+                    .map_err(|_| StoreError::CorruptIndex)?,
+            });
+        }
+        Ok(conflicts)
     }
 
     /// Atomically persists one verified event and the MLS provider state that
@@ -1402,6 +1514,7 @@ impl EventStore {
             "DELETE FROM peer_acknowledged_author_heads WHERE group_id = ?1",
             "DELETE FROM blocked_local_devices WHERE group_id = ?1",
             "DELETE FROM peer_addresses WHERE group_id = ?1",
+            "DELETE FROM sequence_conflicts WHERE group_id = ?1",
         ] {
             transaction.execute(statement, [&group_id])?;
         }
@@ -1915,7 +2028,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=20 => {}
+            6..=21 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2193,6 +2306,22 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 21 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sequence_conflicts (
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    stored_event_id BLOB NOT NULL CHECK(length(stored_event_id) = 32),
+                    conflicting_event_id BLOB NOT NULL CHECK(length(conflicting_event_id) = 32),
+                    PRIMARY KEY(group_id, author_id, author_sequence)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -2418,8 +2547,9 @@ mod tests {
     use super::{
         AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
         MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_PEER_ADDRESS_BYTES, MAX_SYNC_BATCH_EVENTS,
-        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome, StoreError,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_PEER_ADDRESS_BYTES,
+        MAX_SEQUENCE_CONFLICTS_PER_AUTHOR, MAX_SYNC_BATCH_EVENTS, OwnerDiscoveryKeyMetadata,
+        PendingInvitationMetadata, PutEventOutcome, SequenceConflictSummary, StoreError,
     };
 
     fn message_event(
@@ -2492,6 +2622,83 @@ mod tests {
         ));
         assert!(store.get_event(first.id()).unwrap().is_some());
         assert!(store.get_event(conflict.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn sequence_conflicts_are_recorded_per_author() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let honest = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let group_id = group.group_id();
+        store
+            .put_events(&[
+                message_event(&author, &group, 1, b"first"),
+                message_event(&author, &group, 2, b"second"),
+                message_event(&honest, &group, 1, b"honest"),
+            ])
+            .unwrap();
+        assert!(store.sequence_conflicts(group_id).unwrap().is_empty());
+
+        let batch_conflict = message_event(&author, &group, 2, b"other second");
+        let unrelated = message_event(&honest, &group, 2, b"honest next");
+        let unrelated_id = unrelated.id();
+        assert!(matches!(
+            store.put_events(&[
+                unrelated,
+                message_event(&author, &group, 2, b"other second")
+            ]),
+            Err(StoreError::SequenceConflict { sequence: 2 })
+        ));
+        assert!(store.get_event(unrelated_id).unwrap().is_none());
+        for _ in 0..2 {
+            assert!(matches!(
+                store.put_event(&message_event(&author, &group, 1, b"other first")),
+                Err(StoreError::SequenceConflict { sequence: 1 })
+            ));
+        }
+        assert!(matches!(
+            store.put_event(&batch_conflict),
+            Err(StoreError::SequenceConflict { sequence: 2 })
+        ));
+
+        assert_eq!(
+            store.sequence_conflicts(group_id).unwrap(),
+            vec![SequenceConflictSummary {
+                author_id: author.peer_id(),
+                conflicting_sequences: 2,
+                first_sequence: 1,
+            }]
+        );
+        assert!(
+            store
+                .sequence_conflicts(GroupIdentity::generate().group_id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sequence_conflicts_are_bounded_per_author() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let limit = u64::try_from(MAX_SEQUENCE_CONFLICTS_PER_AUTHOR).unwrap();
+        for sequence in 1..=limit + 2 {
+            store
+                .put_event(&message_event(&author, &group, sequence, b"stored"))
+                .unwrap();
+            assert!(
+                store
+                    .put_event(&message_event(&author, &group, sequence, b"conflict"))
+                    .is_err()
+            );
+        }
+
+        let conflicts = store.sequence_conflicts(group.group_id()).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflicting_sequences, limit);
+        assert_eq!(conflicts[0].first_sequence, 1);
     }
 
     #[test]
@@ -3986,6 +4193,35 @@ mod tests {
             store.record_peer_address_success(group, peer, &[0; MAX_PEER_ADDRESS_BYTES + 1], 1),
             Err(StoreError::InvalidPeerAddressSize(_))
         ));
+    }
+
+    #[test]
+    fn version_twenty_one_database_adds_sequence_conflicts() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE sequence_conflicts;
+                     PRAGMA user_version = 21;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        store
+            .put_event(&message_event(&author, &group, 1, b"first"))
+            .unwrap();
+        assert!(
+            store
+                .put_event(&message_event(&author, &group, 1, b"other"))
+                .is_err()
+        );
+        assert_eq!(store.sequence_conflicts(group.group_id()).unwrap().len(), 1);
     }
 
     #[test]

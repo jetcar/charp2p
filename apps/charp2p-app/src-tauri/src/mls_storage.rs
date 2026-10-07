@@ -185,6 +185,14 @@ pub(crate) struct MemberActivity {
     pub last_signed_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeviceSequenceConflict {
+    pub device_id: String,
+    pub conflicting_sequences: u64,
+    pub first_sequence: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemberAdmissionError {
     Unauthorized,
@@ -786,6 +794,33 @@ impl MlsProviderService {
             .map(|(device_id, last_signed_at_unix_ms)| MemberActivity {
                 device_id: device_id.to_string(),
                 last_signed_at_unix_ms,
+            })
+            .collect())
+    }
+
+    /// Reports devices that signed different events with the same author
+    /// sequence in a group. Both signed events were observed, so each entry is
+    /// evidence of equivocation by that device.
+    pub(crate) fn sequence_conflicts(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<DeviceSequenceConflict>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        Ok(store
+            .sequence_conflicts(group_id)
+            .map_err(|_| "sequence_conflicts_unavailable")?
+            .into_iter()
+            .map(|conflict| DeviceSequenceConflict {
+                device_id: conflict.author_id.to_string(),
+                conflicting_sequences: conflict.conflicting_sequences,
+                first_sequence: conflict.first_sequence,
             })
             .collect())
     }
@@ -2466,9 +2501,9 @@ mod tests {
     };
 
     use charp2p_core::{
-        DeviceIdentity, EventKind, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        PeerId, SignedEvent, SyncAuthorHead, SyncPeerHead, SyncRejectReason, SyncRequest,
-        SyncResponse,
+        DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, Invitation,
+        InvitationSpec, PeerId, SignedEvent, SyncAuthorHead, SyncPeerHead, SyncRejectReason,
+        SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -2486,9 +2521,10 @@ mod tests {
 
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
-        encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash, GroupMemberDevice,
-        MemberActivity, MemberAdmissionError, MlsProviderMutationError, MlsProviderService,
-        UnreadMessageCount, WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
+        encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash,
+        DeviceSequenceConflict, GroupMemberDevice, MemberActivity, MemberAdmissionError,
+        MlsProviderMutationError, MlsProviderService, UnreadMessageCount, WrappingKeyStore,
+        MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::{EventStore, PendingInvitationMetadata};
 
@@ -2647,6 +2683,29 @@ mod tests {
             vec![MemberActivity {
                 device_id: device_id.to_string(),
                 last_signed_at_unix_ms: created.created_at_unix_ms(),
+            }]
+        );
+        assert!(service.sequence_conflicts(group_id).unwrap().is_empty());
+        let mut store = store;
+        let equivocation = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id,
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: created.created_at_unix_ms(),
+                kind: EventKind::MessageCreated,
+                protected_payload: b"conflicting content",
+            },
+        )
+        .unwrap();
+        assert!(store.put_event(&equivocation).is_err());
+        assert_eq!(
+            service.sequence_conflicts(group_id).unwrap(),
+            vec![DeviceSequenceConflict {
+                device_id: device_id.to_string(),
+                conflicting_sequences: 1,
+                first_sequence: 1,
             }]
         );
         drop(store);

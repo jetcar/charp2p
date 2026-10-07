@@ -19,8 +19,8 @@ use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
 use mls_storage::{
-    CreatedMessage, EvidenceExport, GroupMemberDevice, MemberActivity, MlsProviderService,
-    StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
+    CreatedMessage, DeviceSequenceConflict, EvidenceExport, GroupMemberDevice, MemberActivity,
+    MlsProviderService, StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
 };
 use network::{
     AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
@@ -515,6 +515,17 @@ fn group_member_activity(
 }
 
 #[tauri::command]
+fn group_sequence_conflicts(
+    group_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<DeviceSequenceConflict>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    mls_service
+        .sequence_conflicts(group_id)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn blocked_group_devices(
     group_id: String,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
@@ -924,6 +935,7 @@ pub fn run() {
             group_members,
             remove_group_member,
             group_member_activity,
+            group_sequence_conflicts,
             blocked_group_devices,
             set_group_device_blocked,
             advertise_owned_groups,

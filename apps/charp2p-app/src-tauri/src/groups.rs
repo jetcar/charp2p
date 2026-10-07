@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -1097,6 +1098,76 @@ fn issued_invitation(invitation: &Invitation, encoded: &str) -> IssuedInvitation
     }
 }
 
+/// Verifies an owner's answer to this member device's invite request
+/// (ADR-036): the invitation must decode unexpired, belong to the requested
+/// group and pin the owner device that was asked.
+pub(crate) fn requested_invitation(
+    response: &InviteResponse,
+    group_id: PeerId,
+    owner_device_id: PeerId,
+    now_unix: u64,
+) -> Result<IssuedInvitation, &'static str> {
+    if let Some(reason) = response.rejection() {
+        return Err(match reason {
+            InviteRejectReason::Unauthorized => "invite_unauthorized",
+            InviteRejectReason::Busy => "invite_busy",
+        });
+    }
+    let encoded = response.invitation().ok_or("invite_response_invalid")?;
+    let invitation =
+        Invitation::decode(encoded, now_unix).map_err(|_| "invite_response_invalid")?;
+    if invitation.group_id() != group_id || invitation.inviter_device_id() != owner_device_id {
+        return Err("invite_response_invalid");
+    }
+    Ok(issued_invitation(&invitation, encoded))
+}
+
+/// Invitations the owner issued at this member device's request, kept in
+/// memory only for display until they expire or the app closes. Asking the
+/// owner again returns the same active invitation.
+#[derive(Default)]
+pub struct ReceivedInvitationCache {
+    invitations: Mutex<BTreeMap<String, IssuedInvitation>>,
+}
+
+impl ReceivedInvitationCache {
+    /// Keeps the latest invitation for its group.
+    pub fn save(&self, invitation: IssuedInvitation) -> Result<(), &'static str> {
+        self.invitations
+            .lock()
+            .map_err(|_| "received_invitations_unavailable")?
+            .insert(invitation.group_id.clone(), invitation);
+        Ok(())
+    }
+
+    /// Lists unexpired invitations for which `permitted` still holds,
+    /// forgetting the rest.
+    pub fn list(
+        &self,
+        permitted: impl FnMut(&IssuedInvitation) -> bool,
+    ) -> Result<Vec<IssuedInvitation>, &'static str> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
+        self.list_at(now_unix, permitted)
+    }
+
+    fn list_at(
+        &self,
+        now_unix: u64,
+        mut permitted: impl FnMut(&IssuedInvitation) -> bool,
+    ) -> Result<Vec<IssuedInvitation>, &'static str> {
+        let mut invitations = self
+            .invitations
+            .lock()
+            .map_err(|_| "received_invitations_unavailable")?;
+        invitations
+            .retain(|_, invitation| invitation.expires_at_unix > now_unix && permitted(invitation));
+        Ok(invitations.values().cloned().collect())
+    }
+}
+
 pub(crate) fn normalize_group_name(requested: &str) -> Result<String, &'static str> {
     let name = requested.trim();
     if name.is_empty()
@@ -1132,14 +1203,15 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy,
-        Invitation, InvitationId, InvitationSpec, InviteRejectReason, InviteRequest, JoinRequest,
-        PeerId,
+        Invitation, InvitationId, InvitationSpec, InviteRejectReason, InviteRequest,
+        InviteResponse, JoinRequest, PeerId,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
     use super::{
-        issued_invitation, CreateGroupSpec, GroupSecretStore, GroupService,
+        issued_invitation, requested_invitation, CreateGroupSpec, GroupSecretStore, GroupService,
         IssuedInvitationSecretStore, JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
+        ReceivedInvitationCache,
     };
     use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
@@ -1516,6 +1588,69 @@ mod tests {
                 .expires_at_unix(),
             NOW + 604_800
         );
+    }
+
+    #[test]
+    fn member_accepts_only_the_requested_owner_invitation_and_caches_it() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+        let member = DeviceIdentity::generate().peer_id();
+        let request = InviteRequest::new(group_id, 86_400).unwrap();
+        let response = service.answer_invite_request_at(
+            owner,
+            "Maya's PC",
+            member,
+            &request,
+            |_, _| Ok(true),
+            NOW,
+        );
+
+        let accepted = requested_invitation(&response, group_id, owner, NOW).unwrap();
+        assert_eq!(accepted.group_id, group_id.to_string());
+        assert_eq!(accepted.expires_at_unix, NOW + 86_400);
+        assert!(accepted.link.starts_with("charp2p://join/"));
+        let other = DeviceIdentity::generate().peer_id();
+        assert!(matches!(
+            requested_invitation(&response, other, owner, NOW),
+            Err("invite_response_invalid")
+        ));
+        assert!(matches!(
+            requested_invitation(&response, group_id, other, NOW),
+            Err("invite_response_invalid")
+        ));
+        assert!(matches!(
+            requested_invitation(&response, group_id, owner, NOW + 86_400),
+            Err("invite_response_invalid")
+        ));
+        assert!(matches!(
+            requested_invitation(
+                &InviteResponse::rejected(InviteRejectReason::Unauthorized),
+                group_id,
+                owner,
+                NOW
+            ),
+            Err("invite_unauthorized")
+        ));
+        assert!(matches!(
+            requested_invitation(
+                &InviteResponse::rejected(InviteRejectReason::Busy),
+                group_id,
+                owner,
+                NOW
+            ),
+            Err("invite_busy")
+        ));
+
+        let cache = ReceivedInvitationCache::default();
+        cache.save(accepted.clone()).unwrap();
+        assert!(cache.list_at(NOW, |_| true).unwrap() == vec![accepted.clone()]);
+        // Withdrawn permission or expiry forgets the invitation.
+        assert!(cache.list_at(NOW, |_| false).unwrap().is_empty());
+        cache.save(accepted).unwrap();
+        assert!(cache.list_at(NOW + 86_400, |_| true).unwrap().is_empty());
     }
 
     #[test]

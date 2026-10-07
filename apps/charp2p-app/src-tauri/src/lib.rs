@@ -18,6 +18,7 @@ use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{
     CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup, MemberInvitationService,
+    ReceivedInvitationCache,
 };
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
@@ -262,6 +263,79 @@ fn set_member_invite_permission(
     mls_service
         .change_invite_permission(group_id, &identity, member_id, granted)
         .map(|devices| devices.iter().map(ToString::to_string).collect())
+        .map_err(str::to_owned)
+}
+
+/// Asks the pinned owner device for an invitation this member device may
+/// share, when the owner granted it invite permission (ADR-036). The owner
+/// caps the lifetime by the group maximum; the invitation is kept in memory
+/// for display.
+#[tauri::command]
+async fn request_member_invitation(
+    group_id: String,
+    lifetime_seconds: Option<u32>,
+    identity_service: tauri::State<'_, IdentityService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    received_invitations: tauri::State<'_, ReceivedInvitationCache>,
+) -> Result<IssuedInvitation, String> {
+    let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    if !mls_service
+        .may_request_invitation(group_id, identity.peer_id())
+        .map_err(str::to_owned)?
+    {
+        return Err("invite_permission_missing".to_owned());
+    }
+    let (discovery_key, owner_device_id) = pending_service
+        .joined_sync_target(group_id)
+        .map_err(str::to_owned)?;
+    let known_addresses = pending_service
+        .known_peer_addresses(group_id, owner_device_id)
+        .map_err(str::to_owned)?
+        .into_iter()
+        .filter_map(|address| Multiaddr::try_from(address).ok())
+        .collect::<Vec<_>>();
+    let invitation = network_service
+        .request_member_invitation(
+            identity,
+            discovery_key,
+            group_id,
+            owner_device_id,
+            &known_addresses,
+            lifetime_seconds.unwrap_or(charp2p_core::MAX_INVITE_REQUEST_LIFETIME_SECONDS),
+        )
+        .await
+        .map_err(str::to_owned)?;
+    received_invitations
+        .save(invitation.clone())
+        .map_err(str::to_owned)?;
+    Ok(invitation)
+}
+
+/// Lists invitations received from owners in this session while this
+/// device still holds invite permission for their groups.
+#[tauri::command]
+fn received_member_invitations(
+    identity_service: tauri::State<'_, IdentityService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    received_invitations: tauri::State<'_, ReceivedInvitationCache>,
+) -> Result<Vec<IssuedInvitation>, String> {
+    let local_device = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?
+        .peer_id();
+    received_invitations
+        .list(|invitation| {
+            invitation.group_id.parse().is_ok_and(|group_id| {
+                mls_service
+                    .may_request_invitation(group_id, local_device)
+                    .unwrap_or(false)
+            })
+        })
         .map_err(str::to_owned)
 }
 
@@ -1005,6 +1079,7 @@ pub fn run() {
             app.manage(groups);
             app.manage(mls);
             app.manage(network);
+            app.manage(ReceivedInvitationCache::default());
             app.manage(BackgroundService::new(
                 data_directory.join("background.json"),
             ));
@@ -1073,6 +1148,8 @@ pub fn run() {
             rename_group,
             invite_permitted_devices,
             set_member_invite_permission,
+            request_member_invitation,
+            received_member_invitations,
             issued_invitations,
             create_group,
             create_group_invitation,

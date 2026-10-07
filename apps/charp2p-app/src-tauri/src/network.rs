@@ -21,6 +21,7 @@ use tokio::{
 };
 
 use crate::bandwidth::BandwidthService;
+use crate::groups::{requested_invitation, IssuedInvitation};
 use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
@@ -1215,6 +1216,56 @@ impl NetworkService {
             group_id: invitation.group_id().to_string(),
             synchronized_events,
         })
+    }
+
+    /// Asks the pinned owner device for an invitation this member device
+    /// may share (ADR-036) and verifies the owner's answer.
+    pub async fn request_member_invitation(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        group_id: PeerId,
+        owner_device_id: PeerId,
+        known_addresses: &[Multiaddr],
+        lifetime_seconds: u32,
+    ) -> Result<IssuedInvitation, &'static str> {
+        if identity.peer_id() == owner_device_id {
+            return Err("invitation_inviter_mismatch");
+        }
+        let request =
+            InviteRequest::new(group_id, lifetime_seconds).map_err(|_| "invite_request_invalid")?;
+        let ProviderConnection { mut node, .. } = self
+            .connect_to_group_provider(identity, key, owner_device_id, known_addresses)
+            .await?;
+        let request_id = node.send_invite_request(owner_device_id, request);
+        let response = timeout(JOIN_RESPONSE_TIMEOUT, async {
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::InviteResponseReceived {
+                        peer_id,
+                        request_id: received_id,
+                        response,
+                    } if peer_id == owner_device_id && received_id == request_id => {
+                        return Ok(response);
+                    }
+                    NetworkEvent::InviteRequestFailed {
+                        peer_id,
+                        request_id: failed_id,
+                        ..
+                    } if peer_id == owner_device_id && failed_id == request_id => {
+                        return Err("network_invite_failed");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "network_invite_timed_out")??;
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
+        requested_invitation(&response, group_id, owner_device_id, now_unix)
     }
 
     pub async fn synchronize(

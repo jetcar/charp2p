@@ -581,6 +581,57 @@ fn remove_group_member(
         .map_err(str::to_owned)
 }
 
+/// Lists devices removed from a locally owned group that stay blocked from
+/// joining again.
+#[tauri::command]
+fn removed_group_members(
+    group_id: String,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    ensure_owned_group(&group_service, group_id, "member_readmission_not_allowed")?;
+    mls_service.removed_members(group_id).map_err(str::to_owned)
+}
+
+/// Lets a removed device join a locally owned group again through an
+/// active invitation (ADR-034).
+#[tauri::command]
+fn allow_group_member_readmission(
+    group_id: String,
+    member_device_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let member_id = parse_group_id(&member_device_id, "member_not_found")?;
+    ensure_owned_group(&group_service, group_id, "member_readmission_not_allowed")?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .allow_member_readmission(group_id, &identity, member_id)
+        .map_err(str::to_owned)
+}
+
+fn ensure_owned_group(
+    group_service: &GroupService,
+    group_id: charp2p_core::PeerId,
+    error: &str,
+) -> Result<(), String> {
+    if group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == group_id.to_string())
+    {
+        Ok(())
+    } else {
+        Err(error.to_owned())
+    }
+}
+
 /// Reports connection type, bootstrap nodes and advertising state for the
 /// Network page. Contains no keys, invitations or group identifiers.
 #[tauri::command]
@@ -934,6 +985,8 @@ pub fn run() {
             unread_message_counts,
             group_members,
             remove_group_member,
+            removed_group_members,
+            allow_group_member_readmission,
             group_member_activity,
             group_sequence_conflicts,
             blocked_group_devices,

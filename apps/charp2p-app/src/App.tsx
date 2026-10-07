@@ -236,6 +236,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   member_owner_cannot_remove: "The owner device cannot remove itself.",
   member_removal_failed: "The device could not be removed securely.",
   member_removal_not_allowed: "Only this group's owner can remove devices.",
+  member_readmission_not_allowed: "Only this group's owner can allow removed devices to join again.",
+  member_not_removed: "This device is no longer blocked from joining.",
   device_block_failed: "The block setting could not be saved on this device.",
   device_block_self: "This device cannot block itself.",
   device_block_unavailable: "Blocked devices could not be loaded.",
@@ -441,6 +443,9 @@ function MembersView({
   blockedDeviceIds,
   blockingDeviceId,
   onToggleBlock,
+  removedDeviceIds,
+  readmittingDeviceId,
+  onAllowReadmission,
   onRename,
   onLeave,
   leaving,
@@ -460,6 +465,9 @@ function MembersView({
   blockedDeviceIds: string[];
   blockingDeviceId: string;
   onToggleBlock: (deviceId: string, blocked: boolean) => void;
+  removedDeviceIds: string[];
+  readmittingDeviceId: string;
+  onAllowReadmission: (deviceId: string) => void;
   onRename: (groupName: string) => Promise<void>;
   onLeave: (() => void) | null;
   leaving: boolean;
@@ -579,6 +587,34 @@ function MembersView({
           );
         })}
       </div>
+      {canManageMembers && removedDeviceIds.length > 0 && (
+        <div className="removed-devices">
+          <h3>Removed devices</h3>
+          <div className="member-list" role="list">
+            {removedDeviceIds.map((deviceId) => (
+              <article className="member-row" key={deviceId} role="listitem">
+                <div className="member-avatar" aria-hidden="true">○</div>
+                <div className="member-identity">
+                  <strong>{`Member ${shortPeerId(deviceId)}`}</strong>
+                  <span>Removed device</span>
+                  <code title={deviceId}>{shortPeerId(deviceId)}</code>
+                </div>
+                <div className="member-actions">
+                  <button
+                    className="member-block"
+                    disabled={Boolean(readmittingDeviceId)}
+                    onClick={() => onAllowReadmission(deviceId)}
+                    type="button"
+                  >
+                    {readmittingDeviceId === deviceId ? "Saving…" : "Allow to join again"}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+          <p className="preview-note">Removed devices cannot join with any invitation. Allowing one to join again does not add it back: it must leave the group on its own device, then join through an active invitation with new keys. It cannot read messages sent while it was removed.</p>
+        </div>
+      )}
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
       <p className="preview-note">Activity times are the latest signed event this device holds from each member, as claimed by that member. They do not show whether a device is online.</p>
       <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
@@ -1491,6 +1527,8 @@ function App() {
   const [memberActivity, setMemberActivity] = useState<Record<string, number>>({});
   const [sequenceConflicts, setSequenceConflicts] = useState<Record<string, DeviceSequenceConflict>>({});
   const [blockingDevice, setBlockingDevice] = useState("");
+  const [removedDevices, setRemovedDevices] = useState<string[]>([]);
+  const [readmittingDevice, setReadmittingDevice] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
@@ -1908,6 +1946,7 @@ function App() {
     if (!isTauri() || !groupId) {
       setGroupMembers([]);
       setBlockedDevices([]);
+      setRemovedDevices([]);
       setMemberActivity({});
       setSequenceConflicts({});
       setMembersError("");
@@ -1920,15 +1959,17 @@ function App() {
 
     async function refreshMembers() {
       try {
-        const [members, blocked, activity, conflicts] = await Promise.all([
+        const [members, blocked, activity, conflicts, removed] = await Promise.all([
           invoke<GroupMemberDevice[]>("group_members", { groupId }),
           invoke<string[]>("blocked_group_devices", { groupId }),
           invoke<MemberActivity[]>("group_member_activity", { groupId }),
           invoke<DeviceSequenceConflict[]>("group_sequence_conflicts", { groupId }),
+          localGroup ? invoke<string[]>("removed_group_members", { groupId }) : Promise.resolve([]),
         ]);
         if (active) {
           setGroupMembers(members);
           setBlockedDevices(blocked);
+          setRemovedDevices(removed);
           setMemberActivity(Object.fromEntries(activity.map((entry) => [entry.deviceId, entry.lastSignedAtUnixMs])));
           setSequenceConflicts(Object.fromEntries(conflicts.map((entry) => [entry.deviceId, entry])));
           setMembersError("");
@@ -2179,10 +2220,28 @@ function App() {
         memberDeviceId,
       });
       setGroupMembers(members);
+      setRemovedDevices(await invoke<string[]>("removed_group_members", { groupId: localGroup.groupId }));
     } catch (reason) {
       setMembersError(errorMessage(reason));
     } finally {
       setRemovingMember("");
+    }
+  }
+
+  async function allowGroupMemberReadmission(memberDeviceId: string) {
+    if (!localGroup || readmittingDevice || !isTauri()) return;
+    if (!window.confirm("Allow this removed device to join again? Anyone holding it can then use an active invitation to rejoin.")) return;
+    setMembersError("");
+    setReadmittingDevice(memberDeviceId);
+    try {
+      setRemovedDevices(await invoke<string[]>("allow_group_member_readmission", {
+        groupId: localGroup.groupId,
+        memberDeviceId,
+      }));
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setReadmittingDevice("");
     }
   }
 
@@ -2783,6 +2842,9 @@ function App() {
               blockedDeviceIds={blockedDevices}
               blockingDeviceId={blockingDevice}
               onToggleBlock={setDeviceBlocked}
+              removedDeviceIds={removedDevices}
+              readmittingDeviceId={readmittingDevice}
+              onAllowReadmission={allowGroupMemberReadmission}
               onRename={renameLocalGroup}
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}

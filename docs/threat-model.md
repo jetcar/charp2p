@@ -61,7 +61,7 @@ can author a membership change that another device will apply.
 | Threat | Control | Residual risk |
 | --- | --- | --- |
 | Removed device reads future messages | Owner stages an MLS remove commit, publishes it as a signed `MemberRemoved` event, and stores event, snapshot, and removed marker in one transaction (ADR-020). Members apply it before materializing later messages. | Members that have not yet synchronized still encrypt to the old epoch until they pull the commit. |
-| Removed device rejoins with a reusable link | Admission checks the removed-device index before cached responses or MLS processing; the cached Welcome is deleted in the removal transaction. | Re-admission needs a future owner unblock flow. |
+| Removed device rejoins with a reusable link | Admission checks the removed-device index before cached responses or MLS processing; the cached Welcome is deleted in the removal transaction. | The owner can clear the block (ADR-034); the device then rejoins only through an active invitation with a new KeyPackage and a new MLS leaf. |
 | Removed device keeps synchronizing | The owner serves synchronization only to peers in its current MLS membership. | It can still find the owner through its retained rendezvous key (ADR-025). |
 | Erasure of already received data | Not provided. | Removal and deletion never erase copies already held by any device. |
 | Member leaves while the owner is offline | Leave is device-local and deletes the group's keys and messages on that device (ADR-027). | The owner still lists the device as a member until it removes it. |

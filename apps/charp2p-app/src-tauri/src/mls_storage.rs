@@ -440,6 +440,58 @@ impl MlsProviderService {
         result
     }
 
+    /// Lists the devices removed from an owned group that remain blocked from
+    /// re-admission.
+    pub(crate) fn removed_members(&self, group_id: PeerId) -> Result<Vec<String>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        removed_member_ids(&store, group_id)
+    }
+
+    /// Lets the owner clear a removed device's re-admission block. The device
+    /// is not added back: it must join again through an active invitation
+    /// with a new KeyPackage, which creates a new MLS leaf and epoch.
+    pub(crate) fn allow_member_readmission(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        removed_peer: PeerId,
+    ) -> Result<Vec<String>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map_err(|_| "mls_group_storage_unavailable")?
+        .ok_or("mls_joined_group_missing")?;
+        validate_owner_group(&group, group_id, owner_identity.peer_id())
+            .map_err(|_| "member_readmission_not_allowed")?;
+        if !store
+            .allow_removed_mls_member_readmission(group_id, removed_peer)
+            .map_err(|_| "member_readmission_failed")?
+        {
+            return Err("member_not_removed");
+        }
+        removed_member_ids(&store, group_id)
+    }
+
     pub(crate) fn create_message(
         &self,
         group_id: PeerId,
@@ -2200,6 +2252,15 @@ fn initialize_owner_group(
     validate_owner_group(&group, group_id, device_id)
 }
 
+fn removed_member_ids(store: &EventStore, group_id: PeerId) -> Result<Vec<String>, &'static str> {
+    Ok(store
+        .removed_mls_members(group_id)
+        .map_err(|_| "removed_members_unavailable")?
+        .into_iter()
+        .map(|device_id| device_id.to_string())
+        .collect())
+}
+
 fn validate_owner_group(
     group: &MlsGroup,
     group_id: PeerId,
@@ -3141,6 +3202,63 @@ mod tests {
             restored.admit_member_at(group_id, &owner, member_id, replacement.encoded(), 45),
             Err(MemberAdmissionError::Unauthorized)
         ));
+        assert_eq!(
+            restored.removed_members(group_id).unwrap(),
+            vec![member_id.to_string()]
+        );
+    }
+
+    #[test]
+    fn owner_allows_removed_device_to_join_again_with_a_new_key_package() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (_, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
+            .unwrap();
+        service
+            .remove_member_at(group_id, &owner, member_id, 43)
+            .unwrap();
+
+        assert!(matches!(
+            service.allow_member_readmission(group_id, &DeviceIdentity::generate(), member_id),
+            Err("member_readmission_not_allowed")
+        ));
+        assert!(matches!(
+            service.allow_member_readmission(
+                group_id,
+                &owner,
+                DeviceIdentity::generate().peer_id()
+            ),
+            Err("member_not_removed")
+        ));
+        assert!(service
+            .allow_member_readmission(group_id, &owner, member_id)
+            .unwrap()
+            .is_empty());
+        assert!(service.removed_members(group_id).unwrap().is_empty());
+
+        let (member_provider, replacement) = member_key_package(member_id);
+        let response = service
+            .admit_member_at(group_id, &owner, member_id, replacement.encoded(), 44)
+            .unwrap();
+        let staged = stage_profile_welcome(&member_provider, response.welcome().unwrap()).unwrap();
+        staged.into_group(&member_provider).unwrap();
+        let members = service.group_members(group_id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .any(|member| member.device_id == member_id.to_string()));
     }
 
     #[test]

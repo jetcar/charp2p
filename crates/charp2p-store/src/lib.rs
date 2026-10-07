@@ -404,6 +404,36 @@ impl EventStore {
             .is_some())
     }
 
+    /// Lists the devices an owner has removed from the group and not yet
+    /// allowed to join again, ordered by device identifier.
+    pub fn removed_mls_members(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT member_id FROM removed_mls_members
+             WHERE group_id = ?1
+             ORDER BY member_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(PeerId::from_bytes(&row?).map_err(|_| StoreError::CorruptIndex)?);
+        }
+        Ok(members)
+    }
+
+    /// Clears the re-admission block of a removed device so a valid
+    /// invitation can admit it again with a new KeyPackage. The signed
+    /// removal event stays in history. Returns whether a block was cleared.
+    pub fn allow_removed_mls_member_readmission(
+        &mut self,
+        group_id: PeerId,
+        member_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM removed_mls_members WHERE group_id = ?1 AND member_id = ?2",
+            params![group_id.to_bytes(), member_id.to_bytes()],
+        )? > 0)
+    }
+
     /// Atomically persists a member-removal event, the advanced MLS state,
     /// and the durable re-admission block for that device.
     pub fn put_mls_member_removal(
@@ -3548,6 +3578,39 @@ mod tests {
                 .iter()
                 .any(|event| event.id() == removed.id())
         );
+        assert_eq!(
+            store.removed_mls_members(group.group_id()).unwrap(),
+            vec![member_id]
+        );
+        assert!(
+            store
+                .removed_mls_members(GroupIdentity::generate().group_id())
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .allow_removed_mls_member_readmission(group.group_id(), member_id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .allow_removed_mls_member_readmission(group.group_id(), member_id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_removed_mls_member(group.group_id(), member_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .removed_mls_members(group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_event(removed.id()).unwrap().is_some());
     }
 
     #[test]

@@ -76,6 +76,7 @@ type BackgroundPreference = { keepRunningWhenClosed: boolean; launchAtLogin: boo
 type BackgroundStatus = { available: boolean; preference: BackgroundPreference };
 type BandwidthPreference = { syncLimitMibPerHour: number | null };
 type BandwidthStatus = { preference: BandwidthPreference; remainingSyncBytes: number | null };
+type RetentionPreference = { keepMessagesDays: number | null };
 type AppInformation = {
   appVersion: string;
   os: string;
@@ -225,6 +226,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   bandwidth_limit_invalid: "Enter a synchronization limit between 1 and 1024 MiB per hour.",
   bandwidth_preference_invalid: "The saved bandwidth limit is damaged. Save a new limit to resume synchronization.",
   bandwidth_preference_unavailable: "The bandwidth limit could not be read or saved on this device.",
+  retention_preference_invalid: "The saved retention is damaged or out of range. Save a period between 1 and 3650 days; no messages are removed until then.",
+  retention_preference_unavailable: "The message retention could not be read or saved on this device.",
+  message_retention_failed: "Older messages could not be removed from this device.",
   synchronization_failed: "Group synchronization failed. Try again.",
   synchronization_limit_exceeded: "Group synchronization exceeded its safe exchange limit.",
   synchronization_peer_invalid: "The saved synchronization peer is invalid.",
@@ -1071,6 +1075,7 @@ function BackgroundSection() {
 }
 
 const MAX_SYNC_LIMIT_MIB_PER_HOUR = 1024;
+const MAX_RETENTION_DAYS = 3650;
 
 function BandwidthSection() {
   const [status, setStatus] = useState<BandwidthStatus | null>(null);
@@ -1163,6 +1168,112 @@ function BandwidthSection() {
   );
 }
 
+function RetentionSection() {
+  const [stored, setStored] = useState<number | null | undefined>(undefined);
+  const [limited, setLimited] = useState(false);
+  const [days, setDays] = useState(365);
+  const [saving, setSaving] = useState(false);
+  const [removed, setRemoved] = useState<number | null>(null);
+  const [error, setError] = useState("");
+
+  function show(preference: RetentionPreference) {
+    setStored(preference.keepMessagesDays);
+    setLimited(preference.keepMessagesDays !== null);
+    if (preference.keepMessagesDays !== null) setDays(preference.keepMessagesDays);
+  }
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<RetentionPreference>("retention_preference")
+      .then((next) => {
+        if (active) show(next);
+      })
+      .catch((caught) => {
+        if (active) setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const daysValid = Number.isInteger(days) && days >= 1 && days <= MAX_RETENTION_DAYS;
+  const changed = stored === undefined || (limited ? stored !== days : stored !== null);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    const preference: RetentionPreference = { keepMessagesDays: limited ? days : null };
+    if (
+      limited &&
+      !window.confirm(
+        `Remove messages older than ${days} ${days === 1 ? "day" : "days"} from this device? Other group members keep their copies.`,
+      )
+    ) {
+      return;
+    }
+    setSaving(true);
+    setError("");
+    setRemoved(null);
+    try {
+      setRemoved(await invoke<number>("set_retention_preference", { preference }));
+      show(preference);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3>Message retention</h3>
+      <p>
+        Messages are kept on this device until you hide them or leave the group, unless you choose a retention period.
+        Older messages are then removed from this device only; signed events stay for synchronization and other members
+        keep their copies.
+      </p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <form onSubmit={(event) => void save(event)}>
+        <label className="contribution-option">
+          <input
+            checked={limited}
+            disabled={saving}
+            onChange={(event) => setLimited(event.target.checked)}
+            type="checkbox"
+          />
+          Remove older messages from this device
+        </label>
+        {limited && (
+          <div className="contribution-limits">
+            <label>
+              Keep messages for days (1–{MAX_RETENTION_DAYS})
+              <input
+                disabled={saving}
+                max={MAX_RETENTION_DAYS}
+                min={1}
+                onChange={(event) => setDays(event.target.valueAsNumber)}
+                type="number"
+                value={Number.isNaN(days) ? "" : days}
+              />
+            </label>
+            {!daysValid && <p>Enter a whole number within the range shown.</p>}
+          </div>
+        )}
+        {removed !== null && !changed && (
+          <p>
+            {removed === 0
+              ? "No messages needed to be removed."
+              : `Removed ${removed} ${removed === 1 ? "message" : "messages"} from this device.`}
+          </p>
+        )}
+        <button className="secondary-button" disabled={saving || !changed || (limited && !daysValid)} type="submit">
+          {saving ? "Saving…" : "Save retention"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function SettingsView({
   onOpenBackup,
   onClose,
@@ -1204,8 +1315,8 @@ function SettingsView({
               ? `${formatStorageBytes(information.storage.databaseBytes)} used by groups, messages and invitations on this device`
               : "Unavailable outside the app"}
           </p>
-          <p>Messages are kept on this device until you hide them or leave the group. Hiding affects only this device.</p>
         </section>
+        <RetentionSection />
         <BackgroundSection />
         <BandwidthSection />
         <section>

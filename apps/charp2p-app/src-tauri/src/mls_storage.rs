@@ -800,6 +800,25 @@ impl MlsProviderService {
         Ok(())
     }
 
+    /// Removes readable copies of messages created before the cutoff in
+    /// every group on this device (ADR-035) and returns how many were removed.
+    pub(crate) fn hide_messages_created_before(
+        &self,
+        cutoff_unix_ms: u64,
+    ) -> Result<u64, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        store
+            .hide_messages_created_before(cutoff_unix_ms)
+            .map_err(|_| "message_retention_failed")
+    }
+
     /// Blocks or unblocks one device's messages on this device only and
     /// returns the group's locally blocked devices.
     pub(crate) fn set_device_blocked_locally(

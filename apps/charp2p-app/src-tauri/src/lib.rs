@@ -8,6 +8,7 @@ mod mls_storage;
 mod network;
 mod pending;
 mod preference_file;
+mod retention;
 mod settings;
 
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,7 @@ use network::{
     OwnedGroupDiscoveryStatus, PeerSearchResult, SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
+use retention::{RetentionPreference, RetentionService};
 use settings::{AppInformation, SettingsService};
 use tauri::Manager;
 
@@ -431,8 +433,10 @@ fn group_messages(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    retention_service: tauri::State<'_, RetentionService>,
 ) -> Result<StoredMessagePage, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
+    apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -479,7 +483,9 @@ fn export_message_evidence(
 #[tauri::command]
 fn unread_message_counts(
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    retention_service: tauri::State<'_, RetentionService>,
 ) -> Result<Vec<UnreadMessageCount>, String> {
+    apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
     mls_service.unread_message_counts().map_err(str::to_owned)
 }
 
@@ -757,6 +763,39 @@ fn set_bandwidth_preference(
     service.set(preference).map_err(str::to_owned)
 }
 
+/// Removes readable message copies older than the stored retention
+/// (ADR-035). Messages synchronized later with old timestamps are removed
+/// before they are next listed. Returns how many copies were removed.
+fn apply_message_retention(
+    retention: &RetentionService,
+    mls: &MlsProviderService,
+) -> Result<u64, &'static str> {
+    match retention.current_cutoff_unix_ms() {
+        Some(cutoff_unix_ms) => mls.hide_messages_created_before(cutoff_unix_ms),
+        None => Ok(0),
+    }
+}
+
+/// Reports the device-local message retention (ADR-035).
+#[tauri::command]
+fn retention_preference(
+    service: tauri::State<'_, RetentionService>,
+) -> Result<RetentionPreference, String> {
+    service.preference().map_err(str::to_owned)
+}
+
+/// Stores the device-local message retention and applies it at once.
+/// Returns how many readable message copies were removed.
+#[tauri::command]
+fn set_retention_preference(
+    preference: RetentionPreference,
+    service: tauri::State<'_, RetentionService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<u64, String> {
+    service.set(preference).map_err(str::to_owned)?;
+    apply_message_retention(&service, &mls_service).map_err(str::to_owned)
+}
+
 /// Exits the application, including when closing the window would only hide
 /// it.
 #[tauri::command]
@@ -924,6 +963,7 @@ pub fn run() {
                 data_directory.join("contribution.json"),
             ));
             app.manage(BandwidthService::new(data_directory.join("bandwidth.json")));
+            app.manage(RetentionService::new(data_directory.join("retention.json")));
             app.manage(SettingsService::new(database_path));
 
             // Resume an opted-in contribution from the stored preference; a
@@ -1002,6 +1042,8 @@ pub fn run() {
             quit_app,
             bandwidth_status,
             set_bandwidth_preference,
+            retention_preference,
+            set_retention_preference,
             contribution_status,
             set_contribution_preference
         ])

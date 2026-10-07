@@ -817,6 +817,37 @@ impl EventStore {
         Ok(true)
     }
 
+    /// Applies device-local retention (ADR-035): removes every readable
+    /// message copy created before the cutoff, in all groups, and hides the
+    /// retained signed events from future materialization. Returns the
+    /// number of message copies removed.
+    pub fn hide_messages_created_before(&mut self, cutoff_unix_ms: u64) -> Result<u64, StoreError> {
+        let cutoff = i64::try_from(cutoff_unix_ms)
+            .map_err(|_| StoreError::TimestampTooLarge(cutoff_unix_ms))?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO hidden_local_messages (event_id, group_id)
+             SELECT event_id, group_id FROM materialized_messages
+             WHERE created_at_unix_ms < ?1
+             ON CONFLICT(event_id) DO NOTHING",
+            [cutoff],
+        )?;
+        transaction.execute(
+            "DELETE FROM unread_local_messages
+             WHERE event_id IN (
+                 SELECT event_id FROM materialized_messages
+                 WHERE created_at_unix_ms < ?1
+             )",
+            [cutoff],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM materialized_messages WHERE created_at_unix_ms < ?1",
+            [cutoff],
+        )?;
+        transaction.commit()?;
+        Ok(removed as u64)
+    }
+
     /// Counts readable messages from other devices not yet viewed on this
     /// device, grouped by group identifier.
     pub fn unread_message_counts(&self) -> Result<Vec<(PeerId, u64)>, StoreError> {
@@ -3826,6 +3857,66 @@ mod tests {
                 .hide_message_locally(group.group_id(), event.id().as_bytes())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn retention_hides_only_messages_created_before_the_cutoff() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let timed = |group: &GroupIdentity, sequence, created_at| {
+            SignedEvent::create(
+                &author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: created_at,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"MLS ciphertext",
+                },
+            )
+            .unwrap()
+        };
+        let old = timed(&group, 1, 1_000);
+        let recent = timed(&group, 2, 5_000);
+        let other_old = timed(&other_group, 1, 2_000);
+        for event in [&old, &recent, &other_old] {
+            store
+                .put_received_message_and_encrypted_mls_provider_snapshot(
+                    event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.hide_messages_created_before(5_000).unwrap(), 2);
+        let remaining = store.encrypted_messages(group.group_id()).unwrap().messages;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].created_at_unix_ms, 5_000);
+        assert!(
+            store
+                .encrypted_messages(other_group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
+        for event in [&old, &other_old] {
+            assert!(store.get_event(event.id()).unwrap().is_some());
+        }
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.hide_messages_created_before(5_000).unwrap(), 0);
     }
 
     #[test]

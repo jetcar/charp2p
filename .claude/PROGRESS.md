@@ -44,7 +44,7 @@
 - [x] Routing node: bound pending, established inbound, and per-peer connections on serving nodes (technical-design node policy 'per-IP and per-peer connection limits', part 1/2).
 - [x] Routing node: per-IP established inbound connection limit (technical-design node policy, part 2/2).
 - [x] Groups page: show last synchronization per joined group in the group list (product page 2).
-- [ ] Invitations page: state explicitly whether the issued invitation is reusable and that no owner approval is needed (product page 8).
+- [x] Invitations page: state explicitly whether the issued invitation is reusable and that no owner approval is needed (product page 8).
 - [ ] LAN discovery via mDNS as an additional (never sole) discovery path for joined-group peers (technical-design Discovery), reported as the LAN connection type.
 
 ## Needs human
@@ -99,3 +99,4 @@
 2026-10-07T08:28:28Z Routing node connection limits 1/2: libp2p connection_limits on routing and contributor nodes (128 pending, 1024 inbound, 4 per peer); loopback test; technical-design updated. All checks pass.
 2026-10-07T09:28:50Z Routing node connection limits 2/2: custom ip_limits behaviour refuses a 17th established direct inbound connection from one remote IP on routing and contributor nodes (relayed/non-IP addresses not counted; clients unbounded); unit test for address parsing and loopback test (limit 1) verified to fail without enforcement; technical-design updated. Backlog empty; next run should re-derive gaps. Workspace fmt/clippy/test and npm build pass; src-tauri unchanged.
 2026-10-07T10:26:42Z Groups list last synchronization: re-derived backlog (gaps: last sync in Groups list, invitation reusable/approval label, optional mDNS LAN discovery). Group switcher shows a relative 'Synced N min ago'/'Not synced yet' label for member groups with the full time as tooltip; owner groups serve sync and show none. Frontend only; all checks pass.
+2026-10-07T11:27Z Invitations page reusable/approval status: issued invitation now shows reusable-until-expiry (or single use) and whether owner approval is needed from the group settings; fmt/clippy/tests/npm build pass.

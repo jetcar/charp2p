@@ -3339,7 +3339,8 @@ function App() {
                   />
                   <p className="preview-note">
                     {expiryDescription(issuedInvitation.expiresAtUnix)}
-                    {" · Valid until expiry"}
+                    {issuedInvitation.reusable ? " · Reusable until expiry" : " · Single use"}
+                    {localGroup.approvalRequired ? " · Owner approval needed" : " · No owner approval needed"}
                   </p>
                   {invitationQrCode && (
                     <figure className="invitation-qr">

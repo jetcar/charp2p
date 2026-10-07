@@ -9,6 +9,7 @@ mod group_metadata;
 mod identity;
 mod identity_backup;
 mod invitation;
+mod invite_permission;
 mod join;
 mod message_body;
 mod message_edit;
@@ -28,6 +29,7 @@ pub use invitation::{
     HistoryPolicy, Invitation, InvitationError, InvitationId, InvitationSpec,
     MAX_INVITATION_ENCODED_BYTES,
 };
+pub use invite_permission::{InvitePermission, InvitePermissionError};
 pub use join::{
     JoinError, JoinRejectReason, JoinRequest, JoinResponse, MAX_JOIN_MLS_MESSAGE_BYTES,
     MAX_JOIN_REQUEST_WIRE_BYTES, MAX_JOIN_RESPONSE_WIRE_BYTES,

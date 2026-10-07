@@ -57,6 +57,8 @@ pub enum EventKind {
     MessageDeleted,
     /// Advances group message-protection key material.
     KeyEpochAdvanced,
+    /// Grants or withdraws a member device's invite permission.
+    InvitePermissionChanged,
 }
 
 impl EventKind {
@@ -74,6 +76,7 @@ impl EventKind {
             Self::MessageEdited => 10,
             Self::MessageDeleted => 11,
             Self::KeyEpochAdvanced => 12,
+            Self::InvitePermissionChanged => 13,
         }
     }
 
@@ -91,6 +94,7 @@ impl EventKind {
             10 => Ok(Self::MessageEdited),
             11 => Ok(Self::MessageDeleted),
             12 => Ok(Self::KeyEpochAdvanced),
+            13 => Ok(Self::InvitePermissionChanged),
             _ => Err(EventError::UnsupportedKind(code)),
         }
     }
@@ -407,6 +411,26 @@ mod tests {
         let second = create_message(&author, &group, 1, &[], b"second").unwrap();
 
         assert_ne!(first.id(), second.id());
+    }
+
+    #[test]
+    fn event_kind_codes_round_trip() {
+        for code in 1..=13 {
+            let kind = EventKind::from_code(code).expect("known kind");
+            assert_eq!(kind.code(), code);
+        }
+        assert_eq!(
+            EventKind::from_code(13).expect("known kind"),
+            EventKind::InvitePermissionChanged
+        );
+        assert!(matches!(
+            EventKind::from_code(14),
+            Err(EventError::UnsupportedKind(14))
+        ));
+        assert!(matches!(
+            EventKind::from_code(0),
+            Err(EventError::UnsupportedKind(0))
+        ));
     }
 
     #[test]

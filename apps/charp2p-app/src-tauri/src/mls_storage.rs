@@ -1301,6 +1301,13 @@ impl MlsProviderService {
         group_id: PeerId,
         event: &SignedEvent,
     ) -> Result<bool, ApplyGroupCommitError> {
+        // Only the pinned owner device commits membership changes; a commit
+        // from any other member stays unapplied even if MLS would accept it.
+        if !is_joined_group_owner(store, group_id, event.author_id())
+            .map_err(ApplyGroupCommitError::Unavailable)?
+        {
+            return Err(ApplyGroupCommitError::Unreadable);
+        }
         let mut group = MlsGroup::load(
             provider.storage(),
             &GroupId::from_slice(&group_id.to_bytes()),
@@ -3369,6 +3376,7 @@ mod tests {
         first_service
             .complete_join(group_id, first_welcome.welcome().unwrap())
             .unwrap();
+        pin_joined_owner(&first_service, group_id, owner.peer_id());
 
         let second_join = second_service
             .prepare_join_request(second_member.peer_id(), &invitation)
@@ -3385,6 +3393,7 @@ mod tests {
         second_service
             .complete_join(group_id, second_welcome.welcome().unwrap())
             .unwrap();
+        pin_joined_owner(&second_service, group_id, owner.peer_id());
 
         pull_all(
             &owner_service,
@@ -3471,6 +3480,86 @@ mod tests {
             Box::new(MemoryWrappingKeyStore::default()),
         )
         .unwrap()
+    }
+
+    fn pin_joined_owner(service: &MlsProviderService, group_id: PeerId, owner_id: PeerId) {
+        let mut store = service.store.lock().unwrap();
+        store
+            .put_pending_invitation(&charp2p_store::PendingInvitationMetadata {
+                group_id,
+                group_name: "Design Crew".to_owned(),
+                inviter_name: "Owner".to_owned(),
+                expires_at_unix: u64::from(u32::MAX),
+                history_policy: charp2p_core::HistoryPolicy::None,
+                reusable: true,
+            })
+            .unwrap();
+        assert!(store
+            .promote_pending_invitation_to_joined_group(group_id, owner_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn members_apply_membership_commits_only_from_the_pinned_owner() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let removed = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let removed_service = test_service(directory.path().join("removed.sqlite3"));
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        for (service, device, created_at) in [
+            (&removed_service, &removed, 41),
+            (&member_service, &member, 42),
+        ] {
+            let join = service
+                .prepare_join_request(device.peer_id(), &invitation)
+                .unwrap();
+            let welcome = owner_service
+                .admit_member_at(
+                    group_id,
+                    &owner,
+                    device.peer_id(),
+                    join.key_package(),
+                    created_at,
+                )
+                .unwrap();
+            service
+                .complete_join(group_id, welcome.welcome().unwrap())
+                .unwrap();
+        }
+        // The member pinned a different device as its group owner.
+        pin_joined_owner(
+            &member_service,
+            group_id,
+            DeviceIdentity::generate().peer_id(),
+        );
+        owner_service
+            .remove_member_at(group_id, &owner, removed.peer_id(), 43)
+            .unwrap();
+
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+
+        let unapplied = member_service
+            .store
+            .lock()
+            .unwrap()
+            .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+            .unwrap();
+        assert!(unapplied
+            .iter()
+            .any(|event| event.kind() == EventKind::MemberRemoved));
+        assert!(member_service
+            .group_members(group_id)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.device_id == removed.peer_id().to_string()));
     }
 
     fn pull_all(

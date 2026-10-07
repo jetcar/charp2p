@@ -12,7 +12,7 @@ use charp2p_core::{
 };
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, identify,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, connection_limits, identify,
     identity::Keypair,
     kad,
     multiaddr::Protocol,
@@ -41,10 +41,14 @@ const RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(5 * 60);
 const RELAY_CIRCUIT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RELAY_CIRCUITS: u32 = 32;
 const MEBIBYTE: u64 = 1024 * 1024;
+const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
+const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
+const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 4;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     blocked_peers: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
+    connection_limits: connection_limits::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
@@ -60,6 +64,7 @@ impl Behaviour {
         dht_mode: kad::Mode,
         relay_client: relay::client::Behaviour,
         relay_server: Option<relay::Config>,
+        connection_limits: connection_limits::ConnectionLimits,
     ) -> Self {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
@@ -90,6 +95,7 @@ impl Behaviour {
 
         Self {
             blocked_peers: allow_block_list::Behaviour::default(),
+            connection_limits: connection_limits::Behaviour::new(connection_limits),
             ping: ping::Behaviour::new(ping::Config::new()),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), identity.public())
@@ -117,6 +123,15 @@ fn relay_server_config() -> relay::Config {
         max_circuit_bytes: RELAY_CIRCUIT_BYTES,
         ..Default::default()
     }
+}
+
+/// Connection bounds for nodes that accept inbound peers on behalf of the
+/// network. Client nodes dial only the peers they need and stay unbounded.
+fn serving_connection_limits() -> connection_limits::ConnectionLimits {
+    connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS))
+        .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS))
+        .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
 }
 
 /// User-chosen relay capacity for an opted-in desktop contributor. Both
@@ -181,12 +196,22 @@ pub struct NetworkNode {
 impl NetworkNode {
     /// Builds a node from its persistent libp2p device identity.
     pub fn new(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Client, None)
+        Self::with_dht_mode(
+            identity,
+            kad::Mode::Client,
+            None,
+            connection_limits::ConnectionLimits::default(),
+        )
     }
 
     /// Builds a routing node that answers Kademlia queries from other peers.
     pub fn new_routing(identity: Keypair) -> Self {
-        Self::with_dht_mode(identity, kad::Mode::Server, Some(relay_server_config()))
+        Self::with_dht_mode(
+            identity,
+            kad::Mode::Server,
+            Some(relay_server_config()),
+            serving_connection_limits(),
+        )
     }
 
     /// Builds an opted-in desktop contributor that answers Kademlia queries
@@ -196,6 +221,7 @@ impl NetworkNode {
             identity,
             kad::Mode::Server,
             relay.map(|limits| limits.server_config()),
+            serving_connection_limits(),
         )
     }
 
@@ -203,6 +229,7 @@ impl NetworkNode {
         identity: Keypair,
         dht_mode: kad::Mode,
         relay_server: Option<relay::Config>,
+        connection_limits: connection_limits::ConnectionLimits,
     ) -> Self {
         let relay_server_enabled = relay_server.is_some();
         let swarm = SwarmBuilder::with_existing_identity(identity)
@@ -211,7 +238,13 @@ impl NetworkNode {
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .expect("relay transport construction is infallible")
             .with_behaviour(|identity, relay_client| {
-                Behaviour::new(identity, dht_mode, relay_client, relay_server)
+                Behaviour::new(
+                    identity,
+                    dht_mode,
+                    relay_client,
+                    relay_server,
+                    connection_limits,
+                )
             })
             .expect("behaviour construction is infallible")
             .with_swarm_config(|config| {
@@ -925,7 +958,7 @@ mod tests {
         DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
         JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
     };
-    use libp2p::{Multiaddr, identity::Keypair, multiaddr::Protocol};
+    use libp2p::{Multiaddr, connection_limits, identity::Keypair, kad, multiaddr::Protocol};
     use tokio::time::timeout;
 
     use super::{ConnectionPath, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION, RelayLimits};
@@ -1291,6 +1324,61 @@ mod tests {
         .await
         .expect("an unblocked peer should connect");
         assert_eq!(peer_id, dialer_id);
+    }
+
+    #[tokio::test]
+    async fn serving_node_refuses_inbound_connections_beyond_its_limit() {
+        let mut listener = NetworkNode::with_dht_mode(
+            Keypair::generate_ed25519(),
+            kad::Mode::Server,
+            None,
+            connection_limits::ConnectionLimits::default().with_max_established_incoming(Some(1)),
+        );
+        let mut first = NetworkNode::new(Keypair::generate_ed25519());
+        let mut second = NetworkNode::new(Keypair::generate_ed25519());
+        let listener_id = listener.peer_id();
+        let first_id = first.peer_id();
+
+        listener
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_address = next_listen_address(&mut listener).await;
+        let dial_address: Multiaddr = format!("{listen_address}/p2p/{listener_id}")
+            .parse()
+            .unwrap();
+
+        first.dial(dial_address.clone()).unwrap();
+        let (peer_id, _) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    connected = next_connected_peer(&mut listener) => break connected,
+                    _ = first.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("the first peer should connect");
+        assert_eq!(peer_id, first_id);
+
+        second.dial(dial_address).unwrap();
+        let refused = timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = listener.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, .. } = event {
+                            break peer_id;
+                        }
+                    }
+                    _ = first.next_event() => {}
+                    _ = second.next_event() => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            refused.is_err(),
+            "a peer beyond the limit must not be accepted"
+        );
     }
 
     #[tokio::test]

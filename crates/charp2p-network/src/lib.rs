@@ -2,6 +2,7 @@
 
 //! Portable libp2p transport and peer-discovery foundation for CharP2P.
 
+mod invite_codec;
 mod ip_limits;
 mod join_codec;
 
@@ -11,8 +12,8 @@ use std::{
 };
 
 use charp2p_core::{
-    DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError,
-    SyncRejectReason, SyncRequest, SyncResponse,
+    DiscoveryKey, InviteRejectReason, InviteRequest, InviteResponse, JoinRejectReason, JoinRequest,
+    JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError, SyncRejectReason, SyncRequest, SyncResponse,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -29,7 +30,7 @@ use libp2p::{
 };
 use thiserror::Error;
 
-use crate::join_codec::JoinCodec;
+use crate::{invite_codec::InviteCodec, join_codec::JoinCodec};
 
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
@@ -38,6 +39,8 @@ const SYNC_PROTOCOL: &str = "/charp2p/sync/2.0.0";
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_PROTOCOL: &str = "/charp2p/join/1.0.0";
 const JOIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const INVITE_PROTOCOL: &str = "/charp2p/invite/1.0.0";
+const INVITE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_WIRE_REQUEST_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 const MAX_SYNC_WIRE_RESPONSE_BYTES: u64 = (MAX_SYNC_RESPONSE_BYTES + 128 * 1024) as u64;
 const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(60 * 60);
@@ -59,6 +62,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
     join: request_response::Behaviour<JoinCodec>,
+    invite: request_response::Behaviour<InviteCodec>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
@@ -93,6 +97,16 @@ impl Behaviour {
                 .with_request_timeout(JOIN_REQUEST_TIMEOUT)
                 .with_max_concurrent_streams(16),
         );
+        let invite = request_response::Behaviour::with_codec(
+            InviteCodec,
+            [(
+                StreamProtocol::new(INVITE_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(INVITE_REQUEST_TIMEOUT)
+                .with_max_concurrent_streams(16),
+        );
         let sync_codec = request_response::cbor::codec::Codec::default()
             .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
             .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES);
@@ -118,6 +132,7 @@ impl Behaviour {
             ),
             dht,
             join,
+            invite,
             sync,
             relay_client,
             relay_server: Toggle::from(
@@ -204,6 +219,8 @@ pub struct NetworkNode {
         HashMap<InboundSyncRequestId, request_response::ResponseChannel<SyncResponse>>,
     pending_join_responses:
         HashMap<InboundJoinRequestId, request_response::ResponseChannel<JoinResponse>>,
+    pending_invite_responses:
+        HashMap<InboundInviteRequestId, request_response::ResponseChannel<InviteResponse>>,
 }
 
 impl NetworkNode {
@@ -304,6 +321,7 @@ impl NetworkNode {
             lan_addresses: HashSet::new(),
             pending_sync_responses: HashMap::new(),
             pending_join_responses: HashMap::new(),
+            pending_invite_responses: HashMap::new(),
         }
     }
 
@@ -466,6 +484,48 @@ impl NetworkNode {
         reason: JoinRejectReason,
     ) -> Result<(), NetworkError> {
         self.send_join_response(request_id, JoinResponse::rejected(reason))
+    }
+
+    /// Asks a group owner device for an invitation on behalf of a permitted
+    /// member (ADR-036).
+    pub fn send_invite_request(
+        &mut self,
+        peer_id: PeerId,
+        request: InviteRequest,
+    ) -> OutboundInviteRequestId {
+        OutboundInviteRequestId(
+            self.swarm
+                .behaviour_mut()
+                .invite
+                .send_request(&peer_id, request),
+        )
+    }
+
+    /// Sends an issued invitation or rejection to a previously surfaced
+    /// invite request.
+    pub fn send_invite_response(
+        &mut self,
+        request_id: InboundInviteRequestId,
+        response: InviteResponse,
+    ) -> Result<(), NetworkError> {
+        let channel = self
+            .pending_invite_responses
+            .remove(&request_id)
+            .ok_or(NetworkError::UnknownInviteRequest)?;
+        self.swarm
+            .behaviour_mut()
+            .invite
+            .send_response(channel, response)
+            .map_err(|_| NetworkError::InviteResponseChannelClosed)
+    }
+
+    /// Rejects an inbound invite request without revealing which check failed.
+    pub fn reject_invite_request(
+        &mut self,
+        request_id: InboundInviteRequestId,
+        reason: InviteRejectReason,
+    ) -> Result<(), NetworkError> {
+        self.send_invite_response(request_id, InviteResponse::rejected(reason))
     }
 
     /// Sends a validated response to a previously surfaced inbound request.
@@ -668,6 +728,63 @@ impl NetworkNode {
                     self.pending_join_responses
                         .remove(&InboundJoinRequestId(request_id));
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                    request_response::Event::Message {
+                        peer,
+                        message:
+                            request_response::Message::Request {
+                                request_id,
+                                request,
+                                channel,
+                            },
+                        ..
+                    },
+                )) => {
+                    let request_id = InboundInviteRequestId(request_id);
+                    self.pending_invite_responses.insert(request_id, channel);
+                    return NetworkEvent::InviteRequestReceived {
+                        peer_id: peer,
+                        request_id,
+                        request,
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                    request_response::Event::Message {
+                        peer,
+                        message:
+                            request_response::Message::Response {
+                                request_id,
+                                response,
+                            },
+                        ..
+                    },
+                )) => {
+                    return NetworkEvent::InviteResponseReceived {
+                        peer_id: peer,
+                        request_id: OutboundInviteRequestId(request_id),
+                        response,
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    return NetworkEvent::InviteRequestFailed {
+                        peer_id: peer,
+                        request_id: OutboundInviteRequestId(request_id),
+                        failure: JoinFailure::from(error),
+                    };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                    request_response::Event::InboundFailure { request_id, .. },
+                )) => {
+                    self.pending_invite_responses
+                        .remove(&InboundInviteRequestId(request_id));
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
                     peer,
                     message:
@@ -759,6 +876,14 @@ pub struct InboundJoinRequestId(request_response::InboundRequestId);
 /// Opaque identifier for an outbound membership request.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OutboundJoinRequestId(request_response::OutboundRequestId);
+
+/// Opaque identifier for an inbound invite request awaiting response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InboundInviteRequestId(request_response::InboundRequestId);
+
+/// Opaque identifier for an outbound invite request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OutboundInviteRequestId(request_response::OutboundRequestId);
 
 /// Application-facing network lifecycle events.
 #[derive(Debug)]
@@ -854,6 +979,35 @@ pub enum NetworkEvent {
         peer_id: PeerId,
         /// Original local request token.
         request_id: OutboundJoinRequestId,
+        /// Stable failure category.
+        failure: JoinFailure,
+    },
+    /// A bounded invite request arrived from an authenticated peer.
+    InviteRequestReceived {
+        /// Authenticated transport peer whose membership and permission the
+        /// owner must recheck.
+        peer_id: PeerId,
+        /// Token used to send the response.
+        request_id: InboundInviteRequestId,
+        /// Requested group and lifetime.
+        request: InviteRequest,
+    },
+    /// A bounded invite response arrived from an authenticated peer.
+    InviteResponseReceived {
+        /// Authenticated transport peer that processed the request.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundInviteRequestId,
+        /// Issued invitation or privacy-preserving rejection.
+        response: InviteResponse,
+    },
+    /// An outbound invite request failed; it uses the same transport failure
+    /// categories as membership requests.
+    InviteRequestFailed {
+        /// Target peer.
+        peer_id: PeerId,
+        /// Original local request token.
+        request_id: OutboundInviteRequestId,
         /// Stable failure category.
         failure: JoinFailure,
     },
@@ -1027,6 +1181,12 @@ pub enum NetworkError {
     /// The peer stream closed before the membership response could be queued.
     #[error("membership response channel is closed")]
     JoinResponseChannelClosed,
+    /// The inbound invite request token is no longer pending.
+    #[error("invite request is no longer awaiting a response")]
+    UnknownInviteRequest,
+    /// The peer stream closed before the invite response could be queued.
+    #[error("invite response channel is closed")]
+    InviteResponseChannelClosed,
 }
 
 fn record_key(key: DiscoveryKey) -> kad::RecordKey {
@@ -1038,8 +1198,9 @@ mod tests {
     use std::time::Duration;
 
     use charp2p_core::{
-        DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, JoinRequest,
-        JoinResponse, SyncAuthorHead, SyncRequest, SyncResponse,
+        DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, InviteRejectReason,
+        InviteRequest, InviteResponse, JoinRequest, JoinResponse, SyncAuthorHead, SyncRequest,
+        SyncResponse,
     };
     use libp2p::{Multiaddr, connection_limits, identity::Keypair, kad, multiaddr::Protocol};
     use tokio::time::timeout;
@@ -1143,6 +1304,79 @@ mod tests {
         assert_eq!(response_peer, listener_id);
         assert_eq!(received_id, outbound_id);
         assert_eq!(response.welcome(), Some([4, 5, 6].as_slice()));
+    }
+
+    #[tokio::test]
+    async fn connected_peers_exchange_bounded_invite_messages() {
+        let (mut listener, mut dialer, listener_id, dialer_id) = connected_nodes().await;
+        let group = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &group,
+            listener_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap();
+        let outbound_id = dialer.send_invite_request(
+            listener_id,
+            InviteRequest::new(group.group_id(), 3_600).unwrap(),
+        );
+
+        let (request_peer, inbound_id, request) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = listener.next_event() => {
+                        if let NetworkEvent::InviteRequestReceived { peer_id, request_id, request } = event {
+                            return (peer_id, request_id, request);
+                        }
+                    }
+                    _ = dialer.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("listener should receive the invite request");
+        assert_eq!(request_peer, dialer_id);
+        assert_eq!(request.group_id(), group.group_id());
+        assert_eq!(request.lifetime_seconds(), 3_600);
+
+        listener
+            .send_invite_response(inbound_id, InviteResponse::issued(&invitation).unwrap())
+            .unwrap();
+        assert!(matches!(
+            listener.send_invite_response(
+                inbound_id,
+                InviteResponse::rejected(InviteRejectReason::Busy)
+            ),
+            Err(super::NetworkError::UnknownInviteRequest)
+        ));
+
+        let (response_peer, received_id, response) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = dialer.next_event() => {
+                        if let NetworkEvent::InviteResponseReceived { peer_id, request_id, response } = event {
+                            return (peer_id, request_id, response);
+                        }
+                    }
+                    _ = listener.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("dialer should receive the invite response");
+        assert_eq!(response_peer, listener_id);
+        assert_eq!(received_id, outbound_id);
+        assert_eq!(
+            response.invitation(),
+            Some(invitation.encode().unwrap().as_str())
+        );
     }
 
     #[test]

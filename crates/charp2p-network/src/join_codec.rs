@@ -62,7 +62,7 @@ impl request_response::Codec for JoinCodec {
     }
 }
 
-async fn read_bounded<T>(io: &mut T, maximum: usize) -> io::Result<Zeroizing<Vec<u8>>>
+pub(crate) async fn read_bounded<T>(io: &mut T, maximum: usize) -> io::Result<Zeroizing<Vec<u8>>>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -73,13 +73,13 @@ where
     if encoded.len() > maximum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "join message exceeds its wire limit",
+            "protocol message exceeds its wire limit",
         ));
     }
     Ok(encoded)
 }
 
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+pub(crate) fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 

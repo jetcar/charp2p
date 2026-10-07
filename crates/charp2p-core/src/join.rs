@@ -360,7 +360,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-fn is_canonical_invitation_text(invitation: &str) -> bool {
+pub(crate) fn is_canonical_invitation_text(invitation: &str) -> bool {
     if invitation.is_empty()
         || invitation.len() > MAX_INVITATION_ENCODED_BYTES
         || !invitation

@@ -10,6 +10,7 @@ mod identity;
 mod identity_backup;
 mod invitation;
 mod invite_permission;
+mod invite_request;
 mod join;
 mod message_body;
 mod message_edit;
@@ -30,6 +31,11 @@ pub use invitation::{
     MAX_INVITATION_ENCODED_BYTES,
 };
 pub use invite_permission::{InvitePermission, InvitePermissionError};
+pub use invite_request::{
+    InviteRejectReason, InviteRequest, InviteRequestError, InviteResponse,
+    MAX_INVITE_REQUEST_LIFETIME_SECONDS, MAX_INVITE_REQUEST_WIRE_BYTES,
+    MAX_INVITE_RESPONSE_WIRE_BYTES,
+};
 pub use join::{
     JoinError, JoinRejectReason, JoinRequest, JoinResponse, MAX_JOIN_MLS_MESSAGE_BYTES,
     MAX_JOIN_REQUEST_WIRE_BYTES, MAX_JOIN_RESPONSE_WIRE_BYTES,

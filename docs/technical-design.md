@@ -127,6 +127,14 @@ deliveries. Windows uses one application instance so a later link is forwarded
 to the active window. OS routing is not trust: every delivered string still
 passes the same bounded Rust invitation parser and signature verification.
 
+Only the owner device signs invitations. A member the owner has granted invite
+permission requests one from the owner device over the authenticated
+`/charp2p/invite/1.0.0` request-response protocol (ADR-036). The owner rechecks
+the requesting device's membership and current permission, then issues, stores
+and advertises a normal version 2 invitation under the group settings and
+records the requesting device in its issued-invitation index. Withdrawing the
+permission revokes the active invitations issued at that device's request.
+
 ## Discovery
 
 CharP2P uses a dedicated, open libp2p-compatible network rather than storing
@@ -378,6 +386,7 @@ MessageCreated
 MessageEdited
 MessageDeleted
 KeyEpochAdvanced
+InvitePermissionChanged
 ```
 
 A `GroupMetadataChanged` event carries versioned display metadata (currently
@@ -386,6 +395,12 @@ author it: members apply a change only when its author is the owner device that
 admitted them, and the change with the owner's highest author sequence is the
 current name. Metadata changes are delivered by pull synchronization and are
 never accepted through member pushes.
+
+An `InvitePermissionChanged` event grants or withdraws one admitted member
+device's permission to request invitations (ADR-036). It carries a versioned
+target device ID and granted flag as an MLS application message, follows the
+same owner-only authorship, highest-owner-sequence and pull-only rules as
+metadata changes, and is dropped for a removed device.
 
 A `MessageEdited` event carries a versioned edit (target `MessageCreated`
 event identifier and replacement text, at most 16 KiB) as an MLS application

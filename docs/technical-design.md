@@ -182,7 +182,14 @@ bounded to 64 keys per group. Closing the app removes the live provider, while
 short-lived DHT records may remain until their network TTL elapses.
 
 LAN discovery may use mDNS as an additional path, never as the only discovery
-mechanism.
+mechanism. Client nodes built with LAN discovery announce their peer ID and
+listen addresses on the local network segment and register the addresses of
+other CharP2P devices they hear; routing and contributor nodes never use mDNS.
+mDNS only supplies addresses: group membership and synchronization still need
+invitation-bound discovery and authenticated protocols. A connection reached
+through an mDNS-announced address is reported as LAN even when the address is
+outside private ranges. When the multicast socket cannot be opened the node
+continues without LAN discovery.
 
 ## Connectivity
 

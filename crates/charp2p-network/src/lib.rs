@@ -5,7 +5,10 @@
 mod ip_limits;
 mod join_codec;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use charp2p_core::{
     DiscoveryKey, JoinRejectReason, JoinRequest, JoinResponse, MAX_SYNC_RESPONSE_BYTES, SyncError,
@@ -15,7 +18,7 @@ use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, connection_limits, identify,
     identity::Keypair,
-    kad,
+    kad, mdns,
     multiaddr::Protocol,
     noise, ping, relay, request_response,
     swarm::{
@@ -59,6 +62,7 @@ struct Behaviour {
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
+    lan_discovery: Toggle<mdns::tokio::Behaviour>,
 }
 
 impl Behaviour {
@@ -69,8 +73,14 @@ impl Behaviour {
         relay_server: Option<relay::Config>,
         connection_limits: connection_limits::ConnectionLimits,
         max_inbound_per_ip: Option<u32>,
+        lan_discovery: bool,
     ) -> Self {
         let peer_id = identity.public().to_peer_id();
+        // mDNS is an additional discovery path only: when the multicast socket
+        // cannot be opened, the node keeps working through the DHT.
+        let lan_discovery = lan_discovery
+            .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).ok())
+            .flatten();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
         dht.set_mode(Some(dht_mode));
         let join = request_response::Behaviour::with_codec(
@@ -113,6 +123,7 @@ impl Behaviour {
             relay_server: Toggle::from(
                 relay_server.map(|config| relay::Behaviour::new(peer_id, config)),
             ),
+            lan_discovery: Toggle::from(lan_discovery),
         }
     }
 }
@@ -192,6 +203,7 @@ pub struct NetworkNode {
     swarm: Swarm<Behaviour>,
     relay_server: bool,
     discovery_queries: HashMap<kad::QueryId, DiscoveryKey>,
+    lan_addresses: HashSet<Multiaddr>,
     pending_sync_responses:
         HashMap<InboundSyncRequestId, request_response::ResponseChannel<SyncResponse>>,
     pending_join_responses:
@@ -207,6 +219,22 @@ impl NetworkNode {
             None,
             connection_limits::ConnectionLimits::default(),
             None,
+            false,
+        )
+    }
+
+    /// Builds a client node that also announces itself and finds other
+    /// CharP2P devices on the local network through mDNS. LAN discovery only
+    /// adds addresses for peers; group membership is still established
+    /// through invitation-bound DHT discovery and authenticated protocols.
+    pub fn new_with_lan_discovery(identity: Keypair) -> Self {
+        Self::with_dht_mode(
+            identity,
+            kad::Mode::Client,
+            None,
+            connection_limits::ConnectionLimits::default(),
+            None,
+            true,
         )
     }
 
@@ -218,6 +246,7 @@ impl NetworkNode {
             Some(relay_server_config()),
             serving_connection_limits(),
             Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP),
+            false,
         )
     }
 
@@ -230,6 +259,7 @@ impl NetworkNode {
             relay.map(|limits| limits.server_config()),
             serving_connection_limits(),
             Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP),
+            false,
         )
     }
 
@@ -239,6 +269,7 @@ impl NetworkNode {
         relay_server: Option<relay::Config>,
         connection_limits: connection_limits::ConnectionLimits,
         max_inbound_per_ip: Option<u32>,
+        lan_discovery: bool,
     ) -> Self {
         let relay_server_enabled = relay_server.is_some();
         let swarm = SwarmBuilder::with_existing_identity(identity)
@@ -254,6 +285,7 @@ impl NetworkNode {
                     relay_server,
                     connection_limits,
                     max_inbound_per_ip,
+                    lan_discovery,
                 )
             })
             .expect("behaviour construction is infallible")
@@ -266,6 +298,7 @@ impl NetworkNode {
             swarm,
             relay_server: relay_server_enabled,
             discovery_queries: HashMap::new(),
+            lan_addresses: HashSet::new(),
             pending_sync_responses: HashMap::new(),
             pending_join_responses: HashMap::new(),
         }
@@ -472,10 +505,19 @@ impl NetworkNode {
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {
+                    let remote_address = transport_address(endpoint.get_remote_address());
+                    // An address announced over mDNS was reachable on the local
+                    // network segment even when it is not in a private range.
+                    let path =
+                        if !endpoint.is_relayed() && self.lan_addresses.contains(&remote_address) {
+                            ConnectionPath::Lan
+                        } else {
+                            connection_path(&endpoint)
+                        };
                     return NetworkEvent::PeerConnected {
                         peer_id,
-                        path: connection_path(&endpoint),
-                        remote_address: transport_address(endpoint.get_remote_address()),
+                        path,
+                        remote_address,
                     };
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -496,6 +538,23 @@ impl NetworkNode {
                         peer_id,
                         listen_addresses: info.listen_addrs,
                     };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::LanDiscovery(mdns::Event::Discovered(
+                    peers,
+                ))) => {
+                    for (peer_id, address) in &peers {
+                        self.swarm.add_peer_address(*peer_id, address.clone());
+                        self.lan_addresses.insert(transport_address(address));
+                    }
+                    return NetworkEvent::LanPeersDiscovered { peers };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::LanDiscovery(mdns::Event::Expired(
+                    peers,
+                ))) => {
+                    for (_, address) in &peers {
+                        self.lan_addresses.remove(&transport_address(address));
+                    }
+                    return NetworkEvent::LanPeersExpired { peers };
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
@@ -732,6 +791,17 @@ pub enum NetworkEvent {
         peer_id: PeerId,
         /// Addresses advertised by the remote Identify behaviour.
         listen_addresses: Vec<Multiaddr>,
+    },
+    /// mDNS found CharP2P devices on the local network. Their addresses are
+    /// registered with the swarm, so `dial_peer` can reach them directly.
+    LanPeersDiscovered {
+        /// Local-network peer identities with one advertised address each.
+        peers: Vec<(PeerId, Multiaddr)>,
+    },
+    /// mDNS records for local-network devices expired without renewal.
+    LanPeersExpired {
+        /// Peer identities and addresses that are no longer announced.
+        peers: Vec<(PeerId, Multiaddr)>,
     },
     /// This node's provider record was published to the DHT.
     GroupAnnounced {
@@ -1344,6 +1414,7 @@ mod tests {
             None,
             connection_limits::ConnectionLimits::default().with_max_established_incoming(Some(1)),
             None,
+            false,
         );
         let mut first = NetworkNode::new(Keypair::generate_ed25519());
         let mut second = NetworkNode::new(Keypair::generate_ed25519());
@@ -1400,6 +1471,7 @@ mod tests {
             None,
             connection_limits::ConnectionLimits::default(),
             Some(1),
+            false,
         );
         let mut first = NetworkNode::new(Keypair::generate_ed25519());
         let mut second = NetworkNode::new(Keypair::generate_ed25519());
@@ -1472,6 +1544,63 @@ mod tests {
         .expect("local provider lookup should complete");
 
         assert_eq!(providers, vec![node.peer_id()]);
+    }
+
+    #[tokio::test]
+    async fn lan_discovery_finds_and_dials_a_local_device() {
+        let mut first = NetworkNode::new_with_lan_discovery(Keypair::generate_ed25519());
+        let mut second = NetworkNode::new_with_lan_discovery(Keypair::generate_ed25519());
+        let second_peer_id = second.peer_id();
+        first
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        second
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+
+        timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    event = first.next_event() => {
+                        if let NetworkEvent::LanPeersDiscovered { peers } = event
+                            && peers.iter().any(|(peer_id, _)| *peer_id == second_peer_id)
+                        {
+                            break;
+                        }
+                    }
+                    _ = second.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("mDNS should find the other local device");
+
+        first.dial_peer(second_peer_id).unwrap();
+        let path = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = first.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, path, .. } = event
+                            && peer_id == second_peer_id
+                        {
+                            break path;
+                        }
+                    }
+                    _ = second.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("a LAN-discovered peer should be dialable by identity");
+
+        assert_eq!(path, ConnectionPath::Lan);
+    }
+
+    #[tokio::test]
+    async fn client_nodes_do_not_announce_on_the_local_network() {
+        let node = NetworkNode::new(Keypair::generate_ed25519());
+
+        assert!(!node.swarm.behaviour().lan_discovery.is_enabled());
     }
 
     async fn next_listen_address(node: &mut NetworkNode) -> Multiaddr {

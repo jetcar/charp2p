@@ -45,7 +45,8 @@
 - [x] Routing node: per-IP established inbound connection limit (technical-design node policy, part 2/2).
 - [x] Groups page: show last synchronization per joined group in the group list (product page 2).
 - [x] Invitations page: state explicitly whether the issued invitation is reusable and that no owner approval is needed (product page 8).
-- [ ] LAN discovery via mDNS as an additional (never sole) discovery path for joined-group peers (technical-design Discovery), reported as the LAN connection type.
+- [x] LAN discovery via mDNS, part 1/2: optional mDNS behaviour on client network nodes emitting LAN peer events and reporting mDNS-reached connections as LAN (charp2p-network).
+- [ ] LAN discovery via mDNS, part 2/2: enable LAN discovery in the app's client node and dial a joined group's known provider peers (pinned owner device / remembered providers) when mDNS finds them, before or alongside DHT lookup.
 
 ## Needs human
 
@@ -100,3 +101,4 @@
 2026-10-07T09:28:50Z Routing node connection limits 2/2: custom ip_limits behaviour refuses a 17th established direct inbound connection from one remote IP on routing and contributor nodes (relayed/non-IP addresses not counted; clients unbounded); unit test for address parsing and loopback test (limit 1) verified to fail without enforcement; technical-design updated. Backlog empty; next run should re-derive gaps. Workspace fmt/clippy/test and npm build pass; src-tauri unchanged.
 2026-10-07T10:26:42Z Groups list last synchronization: re-derived backlog (gaps: last sync in Groups list, invitation reusable/approval label, optional mDNS LAN discovery). Group switcher shows a relative 'Synced N min ago'/'Not synced yet' label for member groups with the full time as tooltip; owner groups serve sync and show none. Frontend only; all checks pass.
 2026-10-07T11:27Z Invitations page reusable/approval status: issued invitation now shows reusable-until-expiry (or single use) and whether owner approval is needed from the group settings; fmt/clippy/tests/npm build pass.
+2026-10-07T12:32:53Z LAN discovery via mDNS 1/2: libp2p mdns feature; NetworkNode::new_with_lan_discovery (clients only, falls back silently when multicast socket fails) emits LanPeersDiscovered/LanPeersExpired, registers addresses for dial_peer, reports connections to mDNS-announced addresses as LAN; two-node discovery+dial test and disabled-by-default test; technical-design Discovery updated. fmt/clippy/tests, npm build and src-tauri cargo check pass (installed webkit2gtk/gtk dev libs via apt).

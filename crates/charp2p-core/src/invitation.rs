@@ -138,6 +138,9 @@ impl Invitation {
 
         let bytes = URL_SAFE_NO_PAD.decode(encoded)?;
         let wire: SignedInvitation = postcard::from_bytes(&bytes)?;
+        if postcard::to_allocvec(&wire)? != bytes {
+            return Err(InvitationError::NonCanonical);
+        }
         validate_claims(&wire.claims, now_unix)?;
 
         let owner_public_key = PublicKey::try_decode_protobuf(&wire.claims.owner_public_key)?;
@@ -224,6 +227,9 @@ pub enum InvitationError {
     /// The payload is empty or exceeds the protocol limit.
     #[error("invitation payload has an invalid size")]
     InvalidSize,
+    /// The payload is not in its canonical binary encoding.
+    #[error("invitation payload is not canonically encoded")]
+    NonCanonical,
     /// A link does not use the supported scheme, host, path, or fragment form.
     #[error("invitation link is invalid")]
     InvalidLink,
@@ -400,6 +406,27 @@ mod tests {
         assert!(!decoded.is_reusable());
         assert_eq!(decoded.discovery_secret(), invitation.discovery_secret());
         assert_eq!(decoded.invitation_id(), invitation.invitation_id());
+    }
+
+    #[test]
+    fn decoder_accepts_only_the_canonical_encoding() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            NOW,
+        )
+        .unwrap();
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(invitation.encode().unwrap())
+            .unwrap();
+        bytes.push(0);
+
+        assert!(matches!(
+            Invitation::decode(&URL_SAFE_NO_PAD.encode(bytes), NOW),
+            Err(InvitationError::NonCanonical)
+        ));
     }
 
     #[test]

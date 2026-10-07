@@ -535,6 +535,60 @@ Whichever construction is selected must provide:
 Cryptography does not provide anonymity: peers and relays can observe network
 metadata, and group members know which device signed a message.
 
+## Serialization and size limits
+
+Protocol structures use one of two canonical binary encodings, each carrying a
+leading version field:
+
+- Postcard (serde, unsigned varint integers, length-prefixed byte strings and
+  sequences, fields in declaration order) for signed events, invitations, and
+  MLS-protected plaintexts (reply bodies, message edits, group metadata).
+- A hand-written big-endian codec for the join exchange: a `u16` version, then
+  `u16` or `u32` length-prefixed fields (group ID, invitation, KeyPackage) or
+  a one-byte response tag followed by a `u32`-prefixed Welcome or a one-byte
+  rejection code. Declared lengths are checked before allocation.
+
+Signatures and identifiers cover the re-encoded canonical body behind a
+domain-separation prefix (`charp2p-event-signature-v1\0`,
+`charp2p-event-id-v1\0`, `charp2p-rendezvous-v1\0`). Signed events and
+invitations are accepted only when re-encoding the decoded structure
+reproduces the received bytes exactly, so trailing bytes or non-minimal
+varints cannot create a second byte form of the same event or invitation.
+MLS-protected plaintexts reject trailing bytes. Message text without a reply
+is plain UTF-8; a reply starts with the marker byte `0xFF`. The fixed-seed
+vectors in `crates/charp2p-core/tests/protocol_vectors.rs` pin these forms.
+
+Synchronization requests and responses use the libp2p CBOR request-response
+codec. That envelope is neither signed nor canonical; every event inside it is
+a canonical signed envelope that the receiver decodes and verifies itself.
+
+Every parser checks the outer size before decoding:
+
+| Structure | Limit |
+| --- | --- |
+| Encoded signed event | 128 KiB |
+| Event protected payload | 64 KiB |
+| Event causal parents | 16, unique |
+| Invitation payload (Base64) | 8 KiB; pasted links 8 KiB + 256 bytes |
+| Group and inviter display names | 80 bytes |
+| Inviter device ID, join group ID | 128 bytes |
+| Join KeyPackage or Welcome | 128 KiB |
+| Join request / response wire | sum of the field limits and prefixes |
+| Message or edit text | 16 KiB (body 16 KiB + 64 bytes) |
+| Group metadata plaintext | 128 bytes |
+| Sync author summary or reported heads | 1,024 entries |
+| Sync event-ID page or event batch | 256 items |
+| Sync event data per response | 2 MiB |
+| Sync wire message | 2 MiB + 128 KiB |
+| Encrypted identity backup | 1 KiB (plaintext 512 bytes) |
+| MLS provider snapshot | 8 MiB, 4,096 records |
+| Device-local preference files | 4 KiB |
+
+The join transport reads one byte beyond each outer bound and the sync codec
+stops reading at its bound, so an oversized message is rejected without
+buffering more. Changing an encoding, domain prefix, or limit
+that peers enforce requires a new protocol or payload version.
+
 ## Local data
 
 Each client stores:
@@ -627,7 +681,8 @@ Before protocol implementation:
    same Rust core and assembles an arm64 debug APK. Emulator and physical-device
    validation remain part of the application integration gate.
 2. Select the portable core and UI stack.
-3. Define canonical binary serialization and size limits.
+3. ~~Define canonical binary serialization and size limits.~~ See
+   "Serialization and size limits".
 4. ~~Write protocol test vectors for identities, invitations, event signatures,
    and discovery keys.~~ Fixed-seed vectors live in
    `crates/charp2p-core/tests/protocol_vectors.rs`; changing one requires a new

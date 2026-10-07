@@ -163,6 +163,12 @@ impl SignedEvent {
         }
         let wire: SignedEventWire = postcard::from_bytes(encoded)?;
         validate_body(&wire.body)?;
+        // One event has exactly one accepted byte form: trailing bytes and
+        // non-minimal varints would otherwise give a second envelope with the
+        // same identifier.
+        if postcard::to_allocvec(&wire)? != encoded {
+            return Err(EventError::NonCanonical);
+        }
         let author_public_key = PublicKey::try_decode_protobuf(&wire.body.author_public_key)?;
         let body_bytes = postcard::to_allocvec(&wire.body)?;
         if !author_public_key.verify(&signing_payload(&body_bytes), &wire.signature) {
@@ -224,6 +230,9 @@ pub enum EventError {
     /// The wire event is empty or exceeds its protocol limit.
     #[error("event has an invalid encoded size")]
     InvalidSize,
+    /// The wire event is not in its canonical encoding.
+    #[error("event is not canonically encoded")]
+    NonCanonical,
     /// The protected payload exceeds the message-event limit.
     #[error("protected event payload is too large")]
     PayloadTooLarge,
@@ -351,6 +360,28 @@ mod tests {
         assert_eq!(decoded.created_at_unix_ms(), 1_800_000_000_000);
         assert_eq!(decoded.kind(), EventKind::MessageCreated);
         assert_eq!(decoded.protected_payload(), b"protected");
+    }
+
+    #[test]
+    fn decoder_accepts_only_the_canonical_encoding() {
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let encoded = create_message(&author, &group, 1, &[], b"protected")
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        // Version 1 written as a two-byte varint instead of one byte.
+        let mut overlong = vec![0x81, 0x00];
+        overlong.extend_from_slice(&encoded[1..]);
+
+        assert_eq!(encoded[0], 0x01);
+        assert!(matches!(
+            SignedEvent::decode(&trailing),
+            Err(EventError::NonCanonical)
+        ));
+        assert!(SignedEvent::decode(&overlong).is_err());
     }
 
     #[test]

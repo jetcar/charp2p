@@ -12,7 +12,7 @@ use charp2p_core::{
 };
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, identify,
     identity::Keypair,
     kad,
     multiaddr::Protocol,
@@ -44,6 +44,7 @@ const MEBIBYTE: u64 = 1024 * 1024;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    blocked_peers: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
@@ -88,6 +89,7 @@ impl Behaviour {
         );
 
         Self {
+            blocked_peers: allow_block_list::Behaviour::default(),
             ping: ping::Behaviour::new(ping::Config::new()),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), identity.public())
@@ -280,6 +282,21 @@ impl NetworkNode {
             .behaviour_mut()
             .dht
             .add_address(&peer_id, address);
+    }
+
+    /// Refuses every connection with `peer_id` and closes existing ones. The
+    /// block is local to this node and lasts until it is lifted or the node
+    /// stops.
+    pub fn block_peer(&mut self, peer_id: PeerId) {
+        self.swarm.behaviour_mut().blocked_peers.block_peer(peer_id);
+    }
+
+    /// Lifts a local block so `peer_id` may connect again.
+    pub fn unblock_peer(&mut self, peer_id: PeerId) {
+        self.swarm
+            .behaviour_mut()
+            .blocked_peers
+            .unblock_peer(peer_id);
     }
 
     /// Starts a Kademlia bootstrap query using configured peer addresses.
@@ -1204,6 +1221,76 @@ mod tests {
         assert_eq!(dialer_path, ConnectionPath::Lan);
 
         (listener, dialer, listener_id, dialer_id)
+    }
+
+    #[tokio::test]
+    async fn blocking_a_connected_peer_closes_its_connection() {
+        let (mut listener, mut dialer, _, dialer_id) = connected_nodes().await;
+
+        listener.block_peer(dialer_id);
+
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = listener.next_event() => {
+                        if let NetworkEvent::PeerDisconnected { peer_id } = event {
+                            assert_eq!(peer_id, dialer_id);
+                            break;
+                        }
+                    }
+                    _ = dialer.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("blocking should close the existing connection");
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_cannot_connect_until_unblocked() {
+        let mut listener = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let mut dialer = NetworkNode::new(Keypair::generate_ed25519());
+        let listener_id = listener.peer_id();
+        let dialer_id = dialer.peer_id();
+        listener.block_peer(dialer_id);
+
+        listener
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_address = next_listen_address(&mut listener).await;
+        let dial_address: Multiaddr = format!("{listen_address}/p2p/{listener_id}")
+            .parse()
+            .unwrap();
+        dialer.dial(dial_address.clone()).unwrap();
+
+        let refused = timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = listener.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, .. } = event {
+                            break peer_id;
+                        }
+                    }
+                    _ = dialer.next_event() => {}
+                }
+            }
+        })
+        .await;
+        assert!(refused.is_err(), "a blocked peer must not be accepted");
+
+        listener.unblock_peer(dialer_id);
+        dialer.dial(dial_address).unwrap();
+        let (peer_id, _) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    connected = next_connected_peer(&mut listener) => break connected,
+                    _ = dialer.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("an unblocked peer should connect");
+        assert_eq!(peer_id, dialer_id);
     }
 
     #[tokio::test]

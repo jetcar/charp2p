@@ -25,6 +25,13 @@ CHARP2P_NODE_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1
 CHARP2P_NODE_IDENTITY=data/node-identity.key
 ```
 
+To refuse abusive peers, list their peer IDs one per line in a text file and
+pass it with `--blocked-peers <file>` or `CHARP2P_NODE_BLOCKED_PEERS`. Blank
+lines and lines starting with `#` are ignored. The file is read once at
+startup, is limited to 256 KiB and 4,096 peer IDs, and an invalid line stops
+startup. Blocked peers cannot connect, route through the DHT, or reserve relay
+circuits on this node; the block does not affect other nodes or any group.
+
 On Unix, a new identity file is created with mode `0600`; startup fails when an
 existing identity is accessible by group or other users. Back up this file if
 the node should keep the same peer ID.

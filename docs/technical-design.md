@@ -646,7 +646,9 @@ message payloads.
 The standalone node implements bootstrap and Kademlia routing with in-memory
 DHT state plus Circuit Relay v2. It rejects group synchronization requests.
 Relay reservations and circuits have fixed count, duration, byte, per-peer,
-and upstream per-IP rate bounds. Load-tested quotas, metrics, and deployment
+and upstream per-IP rate bounds. An operator-supplied list of blocked peer
+IDs, read at startup, refuses those identities' connections on that node only.
+Load-tested quotas, metrics, and deployment
 packaging remain production gates.
 
 It can:

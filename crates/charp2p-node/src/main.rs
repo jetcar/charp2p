@@ -9,12 +9,14 @@ use std::{
 use charp2p_core::{JoinRejectReason, SyncRejectReason};
 use charp2p_network::{DiscoveryOperation, NetworkEvent, NetworkNode};
 use clap::Parser;
-use libp2p::{Multiaddr, identity::Keypair};
+use libp2p::{Multiaddr, PeerId, identity::Keypair};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const IDENTITY_VERSION: u8 = 1;
 const MAX_IDENTITY_BYTES: usize = 512;
+const MAX_BLOCKED_PEERS_BYTES: u64 = 256 * 1024;
+const MAX_BLOCKED_PEERS: usize = 4_096;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,18 +39,33 @@ struct Config {
         default_value = "data/node-identity.key"
     )]
     identity: PathBuf,
+
+    /// Optional file listing peer IDs this node refuses, one per line.
+    /// Blank lines and lines starting with `#` are ignored.
+    #[arg(long, env = "CHARP2P_NODE_BLOCKED_PEERS")]
+    blocked_peers: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), NodeError> {
     let config = Config::parse();
     let identity = load_or_create_identity(&config.identity)?;
+    let blocked_peers = match &config.blocked_peers {
+        Some(path) => read_blocked_peers(path)?,
+        None => Vec::new(),
+    };
     let mut node = NetworkNode::new_routing(identity);
+    for blocked_peer in &blocked_peers {
+        node.block_peer(*blocked_peer);
+    }
     let peer_id = node.peer_id();
     node.listen_on(config.listen)?;
 
     println!("CharP2P routing node");
     println!("Peer ID: {peer_id}");
+    if !blocked_peers.is_empty() {
+        println!("Blocked peer identities: {}", blocked_peers.len());
+    }
 
     loop {
         tokio::select! {
@@ -81,6 +98,39 @@ fn operation_name(operation: DiscoveryOperation) -> &'static str {
         DiscoveryOperation::Announcement => "announcement",
         DiscoveryOperation::Search => "search",
     }
+}
+
+fn read_blocked_peers(path: &Path) -> Result<Vec<PeerId>, NodeError> {
+    let mut text = String::new();
+    File::open(path)
+        .map_err(NodeError::BlockedPeersIo)?
+        .take(MAX_BLOCKED_PEERS_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(NodeError::BlockedPeersIo)?;
+    if text.len() as u64 > MAX_BLOCKED_PEERS_BYTES {
+        return Err(NodeError::BlockedPeersTooLarge);
+    }
+    parse_blocked_peers(&text)
+}
+
+fn parse_blocked_peers(text: &str) -> Result<Vec<PeerId>, NodeError> {
+    let mut peers = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let peer_id = line
+            .parse::<PeerId>()
+            .map_err(|_| NodeError::BlockedPeerInvalid { line: index + 1 })?;
+        if !peers.contains(&peer_id) {
+            if peers.len() == MAX_BLOCKED_PEERS {
+                return Err(NodeError::BlockedPeersTooLarge);
+            }
+            peers.push(peer_id);
+        }
+    }
+    Ok(peers)
 }
 
 fn load_or_create_identity(path: &Path) -> Result<Keypair, NodeError> {
@@ -180,6 +230,12 @@ enum NodeError {
     #[cfg(unix)]
     #[error("node identity file must not be accessible by group or other users")]
     IdentityPermissions,
+    #[error("blocked peer list could not be read")]
+    BlockedPeersIo(io::Error),
+    #[error("blocked peer list exceeds its size limit")]
+    BlockedPeersTooLarge,
+    #[error("blocked peer list line {line} is not a peer ID")]
+    BlockedPeerInvalid { line: usize },
     #[error("network operation failed")]
     Network(#[from] charp2p_network::NetworkError),
     #[error("shutdown signal handler failed")]
@@ -192,7 +248,12 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{NodeError, create_private_file, load_or_create_identity, read_identity};
+    use libp2p::identity::Keypair;
+
+    use super::{
+        MAX_BLOCKED_PEERS, NodeError, create_private_file, load_or_create_identity,
+        parse_blocked_peers, read_blocked_peers, read_identity,
+    };
 
     fn write_private(path: &Path, bytes: &[u8]) {
         let mut file = create_private_file(path).unwrap();
@@ -228,6 +289,51 @@ mod tests {
         assert!(matches!(
             read_identity(&oversized),
             Err(NodeError::IdentityRecordInvalid)
+        ));
+    }
+
+    #[test]
+    fn blocked_peer_list_skips_comments_and_duplicates() {
+        let first = Keypair::generate_ed25519().public().to_peer_id();
+        let second = Keypair::generate_ed25519().public().to_peer_id();
+        let text = format!("# abusive peers\n\n{first}\n  {second}  \n{first}\n");
+
+        assert_eq!(parse_blocked_peers(&text).unwrap(), vec![first, second]);
+        assert!(parse_blocked_peers("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocked_peer_list_rejects_invalid_or_excessive_entries() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        assert!(matches!(
+            parse_blocked_peers(&format!("{peer}\nnot-a-peer\n")),
+            Err(NodeError::BlockedPeerInvalid { line: 2 })
+        ));
+
+        let excessive = (0..=MAX_BLOCKED_PEERS)
+            .map(|_| {
+                Keypair::generate_ed25519()
+                    .public()
+                    .to_peer_id()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            parse_blocked_peers(&excessive),
+            Err(NodeError::BlockedPeersTooLarge)
+        ));
+
+        let directory = tempdir().unwrap();
+        let oversized = directory.path().join("blocked.txt");
+        std::fs::write(&oversized, vec![b'#'; 256 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            read_blocked_peers(&oversized),
+            Err(NodeError::BlockedPeersTooLarge)
+        ));
+        assert!(matches!(
+            read_blocked_peers(&directory.path().join("missing.txt")),
+            Err(NodeError::BlockedPeersIo(_))
         ));
     }
 }

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -464,6 +464,11 @@ impl EventStore {
                 removed_member_id.to_bytes(),
                 event.id().as_bytes().as_slice(),
             ],
+        )?;
+        transaction.execute(
+            "UPDATE applied_invite_permissions SET granted = 0
+             WHERE group_id = ?1 AND target_device_id = ?2",
+            params![event.group_id().to_bytes(), removed_member_id.to_bytes()],
         )?;
         transaction.commit()?;
         Ok(outcome)
@@ -1034,6 +1039,94 @@ impl EventStore {
         Ok(outcome)
     }
 
+    /// Atomically stores a decrypted invite permission change and the advanced
+    /// encrypted MLS provider state. The caller authorizes the owner author;
+    /// for each target device the change with the highest author sequence is
+    /// current. A change for a removed device is stored as withdrawn.
+    pub fn put_invite_permission_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        permission: &charp2p_core::InvitePermission,
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::InvitePermissionChanged {
+            return Err(StoreError::InvalidInvitePermissionEvent);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let sequence = i64::try_from(event.author_sequence())
+            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        let removed = transaction
+            .query_row(
+                "SELECT 1 FROM removed_mls_members
+                 WHERE group_id = ?1 AND member_id = ?2",
+                params![
+                    event.group_id().to_bytes(),
+                    permission.device_id().to_bytes()
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        transaction.execute(
+            "INSERT INTO applied_invite_permissions (
+                event_id, group_id, author_id, author_sequence, target_device_id, granted
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+                sequence,
+                permission.device_id().to_bytes(),
+                permission.granted() && !removed,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Reports whether the owner's latest applied change for this device
+    /// grants permission to request invitations and the device is not removed.
+    pub fn has_invite_permission(
+        &self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .invite_permitted_devices(group_id)?
+            .contains(&device_id))
+    }
+
+    /// Lists the non-removed devices currently granted permission to request
+    /// invitations, ordered by device identifier.
+    pub fn invite_permitted_devices(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.target_device_id
+             FROM applied_invite_permissions p
+             WHERE p.group_id = ?1 AND p.granted = 1
+               AND p.author_sequence = (
+                   SELECT MAX(latest.author_sequence)
+                   FROM applied_invite_permissions latest
+                   WHERE latest.group_id = p.group_id
+                     AND latest.target_device_id = p.target_device_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM removed_mls_members r
+                   WHERE r.group_id = p.group_id AND r.member_id = p.target_device_id
+               )
+             ORDER BY p.target_device_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut devices = Vec::new();
+        for row in rows {
+            devices.push(PeerId::from_bytes(&row?).map_err(|_| StoreError::CorruptIndex)?);
+        }
+        Ok(devices)
+    }
+
     /// Returns the current authenticated group name for every group with an
     /// applied metadata change.
     pub fn current_group_names(&self) -> Result<Vec<(PeerId, String)>, StoreError> {
@@ -1059,7 +1152,8 @@ impl EventStore {
         .collect()
     }
 
-    /// Returns at most `limit` verified message, edit, and group-metadata events that
+    /// Returns at most `limit` verified message, edit, group-metadata, and
+    /// invite-permission events that
     /// have not been decrypted locally yet. Events are ordered by author and
     /// sequence so each sender ratchet advances consistently.
     pub fn unmaterialized_message_events(
@@ -1077,8 +1171,9 @@ impl EventStore {
              LEFT JOIN hidden_local_messages h ON h.event_id = e.event_id
              LEFT JOIN applied_group_metadata g ON g.event_id = e.event_id
              LEFT JOIN applied_message_edits x ON x.event_id = e.event_id
+             LEFT JOIN applied_invite_permissions p ON p.event_id = e.event_id
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
-               AND g.event_id IS NULL AND x.event_id IS NULL
+               AND g.event_id IS NULL AND x.event_id IS NULL AND p.event_id IS NULL
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
@@ -1093,6 +1188,7 @@ impl EventStore {
                 charp2p_core::EventKind::MessageCreated
                     | charp2p_core::EventKind::MessageEdited
                     | charp2p_core::EventKind::GroupMetadataChanged
+                    | charp2p_core::EventKind::InvitePermissionChanged
             ) {
                 events.push(event);
                 if events.len() == limit {
@@ -2089,7 +2185,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=21 => {}
+            6..=22 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2383,6 +2479,27 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 22 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS applied_invite_permissions (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    target_device_id BLOB NOT NULL,
+                    granted INTEGER NOT NULL CHECK(granted IN (0, 1))
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS applied_invite_permissions_by_target
+                    ON applied_invite_permissions(group_id, target_device_id, author_sequence);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -2577,6 +2694,9 @@ pub enum StoreError {
     /// Only a signed metadata-change event can update group metadata.
     #[error("event is not a group metadata change")]
     InvalidGroupMetadataEvent,
+    /// Only a signed invite-permission event can change invite permission.
+    #[error("event is not an invite permission change")]
+    InvalidInvitePermissionEvent,
     /// A remembered peer address is empty or above the local bound.
     #[error("invalid peer address size {0}")]
     InvalidPeerAddressSize(usize),
@@ -4347,6 +4467,186 @@ mod tests {
             store.record_peer_address_success(group, peer, &[0; MAX_PEER_ADDRESS_BYTES + 1], 1),
             Err(StoreError::InvalidPeerAddressSize(_))
         ));
+    }
+
+    #[test]
+    fn invite_permission_changes_apply_latest_per_device_and_drop_on_removal() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let member = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let owner_event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"protected permission",
+                },
+            )
+            .unwrap()
+        };
+        let grant = owner_event(1, EventKind::InvitePermissionChanged);
+        let withdraw = owner_event(2, EventKind::InvitePermissionChanged);
+        let other_grant = owner_event(3, EventKind::InvitePermissionChanged);
+        let regrant = owner_event(4, EventKind::InvitePermissionChanged);
+        for event in [&grant, &withdraw, &other_grant, &regrant] {
+            store.put_event(event).unwrap();
+        }
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .len(),
+            4,
+            "permission changes wait for decryption like metadata"
+        );
+        let message = message_event(&owner, &group, 5, b"protected message");
+        assert!(matches!(
+            store.put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &message,
+                b"snapshot",
+                &charp2p_core::InvitePermission::new(member, true),
+            ),
+            Err(StoreError::InvalidInvitePermissionEvent)
+        ));
+
+        // Applied out of order: the withdrawal has the higher sequence.
+        store
+            .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &withdraw,
+                b"snapshot two",
+                &charp2p_core::InvitePermission::new(member, false),
+            )
+            .unwrap();
+        store
+            .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &grant,
+                b"snapshot one",
+                &charp2p_core::InvitePermission::new(member, true),
+            )
+            .unwrap();
+        store
+            .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &other_grant,
+                b"snapshot three",
+                &charp2p_core::InvitePermission::new(other, true),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .has_invite_permission(group.group_id(), member)
+                .unwrap()
+        );
+        assert_eq!(
+            store.invite_permitted_devices(group.group_id()).unwrap(),
+            vec![other]
+        );
+
+        store
+            .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &regrant,
+                b"snapshot four",
+                &charp2p_core::InvitePermission::new(member, true),
+            )
+            .unwrap();
+        assert!(
+            store
+                .has_invite_permission(group.group_id(), member)
+                .unwrap()
+        );
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let removal = owner_event(5, EventKind::MemberRemoved);
+        store
+            .put_mls_member_removal(&removal, b"snapshot five", member)
+            .unwrap();
+        assert!(
+            !store
+                .has_invite_permission(group.group_id(), member)
+                .unwrap()
+        );
+        assert!(
+            store
+                .allow_removed_mls_member_readmission(group.group_id(), member)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_invite_permission(group.group_id(), member)
+                .unwrap(),
+            "permission is not restored when a removed device is readmitted"
+        );
+        assert_eq!(
+            store.invite_permitted_devices(group.group_id()).unwrap(),
+            vec![other]
+        );
+
+        let late = owner_event(6, EventKind::InvitePermissionChanged);
+        store.put_event(&late).unwrap();
+        store
+            .put_mls_member_removal(
+                &owner_event(7, EventKind::MemberRemoved),
+                b"snapshot",
+                other,
+            )
+            .unwrap();
+        store
+            .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                &late,
+                b"snapshot six",
+                &charp2p_core::InvitePermission::new(other, true),
+            )
+            .unwrap();
+        store
+            .allow_removed_mls_member_readmission(group.group_id(), other)
+            .unwrap();
+        assert!(
+            store
+                .invite_permitted_devices(group.group_id())
+                .unwrap()
+                .is_empty(),
+            "a grant applied while the device is removed stays withdrawn"
+        );
+    }
+
+    #[test]
+    fn version_twenty_two_database_adds_invite_permissions() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_invite_permissions;
+                     PRAGMA user_version = 22;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let group = GroupIdentity::generate();
+        assert!(
+            store
+                .invite_permitted_devices(group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]

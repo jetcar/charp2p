@@ -10,9 +10,9 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use charp2p_core::{
-    DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, JoinRequest,
-    JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncPeerHead, SyncRejectReason,
-    SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS,
+    DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, InvitePermission,
+    JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncPeerHead,
+    SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS,
     MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
@@ -1513,9 +1513,11 @@ impl MlsProviderService {
         group_id: PeerId,
         event: &SignedEvent,
     ) -> Result<(), MaterializeMessageError> {
-        if event.kind() == EventKind::GroupMetadataChanged
-            && !is_joined_group_owner(store, group_id, event.author_id())
-                .map_err(MaterializeMessageError::Unavailable)?
+        if matches!(
+            event.kind(),
+            EventKind::GroupMetadataChanged | EventKind::InvitePermissionChanged
+        ) && !is_joined_group_owner(store, group_id, event.author_id())
+            .map_err(MaterializeMessageError::Unavailable)?
         {
             return Err(MaterializeMessageError::Unreadable);
         }
@@ -1559,7 +1561,15 @@ impl MlsProviderService {
         } else {
             None
         };
-        let body = if edit.is_none() && metadata.is_none() {
+        let permission = if event.kind() == EventKind::InvitePermissionChanged {
+            Some(
+                InvitePermission::decode(&plaintext)
+                    .map_err(|_| MaterializeMessageError::Unreadable)?,
+            )
+        } else {
+            None
+        };
+        let body = if edit.is_none() && metadata.is_none() && permission.is_none() {
             Some(MessageBody::decode(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?)
         } else {
             None
@@ -1578,6 +1588,16 @@ impl MlsProviderService {
                     event,
                     &encrypted_snapshot,
                     &metadata,
+                )
+                .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
+            return Ok(());
+        }
+        if let Some(permission) = permission {
+            store
+                .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                    event,
+                    &encrypted_snapshot,
+                    &permission,
                 )
                 .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
             return Ok(());
@@ -4108,6 +4128,104 @@ mod tests {
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["After rename"]
+        );
+    }
+
+    #[test]
+    fn owner_invite_permission_reaches_members_and_member_grants_are_ignored() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        {
+            let mut store = member_service.store.lock().unwrap();
+            store
+                .put_pending_invitation(&charp2p_store::PendingInvitationMetadata {
+                    group_id,
+                    group_name: "Design Crew".to_owned(),
+                    inviter_name: "Owner".to_owned(),
+                    expires_at_unix: u64::from(u32::MAX),
+                    history_policy: charp2p_core::HistoryPolicy::None,
+                    reusable: false,
+                })
+                .unwrap();
+            assert!(store
+                .promote_pending_invitation_to_joined_group(group_id, owner.peer_id())
+                .unwrap());
+        }
+
+        // A member cannot grant itself permission on the owner's device.
+        let forged = member_service
+            .create_application_event_at(
+                group_id,
+                &member,
+                EventKind::InvitePermissionChanged,
+                &charp2p_core::InvitePermission::new(member_id, true)
+                    .encode()
+                    .unwrap(),
+                42,
+                |store, event, _, _| {
+                    store.put_event(event).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        {
+            let mut owner_store = owner_service.store.lock().unwrap();
+            owner_store.put_event(&forged).unwrap();
+            let mut provider = owner_service.provider.lock().unwrap();
+            owner_service
+                .materialize_pending_messages(&mut provider, &mut owner_store, group_id)
+                .unwrap();
+            assert!(!owner_store
+                .has_invite_permission(group_id, member_id)
+                .unwrap());
+        }
+
+        let grant = charp2p_core::InvitePermission::new(member_id, true);
+        owner_service
+            .create_application_event_at(
+                group_id,
+                &owner,
+                EventKind::InvitePermissionChanged,
+                &grant.encode().unwrap(),
+                43,
+                |store, event, snapshot, _| {
+                    store
+                        .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                            event, snapshot, &grant,
+                        )
+                        .map(|_| ())
+                        .map_err(|_| "message_store_unavailable")
+                },
+            )
+            .unwrap();
+        pull_all(&owner_service, &member_service, member_id, group_id);
+        assert_eq!(
+            member_service
+                .store
+                .lock()
+                .unwrap()
+                .invite_permitted_devices(group_id)
+                .unwrap(),
+            vec![member_id]
         );
     }
 

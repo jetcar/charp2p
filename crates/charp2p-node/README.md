@@ -6,7 +6,11 @@ rejects synchronization requests.
 
 Relay service is bounded to 32 reservations, one reservation per peer, 32
 simultaneous circuits, four circuits per peer, five minutes per circuit, and
-32 MiB per circuit. The upstream per-peer and per-IP request rate limits remain
+32 MiB per circuit. An operator can lower those limits with
+`--relay-max-circuits <1-32>` (`CHARP2P_NODE_RELAY_MAX_CIRCUITS`) and
+`--relay-max-circuit-mib <1-32>` (`CHARP2P_NODE_RELAY_MAX_CIRCUIT_MIB`), or
+offer DHT routing only with `--disable-relay` (`CHARP2P_NODE_DISABLE_RELAY=true`).
+Values outside those bounds stop startup. The upstream per-peer and per-IP request rate limits remain
 enabled. Production metrics, deployment packaging, and load-tested quotas are
 later increments.
 

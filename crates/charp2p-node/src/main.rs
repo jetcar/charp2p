@@ -7,7 +7,7 @@ use std::{
 };
 
 use charp2p_core::{JoinRejectReason, SyncRejectReason};
-use charp2p_network::{DiscoveryOperation, NetworkEvent, NetworkNode};
+use charp2p_network::{DiscoveryOperation, NetworkEvent, NetworkNode, RelayLimits};
 use clap::Parser;
 use libp2p::{Multiaddr, PeerId, identity::Keypair};
 use thiserror::Error;
@@ -44,17 +44,41 @@ struct Config {
     /// Blank lines and lines starting with `#` are ignored.
     #[arg(long, env = "CHARP2P_NODE_BLOCKED_PEERS")]
     blocked_peers: Option<PathBuf>,
+
+    /// Simultaneous relayed circuits this node allows (1 to 32).
+    #[arg(long, env = "CHARP2P_NODE_RELAY_MAX_CIRCUITS", default_value_t = 32)]
+    relay_max_circuits: u32,
+
+    /// Bytes one relayed circuit may carry, in whole MiB (1 to 32).
+    #[arg(long, env = "CHARP2P_NODE_RELAY_MAX_CIRCUIT_MIB", default_value_t = 32)]
+    relay_max_circuit_mib: u32,
+
+    /// Offer DHT routing only and refuse relay reservations and circuits.
+    #[arg(long, env = "CHARP2P_NODE_DISABLE_RELAY")]
+    disable_relay: bool,
+}
+
+impl Config {
+    fn relay_limits(&self) -> Result<Option<RelayLimits>, NodeError> {
+        if self.disable_relay {
+            return Ok(None);
+        }
+        RelayLimits::new(self.relay_max_circuits, self.relay_max_circuit_mib)
+            .map(Some)
+            .map_err(|_| NodeError::RelayLimitsInvalid)
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), NodeError> {
     let config = Config::parse();
+    let relay_limits = config.relay_limits()?;
     let identity = load_or_create_identity(&config.identity)?;
     let blocked_peers = match &config.blocked_peers {
         Some(path) => read_blocked_peers(path)?,
         None => Vec::new(),
     };
-    let mut node = NetworkNode::new_routing(identity);
+    let mut node = NetworkNode::new_routing_with_relay(identity, relay_limits);
     for blocked_peer in &blocked_peers {
         node.block_peer(*blocked_peer);
     }
@@ -63,6 +87,14 @@ async fn main() -> Result<(), NodeError> {
 
     println!("CharP2P routing node");
     println!("Peer ID: {peer_id}");
+    match relay_limits {
+        Some(limits) => println!(
+            "Relay: up to {} MiB per {}-second circuit period",
+            limits.max_bytes_per_circuit_period() / (1024 * 1024),
+            RelayLimits::circuit_duration().as_secs()
+        ),
+        None => println!("Relay: disabled"),
+    }
     if !blocked_peers.is_empty() {
         println!("Blocked peer identities: {}", blocked_peers.len());
     }
@@ -236,6 +268,8 @@ enum NodeError {
     BlockedPeersTooLarge,
     #[error("blocked peer list line {line} is not a peer ID")]
     BlockedPeerInvalid { line: usize },
+    #[error("relay limits must be 1 to 32 circuits and 1 to 32 MiB per circuit")]
+    RelayLimitsInvalid,
     #[error("network operation failed")]
     Network(#[from] charp2p_network::NetworkError),
     #[error("shutdown signal handler failed")]
@@ -248,10 +282,12 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use charp2p_network::RelayLimits;
+    use clap::Parser;
     use libp2p::identity::Keypair;
 
     use super::{
-        MAX_BLOCKED_PEERS, NodeError, create_private_file, load_or_create_identity,
+        Config, MAX_BLOCKED_PEERS, NodeError, create_private_file, load_or_create_identity,
         parse_blocked_peers, read_blocked_peers, read_identity,
     };
 
@@ -335,5 +371,46 @@ mod tests {
             read_blocked_peers(&directory.path().join("missing.txt")),
             Err(NodeError::BlockedPeersIo(_))
         ));
+    }
+
+    #[test]
+    fn relay_limits_default_to_the_maximum_and_follow_operator_choices() {
+        let default = Config::try_parse_from(["charp2p-node"]).unwrap();
+        assert_eq!(
+            default.relay_limits().unwrap(),
+            Some(RelayLimits::maximum())
+        );
+
+        let reduced = Config::try_parse_from([
+            "charp2p-node",
+            "--relay-max-circuits",
+            "4",
+            "--relay-max-circuit-mib",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(
+            reduced.relay_limits().unwrap(),
+            Some(RelayLimits::new(4, 8).unwrap())
+        );
+
+        let disabled = Config::try_parse_from(["charp2p-node", "--disable-relay"]).unwrap();
+        assert_eq!(disabled.relay_limits().unwrap(), None);
+    }
+
+    #[test]
+    fn relay_limits_outside_the_fixed_bounds_are_rejected() {
+        for args in [
+            ["charp2p-node", "--relay-max-circuits", "0"],
+            ["charp2p-node", "--relay-max-circuits", "33"],
+            ["charp2p-node", "--relay-max-circuit-mib", "0"],
+            ["charp2p-node", "--relay-max-circuit-mib", "33"],
+        ] {
+            let config = Config::try_parse_from(args).unwrap();
+            assert!(matches!(
+                config.relay_limits(),
+                Err(NodeError::RelayLimitsInvalid)
+            ));
+        }
     }
 }

@@ -128,19 +128,6 @@ impl Behaviour {
     }
 }
 
-fn relay_server_config() -> relay::Config {
-    relay::Config {
-        max_reservations: 32,
-        max_reservations_per_peer: 1,
-        reservation_duration: RELAY_RESERVATION_DURATION,
-        max_circuits: 32,
-        max_circuits_per_peer: 4,
-        max_circuit_duration: RELAY_CIRCUIT_DURATION,
-        max_circuit_bytes: RELAY_CIRCUIT_BYTES,
-        ..Default::default()
-    }
-}
-
 /// Connection bounds for nodes that accept inbound peers on behalf of the
 /// network. Client nodes dial only the peers they need and stay unbounded.
 fn serving_connection_limits() -> connection_limits::ConnectionLimits {
@@ -150,8 +137,9 @@ fn serving_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
 }
 
-/// User-chosen relay capacity for an opted-in desktop contributor. Both
-/// limits stay within the routing node's fixed limits (ADR-026, ADR-031).
+/// Relay capacity chosen by a routing node operator or an opted-in desktop
+/// contributor. Both limits stay within the fixed bounds of ADR-026 and
+/// ADR-031.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RelayLimits {
     max_circuits: u32,
@@ -172,6 +160,14 @@ impl RelayLimits {
             max_circuits,
             max_circuit_bytes,
         })
+    }
+
+    /// Returns the largest relay capacity any node may offer.
+    pub fn maximum() -> Self {
+        Self {
+            max_circuits: MAX_RELAY_CIRCUITS,
+            max_circuit_bytes: RELAY_CIRCUIT_BYTES,
+        }
     }
 
     /// Returns the most relayed bytes these limits allow per circuit duration.
@@ -238,12 +234,19 @@ impl NetworkNode {
         )
     }
 
-    /// Builds a routing node that answers Kademlia queries from other peers.
+    /// Builds a routing node that answers Kademlia queries from other peers
+    /// and relays circuits within the maximum relay limits.
     pub fn new_routing(identity: Keypair) -> Self {
+        Self::new_routing_with_relay(identity, Some(RelayLimits::maximum()))
+    }
+
+    /// Builds a routing node whose operator chose its relay capacity, or
+    /// disabled relaying when no limits are given.
+    pub fn new_routing_with_relay(identity: Keypair, relay: Option<RelayLimits>) -> Self {
         Self::with_dht_mode(
             identity,
             kad::Mode::Server,
-            Some(relay_server_config()),
+            relay.map(|limits| limits.server_config()),
             serving_connection_limits(),
             Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP),
             false,
@@ -1159,6 +1162,15 @@ mod tests {
 
         let single = RelayLimits::new(1, 32).unwrap().server_config();
         assert_eq!(single.max_circuits_per_peer, 1);
+
+        let maximum = RelayLimits::maximum();
+        assert_eq!(maximum, RelayLimits::new(32, 32).unwrap());
+        let config = maximum.server_config();
+        assert_eq!(config.max_reservations, 32);
+        assert_eq!(config.max_reservations_per_peer, 1);
+        assert_eq!(config.max_circuits, 32);
+        assert_eq!(config.max_circuits_per_peer, 4);
+        assert_eq!(config.max_circuit_bytes, 32 * 1024 * 1024);
     }
 
     #[tokio::test]

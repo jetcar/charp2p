@@ -659,8 +659,10 @@ message payloads.
 The standalone node implements bootstrap and Kademlia routing with in-memory
 DHT state plus Circuit Relay v2. It rejects group synchronization requests.
 Relay reservations and circuits have fixed count, duration, byte, per-peer,
-and upstream per-IP rate bounds. An operator-supplied list of blocked peer
-IDs, read at startup, refuses those identities' connections on that node only.
+and upstream per-IP rate bounds; the operator may lower the circuit count and
+per-circuit byte limit or disable relaying, but never exceed those bounds. An
+operator-supplied list of blocked peer IDs, read at startup, refuses those
+identities' connections on that node only.
 Routing nodes and opted-in desktop contributors bound inbound connections: at
 most 128 pending and 1,024 established inbound connections, 16 established
 direct inbound connections per remote IP address, and 4 established

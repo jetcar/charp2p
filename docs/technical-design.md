@@ -686,7 +686,9 @@ Before protocol implementation:
    executable Windows prototype. The Android project now cross-compiles the
    same Rust core and assembles an arm64 debug APK. Emulator and physical-device
    validation remain part of the application integration gate.
-2. Select the portable core and UI stack.
+2. ~~Select the portable core and UI stack.~~ A shared Rust core with Tauri 2
+   application shells and a React interface; see
+   `docs/decisions/0001-application-stack.md`.
 3. ~~Define canonical binary serialization and size limits.~~ See
    "Serialization and size limits".
 4. ~~Write protocol test vectors for identities, invitations, event signatures,

@@ -1613,7 +1613,13 @@ function App() {
   const [inviteInput, setInviteInput] = useState("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
   const [verifyingInvite, setVerifyingInvite] = useState(false);
-  const [pendingGroup, setPendingGroup] = useState<PendingGroup | null>(null);
+  const [pendingGroups, setPendingGroups] = useState<PendingGroup[]>([]);
+  const [openPendingGroupId, setOpenPendingGroupId] = useState("");
+  const openPendingGroupIdRef = useRef("");
+  const pendingGroup = useMemo(
+    () => pendingGroups.find(({ groupId }) => groupId === openPendingGroupId) ?? null,
+    [pendingGroups, openPendingGroupId],
+  );
   const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([]);
   const [synchronizingGroup, setSynchronizingGroup] = useState(false);
   const [synchronizationResult, setSynchronizationResult] =
@@ -1652,10 +1658,10 @@ function App() {
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [cancellingPending, setCancellingPending] = useState(false);
-  const [autoJoinRetrying, setAutoJoinRetrying] = useState(false);
+  const [autoJoinWaitingIds, setAutoJoinWaitingIds] = useState<string[]>([]);
   const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
-  const pendingExpiryCleanupRef = useRef("");
+  const pendingExpiryRefreshAtRef = useRef(0);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
@@ -1726,7 +1732,8 @@ function App() {
           setError(errorMessage(identityResult.reason));
         }
         if (pendingResult.status === "fulfilled") {
-          setPendingGroup(pendingResult.value[0] ?? null);
+          setPendingGroups(pendingResult.value);
+          setOpenPendingGroupId(pendingResult.value[0]?.groupId ?? "");
         } else {
           setError(errorMessage(pendingResult.reason));
         }
@@ -1808,33 +1815,45 @@ function App() {
   }, [issuedInvitation]);
 
   useEffect(() => {
-    if (!pendingGroup || !isTauri()) return;
-    const groupId = pendingGroup.groupId;
-    if (pendingExpiryCleanupRef.current === groupId) return;
+    openPendingGroupIdRef.current = openPendingGroupId;
+  }, [openPendingGroupId]);
+
+  // Refreshing the saved invitations removes expired ones (and their pending
+  // joins) on the backend, so the earliest expiry drives one shared timer.
+  useEffect(() => {
+    if (pendingGroups.length === 0 || joiningGroup || !isTauri()) return;
     let active = true;
     let timer: number | undefined;
+    const earliestExpiryMs = Math.min(
+      ...pendingGroups.map(({ expiresAtUnix }) => expiresAtUnix * 1000),
+    );
     const scheduleExpiry = () => {
-      const remainingMs = pendingGroup.expiresAtUnix * 1000 - Date.now();
-      if (remainingMs > 0) {
+      const remainingMs = earliestExpiryMs - Date.now();
+      const sinceRefreshMs = Date.now() - pendingExpiryRefreshAtRef.current;
+      if (remainingMs > 0 || sinceRefreshMs < INVITATION_EXPIRY_CHECK_INTERVAL_MS) {
         timer = window.setTimeout(
           scheduleExpiry,
-          Math.min(remainingMs, INVITATION_EXPIRY_CHECK_INTERVAL_MS),
+          Math.max(
+            Math.min(remainingMs, INVITATION_EXPIRY_CHECK_INTERVAL_MS),
+            INVITATION_EXPIRY_CHECK_INTERVAL_MS - sinceRefreshMs,
+            0,
+          ),
         );
         return;
       }
-      if (joiningGroup || pendingExpiryCleanupRef.current === groupId) return;
-      pendingExpiryCleanupRef.current = groupId;
+      pendingExpiryRefreshAtRef.current = Date.now();
       setCancellingPending(true);
-      void invoke("cancel_pending_invitation", { groupId })
-        .then(() => {
+      void invoke<PendingGroup[]>("pending_invitations")
+        .then((pending) => {
           if (!active) return;
-          setPendingGroup((current) => current?.groupId === groupId ? null : current);
+          setPendingGroups(pending);
+          setOpenPendingGroupId((current) =>
+            pending.some(({ groupId }) => groupId === current) ? current : "");
           setPeerSearchResult(null);
           setError("");
         })
         .catch((reason) => {
           if (active) {
-            pendingExpiryCleanupRef.current = "";
             setError(errorMessage(reason));
             timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
           }
@@ -1848,29 +1867,37 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [pendingGroup, joiningGroup]);
+  }, [pendingGroups, joiningGroup]);
 
-  const pendingJoinGroupId = pendingGroup?.groupId ?? "";
+  const pendingJoinGroupIds = pendingGroups.map(({ groupId }) => groupId).join(",");
 
-  // A saved invitation keeps trying to join while the app runs, so the user
-  // need not be present when a group owner comes online.
+  // Saved invitations keep trying to join while the app runs, one at a time,
+  // so the user need not be present when a group owner comes online.
   useEffect(() => {
-    setAutoJoinRetrying(false);
-    if (!isTauri() || !pendingJoinGroupId) return;
+    if (!isTauri() || !pendingJoinGroupIds) {
+      setAutoJoinWaitingIds([]);
+      return;
+    }
     let active = true;
     let timer: number | undefined;
+    const groupIds = pendingJoinGroupIds.split(",");
+    setAutoJoinWaitingIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
 
-    async function retryJoin() {
-      const retry = await attemptPendingJoin(pendingJoinGroupId, true);
-      if (active && retry) timer = window.setTimeout(retryJoin, PENDING_JOIN_RETRY_INTERVAL_MS);
+    async function retryJoins() {
+      let retry = false;
+      for (const groupId of groupIds) {
+        if (!active) return;
+        if (await attemptPendingJoin(groupId, true)) retry = true;
+      }
+      if (active && retry) timer = window.setTimeout(retryJoins, PENDING_JOIN_RETRY_INTERVAL_MS);
     }
 
-    timer = window.setTimeout(retryJoin, PENDING_JOIN_START_DELAY_MS);
+    timer = window.setTimeout(retryJoins, PENDING_JOIN_START_DELAY_MS);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [pendingJoinGroupId]);
+  }, [pendingJoinGroupIds]);
 
   // One background advertisement covers every owned group, so members of a
   // group that is not open here can still join and synchronize.
@@ -2219,8 +2246,11 @@ function App() {
       const accepted = await invoke<PendingGroup>("accept_invitation", {
         input: inviteInput,
       });
-      pendingExpiryCleanupRef.current = "";
-      setPendingGroup(accepted);
+      setPendingGroups((groups) => [
+        ...groups.filter(({ groupId }) => groupId !== accepted.groupId),
+        accepted,
+      ]);
+      setOpenPendingGroupId(accepted.groupId);
       setPeerSearchResult(null);
       setInvitationPreview(null);
       setInviteInput("");
@@ -2262,19 +2292,24 @@ function App() {
         ...groups.filter(({ groupId }) => groupId !== joined.groupId),
         joined,
       ]);
-      setActiveGroupId(joined.groupId);
-      setSynchronizationResult(null);
-      pendingExpiryCleanupRef.current = "";
-      setPendingGroup((current) => current?.groupId === groupId ? null : current);
-      setPeerSearchResult(null);
-      setAutoJoinRetrying(false);
+      // An automatic join of an invitation that is not open here must not
+      // switch away from the group the user is looking at.
+      if (!automatic || openPendingGroupIdRef.current === groupId) {
+        setActiveGroupId(joined.groupId);
+        setSynchronizationResult(null);
+        setPeerSearchResult(null);
+      }
+      setPendingGroups((groups) => groups.filter((group) => group.groupId !== groupId));
+      setOpenPendingGroupId((current) => current === groupId ? "" : current);
+      setAutoJoinWaitingIds((current) => current.filter((id) => id !== groupId));
       return false;
     } catch (reason) {
       const retryable = typeof reason === "string" && RETRYABLE_JOIN_ERRORS.has(reason);
-      if (automatic && retryable) {
-        setAutoJoinRetrying(true);
-      } else {
-        setAutoJoinRetrying(false);
+      setAutoJoinWaitingIds((current) => [
+        ...current.filter((id) => id !== groupId),
+        ...(automatic && retryable ? [groupId] : []),
+      ]);
+      if (!(automatic && retryable)) {
         setError(errorMessage(reason));
       }
       return retryable;
@@ -2294,17 +2329,16 @@ function App() {
     if (!window.confirm("Remove this saved invitation from this device?")) return;
 
     setError("");
-    pendingExpiryCleanupRef.current = pendingGroup.groupId;
+    const cancelledGroupId = pendingGroup.groupId;
     setCancellingPending(true);
     try {
       await invoke("cancel_pending_invitation", {
-        groupId: pendingGroup.groupId,
+        groupId: cancelledGroupId,
       });
-      pendingExpiryCleanupRef.current = "";
-      setPendingGroup(null);
+      setPendingGroups((groups) => groups.filter(({ groupId }) => groupId !== cancelledGroupId));
+      setOpenPendingGroupId("");
       setPeerSearchResult(null);
     } catch (reason) {
-      pendingExpiryCleanupRef.current = "";
       setError(errorMessage(reason));
     } finally {
       setCancellingPending(false);
@@ -2900,7 +2934,7 @@ function App() {
               <div className="status-row" aria-label="Join status">
                 <span className="status-chip">✓ Verified invitation</span>
                 <span className="status-chip muted">○ {searchingPeers ? "Searching…" : peerSearchDescription(peerSearchResult)}</span>
-                {(joiningGroup || autoJoinRetrying) && (
+                {(joiningGroup || autoJoinWaitingIds.includes(pendingGroup.groupId)) && (
                   <span className="status-chip muted">{joiningGroup ? "Joining…" : "Waiting for the group owner · retrying every minute"}</span>
                 )}
               </div>
@@ -2922,10 +2956,21 @@ function App() {
               <button className="text-button" disabled={joiningGroup || searchingPeers || cancellingPending || !isTauri()} onClick={cancelPendingInvitation} type="button">
                 {cancellingPending ? "Removing…" : "Remove invitation"}
               </button>
+              <button
+                className="text-button"
+                onClick={() => {
+                  setOpenPendingGroupId("");
+                  setPeerSearchResult(null);
+                  setError("");
+                }}
+                type="button"
+              >
+                {pendingGroups.length > 1 ? "Show all groups and invitations" : "Back to groups"}
+              </button>
             </section>
           )}
 
-          {step === 3 && !pendingGroup && !joinMode && !createGroupMode && !showMembers && availableGroups.length > 0 && (
+          {step === 3 && !pendingGroup && !joinMode && !createGroupMode && !showMembers && (availableGroups.length > 0 || pendingGroups.length > 0) && (
             <nav className="group-switcher" aria-label="Your groups">
               <div className="group-switcher-list">
                 {availableGroups.map((group) => (
@@ -2959,6 +3004,26 @@ function App() {
                           {unreadCounts[group.groupId] > 99 ? "99+" : unreadCounts[group.groupId]}
                         </em>
                       )}
+                    </span>
+                  </button>
+                ))}
+                {pendingGroups.map((group) => (
+                  <button
+                    className="pending"
+                    key={`pending-${group.groupId}`}
+                    onClick={() => {
+                      setOpenPendingGroupId(group.groupId);
+                      setPeerSearchResult(null);
+                      setError("");
+                    }}
+                    type="button"
+                  >
+                    <strong>{group.groupName}</strong>
+                    <span>
+                      Pending invitation
+                      <i className="group-connection waiting">
+                        {autoJoinWaitingIds.includes(group.groupId) ? "Waiting for owner" : expiryDescription(group.expiresAtUnix)}
+                      </i>
                     </span>
                   </button>
                 ))}
@@ -3345,7 +3410,7 @@ function App() {
             </form>
           )}
 
-          {step === 3 && !pendingGroup && availableGroups.length === 0 && !joinMode && !createGroupMode && (
+          {step === 3 && !pendingGroup && availableGroups.length === 0 && pendingGroups.length === 0 && !joinMode && !createGroupMode && (
             <section className="setup-form ready-card">
               <div className="ready-check" aria-hidden="true">✓</div>
               <header>

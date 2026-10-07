@@ -319,6 +319,17 @@ function synchronizationDescription(synchronizedAtUnix: number | null) {
   });
 }
 
+function lastSynchronizationLabel(synchronizedAtUnix: number | null) {
+  if (synchronizedAtUnix === null) return "Not synced yet";
+  const elapsedSeconds = Math.max(0, Math.floor(Date.now() / 1000) - synchronizedAtUnix);
+  if (elapsedSeconds < 60) return "Synced just now";
+  const minutes = Math.floor(elapsedSeconds / 60);
+  if (minutes < 60) return `Synced ${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `Synced ${hours} h ago`;
+  return `Synced ${Math.floor(hours / 24)} days ago`;
+}
+
 function signedActivityDescription(lastSignedAtUnixMs: number | undefined) {
   if (lastSignedAtUnixMs === undefined) return "No signed activity received";
   return `Last signed activity ${new Date(lastSignedAtUnixMs).toLocaleString([], {
@@ -1696,11 +1707,13 @@ function App() {
         groupId: group.groupId,
         groupName: group.groupName,
         role: "Owner",
+        lastSynchronizedAtUnix: undefined as number | null | undefined,
       })),
       ...joinedGroups.map((group) => ({
         groupId: group.groupId,
         groupName: group.groupName,
         role: "Member",
+        lastSynchronizedAtUnix: group.lastSynchronizedAtUnix as number | null | undefined,
       })),
     ],
     [joinedGroups, localGroups],
@@ -2991,6 +3004,14 @@ function App() {
                     <strong>{group.groupName}</strong>
                     <span>
                       {group.role}
+                      {group.lastSynchronizedAtUnix !== undefined && (
+                        <i
+                          className="group-last-sync"
+                          title={`Last synchronized: ${synchronizationDescription(group.lastSynchronizedAtUnix)}`}
+                        >
+                          {lastSynchronizationLabel(group.lastSynchronizedAtUnix)}
+                        </i>
+                      )}
                       {connectionStates[group.groupId] && (
                         <i className={`group-connection ${connectionStates[group.groupId]}`}>
                           {groupConnectionDescription(connectionStates[group.groupId])}

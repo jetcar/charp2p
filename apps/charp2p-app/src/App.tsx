@@ -465,6 +465,9 @@ function MembersView({
   removedDeviceIds,
   readmittingDeviceId,
   onAllowReadmission,
+  invitePermittedDeviceIds,
+  changingInvitePermissionId,
+  onToggleInvitePermission,
   onRename,
   onLeave,
   leaving,
@@ -487,6 +490,9 @@ function MembersView({
   removedDeviceIds: string[];
   readmittingDeviceId: string;
   onAllowReadmission: (deviceId: string) => void;
+  invitePermittedDeviceIds: string[];
+  changingInvitePermissionId: string;
+  onToggleInvitePermission: (deviceId: string, granted: boolean) => void;
   onRename: (groupName: string) => Promise<void>;
   onLeave: (() => void) | null;
   leaving: boolean;
@@ -558,6 +564,7 @@ function MembersView({
           const isOwner = member.deviceId === ownerDeviceId;
           const isLocal = member.deviceId === profile?.peerId;
           const isBlocked = blockedDeviceIds.includes(member.deviceId);
+          const mayInvite = invitePermittedDeviceIds.includes(member.deviceId);
           const name = isLocal
             ? `${profile?.deviceName ?? "This device"} (You)`
             : isOwner
@@ -580,6 +587,7 @@ function MembersView({
               <div className="member-actions">
                 <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
                 {isBlocked && <span className="status-chip blocked-chip">Blocked here</span>}
+                {mayInvite && <span className="status-chip">May invite</span>}
                 {sequenceConflicts[member.deviceId] && <span className="status-chip conflict-chip">Conflicting events</span>}
                 {!isLocal && (
                   <button
@@ -589,6 +597,18 @@ function MembersView({
                     type="button"
                   >
                     {blockingDeviceId === member.deviceId ? "Saving…" : isBlocked ? "Unblock" : "Block on this device"}
+                  </button>
+                )}
+                {canManageMembers && !isOwner && (
+                  <button
+                    className="member-block"
+                    disabled={Boolean(changingInvitePermissionId)}
+                    onClick={() => onToggleInvitePermission(member.deviceId, !mayInvite)}
+                    type="button"
+                  >
+                    {changingInvitePermissionId === member.deviceId
+                      ? "Saving…"
+                      : mayInvite ? "Withdraw invite permission" : "Allow inviting"}
                   </button>
                 )}
                 {canManageMembers && !isOwner && (
@@ -637,6 +657,7 @@ function MembersView({
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
       <p className="preview-note">Activity times are the latest signed event this device holds from each member, as claimed by that member. They do not show whether a device is online.</p>
       <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
+      {canManageMembers && <p className="preview-note">A device allowed to invite can ask this owner device for an invitation to share while this device is reachable. This device still admits every join request. Withdrawing the permission, or removing the device, revokes the invitations it requested.</p>}
       {canManageMembers && <p className="preview-note">Removing a device blocks future group messages and invitation reuse. Messages already saved on that device cannot be erased.</p>}
       {onLeave && (
         <div className="leave-group">
@@ -1661,6 +1682,8 @@ function App() {
   const [blockingDevice, setBlockingDevice] = useState("");
   const [removedDevices, setRemovedDevices] = useState<string[]>([]);
   const [readmittingDevice, setReadmittingDevice] = useState("");
+  const [invitePermittedDevices, setInvitePermittedDevices] = useState<string[]>([]);
+  const [changingInvitePermission, setChangingInvitePermission] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const outgoingMessageBytes = useMemo(
     () => new TextEncoder().encode(outgoingMessage).length,
@@ -2126,6 +2149,7 @@ function App() {
       setGroupMembers([]);
       setBlockedDevices([]);
       setRemovedDevices([]);
+      setInvitePermittedDevices([]);
       setMemberActivity({});
       setSequenceConflicts({});
       setMembersError("");
@@ -2138,17 +2162,19 @@ function App() {
 
     async function refreshMembers() {
       try {
-        const [members, blocked, activity, conflicts, removed] = await Promise.all([
+        const [members, blocked, activity, conflicts, removed, permitted] = await Promise.all([
           invoke<GroupMemberDevice[]>("group_members", { groupId }),
           invoke<string[]>("blocked_group_devices", { groupId }),
           invoke<MemberActivity[]>("group_member_activity", { groupId }),
           invoke<DeviceSequenceConflict[]>("group_sequence_conflicts", { groupId }),
           localGroup ? invoke<string[]>("removed_group_members", { groupId }) : Promise.resolve([]),
+          invoke<string[]>("invite_permitted_devices", { groupId }),
         ]);
         if (active) {
           setGroupMembers(members);
           setBlockedDevices(blocked);
           setRemovedDevices(removed);
+          setInvitePermittedDevices(permitted);
           setMemberActivity(Object.fromEntries(activity.map((entry) => [entry.deviceId, entry.lastSignedAtUnixMs])));
           setSequenceConflicts(Object.fromEntries(conflicts.map((entry) => [entry.deviceId, entry])));
           setMembersError("");
@@ -2422,6 +2448,7 @@ function App() {
       });
       setGroupMembers(members);
       setRemovedDevices(await invoke<string[]>("removed_group_members", { groupId: localGroup.groupId }));
+      setInvitePermittedDevices(await invoke<string[]>("invite_permitted_devices", { groupId: localGroup.groupId }));
     } catch (reason) {
       setMembersError(errorMessage(reason));
     } finally {
@@ -2443,6 +2470,25 @@ function App() {
       setMembersError(errorMessage(reason));
     } finally {
       setReadmittingDevice("");
+    }
+  }
+
+  async function setMemberInvitePermission(memberDeviceId: string, granted: boolean) {
+    if (!localGroup || changingInvitePermission || !isTauri()) return;
+    if (!granted && !window.confirm("Withdraw this device's invite permission? Invitations it requested are revoked.")) return;
+    setMembersError("");
+    setChangingInvitePermission(memberDeviceId);
+    try {
+      setInvitePermittedDevices(await invoke<string[]>("set_member_invite_permission", {
+        groupId: localGroup.groupId,
+        memberDeviceId,
+        granted,
+      }));
+      setIssuedInvitations(await invoke<IssuedInvitation[]>("issued_invitations"));
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setChangingInvitePermission("");
     }
   }
 
@@ -3088,6 +3134,9 @@ function App() {
               removedDeviceIds={removedDevices}
               readmittingDeviceId={readmittingDevice}
               onAllowReadmission={allowGroupMemberReadmission}
+              invitePermittedDeviceIds={invitePermittedDevices}
+              changingInvitePermissionId={changingInvitePermission}
+              onToggleInvitePermission={setMemberInvitePermission}
               onRename={renameLocalGroup}
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}

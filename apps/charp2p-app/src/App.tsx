@@ -129,6 +129,10 @@ const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
+const PENDING_JOIN_RETRY_INTERVAL_MS = 60_000;
+const PENDING_JOIN_START_DELAY_MS = 1_000;
+// Join failures that mean no group owner answered yet; anything else stops automatic retries.
+const RETRYABLE_JOIN_ERRORS = new Set(["network_join_failed", "network_join_timed_out", "join_busy"]);
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
@@ -1648,6 +1652,8 @@ function App() {
   const [acceptingInvite, setAcceptingInvite] = useState(false);
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [cancellingPending, setCancellingPending] = useState(false);
+  const [autoJoinRetrying, setAutoJoinRetrying] = useState(false);
+  const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
   const pendingExpiryCleanupRef = useRef("");
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
@@ -1843,6 +1849,28 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [pendingGroup, joiningGroup]);
+
+  const pendingJoinGroupId = pendingGroup?.groupId ?? "";
+
+  // A saved invitation keeps trying to join while the app runs, so the user
+  // need not be present when a group owner comes online.
+  useEffect(() => {
+    setAutoJoinRetrying(false);
+    if (!isTauri() || !pendingJoinGroupId) return;
+    let active = true;
+    let timer: number | undefined;
+
+    async function retryJoin() {
+      const retry = await attemptPendingJoin(pendingJoinGroupId, true);
+      if (active && retry) timer = window.setTimeout(retryJoin, PENDING_JOIN_RETRY_INTERVAL_MS);
+    }
+
+    timer = window.setTimeout(retryJoin, PENDING_JOIN_START_DELAY_MS);
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [pendingJoinGroupId]);
 
   // One background advertisement covers every owned group, so members of a
   // group that is not open here can still join and synchronize.
@@ -2221,15 +2249,15 @@ function App() {
     }
   }
 
-  async function joinPendingGroup() {
-    if (!pendingGroup || joiningGroup || !isTauri()) return;
+  // Returns whether a later automatic attempt may still succeed.
+  async function attemptPendingJoin(groupId: string, automatic: boolean) {
+    if (joiningRef.current) return true;
 
-    setError("");
+    joiningRef.current = true;
+    if (!automatic) setError("");
     setJoiningGroup(true);
     try {
-      const joined = await invoke<JoinedGroup>("join_group", {
-        groupId: pendingGroup.groupId,
-      });
+      const joined = await invoke<JoinedGroup>("join_group", { groupId });
       setJoinedGroups((groups) => [
         ...groups.filter(({ groupId }) => groupId !== joined.groupId),
         joined,
@@ -2237,13 +2265,28 @@ function App() {
       setActiveGroupId(joined.groupId);
       setSynchronizationResult(null);
       pendingExpiryCleanupRef.current = "";
-      setPendingGroup(null);
+      setPendingGroup((current) => current?.groupId === groupId ? null : current);
       setPeerSearchResult(null);
+      setAutoJoinRetrying(false);
+      return false;
     } catch (reason) {
-      setError(errorMessage(reason));
+      const retryable = typeof reason === "string" && RETRYABLE_JOIN_ERRORS.has(reason);
+      if (automatic && retryable) {
+        setAutoJoinRetrying(true);
+      } else {
+        setAutoJoinRetrying(false);
+        setError(errorMessage(reason));
+      }
+      return retryable;
     } finally {
+      joiningRef.current = false;
       setJoiningGroup(false);
     }
+  }
+
+  async function joinPendingGroup() {
+    if (!pendingGroup || joiningGroup || !isTauri()) return;
+    await attemptPendingJoin(pendingGroup.groupId, false);
   }
 
   async function cancelPendingInvitation() {
@@ -2857,6 +2900,9 @@ function App() {
               <div className="status-row" aria-label="Join status">
                 <span className="status-chip">✓ Verified invitation</span>
                 <span className="status-chip muted">○ {searchingPeers ? "Searching…" : peerSearchDescription(peerSearchResult)}</span>
+                {(joiningGroup || autoJoinRetrying) && (
+                  <span className="status-chip muted">{joiningGroup ? "Joining…" : "Waiting for the group owner · retrying every minute"}</span>
+                )}
               </div>
               <dl className="preview-facts">
                 <div><dt>Invited by</dt><dd>{pendingGroup.inviterName}</dd></div>
@@ -2866,7 +2912,7 @@ function App() {
                 <div><dt>Inviter device</dt><dd><code title={pendingGroup.inviterDeviceId}>{shortPeerId(pendingGroup.inviterDeviceId)}</code></dd></div>
               </dl>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
-              <p className="preview-note">Your invitation is stored securely until the invited owner is online.</p>
+              <p className="preview-note">Your invitation is stored securely. While CharP2P is running it tries to join automatically until the group owner is online or the invitation expires.</p>
               <button className="primary-button join-button" disabled={joiningGroup || searchingPeers || cancellingPending || !isTauri()} onClick={joinPendingGroup} type="button">
                 {joiningGroup ? "Joining securely…" : "Connect and join"}
               </button>

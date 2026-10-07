@@ -649,7 +649,8 @@ Relay reservations and circuits have fixed count, duration, byte, per-peer,
 and upstream per-IP rate bounds. An operator-supplied list of blocked peer
 IDs, read at startup, refuses those identities' connections on that node only.
 Routing nodes and opted-in desktop contributors bound inbound connections: at
-most 128 pending and 1,024 established inbound connections, and 4 established
+most 128 pending and 1,024 established inbound connections, 16 established
+direct inbound connections per remote IP address, and 4 established
 connections per peer. Client nodes dial only the peers they need and keep no
 inbound bound.
 Load-tested quotas, metrics, and deployment

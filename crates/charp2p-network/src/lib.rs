@@ -2,6 +2,7 @@
 
 //! Portable libp2p transport and peer-discovery foundation for CharP2P.
 
+mod ip_limits;
 mod join_codec;
 
 use std::{collections::HashMap, time::Duration};
@@ -44,11 +45,13 @@ const MEBIBYTE: u64 = 1024 * 1024;
 const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 4;
+const MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP: u32 = 16;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     blocked_peers: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
     connection_limits: connection_limits::Behaviour,
+    ip_limits: ip_limits::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     dht: kad::Behaviour<kad::store::MemoryStore>,
@@ -65,6 +68,7 @@ impl Behaviour {
         relay_client: relay::client::Behaviour,
         relay_server: Option<relay::Config>,
         connection_limits: connection_limits::ConnectionLimits,
+        max_inbound_per_ip: Option<u32>,
     ) -> Self {
         let peer_id = identity.public().to_peer_id();
         let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
@@ -96,6 +100,7 @@ impl Behaviour {
         Self {
             blocked_peers: allow_block_list::Behaviour::default(),
             connection_limits: connection_limits::Behaviour::new(connection_limits),
+            ip_limits: ip_limits::Behaviour::new(max_inbound_per_ip),
             ping: ping::Behaviour::new(ping::Config::new()),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), identity.public())
@@ -201,6 +206,7 @@ impl NetworkNode {
             kad::Mode::Client,
             None,
             connection_limits::ConnectionLimits::default(),
+            None,
         )
     }
 
@@ -211,6 +217,7 @@ impl NetworkNode {
             kad::Mode::Server,
             Some(relay_server_config()),
             serving_connection_limits(),
+            Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP),
         )
     }
 
@@ -222,6 +229,7 @@ impl NetworkNode {
             kad::Mode::Server,
             relay.map(|limits| limits.server_config()),
             serving_connection_limits(),
+            Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP),
         )
     }
 
@@ -230,6 +238,7 @@ impl NetworkNode {
         dht_mode: kad::Mode,
         relay_server: Option<relay::Config>,
         connection_limits: connection_limits::ConnectionLimits,
+        max_inbound_per_ip: Option<u32>,
     ) -> Self {
         let relay_server_enabled = relay_server.is_some();
         let swarm = SwarmBuilder::with_existing_identity(identity)
@@ -244,6 +253,7 @@ impl NetworkNode {
                     relay_client,
                     relay_server,
                     connection_limits,
+                    max_inbound_per_ip,
                 )
             })
             .expect("behaviour construction is infallible")
@@ -1333,6 +1343,7 @@ mod tests {
             kad::Mode::Server,
             None,
             connection_limits::ConnectionLimits::default().with_max_established_incoming(Some(1)),
+            None,
         );
         let mut first = NetworkNode::new(Keypair::generate_ed25519());
         let mut second = NetworkNode::new(Keypair::generate_ed25519());
@@ -1378,6 +1389,62 @@ mod tests {
         assert!(
             refused.is_err(),
             "a peer beyond the limit must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_node_refuses_inbound_connections_beyond_its_per_ip_limit() {
+        let mut listener = NetworkNode::with_dht_mode(
+            Keypair::generate_ed25519(),
+            kad::Mode::Server,
+            None,
+            connection_limits::ConnectionLimits::default(),
+            Some(1),
+        );
+        let mut first = NetworkNode::new(Keypair::generate_ed25519());
+        let mut second = NetworkNode::new(Keypair::generate_ed25519());
+        let listener_id = listener.peer_id();
+        let first_id = first.peer_id();
+
+        listener
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_address = next_listen_address(&mut listener).await;
+        let dial_address: Multiaddr = format!("{listen_address}/p2p/{listener_id}")
+            .parse()
+            .unwrap();
+
+        first.dial(dial_address.clone()).unwrap();
+        let (peer_id, _) = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    connected = next_connected_peer(&mut listener) => break connected,
+                    _ = first.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("the first peer should connect");
+        assert_eq!(peer_id, first_id);
+
+        second.dial(dial_address).unwrap();
+        let refused = timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = listener.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, .. } = event {
+                            break peer_id;
+                        }
+                    }
+                    _ = first.next_event() => {}
+                    _ = second.next_event() => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            refused.is_err(),
+            "a second peer from the same IP address must not be accepted"
         );
     }
 

@@ -42,7 +42,7 @@
 - [x] Groups page: list every pending invitation, not only the first one returned by `pending_invitations`, and let the user open each.
 - [x] Docs: mark implementation gate 2 (portable core and UI stack) as done, referencing ADR-0001.
 - [x] Routing node: bound pending, established inbound, and per-peer connections on serving nodes (technical-design node policy 'per-IP and per-peer connection limits', part 1/2).
-- [ ] Routing node: per-IP established inbound connection limit (technical-design node policy, part 2/2).
+- [x] Routing node: per-IP established inbound connection limit (technical-design node policy, part 2/2).
 
 ## Needs human
 
@@ -94,3 +94,4 @@
 2026-10-07T06:28:31Z pending join auto-retry: re-derived backlog (gaps: automatic pending-join retry, multiple pending invitations listed, gate 2 doc). Frontend attempts join_group 1 s after a pending invitation loads and every 60 s while it stays pending; network_join_failed/network_join_timed_out/join_busy keep retrying silently with a 'Waiting for the group owner' chip, other errors stop and show; ref guard prevents overlapping manual/automatic attempts. Workspace fmt/clippy/test and npm build pass; src-tauri unchanged.
 2026-10-07T07:27:52Z multiple pending invitations + gate 2 doc: frontend keeps every saved invitation (pendingGroups + opened id instead of only the first); group switcher lists pending invitations (dashed, expiry or 'Waiting for owner') and opens each; pending card gains 'Back to groups'; automatic join retries cycle through all pending invitations every 60 s (an automatic join of a non-open invitation does not switch the active group); expiry handled by one timer at the earliest expiry that refreshes pending_invitations (backend cancels expired ones). technical-design gate 2 marked done referencing ADR-001. Backlog empty; next run should re-derive gaps. Workspace fmt/clippy/test and npm build pass; src-tauri unchanged.
 2026-10-07T08:28:28Z Routing node connection limits 1/2: libp2p connection_limits on routing and contributor nodes (128 pending, 1024 inbound, 4 per peer); loopback test; technical-design updated. All checks pass.
+2026-10-07T09:28:50Z Routing node connection limits 2/2: custom ip_limits behaviour refuses a 17th established direct inbound connection from one remote IP on routing and contributor nodes (relayed/non-IP addresses not counted; clients unbounded); unit test for address parsing and loopback test (limit 1) verified to fail without enforcement; technical-design updated. Backlog empty; next run should re-derive gaps. Workspace fmt/clippy/test and npm build pass; src-tauri unchanged.

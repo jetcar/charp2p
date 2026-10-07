@@ -1069,6 +1069,107 @@ impl MlsProviderService {
         Ok(())
     }
 
+    /// Grants or withdraws one current member device's permission to request
+    /// owner-issued invitations, storing the signed `InvitePermissionChanged`
+    /// event with the advanced provider state in one transaction (ADR-036).
+    pub(crate) fn change_invite_permission(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        target_device_id: PeerId,
+        granted: bool,
+    ) -> Result<Vec<PeerId>, &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        self.change_invite_permission_at(
+            group_id,
+            author,
+            target_device_id,
+            granted,
+            created_at_unix_ms,
+        )
+    }
+
+    fn change_invite_permission_at(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        target_device_id: PeerId,
+        granted: bool,
+        created_at_unix_ms: u64,
+    ) -> Result<Vec<PeerId>, &'static str> {
+        if target_device_id == author.peer_id() {
+            return Err("invite_permission_owner");
+        }
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            let joined = store
+                .joined_groups()
+                .map_err(|_| "message_store_unavailable")?;
+            if joined.iter().any(|group| group.group_id == group_id) {
+                return Err("group_not_owned");
+            }
+            let current = store
+                .has_invite_permission(group_id, target_device_id)
+                .map_err(|_| "message_store_unavailable")?;
+            if current == granted {
+                return store
+                    .invite_permitted_devices(group_id)
+                    .map_err(|_| "message_store_unavailable");
+            }
+        }
+        let target = target_device_id.to_string();
+        if !self
+            .group_members(group_id)?
+            .iter()
+            .any(|member| member.device_id == target)
+        {
+            return Err("member_not_found");
+        }
+        let permission = InvitePermission::new(target_device_id, granted);
+        let encoded = permission
+            .encode()
+            .map_err(|_| "invite_permission_invalid")?;
+        self.create_application_event_at(
+            group_id,
+            author,
+            EventKind::InvitePermissionChanged,
+            &encoded,
+            created_at_unix_ms,
+            |store, event, encrypted_snapshot, _key| {
+                store
+                    .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                        event,
+                        encrypted_snapshot,
+                        &permission,
+                    )
+                    .map_err(|_| "message_store_unavailable")?;
+                Ok(())
+            },
+        )?;
+        self.invite_permitted_devices(group_id)
+    }
+
+    /// Returns member devices currently permitted to request invitations.
+    pub(crate) fn invite_permitted_devices(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<PeerId>, &'static str> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        store
+            .invite_permitted_devices(group_id)
+            .map_err(|_| "message_store_unavailable")
+    }
+
     /// Returns authenticated group names from applied metadata changes.
     pub(crate) fn current_group_names(&self) -> Result<Vec<(PeerId, String)>, &'static str> {
         let store = self
@@ -4227,6 +4328,85 @@ mod tests {
                 .unwrap(),
             vec![member_id]
         );
+    }
+
+    #[test]
+    fn owner_grants_and_withdraws_invite_permission_for_current_members_only() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            owner_service.change_invite_permission_at(group_id, &owner, owner.peer_id(), true, 43),
+            Err("invite_permission_owner")
+        );
+        assert_eq!(
+            owner_service.change_invite_permission_at(
+                group_id,
+                &owner,
+                DeviceIdentity::generate().peer_id(),
+                true,
+                43
+            ),
+            Err("member_not_found")
+        );
+        assert_eq!(
+            owner_service
+                .change_invite_permission_at(group_id, &owner, member_id, true, 43)
+                .unwrap(),
+            vec![member_id]
+        );
+        // Repeating the current state authors no further event.
+        let events = owner_events(&owner_service, group_id, &owner);
+        assert_eq!(
+            owner_service
+                .change_invite_permission_at(group_id, &owner, member_id, true, 44)
+                .unwrap(),
+            vec![member_id]
+        );
+        assert_eq!(owner_events(&owner_service, group_id, &owner), events);
+        assert_eq!(
+            owner_service
+                .change_invite_permission_at(group_id, &owner, member_id, false, 45)
+                .unwrap(),
+            Vec::<PeerId>::new()
+        );
+        assert!(owner_service
+            .invite_permitted_devices(group_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn owner_events(
+        service: &MlsProviderService,
+        group_id: PeerId,
+        owner: &DeviceIdentity,
+    ) -> usize {
+        service
+            .store
+            .lock()
+            .unwrap()
+            .event_ids_after(group_id, owner.peer_id(), 0, 100)
+            .unwrap()
+            .len()
     }
 
     #[test]

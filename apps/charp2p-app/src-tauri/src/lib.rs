@@ -217,6 +217,46 @@ fn rename_group(
 }
 
 #[tauri::command]
+fn invite_permitted_devices(
+    group_id: String,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    mls_service
+        .invite_permitted_devices(group_id)
+        .map(|devices| devices.iter().map(ToString::to_string).collect())
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn set_member_invite_permission(
+    group_id: String,
+    member_device_id: String,
+    granted: bool,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<Vec<String>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let member_id = parse_group_id(&member_device_id, "member_not_found")?;
+    if !group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == group_id.to_string())
+    {
+        return Err("group_not_owned".to_owned());
+    }
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .change_invite_permission(group_id, &identity, member_id, granted)
+        .map(|devices| devices.iter().map(ToString::to_string).collect())
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn issued_invitations(
     service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<Vec<IssuedInvitation>, String> {
@@ -1010,6 +1050,8 @@ pub fn run() {
             leave_joined_group,
             local_groups,
             rename_group,
+            invite_permitted_devices,
+            set_member_invite_permission,
             issued_invitations,
             create_group,
             create_group_invitation,

@@ -6,7 +6,7 @@ use std::{
 
 use charp2p_core::{
     DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId,
-    InvitationSpec, JoinRequest, PeerId,
+    InvitationSpec, InviteRejectReason, InviteRequest, InviteResponse, JoinRequest, PeerId,
 };
 use charp2p_store::{
     EventStore, IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
@@ -17,7 +17,8 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
-use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
+use crate::mls_storage::MlsProviderService;
+use crate::network::{InviteRequestService, JoinRequestAuthorization, JoinRequestAuthorizer};
 
 const CREDENTIAL_PREFIX: &str = "group-identity-v1-";
 const INVITATION_CREDENTIAL_PREFIX: &str = "issued-invitation-v1-";
@@ -360,6 +361,75 @@ impl GroupService {
         self.issue_invitation_at(group_id, inviter_device_id, inviter_name, now_unix)
     }
 
+    /// Answers a permitted member's invite request (ADR-036): the group must
+    /// be owned here and `permitted` must confirm the authenticated peer's
+    /// current membership and permission before an invitation is issued with
+    /// this device pinned as inviter. Rejections are only `unauthorized` or
+    /// `busy`.
+    pub(crate) fn answer_invite_request(
+        &self,
+        owner_device_id: PeerId,
+        inviter_name: &str,
+        authenticated_peer: PeerId,
+        request: &InviteRequest,
+        permitted: impl FnOnce(PeerId, PeerId) -> Result<bool, &'static str>,
+    ) -> InviteResponse {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return InviteResponse::rejected(InviteRejectReason::Busy);
+        };
+        self.answer_invite_request_at(
+            owner_device_id,
+            inviter_name,
+            authenticated_peer,
+            request,
+            permitted,
+            now.as_secs(),
+        )
+    }
+
+    fn answer_invite_request_at(
+        &self,
+        owner_device_id: PeerId,
+        inviter_name: &str,
+        authenticated_peer: PeerId,
+        request: &InviteRequest,
+        permitted: impl FnOnce(PeerId, PeerId) -> Result<bool, &'static str>,
+        now_unix: u64,
+    ) -> InviteResponse {
+        let group_id = request.group_id();
+        let owned = self
+            .metadata
+            .lock()
+            .map_err(|_| ())
+            .and_then(|store| store.local_groups().map_err(|_| ()))
+            .map(|groups| groups.iter().any(|group| group.group_id == group_id));
+        match owned {
+            Ok(true) => {}
+            Ok(false) => return InviteResponse::rejected(InviteRejectReason::Unauthorized),
+            Err(()) => return InviteResponse::rejected(InviteRejectReason::Busy),
+        }
+        if authenticated_peer == owner_device_id {
+            return InviteResponse::rejected(InviteRejectReason::Unauthorized);
+        }
+        match permitted(group_id, authenticated_peer) {
+            Ok(true) => {}
+            Ok(false) => return InviteResponse::rejected(InviteRejectReason::Unauthorized),
+            Err(_) => return InviteResponse::rejected(InviteRejectReason::Busy),
+        }
+        match self.issue_requested_invitation_at(
+            group_id,
+            owner_device_id,
+            inviter_name,
+            Some((authenticated_peer, u64::from(request.lifetime_seconds()))),
+            now_unix,
+        ) {
+            Ok((invitation, _)) => InviteResponse::issued(&invitation)
+                .unwrap_or_else(|_| InviteResponse::rejected(InviteRejectReason::Busy)),
+            Err("group_not_found") => InviteResponse::rejected(InviteRejectReason::Unauthorized),
+            Err(_) => InviteResponse::rejected(InviteRejectReason::Busy),
+        }
+    }
+
     pub fn issued_invitations(&self) -> Result<Vec<IssuedInvitation>, &'static str> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -636,18 +706,23 @@ impl GroupService {
             None,
             now_unix,
         )
+        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
     }
 
     /// Issues an invitation, recording the member device that requested it
-    /// so withdrawing that member's permission can revoke it (ADR-036).
+    /// so withdrawing that member's permission can revoke it (ADR-036). A
+    /// member request may only shorten the group's invitation lifetime, and
+    /// a repeated request from the same member returns its still-active
+    /// invitation instead of failing.
     fn issue_requested_invitation_at(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
-        requested_by: Option<PeerId>,
+        requested: Option<(PeerId, u64)>,
         now_unix: u64,
-    ) -> Result<IssuedInvitation, &'static str> {
+    ) -> Result<(Invitation, Zeroizing<String>), &'static str> {
+        let requested_by = requested.map(|(requester, _)| requester);
         let _operation = self
             .operations
             .lock()
@@ -686,6 +761,14 @@ impl GroupService {
             }
             self.retain_owner_discovery_key(&mut store, &invitation)?;
             if invitation.expires_at_unix() > now_unix {
+                if requested_by.is_some() && existing.requested_by == requested_by {
+                    let encoded = Zeroizing::new(
+                        invitation
+                            .encode()
+                            .map_err(|_| "issued_invitation_record_invalid")?,
+                    );
+                    return Ok((invitation, encoded));
+                }
                 return Err("invitation_already_exists");
             }
             self.invitation_secrets.remove(existing.invitation_id)?;
@@ -720,8 +803,12 @@ impl GroupService {
         if identity.group_id() != group_id {
             return Err("group_identity_record_invalid");
         }
+        let lifetime_seconds = requested
+            .map_or(group.invitation_lifetime_seconds, |(_, lifetime)| {
+                lifetime.min(group.invitation_lifetime_seconds)
+            });
         let expires_at_unix = now_unix
-            .checked_add(group.invitation_lifetime_seconds)
+            .checked_add(lifetime_seconds)
             .ok_or("system_clock_invalid")?;
         let invitation = Invitation::issue(
             &identity,
@@ -769,7 +856,7 @@ impl GroupService {
                 .map_err(|_| "group_store_unavailable")?;
             return Err(error);
         }
-        Ok(issued_invitation(&invitation, encoded.as_str()))
+        Ok((invitation, encoded))
     }
 
     fn issued_invitations_at(&self, now_unix: u64) -> Result<Vec<IssuedInvitation>, &'static str> {
@@ -913,6 +1000,40 @@ impl JoinRequestAuthorizer for GroupService {
     }
 }
 
+/// Owner-side invite request handling that rechecks membership and
+/// permission in the owner's MLS event state (ADR-036).
+pub(crate) struct MemberInvitationService {
+    groups: Arc<GroupService>,
+    permissions: Arc<MlsProviderService>,
+}
+
+impl MemberInvitationService {
+    pub(crate) fn new(groups: Arc<GroupService>, permissions: Arc<MlsProviderService>) -> Self {
+        Self {
+            groups,
+            permissions,
+        }
+    }
+}
+
+impl InviteRequestService for MemberInvitationService {
+    fn answer_invite_request(
+        &self,
+        owner_device_id: PeerId,
+        inviter_name: &str,
+        authenticated_peer: PeerId,
+        request: &InviteRequest,
+    ) -> InviteResponse {
+        self.groups.answer_invite_request(
+            owner_device_id,
+            inviter_name,
+            authenticated_peer,
+            request,
+            |group_id, peer| self.permissions.may_request_invitation(group_id, peer),
+        )
+    }
+}
+
 impl From<LocalGroupMetadata> for LocalGroup {
     fn from(metadata: LocalGroupMetadata) -> Self {
         Self {
@@ -1011,13 +1132,14 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy,
-        Invitation, InvitationId, InvitationSpec, JoinRequest, PeerId,
+        Invitation, InvitationId, InvitationSpec, InviteRejectReason, InviteRequest, JoinRequest,
+        PeerId,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
     use super::{
-        CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
-        JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
+        issued_invitation, CreateGroupSpec, GroupSecretStore, GroupService,
+        IssuedInvitationSecretStore, JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
     };
     use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
@@ -1312,6 +1434,91 @@ mod tests {
     }
 
     #[test]
+    fn permitted_member_invite_request_issues_owner_pinned_invitation() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+        let member = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let answer = |peer, request: &InviteRequest, permitted: Result<bool, &'static str>| {
+            service.answer_invite_request_at(
+                owner,
+                "Maya's PC",
+                peer,
+                request,
+                |checked_group, checked_peer| {
+                    assert_eq!((checked_group, checked_peer), (group_id, peer));
+                    permitted
+                },
+                NOW,
+            )
+        };
+        let request = InviteRequest::new(group_id, 86_400).unwrap();
+
+        let foreign = InviteRequest::new(DeviceIdentity::generate().peer_id(), 86_400).unwrap();
+        assert_eq!(
+            answer(member, &foreign, Ok(true)).rejection(),
+            Some(InviteRejectReason::Unauthorized)
+        );
+        assert_eq!(
+            answer(owner, &request, Ok(true)).rejection(),
+            Some(InviteRejectReason::Unauthorized)
+        );
+        assert_eq!(
+            answer(member, &request, Ok(false)).rejection(),
+            Some(InviteRejectReason::Unauthorized)
+        );
+        assert_eq!(
+            answer(member, &request, Err("message_store_unavailable")).rejection(),
+            Some(InviteRejectReason::Busy)
+        );
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+
+        let issued = answer(member, &request, Ok(true));
+        let invitation = Invitation::decode(issued.invitation().unwrap(), NOW).unwrap();
+        assert_eq!(invitation.group_id(), group_id);
+        assert_eq!(invitation.inviter_device_id(), owner);
+        assert_eq!(invitation.inviter_name(), "Maya's PC");
+        assert_eq!(invitation.expires_at_unix(), NOW + 86_400);
+        assert!(invitation.is_reusable());
+
+        // A lost response can be retried; another member must wait.
+        let repeated = answer(member, &request, Ok(true));
+        assert_eq!(
+            Invitation::decode(repeated.invitation().unwrap(), NOW)
+                .unwrap()
+                .invitation_id(),
+            invitation.invitation_id()
+        );
+        assert_eq!(
+            answer(other, &request, Ok(true)).rejection(),
+            Some(InviteRejectReason::Busy)
+        );
+
+        let join = JoinRequest::from_invitation(&invitation, vec![1]).unwrap();
+        assert!(service.authorize_join_request_at(&join, NOW).is_ok());
+        assert_eq!(
+            service
+                .revoke_requested_invitations(group_id, member)
+                .unwrap(),
+            1
+        );
+        assert!(service.authorize_join_request_at(&join, NOW).is_err());
+
+        // The owner's group lifetime caps a longer requested lifetime.
+        let longer = InviteRequest::new(group_id, 2_592_000).unwrap();
+        let capped = answer(member, &longer, Ok(true));
+        assert_eq!(
+            Invitation::decode(capped.invitation().unwrap(), NOW)
+                .unwrap()
+                .expires_at_unix(),
+            NOW + 604_800
+        );
+    }
+
+    #[test]
     fn requested_invitations_are_revoked_only_for_their_requester() {
         const NOW: u64 = 1_800_000_000;
         let service = service();
@@ -1320,7 +1527,14 @@ mod tests {
         let owner = DeviceIdentity::generate().peer_id();
         let requester = DeviceIdentity::generate().peer_id();
         let issued = service
-            .issue_requested_invitation_at(group_id, owner, "Maya's PC", Some(requester), NOW)
+            .issue_requested_invitation_at(
+                group_id,
+                owner,
+                "Maya's PC",
+                Some((requester, 86_400)),
+                NOW,
+            )
+            .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
             .unwrap();
         let request = join_request(&issued.link, NOW);
         assert!(service.authorize_join_request_at(&request, NOW).is_ok());

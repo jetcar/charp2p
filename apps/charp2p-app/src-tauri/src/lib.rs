@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use background::{BackgroundPreference, BackgroundService, BackgroundStatus};
 use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
-use groups::{CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup};
+use groups::{
+    CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup, MemberInvitationService,
+};
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
 use mls_storage::{
@@ -914,8 +916,13 @@ async fn advertise_owned_groups(
     let owner_identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
+    let profile = identity_service
+        .status()
+        .map_err(str::to_owned)?
+        .ok_or_else(|| "identity_missing".to_owned())?;
+    let inviter_name = identity::invitation_device_name(&profile.device_name);
     network_service
-        .advertise_owner_group(identity, owner_identity, keys)
+        .advertise_owner_group(identity, owner_identity, inviter_name, keys)
         .await
         .map_err(str::to_owned)
 }
@@ -987,8 +994,12 @@ pub fn run() {
                         .map_err(std::io::Error::other)?;
                 }
             }
-            let network = NetworkService::from_environment(groups.clone(), mls.clone())
-                .map_err(std::io::Error::other)?;
+            let network = NetworkService::from_environment(
+                groups.clone(),
+                mls.clone(),
+                Arc::new(MemberInvitationService::new(groups.clone(), mls.clone())),
+            )
+            .map_err(std::io::Error::other)?;
             app.manage(identity);
             app.manage(pending);
             app.manage(groups);

@@ -1170,6 +1170,29 @@ impl MlsProviderService {
             .map_err(|_| "message_store_unavailable")
     }
 
+    /// Whether an authenticated peer is a current, non-removed member device
+    /// that holds invite permission in this owner's own event state
+    /// (ADR-036).
+    pub(crate) fn may_request_invitation(
+        &self,
+        group_id: PeerId,
+        authenticated_peer: PeerId,
+    ) -> Result<bool, &'static str> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        if store
+            .is_removed_mls_member(group_id, authenticated_peer)
+            .map_err(|_| "message_store_unavailable")?
+        {
+            return Ok(false);
+        }
+        store
+            .has_invite_permission(group_id, authenticated_peer)
+            .map_err(|_| "message_store_unavailable")
+    }
+
     /// Returns authenticated group names from applied metadata changes.
     pub(crate) fn current_group_names(&self) -> Result<Vec<(PeerId, String)>, &'static str> {
         let store = self

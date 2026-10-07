@@ -5,8 +5,9 @@ use std::{
 };
 
 use charp2p_core::{
-    DeviceIdentity, DiscoveryKey, Invitation, JoinRejectReason, JoinRequest, JoinResponse,
-    SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
+    DeviceIdentity, DiscoveryKey, Invitation, InviteRejectReason, InviteRequest, InviteResponse,
+    JoinRejectReason, JoinRequest, JoinResponse, SyncPeerHead, SyncRejectReason, SyncRequest,
+    SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode, RelayLimits};
@@ -50,6 +51,32 @@ pub(crate) enum JoinRequestAuthorization {
 
 pub(crate) trait JoinRequestAuthorizer: Send + Sync {
     fn authorize_join_request(&self, request: &JoinRequest) -> JoinRequestAuthorization;
+}
+
+/// Answers a member's request for an owner-issued invitation (ADR-036).
+pub(crate) trait InviteRequestService: Send + Sync {
+    fn answer_invite_request(
+        &self,
+        owner_device_id: PeerId,
+        inviter_name: &str,
+        authenticated_peer: PeerId,
+        request: &InviteRequest,
+    ) -> InviteResponse;
+}
+
+/// Used until an owner-side service is configured; never issues.
+struct RejectingInviteRequestService;
+
+impl InviteRequestService for RejectingInviteRequestService {
+    fn answer_invite_request(
+        &self,
+        _owner_device_id: PeerId,
+        _inviter_name: &str,
+        _authenticated_peer: PeerId,
+        _request: &InviteRequest,
+    ) -> InviteResponse {
+        InviteResponse::rejected(InviteRejectReason::Unauthorized)
+    }
 }
 
 trait MemberAdmissionService: Send + Sync {
@@ -369,6 +396,7 @@ pub struct NetworkService {
     member_admission: Arc<dyn MemberAdmissionService>,
     pending_join: Arc<dyn PendingJoinService>,
     synchronization: Arc<dyn SynchronizationService>,
+    invite_requests: Arc<dyn InviteRequestService>,
     /// Whether owner and member nodes also use mDNS on the local network.
     lan_discovery: bool,
 }
@@ -377,6 +405,7 @@ impl NetworkService {
     pub fn from_environment(
         join_authorizer: Arc<dyn JoinRequestAuthorizer>,
         member_admission: Arc<MlsProviderService>,
+        invite_requests: Arc<dyn InviteRequestService>,
     ) -> Result<Self, &'static str> {
         let environment = std::env::var(BOOTSTRAP_ENVIRONMENT_VARIABLE).unwrap_or_default();
         Self::from_sources_with_authorizer(
@@ -387,6 +416,13 @@ impl NetworkService {
             member_admission.clone(),
             member_admission,
         )
+        .map(|service| service.with_invite_requests(invite_requests))
+    }
+
+    /// Lets the owner advertising node answer member invite requests.
+    fn with_invite_requests(mut self, invite_requests: Arc<dyn InviteRequestService>) -> Self {
+        self.invite_requests = invite_requests;
+        self
     }
 
     #[cfg(test)]
@@ -437,6 +473,7 @@ impl NetworkService {
             member_admission,
             pending_join,
             synchronization,
+            invite_requests: Arc::new(RejectingInviteRequestService),
             lan_discovery: true,
         })
     }
@@ -468,6 +505,7 @@ impl NetworkService {
         self.advertise_keys(
             network_identity,
             owner_identity,
+            invitation.inviter_name().to_owned(),
             vec![DiscoveryKey::from_invitation(invitation)],
             Some(invitation.expires_at_unix()),
         )
@@ -669,10 +707,13 @@ impl NetworkService {
         }
     }
 
+    /// `inviter_name` is the owner device name placed in invitations issued
+    /// at a permitted member's request.
     pub async fn advertise_owner_group(
         &self,
         network_identity: DeviceIdentity,
         owner_identity: DeviceIdentity,
+        inviter_name: String,
         keys: Vec<DiscoveryKey>,
     ) -> Result<AdvertisementResult, &'static str> {
         if network_identity.peer_id() != owner_identity.peer_id() {
@@ -684,7 +725,7 @@ impl NetworkService {
                 expires_at_unix: 0,
             });
         }
-        self.advertise_keys(network_identity, owner_identity, keys, None)
+        self.advertise_keys(network_identity, owner_identity, inviter_name, keys, None)
             .await
     }
 
@@ -692,6 +733,7 @@ impl NetworkService {
         &self,
         network_identity: DeviceIdentity,
         owner_identity: DeviceIdentity,
+        inviter_name: String,
         mut keys: Vec<DiscoveryKey>,
         expires_at_unix: Option<u64>,
     ) -> Result<AdvertisementResult, &'static str> {
@@ -787,6 +829,19 @@ impl NetworkService {
                         );
                         let _ = node.send_join_response(request_id, response);
                     }
+                    NetworkEvent::InviteRequestReceived {
+                        peer_id,
+                        request_id,
+                        request,
+                    } => {
+                        let response = self.invite_requests.answer_invite_request(
+                            owner_identity.peer_id(),
+                            &inviter_name,
+                            peer_id,
+                            &request,
+                        );
+                        let _ = node.send_invite_response(request_id, response);
+                    }
                     _ => {}
                 }
             }
@@ -801,6 +856,7 @@ impl NetworkService {
         let join_authorizer = Arc::clone(&self.join_authorizer);
         let member_admission = Arc::clone(&self.member_admission);
         let synchronization = Arc::clone(&self.synchronization);
+        let invite_requests = Arc::clone(&self.invite_requests);
         let task_keys = keys.clone();
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
@@ -849,6 +905,19 @@ impl NetworkService {
                                     peer_id,
                                 );
                                 let _ = node.send_join_response(request_id, response);
+                            }
+                            NetworkEvent::InviteRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } => {
+                                let response = invite_requests.answer_invite_request(
+                                    owner_identity.peer_id(),
+                                    &inviter_name,
+                                    peer_id,
+                                    &request,
+                                );
+                                let _ = node.send_invite_response(request_id, response);
                             }
                             _ => {}
                         }
@@ -928,6 +997,12 @@ impl NetworkService {
                             let _ = node.reject_join_request(
                                 request_id,
                                 JoinRejectReason::Unauthorized,
+                            );
+                        }
+                        NetworkEvent::InviteRequestReceived { request_id, .. } => {
+                            let _ = node.reject_invite_request(
+                                request_id,
+                                InviteRejectReason::Unauthorized,
                             );
                         }
                         _ => {}
@@ -3219,7 +3294,12 @@ mod tests {
             };
             let service =
                 NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}")).unwrap();
-            let advertise = service.advertise_owner_group(owner, owner_signer, vec![key]);
+            let advertise = service.advertise_owner_group(
+                owner,
+                owner_signer,
+                "Maya's PC".to_owned(),
+                vec![key],
+            );
             tokio::pin!(advertise);
             timeout(Duration::from_secs(2), async {
                 loop {

@@ -10,7 +10,9 @@ use charp2p_core::{
     SyncResponse,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
-use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode, RelayLimits};
+use charp2p_network::{
+    ConnectionPath, NetworkEvent, NetworkNode, OutboundSyncRequestId, RelayLimits,
+};
 use charp2p_sync::{PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
@@ -1208,7 +1210,13 @@ impl NetworkService {
         self.pending_join
             .complete_join(invitation.group_id(), welcome)?;
         let synchronized_events = self
-            .pull_from_connected_peer(&mut node, expected_inviter, invitation.group_id(), None)
+            .pull_from_connected_peer(
+                &mut node,
+                expected_inviter,
+                invitation.group_id(),
+                None,
+                &mut ConnectionPath::Direct,
+            )
             .await
             .unwrap_or(0);
         Ok(JoinGroupResult {
@@ -1322,18 +1330,46 @@ impl NetworkService {
         };
         let ProviderConnection {
             mut node,
-            path: connection_path,
+            path: mut connection_path,
             address: peer_address,
             ..
         } = connected?;
+        // A relayed connection may be hole-punched while the exchange runs;
+        // the remembered address stays the relayed one, which keeps working
+        // after the NAT mapping of the direct connection expires.
+        let initial_path = connection_path;
         let synchronized_events = self
-            .pull_from_connected_peer(&mut node, expected_peer, group_id, Some(bandwidth))
+            .pull_from_connected_peer(
+                &mut node,
+                expected_peer,
+                group_id,
+                Some(bandwidth),
+                &mut connection_path,
+            )
             .await?;
         let uploaded_events = self
-            .push_to_connected_peer(&mut node, expected_peer, group_id, local_peer, bandwidth)
+            .push_to_connected_peer(
+                &mut node,
+                expected_peer,
+                group_id,
+                local_peer,
+                bandwidth,
+                &mut connection_path,
+            )
             .await?;
-        self.exchange_observed_heads(&mut node, expected_peer, group_id, local_peer)
-            .await?;
+        self.exchange_observed_heads(
+            &mut node,
+            expected_peer,
+            group_id,
+            local_peer,
+            &mut connection_path,
+        )
+        .await?;
+        if connection_path != initial_path {
+            let _ = self.observe_connection(Ok(connection_path), |path| {
+                Some(connection_type_name(*path))
+            });
+        }
         Ok(SynchronizeGroupResult {
             status: "synchronized",
             group_id: group_id.to_string(),
@@ -1533,6 +1569,7 @@ impl NetworkService {
         peer_id: PeerId,
         group_id: PeerId,
         bandwidth: Option<&BandwidthService>,
+        path: &mut ConnectionPath,
     ) -> Result<usize, &'static str> {
         let (mut session, mut request) = PullSession::start(group_id);
         let mut inserted = 0_usize;
@@ -1543,29 +1580,7 @@ impl NetworkService {
             let request_id = node
                 .send_sync_request(peer_id, request)
                 .map_err(|_| "synchronization_failed")?;
-            let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
-                loop {
-                    match node.next_event().await {
-                        NetworkEvent::SyncResponseReceived {
-                            peer_id: response_peer,
-                            request_id: response_id,
-                            response,
-                        } if response_peer == peer_id && response_id == request_id => {
-                            return Ok(response);
-                        }
-                        NetworkEvent::SyncRequestFailed {
-                            peer_id: failed_peer,
-                            request_id: failed_id,
-                            ..
-                        } if failed_peer == peer_id && failed_id == request_id => {
-                            return Err("synchronization_failed");
-                        }
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .map_err(|_| "synchronization_timed_out")??;
+            let response = await_sync_response(node, peer_id, request_id, path).await?;
             if let Some(bandwidth) = bandwidth {
                 bandwidth.charge_sync_bytes(response_event_bytes(&response));
             }
@@ -1595,6 +1610,7 @@ impl NetworkService {
         group_id: PeerId,
         author_id: PeerId,
         bandwidth: &BandwidthService,
+        path: &mut ConnectionPath,
     ) -> Result<usize, &'static str> {
         let mut after_sequence = 0_u64;
         let mut inserted = 0_usize;
@@ -1620,29 +1636,7 @@ impl NetworkService {
             let request_id = node
                 .send_sync_request(peer_id, request)
                 .map_err(|_| "synchronization_failed")?;
-            let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
-                loop {
-                    match node.next_event().await {
-                        NetworkEvent::SyncResponseReceived {
-                            peer_id: response_peer,
-                            request_id: response_id,
-                            response,
-                        } if response_peer == peer_id && response_id == request_id => {
-                            return Ok(response);
-                        }
-                        NetworkEvent::SyncRequestFailed {
-                            peer_id: failed_peer,
-                            request_id: failed_id,
-                            ..
-                        } if failed_peer == peer_id && failed_id == request_id => {
-                            return Err("synchronization_failed");
-                        }
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .map_err(|_| "synchronization_timed_out")??;
+            let response = await_sync_response(node, peer_id, request_id, path).await?;
             bandwidth.charge_sync_bytes(pushed_bytes);
             match response {
                 SyncResponse::EventsAccepted {
@@ -1673,34 +1667,13 @@ impl NetworkService {
         peer_id: PeerId,
         group_id: PeerId,
         author_id: PeerId,
+        path: &mut ConnectionPath,
     ) -> Result<(), &'static str> {
         let request = self.synchronization.report_heads_request(group_id)?;
         let request_id = node
             .send_sync_request(peer_id, request)
             .map_err(|_| "synchronization_failed")?;
-        let response = timeout(SYNC_RESPONSE_TIMEOUT, async {
-            loop {
-                match node.next_event().await {
-                    NetworkEvent::SyncResponseReceived {
-                        peer_id: response_peer,
-                        request_id: response_id,
-                        response,
-                    } if response_peer == peer_id && response_id == request_id => {
-                        return Ok(response);
-                    }
-                    NetworkEvent::SyncRequestFailed {
-                        peer_id: failed_peer,
-                        request_id: failed_id,
-                        ..
-                    } if failed_peer == peer_id && failed_id == request_id => {
-                        return Err("synchronization_failed");
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| "synchronization_timed_out")??;
+        let response = await_sync_response(node, peer_id, request_id, path).await?;
         match response {
             SyncResponse::ObservedHeads {
                 group_id: response_group,
@@ -1719,6 +1692,50 @@ impl NetworkService {
 }
 
 /// Signed event bytes a synchronization request pushes (ADR-033).
+/// Waits for the answer to one synchronization request. A relayed
+/// connection to the peer hole-punched meanwhile (DCUtR) turns `path` direct.
+async fn await_sync_response(
+    node: &mut NetworkNode,
+    peer_id: PeerId,
+    request_id: OutboundSyncRequestId,
+    path: &mut ConnectionPath,
+) -> Result<SyncResponse, &'static str> {
+    timeout(SYNC_RESPONSE_TIMEOUT, async {
+        loop {
+            match node.next_event().await {
+                NetworkEvent::SyncResponseReceived {
+                    peer_id: response_peer,
+                    request_id: response_id,
+                    response,
+                } if response_peer == peer_id && response_id == request_id => {
+                    return Ok(response);
+                }
+                NetworkEvent::SyncRequestFailed {
+                    peer_id: failed_peer,
+                    request_id: failed_id,
+                    ..
+                } if failed_peer == peer_id && failed_id == request_id => {
+                    return Err("synchronization_failed");
+                }
+                event => *path = upgraded_path(*path, &event, peer_id),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "synchronization_timed_out")?
+}
+
+/// Returns the connection path to `peer_id` after `event`: a relayed path
+/// becomes direct once the peer's connection is hole-punched.
+fn upgraded_path(path: ConnectionPath, event: &NetworkEvent, peer_id: PeerId) -> ConnectionPath {
+    match event {
+        NetworkEvent::DirectConnectionUpgraded {
+            peer_id: upgraded_peer,
+        } if path == ConnectionPath::Relayed && *upgraded_peer == peer_id => ConnectionPath::Direct,
+        _ => path,
+    }
+}
+
 fn request_event_bytes(request: &SyncRequest) -> u64 {
     match request {
         SyncRequest::PushEvents { encoded_events, .. } => encoded_bytes(encoded_events),
@@ -1946,7 +1963,7 @@ mod tests {
     use charp2p_mls::{
         device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
     };
-    use charp2p_network::{NetworkEvent, NetworkNode};
+    use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode};
     use openmls::prelude::{tls_codec::Serialize, CredentialWithKey, KeyPackage, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
     use tokio::time::timeout;
@@ -1954,7 +1971,7 @@ mod tests {
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
-        discovery_outcome, join_response, parse_bootstrap_peer, AdvertisementResult,
+        discovery_outcome, join_response, parse_bootstrap_peer, upgraded_path, AdvertisementResult,
         BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
         MemberAdmissionService, NetworkService, NetworkStatus, PeerSearchResult,
         PendingJoinService, PullSession, SessionProgress, SynchronizationService,
@@ -2371,6 +2388,34 @@ mod tests {
             service.stop_contribution().await;
             assert_eq!(service.status().await.contribution_status, "inactive");
         });
+    }
+
+    #[test]
+    fn only_the_peers_hole_punch_turns_a_relayed_path_direct() {
+        let peer = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let upgraded = NetworkEvent::DirectConnectionUpgraded { peer_id: peer };
+
+        assert_eq!(
+            upgraded_path(ConnectionPath::Relayed, &upgraded, peer),
+            ConnectionPath::Direct
+        );
+        assert_eq!(
+            upgraded_path(ConnectionPath::Relayed, &upgraded, other),
+            ConnectionPath::Relayed
+        );
+        assert_eq!(
+            upgraded_path(ConnectionPath::Lan, &upgraded, peer),
+            ConnectionPath::Lan
+        );
+        assert_eq!(
+            upgraded_path(
+                ConnectionPath::Relayed,
+                &NetworkEvent::PeerDisconnected { peer_id: peer },
+                peer
+            ),
+            ConnectionPath::Relayed
+        );
     }
 
     #[test]

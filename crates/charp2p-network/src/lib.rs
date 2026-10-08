@@ -52,6 +52,16 @@ const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 4;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP: u32 = 16;
+/// Provider records expire quickly; online advertisers republish well
+/// within the lifetime and the app refreshes its own publication every five
+/// minutes.
+const PROVIDER_RECORD_TTL: Duration = Duration::from_secs(30 * 60);
+const PROVIDER_PUBLICATION_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const DISCOVERY_KEY_BYTES: usize = 32;
+const MAX_PROVIDER_KEYS: usize = 1_024;
+const MAX_PROVIDERS_PER_KEY: usize = 20;
+const MAX_PROVIDER_ADDRESSES: usize = 8;
+const MAX_PROVIDER_ADDRESS_BYTES: usize = 256;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -90,7 +100,24 @@ impl Behaviour {
         let lan_discovery = lan_discovery
             .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).ok())
             .flatten();
-        let mut dht = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+        // Serving nodes store only validated provider records for opaque
+        // discovery keys (see `accepted_provider_record`); value records are
+        // never stored because CharP2P does not publish any.
+        let mut dht_config = kad::Config::new(kad::PROTOCOL_NAME);
+        dht_config
+            .set_record_filtering(kad::StoreInserts::FilterBoth)
+            .set_provider_record_ttl(Some(PROVIDER_RECORD_TTL))
+            .set_provider_publication_interval(Some(PROVIDER_PUBLICATION_INTERVAL));
+        let dht_store = kad::store::MemoryStore::with_config(
+            peer_id,
+            kad::store::MemoryStoreConfig {
+                max_records: MAX_PROVIDER_KEYS,
+                max_value_bytes: 0,
+                max_providers_per_key: MAX_PROVIDERS_PER_KEY,
+                max_provided_keys: MAX_PROVIDER_KEYS,
+            },
+        );
+        let mut dht = kad::Behaviour::with_config(peer_id, dht_store, dht_config);
         dht.set_mode(Some(dht_mode));
         let join = request_response::Behaviour::with_codec(
             JoinCodec,
@@ -637,6 +664,21 @@ impl NetworkNode {
                     return NetworkEvent::DirectConnectionUpgraded {
                         peer_id: remote_peer_id,
                     };
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Dht(kad::Event::InboundRequest {
+                    request:
+                        kad::InboundRequest::AddProvider {
+                            record: Some(record),
+                        },
+                })) => {
+                    // A full store or per-key limit drops the record; the
+                    // advertiser republishes and other close peers hold it.
+                    if let Some(record) = accepted_provider_record(record) {
+                        let _ = kad::store::RecordStore::add_provider(
+                            self.swarm.behaviour_mut().dht.store_mut(),
+                            record,
+                        );
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dht(
                     kad::Event::OutboundQueryProgressed {
@@ -1210,6 +1252,20 @@ pub enum NetworkError {
     InviteResponseChannelClosed,
 }
 
+/// Validates a provider record received by a serving node: the key must be a
+/// 32-byte opaque discovery key, and at most a bounded number of
+/// size-limited addresses are kept.
+fn accepted_provider_record(mut record: kad::ProviderRecord) -> Option<kad::ProviderRecord> {
+    if record.key.as_ref().len() != DISCOVERY_KEY_BYTES {
+        return None;
+    }
+    record
+        .addresses
+        .retain(|address| address.len() <= MAX_PROVIDER_ADDRESS_BYTES);
+    record.addresses.truncate(MAX_PROVIDER_ADDRESSES);
+    Some(record)
+}
+
 fn record_key(key: DiscoveryKey) -> kad::RecordKey {
     kad::RecordKey::new(key.as_bytes())
 }
@@ -1223,10 +1279,15 @@ mod tests {
         InviteRequest, InviteResponse, JoinRequest, JoinResponse, SyncAuthorHead, SyncRequest,
         SyncResponse,
     };
-    use libp2p::{Multiaddr, connection_limits, identity::Keypair, kad, multiaddr::Protocol};
+    use libp2p::{
+        Multiaddr, PeerId, connection_limits, identity::Keypair, kad, multiaddr::Protocol,
+    };
     use tokio::time::timeout;
 
-    use super::{ConnectionPath, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION, RelayLimits};
+    use super::{
+        ConnectionPath, MAX_PROVIDER_ADDRESSES, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION,
+        RelayLimits, accepted_provider_record, record_key,
+    };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
@@ -1870,6 +1931,90 @@ mod tests {
         .expect("local provider lookup should complete");
 
         assert_eq!(providers, vec![node.peer_id()]);
+    }
+
+    #[test]
+    fn serving_node_accepts_only_bounded_discovery_key_provider_records() {
+        let provider = PeerId::random();
+        let short_key = kad::ProviderRecord::new(kad::RecordKey::new(&[1; 31]), provider, vec![]);
+        assert!(accepted_provider_record(short_key).is_none());
+
+        let oversized: Multiaddr = format!("/dns4/{}/udp/1/quic-v1", "a".repeat(250))
+            .parse()
+            .unwrap();
+        let mut addresses = vec![oversized];
+        addresses.extend((0..10).map(|port| {
+            format!("/ip4/192.0.2.1/udp/{}/quic-v1", 1_000 + port)
+                .parse::<Multiaddr>()
+                .unwrap()
+        }));
+        let key = DiscoveryKey::derive(GroupIdentity::generate().group_id(), &[7; 32]);
+        let record = accepted_provider_record(kad::ProviderRecord::new(
+            record_key(key),
+            provider,
+            addresses.clone(),
+        ))
+        .expect("a discovery key provider record is accepted");
+
+        assert_eq!(record.provider, provider);
+        assert_eq!(record.addresses, addresses[1..=MAX_PROVIDER_ADDRESSES]);
+    }
+
+    #[tokio::test]
+    async fn routing_node_stores_an_announcement_for_other_clients() {
+        let mut routing = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let routing_id = routing.peer_id();
+        routing
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let routing_address = next_listen_address(&mut routing).await;
+        let key = DiscoveryKey::derive(GroupIdentity::generate().group_id(), &[9; 32]);
+
+        let mut advertiser = NetworkNode::new(Keypair::generate_ed25519());
+        let advertiser_id = advertiser.peer_id();
+        advertiser
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        next_listen_address(&mut advertiser).await;
+        advertiser.add_bootstrap_peer(routing_id, routing_address.clone());
+        advertiser.announce_group(key).unwrap();
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = advertiser.next_event() => {
+                        if matches!(event, NetworkEvent::GroupAnnounced { key: announced } if announced == key) {
+                            break;
+                        }
+                    }
+                    _ = routing.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("the routing node should accept the announcement");
+
+        let mut searcher = NetworkNode::new(Keypair::generate_ed25519());
+        searcher.add_bootstrap_peer(routing_id, routing_address);
+        searcher.find_group_peers(key);
+        let providers = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = searcher.next_event() => {
+                        if let NetworkEvent::GroupPeersFound { key: found, providers } = event
+                            && found == key
+                            && !providers.is_empty()
+                        {
+                            break providers;
+                        }
+                    }
+                    _ = routing.next_event() => {}
+                    _ = advertiser.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("the searcher should find the stored provider");
+        assert_eq!(providers, vec![advertiser_id]);
     }
 
     #[tokio::test]

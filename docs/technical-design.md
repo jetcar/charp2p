@@ -147,7 +147,8 @@ Only the owner device signs invitations. A member the owner has granted invite
 permission requests one from the owner device over the authenticated
 `/charp2p/invite/1.0.0` request-response protocol (ADR-036). The owner rechecks
 the requesting device's membership and current permission, then issues, stores
-and advertises a normal version 2 invitation under the group settings and
+and advertises a normal invitation (version 3 when it carries the owner's address
+hints) under the group settings and
 records the requesting device in its issued-invitation index. Withdrawing the
 permission revokes the active invitations issued at that device's request.
 
@@ -176,9 +177,13 @@ signature
 
 It contains no group name, membership, messages, or group encryption keys.
 The 32-byte result is the opaque Kademlia provider-record key preimage. Records
-expire quickly and online peers periodically re-advertise. Exact TTL,
-refresh interval, record size, and per-peer quotas will be fixed through load
-testing.
+expire quickly and online peers periodically re-advertise: nodes keep received
+provider records for 30 minutes and republish their own every 10 minutes.
+Serving nodes filter DHT inserts: they store only provider records whose key
+is exactly 32 bytes, keep at most 8 addresses of at most 256 bytes each, hold
+at most 1,024 keys with 20 providers per key, and never store value records,
+which CharP2P does not publish. Final TTL, refresh interval, and per-peer
+quotas will be fixed through load testing.
 
 Clients enter the network through a versioned list of built-in bootstrap
 multiaddresses. Invitations and learned routing tables provide additional

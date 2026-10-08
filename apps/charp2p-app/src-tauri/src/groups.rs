@@ -352,6 +352,33 @@ impl GroupService {
         Ok(groups)
     }
 
+    /// Changes the local icon of an owned group; members learn it from the
+    /// owner's next metadata change.
+    pub fn set_icon(&self, group_id: PeerId, icon: u8) -> Result<LocalGroup, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        if icon > 4 {
+            return Err("invalid_group_icon");
+        }
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut metadata = store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or("group_not_owned")?;
+        metadata.icon = icon;
+        store
+            .put_local_group(&metadata)
+            .map_err(|_| "group_store_unavailable")?;
+        Ok(metadata.into())
+    }
+
     pub fn issue_invitation(
         &self,
         group_id: PeerId,
@@ -1452,6 +1479,24 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].invitation_id, second_invitation.invitation_id);
         assert_eq!(remaining[0].group_id, second.group_id);
+    }
+
+    #[test]
+    fn owner_changes_only_the_icon_of_an_owned_group() {
+        let service = service();
+        let created = service.create(spec("Launch room")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+
+        let changed = service.set_icon(group_id, 4).unwrap();
+
+        assert_eq!(changed.icon, 4);
+        assert_eq!(changed.group_name, created.group_name);
+        assert_eq!(service.list().unwrap(), vec![changed]);
+        assert_eq!(service.set_icon(group_id, 5), Err("invalid_group_icon"));
+        assert_eq!(
+            service.set_icon(DeviceIdentity::generate().peer_id(), 1),
+            Err("group_not_owned")
+        );
     }
 
     #[test]

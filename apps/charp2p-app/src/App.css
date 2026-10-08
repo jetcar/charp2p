@@ -150,6 +150,7 @@ button { cursor: pointer; }
 .group-switcher-list .group-connection.relayed::before { color: #3f7fd9; }
 .group-switcher-list .group-connection.waiting::before { color: #d99a1e; }
 .group-switcher-list .group-connection.offline::before { color: #a3adbf; }
+.group-switcher-list .group-switcher-icon { display: inline-grid; width: 20px; height: 20px; place-items: center; margin-right: 7px; border-radius: 6px; color: white; font-size: 9px; font-style: normal; letter-spacing: -2px; vertical-align: 1px; }
 .group-switcher-list .group-last-sync { margin-left: 8px; font-style: normal; }
 .group-switcher-join { justify-self: start; padding: 7px 3px; border: 0; color: #087d75; background: transparent; font-weight: 700; }
 .group-ready-card header, .joined-card header { margin-bottom: 28px; text-align: center; }

@@ -15,6 +15,7 @@ type InvitationPreview = {
   historyPolicy: "none" | "fromInvitation" | "allRetained";
   reusable: boolean;
 };
+const GROUP_ICONS = ["●●●", "◆", "▲", "♥", "★"];
 type PendingGroup = InvitationPreview;
 type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable"> & {
   lastSynchronizedAtUnix: number | null;
@@ -592,6 +593,8 @@ function MembersView({
   onToggleInvitePermission,
   joinedGroupId,
   onRename,
+  groupIcon,
+  onChangeIcon,
   onLeave,
   leaving,
   onClose,
@@ -618,6 +621,8 @@ function MembersView({
   onToggleInvitePermission: (deviceId: string, granted: boolean) => void;
   joinedGroupId: string | null;
   onRename: (groupName: string) => Promise<void>;
+  groupIcon: number | null;
+  onChangeIcon: (icon: number) => Promise<void>;
   onLeave: (() => void) | null;
   leaving: boolean;
   onClose: () => void;
@@ -625,6 +630,21 @@ function MembersView({
   const [renameInput, setRenameInput] = useState(groupName);
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState("");
+  const [changingIcon, setChangingIcon] = useState<number | null>(null);
+  const [iconError, setIconError] = useState("");
+
+  async function changeIcon(icon: number) {
+    if (icon === groupIcon || changingIcon !== null) return;
+    setChangingIcon(icon);
+    setIconError("");
+    try {
+      await onChangeIcon(icon);
+    } catch (reason) {
+      setIconError(errorMessage(reason));
+    } finally {
+      setChangingIcon(null);
+    }
+  }
 
   async function submitRename(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -681,6 +701,26 @@ function MembersView({
           <p className="preview-note">The new name is signed by this owner device and reaches members when they synchronize.</p>
           {renameError && <p className="form-error preview-error" role="alert">{renameError}</p>}
         </form>
+      )}
+      {canManageMembers && (
+        <fieldset className="icon-picker group-icon-change">
+          <legend>Group icon</legend>
+          <div>
+            {GROUP_ICONS.map((icon, index) => (
+              <button
+                aria-label={`Group icon ${index + 1}`}
+                aria-pressed={groupIcon === index}
+                className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
+                disabled={changingIcon !== null}
+                key={icon}
+                onClick={() => void changeIcon(index)}
+                type="button"
+              >{icon}</button>
+            ))}
+          </div>
+          <p className="preview-note">The icon is signed with the group name and reaches members when they synchronize.</p>
+          {iconError && <p className="form-error preview-error" role="alert">{iconError}</p>}
+        </fieldset>
       )}
       <p className="preview-note">Each membership belongs to one cryptographic device identity.</p>
       <div className="member-list" role="list">
@@ -1856,12 +1896,14 @@ function App() {
       ...localGroups.map((group) => ({
         groupId: group.groupId,
         groupName: group.groupName,
+        icon: group.icon as number | null,
         role: "Owner",
         lastSynchronizedAtUnix: undefined as number | null | undefined,
       })),
       ...joinedGroups.map((group) => ({
         groupId: group.groupId,
         groupName: group.groupName,
+        icon: group.icon,
         role: "Member",
         lastSynchronizedAtUnix: group.lastSynchronizedAtUnix as number | null | undefined,
       })),
@@ -2664,6 +2706,13 @@ function App() {
     setLocalGroups(await invoke<LocalGroup[]>("local_groups"));
   }
 
+  async function changeLocalGroupIcon(icon: number) {
+    const groupId = localGroup?.groupId;
+    if (!groupId || !isTauri()) return;
+    await invoke("change_group_icon", { groupId, icon });
+    setLocalGroups(await invoke<LocalGroup[]>("local_groups"));
+  }
+
   async function sendGroupMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -3174,7 +3223,12 @@ function App() {
                     }}
                     type="button"
                   >
-                    <strong>{group.groupName}</strong>
+                    <strong>
+                      {group.icon !== null && (
+                        <i aria-hidden="true" className={`group-switcher-icon icon-${group.icon}`}>{GROUP_ICONS[group.icon]}</i>
+                      )}
+                      {group.groupName}
+                    </strong>
                     <span>
                       {group.role}
                       {group.lastSynchronizedAtUnix !== undefined && (
@@ -3266,6 +3320,8 @@ function App() {
               onToggleInvitePermission={setMemberInvitePermission}
               joinedGroupId={joinedGroup?.groupId ?? null}
               onRename={renameLocalGroup}
+              groupIcon={(joinedGroup ?? localGroup)!.icon}
+              onChangeIcon={changeLocalGroupIcon}
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}
               onClose={() => setShowMembers(false)}
@@ -3277,7 +3333,13 @@ function App() {
 
           {step === 3 && joinedGroup && !pendingGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form joined-card">
-              <div className="ready-check" aria-hidden="true">✓</div>
+              {joinedGroup.icon !== null ? (
+                <div className={`group-avatar icon-${joinedGroup.icon}`} aria-hidden="true">
+                  {GROUP_ICONS[joinedGroup.icon]}
+                </div>
+              ) : (
+                <div className="ready-check" aria-hidden="true">✓</div>
+              )}
               <header>
                 <p className="eyebrow">Joined securely</p>
                 <h2>{joinedGroup.groupName}</h2>
@@ -3397,7 +3459,7 @@ function App() {
           {step === 3 && localGroup && !pendingGroup && !joinedGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form group-ready-card">
               <div className={`group-avatar icon-${localGroup.icon}`} aria-hidden="true">
-                {['●●●', '◆', '▲', '♥', '★'][localGroup.icon]}
+                {GROUP_ICONS[localGroup.icon]}
               </div>
               <header>
                 <p className="eyebrow">Group created</p>
@@ -3562,7 +3624,7 @@ function App() {
               <fieldset className="icon-picker">
                 <legend>Group icon</legend>
                 <div>
-                  {['●●●', '◆', '▲', '♥', '★'].map((icon, index) => (
+                  {GROUP_ICONS.map((icon, index) => (
                     <button
                       aria-label={`Group icon ${index + 1}`}
                       aria-pressed={groupIcon === index}

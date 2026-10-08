@@ -1846,6 +1846,28 @@ impl MlsProviderService {
         Ok(response)
     }
 
+    /// Shares a changed icon with members, keeping the owner's current name.
+    pub(crate) fn share_current_metadata(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        local_group_name: &str,
+        icon: u8,
+    ) -> Result<(), &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        self.share_current_metadata_at(
+            group_id,
+            owner_identity,
+            local_group_name,
+            icon,
+            created_at_unix_ms,
+        )
+    }
+
     /// Authors the owner's current name (latest applied rename, else the
     /// local name) and icon as a `GroupMetadataChanged` event.
     fn share_current_metadata_at(

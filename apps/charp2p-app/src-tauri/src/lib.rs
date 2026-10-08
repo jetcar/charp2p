@@ -224,6 +224,39 @@ fn rename_group(
         .map_err(str::to_owned)
 }
 
+/// Changes an owned group's icon and shares it with members first, so a
+/// failed share leaves the owner's icon unchanged and the change retryable.
+#[tauri::command]
+fn change_group_icon(
+    group_id: String,
+    icon: u8,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<LocalGroup, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let Some(group) = group_service
+        .list()
+        .map_err(str::to_owned)?
+        .into_iter()
+        .find(|group| group.group_id == group_id.to_string())
+    else {
+        return Err("group_not_owned".to_owned());
+    };
+    if icon > charp2p_core::MAX_GROUP_ICON {
+        return Err("invalid_group_icon".to_owned());
+    }
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .share_current_metadata(group_id, &identity, &group.group_name, icon)
+        .map_err(str::to_owned)?;
+    group_service
+        .set_icon(group_id, icon)
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn invite_permitted_devices(
     group_id: String,
@@ -1155,6 +1188,7 @@ pub fn run() {
             leave_joined_group,
             local_groups,
             rename_group,
+            change_group_icon,
             invite_permitted_devices,
             set_member_invite_permission,
             request_member_invitation,

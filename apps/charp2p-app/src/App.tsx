@@ -141,7 +141,7 @@ const BACKGROUND_GROUP_SYNC_START_DELAY_MS = 15_000;
 const PENDING_JOIN_RETRY_INTERVAL_MS = 60_000;
 const PENDING_JOIN_START_DELAY_MS = 1_000;
 // Join failures that mean no group owner answered yet; anything else stops automatic retries.
-const RETRYABLE_JOIN_ERRORS = new Set(["network_join_failed", "network_join_timed_out", "join_busy"]);
+const RETRYABLE_JOIN_ERRORS = new Set(["network_join_failed", "network_join_timed_out", "join_busy", "join_awaiting_approval"]);
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
@@ -245,6 +245,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   joined_discovery_record_invalid: "Stored peer discovery information is damaged.",
   joined_discovery_store_unavailable: "Protected peer discovery storage is unavailable.",
   join_busy: "The group owner is busy. Try again shortly.",
+  join_awaiting_approval: "The group owner must approve this device. CharP2P keeps retrying while it waits.",
   join_unauthorized: "The group owner did not accept this invitation.",
   join_unsupported_profile: "The group uses an unsupported security profile.",
   synchronization_busy: "The group peer is busy. Try again shortly.",

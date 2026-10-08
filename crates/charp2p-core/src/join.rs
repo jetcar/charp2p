@@ -255,6 +255,9 @@ pub enum JoinRejectReason {
     Busy,
     /// The supplied MLS profile is unsupported.
     UnsupportedProfile,
+    /// The owner recorded the request and must approve the device first
+    /// (ADR-041).
+    AwaitingApproval,
 }
 
 impl JoinRejectReason {
@@ -263,6 +266,7 @@ impl JoinRejectReason {
             Self::Unauthorized => 1,
             Self::Busy => 2,
             Self::UnsupportedProfile => 3,
+            Self::AwaitingApproval => 4,
         }
     }
 
@@ -271,6 +275,7 @@ impl JoinRejectReason {
             1 => Ok(Self::Unauthorized),
             2 => Ok(Self::Busy),
             3 => Ok(Self::UnsupportedProfile),
+            4 => Ok(Self::AwaitingApproval),
             _ => Err(JoinError::Malformed),
         }
     }
@@ -520,6 +525,22 @@ mod tests {
         let decoded = JoinResponse::decode(&rejected.encode().unwrap()).unwrap();
         assert_eq!(decoded.welcome(), None);
         assert_eq!(decoded.rejection(), Some(JoinRejectReason::Unauthorized));
+
+        let awaiting = JoinResponse::rejected(JoinRejectReason::AwaitingApproval)
+            .encode()
+            .unwrap();
+        assert_eq!(awaiting.last(), Some(&4));
+        let decoded = JoinResponse::decode(&awaiting).unwrap();
+        assert_eq!(
+            decoded.rejection(),
+            Some(JoinRejectReason::AwaitingApproval)
+        );
+        let mut unknown = awaiting;
+        *unknown.last_mut().unwrap() = 5;
+        assert!(matches!(
+            JoinResponse::decode(&unknown),
+            Err(JoinError::Malformed)
+        ));
     }
 
     #[test]

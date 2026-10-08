@@ -1475,6 +1475,7 @@ impl NetworkService {
                 JoinRejectReason::Unauthorized => "join_unauthorized",
                 JoinRejectReason::Busy => "join_busy",
                 JoinRejectReason::UnsupportedProfile => "join_unsupported_profile",
+                JoinRejectReason::AwaitingApproval => "join_awaiting_approval",
             });
         }
         let welcome = response.welcome().ok_or("network_join_failed")?;

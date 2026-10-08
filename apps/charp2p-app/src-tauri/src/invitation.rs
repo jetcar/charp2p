@@ -16,15 +16,28 @@ pub struct InvitationPreview {
 }
 
 pub fn preview_invitation(input: &str) -> Result<InvitationPreview, &'static str> {
-    let now_unix = SystemTime::now()
+    preview_invitation_at(input, current_unix()?)
+}
+
+/// Validates a not-yet-accepted invitation for network use, such as the join
+/// preview's reachability check.
+pub fn decode_invitation(input: &str) -> Result<Invitation, &'static str> {
+    decode_invitation_at(input, current_unix()?)
+}
+
+fn current_unix() -> Result<u64, &'static str> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system_clock_invalid")?
-        .as_secs();
-    preview_invitation_at(input, now_unix)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| "system_clock_invalid")
+}
+
+fn decode_invitation_at(input: &str, now_unix: u64) -> Result<Invitation, &'static str> {
+    Invitation::decode_input(input, now_unix).map_err(public_error_code)
 }
 
 fn preview_invitation_at(input: &str, now_unix: u64) -> Result<InvitationPreview, &'static str> {
-    let invitation = Invitation::decode_input(input, now_unix).map_err(public_error_code)?;
+    let invitation = decode_invitation_at(input, now_unix)?;
     let history_policy = match invitation.history_policy() {
         HistoryPolicy::None => "none",
         HistoryPolicy::FromInvitation => "fromInvitation",
@@ -52,7 +65,7 @@ pub(crate) fn public_error_code(error: InvitationError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::preview_invitation_at;
+    use super::{decode_invitation_at, preview_invitation_at};
     use charp2p_core::{DeviceIdentity, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec};
 
     const NOW: u64 = 1_800_000_000;
@@ -108,6 +121,39 @@ mod tests {
         assert_eq!(
             preview_invitation_at(&encoded, NOW + 1).unwrap_err(),
             "invitation_expired"
+        );
+    }
+
+    #[test]
+    fn decoded_invitation_keeps_the_previewed_inviter_and_rejects_invalid_input() {
+        let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let encoded = Invitation::issue(
+            &owner,
+            inviter_device_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 1,
+                history_policy: HistoryPolicy::None,
+                reusable: true,
+            },
+            NOW,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let invitation = decode_invitation_at(&encoded, NOW).unwrap();
+        assert_eq!(invitation.inviter_device_id(), inviter_device_id);
+        assert_eq!(invitation.group_id(), owner.group_id());
+        assert_eq!(
+            decode_invitation_at(&encoded, NOW + 1).err(),
+            Some("invitation_expired")
+        );
+        assert_eq!(
+            decode_invitation_at("https://example.com/i#abc", NOW).err(),
+            Some("invitation_invalid")
         );
     }
 }

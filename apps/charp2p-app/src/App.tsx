@@ -1810,6 +1810,7 @@ function App() {
   const [restoreView, setRestoreView] = useState(false);
   const [joinMode, setJoinMode] = useState(false);
   const [inviteInput, setInviteInput] = useState("");
+  const inviteInputRef = useRef("");
   const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
   const [verifyingInvite, setVerifyingInvite] = useState(false);
   const [pendingGroups, setPendingGroups] = useState<PendingGroup[]>([]);
@@ -1865,6 +1866,16 @@ function App() {
   const pendingExpiryRefreshAtRef = useRef(0);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
+  const [previewReachability, setPreviewReachability] = useState<PeerSearchResult | null>(null);
+  const [checkingPreviewReachability, setCheckingPreviewReachability] = useState(false);
+
+  useEffect(() => {
+    inviteInputRef.current = inviteInput;
+  }, [inviteInput]);
+
+  useEffect(() => {
+    setPreviewReachability(null);
+  }, [invitationPreview]);
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
   const [activeGroupId, setActiveGroupId] = useState("");
   const activeGroupIdRef = useRef("");
@@ -2442,6 +2453,22 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setVerifyingInvite(false);
+    }
+  }
+
+  async function checkPreviewReachability() {
+    if (!inviteInput.trim() || checkingPreviewReachability || !isTauri()) return;
+
+    const input = inviteInput;
+    setError("");
+    setCheckingPreviewReachability(true);
+    try {
+      const result = await invoke<PeerSearchResult>("check_invitation_reachability", { input });
+      if (inviteInputRef.current === input) setPreviewReachability(result);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCheckingPreviewReachability(false);
     }
   }
 
@@ -3737,7 +3764,13 @@ function App() {
 
               <div className="status-row" aria-label="Invitation status">
                 <span className="status-chip">✓ Verified invitation</span>
-                <span className="status-chip muted">○ Connection not checked</span>
+                <span className="status-chip muted">
+                  ○ {checkingPreviewReachability
+                    ? "Checking connection…"
+                    : previewReachability
+                      ? peerSearchDescription(previewReachability)
+                      : "Connection not checked"}
+                </span>
               </div>
 
               <dl className="preview-facts">
@@ -3750,6 +3783,15 @@ function App() {
 
               <p className="preview-note">Your peer identity will be visible to group members.</p>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
+              <button
+                className="secondary-button"
+                disabled={checkingPreviewReachability}
+                onClick={() => void checkPreviewReachability()}
+                type="button"
+              >
+                {checkingPreviewReachability ? "Checking connection…" : "Check whether the inviter is reachable"}
+              </button>
+              <p className="preview-note">Checking looks up the invitation's discovery key on the network. Joining still waits until a group member is reachable.</p>
               <button className="primary-button join-button" disabled={acceptingInvite} onClick={acceptInvitation} type="button">
                 {acceptingInvite ? "Saving invitation…" : "Join group"}
               </button>

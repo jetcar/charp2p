@@ -471,6 +471,22 @@ async fn search_group_peers(
 }
 
 #[tauri::command]
+async fn check_invitation_reachability(
+    input: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<PeerSearchResult, String> {
+    let invitation = invitation::decode_invitation(&input).map_err(str::to_owned)?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    network_service
+        .search(identity, &invitation)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn join_group(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
@@ -1198,6 +1214,7 @@ pub fn run() {
             create_group_invitation,
             revoke_group_invitation,
             search_group_peers,
+            check_invitation_reachability,
             join_group,
             synchronize_group,
             send_group_message,

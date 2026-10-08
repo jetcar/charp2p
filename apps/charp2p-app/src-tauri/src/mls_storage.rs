@@ -1036,6 +1036,16 @@ impl MlsProviderService {
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .ok_or("system_clock_invalid")?;
+        self.change_group_metadata_at(group_id, author, metadata, created_at_unix_ms)
+    }
+
+    fn change_group_metadata_at(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        metadata: &GroupMetadata,
+        created_at_unix_ms: u64,
+    ) -> Result<(), &'static str> {
         let encoded = metadata.encode().map_err(|_| "invalid_group_name")?;
         {
             let store = self
@@ -1775,28 +1785,90 @@ impl MlsProviderService {
 
     /// Adds one transport-authenticated device, publishes the resulting MLS
     /// Commit as a signed event, and persists the advanced MLS state in the
-    /// same SQLite transaction before returning its Welcome.
-    pub(crate) fn admit_member(
+    /// same SQLite transaction before returning its Welcome. Only when this
+    /// call made a new admission, it then re-authors the current group metadata in the
+    /// joiner's first epoch. A joiner cannot decrypt metadata changes from
+    /// before its Welcome, so this is how it learns the current name and icon.
+    pub(crate) fn admit_member_sharing_metadata(
         &self,
         group_id: PeerId,
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
+        local_group_name: &str,
+        icon: u8,
     ) -> Result<JoinResponse, MemberAdmissionError> {
         let created_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .ok_or(MemberAdmissionError::Unavailable)?;
-        self.admit_member_at(
+        self.admit_member_sharing_metadata_at(
+            group_id,
+            owner_identity,
+            authenticated_peer,
+            encoded_key_package,
+            local_group_name,
+            icon,
+            created_at_unix_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_member_sharing_metadata_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+        local_group_name: &str,
+        icon: u8,
+        created_at_unix_ms: u64,
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        let (response, admitted) = self.admit_member_once_at(
             group_id,
             owner_identity,
             authenticated_peer,
             encoded_key_package,
             created_at_unix_ms,
-        )
+        )?;
+        if admitted {
+            // The admission is already durable, so a failure here only leaves
+            // the joiner with its invitation-time name until the next rename.
+            let _ = self.share_current_metadata_at(
+                group_id,
+                owner_identity,
+                local_group_name,
+                icon,
+                created_at_unix_ms,
+            );
+        }
+        Ok(response)
     }
 
+    /// Authors the owner's current name (latest applied rename, else the
+    /// local name) and icon as a `GroupMetadataChanged` event.
+    fn share_current_metadata_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        local_group_name: &str,
+        icon: u8,
+        created_at_unix_ms: u64,
+    ) -> Result<(), &'static str> {
+        let group_name = self
+            .current_group_names()?
+            .into_iter()
+            .find(|(candidate, _)| *candidate == group_id)
+            .map(|(_, name)| name)
+            .unwrap_or_else(|| local_group_name.to_owned());
+        let metadata = GroupMetadata::new(&group_name)
+            .and_then(|metadata| metadata.with_icon(icon))
+            .map_err(|_| "invalid_group_name")?;
+        self.change_group_metadata_at(group_id, owner_identity, &metadata, created_at_unix_ms)
+    }
+
+    #[cfg(test)]
     fn admit_member_at(
         &self,
         group_id: PeerId,
@@ -1805,6 +1877,26 @@ impl MlsProviderService {
         encoded_key_package: &[u8],
         created_at_unix_ms: u64,
     ) -> Result<JoinResponse, MemberAdmissionError> {
+        self.admit_member_once_at(
+            group_id,
+            owner_identity,
+            authenticated_peer,
+            encoded_key_package,
+            created_at_unix_ms,
+        )
+        .map(|(response, _)| response)
+    }
+
+    /// Returns the Welcome response and whether this call admitted the
+    /// device, as opposed to replaying a stored admission for a retry.
+    fn admit_member_once_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+        created_at_unix_ms: u64,
+    ) -> Result<(JoinResponse, bool), MemberAdmissionError> {
         let _operation = self
             .operations
             .lock()
@@ -1849,7 +1941,7 @@ impl MlsProviderService {
             if response.welcome().is_none() {
                 return Err(MemberAdmissionError::Unavailable);
             }
-            return Ok(response);
+            return Ok((response, false));
         }
         let previous = provider
             .snapshot()
@@ -1932,7 +2024,7 @@ impl MlsProviderService {
                     &encrypted_response,
                 )
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
-            Ok(response)
+            Ok((response, true))
         })();
 
         if result.is_err() {
@@ -4146,6 +4238,105 @@ mod tests {
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["Blocked text"]
+        );
+    }
+
+    #[test]
+    fn new_admission_shares_current_metadata_with_the_late_joiner_once() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        // Renamed before the member joins, in an epoch it cannot decrypt.
+        owner_service
+            .change_group_metadata(
+                group_id,
+                &owner,
+                &charp2p_core::GroupMetadata::new("Renamed Crew")
+                    .unwrap()
+                    .with_icon(1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_sharing_metadata_at(
+                group_id,
+                &owner,
+                member_id,
+                request.key_package(),
+                "Design Crew",
+                4,
+                42,
+            )
+            .unwrap();
+        let retried = owner_service
+            .admit_member_sharing_metadata_at(
+                group_id,
+                &owner,
+                member_id,
+                request.key_package(),
+                "Design Crew",
+                4,
+                43,
+            )
+            .unwrap();
+        assert_eq!(retried.encode().unwrap(), welcome.encode().unwrap());
+        {
+            let store = owner_service.store.lock().unwrap();
+            let kinds = store
+                .event_ids_after(group_id, owner.peer_id(), 0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|id| store.get_event(id).unwrap().unwrap().kind())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec![
+                    EventKind::GroupCreated,
+                    EventKind::GroupMetadataChanged,
+                    EventKind::MemberAdded,
+                    EventKind::GroupMetadataChanged,
+                ]
+            );
+        }
+
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        {
+            let mut store = member_service.store.lock().unwrap();
+            store
+                .put_pending_invitation(&charp2p_store::PendingInvitationMetadata {
+                    group_id,
+                    group_name: "Design Crew".to_owned(),
+                    inviter_name: "Owner".to_owned(),
+                    expires_at_unix: u64::from(u32::MAX),
+                    history_policy: charp2p_core::HistoryPolicy::None,
+                    reusable: false,
+                })
+                .unwrap();
+            assert!(store
+                .promote_pending_invitation_to_joined_group(group_id, owner.peer_id())
+                .unwrap());
+        }
+        pull_all(&owner_service, &member_service, member_id, group_id);
+        assert_eq!(
+            member_service.current_group_names().unwrap(),
+            vec![(group_id, "Renamed Crew".to_owned())]
+        );
+        assert_eq!(
+            member_service.current_group_icons().unwrap(),
+            vec![(group_id, 4)]
         );
     }
 

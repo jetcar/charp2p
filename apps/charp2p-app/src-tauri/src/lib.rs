@@ -18,7 +18,7 @@ use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{
     CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup, MemberInvitationService,
-    ReceivedInvitationCache,
+    OwnerMemberAdmissionService, ReceivedInvitationCache,
 };
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
@@ -1075,6 +1075,10 @@ pub fn run() {
             }
             let network = NetworkService::from_environment(
                 groups.clone(),
+                Arc::new(OwnerMemberAdmissionService::new(
+                    groups.clone(),
+                    mls.clone(),
+                )),
                 mls.clone(),
                 Arc::new(MemberInvitationService::new(groups.clone(), mls.clone())),
             )
@@ -1196,8 +1200,8 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// Replaces invitation-time display names with the latest authenticated
-/// owner rename applied on this device.
+/// Returns the icon of the latest authenticated owner metadata applied on
+/// this device, if any carried one.
 fn current_group_icon(icons: &[(charp2p_core::PeerId, u8)], group_id: &str) -> Option<u8> {
     icons
         .iter()
@@ -1205,6 +1209,8 @@ fn current_group_icon(icons: &[(charp2p_core::PeerId, u8)], group_id: &str) -> O
         .map(|(_, icon)| *icon)
 }
 
+/// Replaces invitation-time display names with the latest authenticated
+/// owner rename applied on this device.
 fn apply_current_group_name(
     names: &[(charp2p_core::PeerId, String)],
     group_id: &str,

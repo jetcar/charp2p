@@ -6,8 +6,9 @@ use std::{
 };
 
 use charp2p_core::{
-    DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation, InvitationId,
-    InvitationSpec, InviteRejectReason, InviteRequest, InviteResponse, JoinRequest, PeerId,
+    DeviceIdentity, DiscoveryKey, GroupIdentity, GroupIdentitySecret, HistoryPolicy, Invitation,
+    InvitationId, InvitationSpec, InviteRejectReason, InviteRequest, InviteResponse, JoinRequest,
+    JoinResponse, PeerId,
 };
 use charp2p_store::{
     EventStore, IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
@@ -18,8 +19,10 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::identity::protected_entry;
-use crate::mls_storage::MlsProviderService;
-use crate::network::{InviteRequestService, JoinRequestAuthorization, JoinRequestAuthorizer};
+use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
+use crate::network::{
+    InviteRequestService, JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService,
+};
 
 const CREDENTIAL_PREFIX: &str = "group-identity-v1-";
 const INVITATION_CREDENTIAL_PREFIX: &str = "issued-invitation-v1-";
@@ -1031,6 +1034,46 @@ impl InviteRequestService for MemberInvitationService {
             authenticated_peer,
             request,
             |group_id, peer| self.permissions.may_request_invitation(group_id, peer),
+        )
+    }
+}
+
+/// Owner-side member admission that also shares the owned group's current
+/// name and icon with the new member, whose Welcome starts after any earlier
+/// metadata change.
+pub(crate) struct OwnerMemberAdmissionService {
+    groups: Arc<GroupService>,
+    mls: Arc<MlsProviderService>,
+}
+
+impl OwnerMemberAdmissionService {
+    pub(crate) fn new(groups: Arc<GroupService>, mls: Arc<MlsProviderService>) -> Self {
+        Self { groups, mls }
+    }
+}
+
+impl MemberAdmissionService for OwnerMemberAdmissionService {
+    fn admit_member(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        authenticated_peer: PeerId,
+        encoded_key_package: &[u8],
+    ) -> Result<JoinResponse, MemberAdmissionError> {
+        let group = self
+            .groups
+            .list()
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+            .into_iter()
+            .find(|group| group.group_id == group_id.to_string())
+            .ok_or(MemberAdmissionError::Unavailable)?;
+        self.mls.admit_member_sharing_metadata(
+            group_id,
+            owner_identity,
+            authenticated_peer,
+            encoded_key_package,
+            &group.group_name,
+            group.icon,
         )
     }
 }

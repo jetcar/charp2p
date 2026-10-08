@@ -82,7 +82,7 @@ impl InviteRequestService for RejectingInviteRequestService {
     }
 }
 
-trait MemberAdmissionService: Send + Sync {
+pub(crate) trait MemberAdmissionService: Send + Sync {
     fn admit_member(
         &self,
         group_id: PeerId,
@@ -138,24 +138,6 @@ trait SynchronizationService: Send + Sync {
         author_id: PeerId,
         peers: &[SyncPeerHead],
     ) -> Result<(), &'static str>;
-}
-
-impl MemberAdmissionService for MlsProviderService {
-    fn admit_member(
-        &self,
-        group_id: PeerId,
-        owner_identity: &DeviceIdentity,
-        authenticated_peer: PeerId,
-        encoded_key_package: &[u8],
-    ) -> Result<JoinResponse, MemberAdmissionError> {
-        MlsProviderService::admit_member(
-            self,
-            group_id,
-            owner_identity,
-            authenticated_peer,
-            encoded_key_package,
-        )
-    }
 }
 
 impl PendingJoinService for MlsProviderService {
@@ -407,7 +389,8 @@ pub struct NetworkService {
 impl NetworkService {
     pub fn from_environment(
         join_authorizer: Arc<dyn JoinRequestAuthorizer>,
-        member_admission: Arc<MlsProviderService>,
+        member_admission: Arc<dyn MemberAdmissionService>,
+        mls: Arc<MlsProviderService>,
         invite_requests: Arc<dyn InviteRequestService>,
     ) -> Result<Self, &'static str> {
         let environment = std::env::var(BOOTSTRAP_ENVIRONMENT_VARIABLE).unwrap_or_default();
@@ -415,9 +398,9 @@ impl NetworkService {
             BUILT_IN_BOOTSTRAP_ADDRESSES,
             &environment,
             join_authorizer,
-            member_admission.clone(),
-            member_admission.clone(),
             member_admission,
+            mls.clone(),
+            mls,
         )
         .map(|service| service.with_invite_requests(invite_requests))
     }

@@ -403,7 +403,9 @@ version 1 change arrives. Only the owner device may
 author it: members apply a change only when its author is the owner device that
 admitted them, and the change with the owner's highest author sequence is the
 current name. Metadata changes are delivered by pull synchronization and are
-never accepted through member pushes.
+never accepted through member pushes. Because a new member cannot decrypt
+epochs before its Welcome, the owner re-authors the current name and icon right
+after each new admission (not on a replayed admission for a retried request).
 
 An `InvitePermissionChanged` event grants or withdraws one admitted member
 device's permission to request invitations (ADR-036). It carries a versioned

@@ -7,7 +7,7 @@ use std::{
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, Invitation, InviteRejectReason, InviteRequest, InviteResponse,
     JoinRejectReason, JoinRequest, JoinResponse, SyncPeerHead, SyncRejectReason, SyncRequest,
-    SyncResponse,
+    SyncResponse, MAX_ADDRESS_HINTS,
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{
@@ -44,6 +44,11 @@ const MAX_SYNC_EXCHANGES: usize = 4_096;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONTRIBUTION_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Most listen addresses of the owner advertising node kept as invitation
+/// hint candidates.
+const MAX_OWNER_LISTEN_ADDRESSES: usize = 16;
+/// Largest binary multiaddress an invitation accepts as a hint (ADR-037).
+const MAX_ADDRESS_HINT_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JoinRequestAuthorization {
@@ -64,6 +69,7 @@ pub(crate) trait InviteRequestService: Send + Sync {
         inviter_name: &str,
         authenticated_peer: PeerId,
         request: &InviteRequest,
+        address_hints: &[Multiaddr],
     ) -> InviteResponse;
 }
 
@@ -77,6 +83,7 @@ impl InviteRequestService for RejectingInviteRequestService {
         _inviter_name: &str,
         _authenticated_peer: PeerId,
         _request: &InviteRequest,
+        _address_hints: &[Multiaddr],
     ) -> InviteResponse {
         InviteResponse::rejected(InviteRejectReason::Unauthorized)
     }
@@ -382,6 +389,9 @@ pub struct NetworkService {
     pending_join: Arc<dyn PendingJoinService>,
     synchronization: Arc<dyn SynchronizationService>,
     invite_requests: Arc<dyn InviteRequestService>,
+    /// Current listen addresses of the owner advertising node, without the
+    /// device peer ID, offered as invitation address hints (ADR-037).
+    owner_addresses: Arc<std::sync::Mutex<Vec<Multiaddr>>>,
     /// Whether owner and member nodes also use mDNS on the local network.
     lan_discovery: bool,
 }
@@ -460,8 +470,19 @@ impl NetworkService {
             pending_join,
             synchronization,
             invite_requests: Arc::new(RejectingInviteRequestService),
+            owner_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
             lan_discovery: true,
         })
+    }
+
+    /// Returns the address hints for invitations issued by this owner
+    /// device: the advertising node's current addresses, relayed ones first.
+    /// Empty while the owner is not advertising.
+    pub fn owner_address_hints(&self) -> Vec<Multiaddr> {
+        self.owner_addresses
+            .lock()
+            .map(|addresses| select_address_hints(&addresses))
+            .unwrap_or_default()
     }
 
     /// Builds the short-lived client node used to advertise or reach a group
@@ -756,6 +777,7 @@ impl NetworkService {
         if let Some(existing) = active.take() {
             existing.task.abort();
         }
+        clear_owner_addresses(&self.owner_addresses);
 
         // The owner device also answers mDNS so members on the same local
         // network can reach it without a relay.
@@ -777,10 +799,13 @@ impl NetworkService {
                 .map_err(|_| "network_unavailable")?;
         }
 
-        timeout(PROVIDER_SEARCH_TIMEOUT, async {
+        let announced = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut pending = keys.clone();
             loop {
                 match node.next_event().await {
+                    NetworkEvent::Listening { address } => {
+                        record_owner_address(&self.owner_addresses, address);
+                    }
                     NetworkEvent::GroupAnnounced { key: announced }
                         if pending.contains(&announced) =>
                     {
@@ -825,6 +850,7 @@ impl NetworkService {
                             &inviter_name,
                             peer_id,
                             &request,
+                            &self.owner_address_hints(),
                         );
                         let _ = node.send_invite_response(request_id, response);
                     }
@@ -833,16 +859,21 @@ impl NetworkService {
             }
         })
         .await
-        .map_err(|_| "network_advertisement_timed_out")??;
-
-        if let Some(expiry) = expires_at_unix {
-            remaining_until_expiry(expiry)?;
+        .map_err(|_| "network_advertisement_timed_out")
+        .and_then(|announced| announced)
+        .and_then(|()| {
+            expires_at_unix.map_or(Ok(()), |expiry| remaining_until_expiry(expiry).map(|_| ()))
+        });
+        if let Err(error) = announced {
+            clear_owner_addresses(&self.owner_addresses);
+            return Err(error);
         }
 
         let join_authorizer = Arc::clone(&self.join_authorizer);
         let member_admission = Arc::clone(&self.member_admission);
         let synchronization = Arc::clone(&self.synchronization);
         let invite_requests = Arc::clone(&self.invite_requests);
+        let owner_addresses = Arc::clone(&self.owner_addresses);
         let task_keys = keys.clone();
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
@@ -869,6 +900,9 @@ impl NetworkService {
                                 key: failed,
                                 operation: charp2p_network::DiscoveryOperation::Announcement,
                             } if task_keys.contains(&failed) => break,
+                            NetworkEvent::Listening { address } => {
+                                record_owner_address(&owner_addresses, address);
+                            }
                             NetworkEvent::SyncRequestReceived {
                                 peer_id,
                                 request_id,
@@ -897,11 +931,16 @@ impl NetworkService {
                                 request_id,
                                 request,
                             } => {
+                                let hints = owner_addresses
+                                    .lock()
+                                    .map(|addresses| select_address_hints(&addresses))
+                                    .unwrap_or_default();
                                 let response = invite_requests.answer_invite_request(
                                     owner_identity.peer_id(),
                                     &inviter_name,
                                     peer_id,
                                     &request,
+                                    &hints,
                                 );
                                 let _ = node.send_invite_response(request_id, response);
                             }
@@ -910,6 +949,7 @@ impl NetworkService {
                     }
                 }
             }
+            clear_owner_addresses(&owner_addresses);
         });
         *active = Some(ActiveAdvertisement {
             keys,
@@ -1913,6 +1953,59 @@ fn discovery_outcome<T>(result: &Result<T, &'static str>) -> Option<&'static str
     }
 }
 
+/// Records a listen address of the owner advertising node as an invitation
+/// hint candidate, when another device could dial it.
+fn record_owner_address(addresses: &std::sync::Mutex<Vec<Multiaddr>>, address: Multiaddr) {
+    let Some(hint) = address_hint(address) else {
+        return;
+    };
+    if let Ok(mut addresses) = addresses.lock() {
+        if !addresses.contains(&hint) && addresses.len() < MAX_OWNER_LISTEN_ADDRESSES {
+            addresses.push(hint);
+        }
+    }
+}
+
+fn clear_owner_addresses(addresses: &std::sync::Mutex<Vec<Multiaddr>>) {
+    if let Ok(mut addresses) = addresses.lock() {
+        addresses.clear();
+    }
+}
+
+/// Strips the trailing device peer ID, which joiners append from the pinned
+/// inviter instead, and rejects loopback, unspecified, and oversized
+/// addresses that cannot serve as an invitation hint.
+fn address_hint(mut address: Multiaddr) -> Option<Multiaddr> {
+    if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
+        address.pop();
+    }
+    let local_only = address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Protocol::Ip6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        _ => false,
+    });
+    let valid = !local_only
+        && !address.is_empty()
+        && address.len() <= MAX_ADDRESS_HINT_BYTES
+        && !matches!(address.iter().last(), Some(Protocol::P2p(_)));
+    valid.then_some(address)
+}
+
+/// Picks at most the invitation hint limit, relay circuit addresses first
+/// because they also reach an owner behind NAT.
+fn select_address_hints(addresses: &[Multiaddr]) -> Vec<Multiaddr> {
+    let (relayed, direct): (Vec<_>, Vec<_>) = addresses.iter().cloned().partition(|address| {
+        address
+            .iter()
+            .any(|protocol| protocol == Protocol::P2pCircuit)
+    });
+    relayed
+        .into_iter()
+        .chain(direct)
+        .take(MAX_ADDRESS_HINTS)
+        .collect()
+}
+
 fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
     let mut address: Multiaddr = input.parse().map_err(|_| "network_configuration_invalid")?;
     let Some(Protocol::P2p(peer_id)) = address.pop() else {
@@ -1954,12 +2047,13 @@ mod tests {
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
-        discovery_outcome, join_response, parse_bootstrap_peer, upgraded_path, AdvertisementResult,
-        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
-        MemberAdmissionService, NetworkService, NetworkStatus, PeerSearchResult,
-        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
-        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
-        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
+        address_hint, discovery_outcome, join_response, parse_bootstrap_peer, record_owner_address,
+        select_address_hints, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
+        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, NetworkService,
+        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
+        SynchronizationService, UnavailableJoinRequestAuthorizer,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
+        MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -2179,6 +2273,49 @@ mod tests {
             self.lan_discovery = false;
             self
         }
+    }
+
+    #[test]
+    fn owner_address_hints_strip_the_peer_id_and_put_relays_first() {
+        let device = DeviceIdentity::generate().peer_id();
+        let relay = DeviceIdentity::generate().peer_id();
+        let direct: libp2p::Multiaddr = "/ip4/192.168.1.20/udp/4001/quic-v1".parse().unwrap();
+        let relayed: libp2p::Multiaddr =
+            format!("/ip4/203.0.113.9/udp/4001/quic-v1/p2p/{relay}/p2p-circuit")
+                .parse()
+                .unwrap();
+        let addresses = std::sync::Mutex::new(Vec::new());
+        record_owner_address(
+            &addresses,
+            direct
+                .clone()
+                .with(libp2p::multiaddr::Protocol::P2p(device)),
+        );
+        record_owner_address(&addresses, direct.clone());
+        record_owner_address(
+            &addresses,
+            relayed
+                .clone()
+                .with(libp2p::multiaddr::Protocol::P2p(device)),
+        );
+        record_owner_address(
+            &addresses,
+            "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap(),
+        );
+        record_owner_address(&addresses, "/ip6/::/udp/4001/quic-v1".parse().unwrap());
+
+        let hints = select_address_hints(&addresses.lock().unwrap());
+        assert_eq!(hints, vec![relayed, direct]);
+
+        let many: Vec<libp2p::Multiaddr> = (1..=6)
+            .map(|port| {
+                format!("/ip4/192.168.1.20/udp/{port}/quic-v1")
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(select_address_hints(&many), many[..4].to_vec());
+        assert_eq!(address_hint(libp2p::Multiaddr::empty()), None);
     }
 
     #[test]

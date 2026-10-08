@@ -27,7 +27,7 @@ pub use identity_backup::{
     seal_identity_backup,
 };
 pub use invitation::{
-    HistoryPolicy, Invitation, InvitationError, InvitationId, InvitationSpec,
+    HistoryPolicy, Invitation, InvitationError, InvitationId, InvitationSpec, MAX_ADDRESS_HINTS,
     MAX_INVITATION_ENCODED_BYTES,
 };
 pub use invite_permission::{InvitePermission, InvitePermissionError};

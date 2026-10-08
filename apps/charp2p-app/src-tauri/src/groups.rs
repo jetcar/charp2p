@@ -14,6 +14,7 @@ use charp2p_store::{
     EventStore, IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
 };
 use keyring_core::Error as KeyringError;
+use libp2p::Multiaddr;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -379,17 +380,28 @@ impl GroupService {
         Ok(metadata.into())
     }
 
+    /// `address_hints` are the inviter device's current addresses, carried
+    /// in the invitation as root-signed hints (ADR-037).
     pub fn issue_invitation(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
+        address_hints: &[Multiaddr],
     ) -> Result<IssuedInvitation, &'static str> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system_clock_invalid")?
             .as_secs();
-        self.issue_invitation_at(group_id, inviter_device_id, inviter_name, now_unix)
+        self.issue_requested_invitation_at(
+            group_id,
+            inviter_device_id,
+            inviter_name,
+            None,
+            address_hints,
+            now_unix,
+        )
+        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
     }
 
     /// Answers a permitted member's invite request (ADR-036): the group must
@@ -403,6 +415,7 @@ impl GroupService {
         inviter_name: &str,
         authenticated_peer: PeerId,
         request: &InviteRequest,
+        address_hints: &[Multiaddr],
         permitted: impl FnOnce(PeerId, PeerId) -> Result<bool, &'static str>,
     ) -> InviteResponse {
         let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
@@ -413,17 +426,20 @@ impl GroupService {
             inviter_name,
             authenticated_peer,
             request,
+            address_hints,
             permitted,
             now.as_secs(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn answer_invite_request_at(
         &self,
         owner_device_id: PeerId,
         inviter_name: &str,
         authenticated_peer: PeerId,
         request: &InviteRequest,
+        address_hints: &[Multiaddr],
         permitted: impl FnOnce(PeerId, PeerId) -> Result<bool, &'static str>,
         now_unix: u64,
     ) -> InviteResponse {
@@ -452,6 +468,7 @@ impl GroupService {
             owner_device_id,
             inviter_name,
             Some((authenticated_peer, u64::from(request.lifetime_seconds()))),
+            address_hints,
             now_unix,
         ) {
             Ok((invitation, _)) => InviteResponse::issued(&invitation)
@@ -723,6 +740,7 @@ impl GroupService {
         })
     }
 
+    #[cfg(test)]
     fn issue_invitation_at(
         &self,
         group_id: PeerId,
@@ -735,6 +753,7 @@ impl GroupService {
             inviter_device_id,
             inviter_name,
             None,
+            &[],
             now_unix,
         )
         .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
@@ -744,13 +763,16 @@ impl GroupService {
     /// so withdrawing that member's permission can revoke it (ADR-036). A
     /// member request may only shorten the group's invitation lifetime, and
     /// a repeated request from the same member returns its still-active
-    /// invitation instead of failing.
+    /// invitation instead of failing. Address hints are dropped when they
+    /// would make the invitation invalid or too large to protect, since they
+    /// are only an optimization.
     fn issue_requested_invitation_at(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
         requested: Option<(PeerId, u64)>,
+        address_hints: &[Multiaddr],
         now_unix: u64,
     ) -> Result<(Invitation, Zeroizing<String>), &'static str> {
         let requested_by = requested.map(|(requester, _)| requester);
@@ -841,24 +863,40 @@ impl GroupService {
         let expires_at_unix = now_unix
             .checked_add(lifetime_seconds)
             .ok_or("system_clock_invalid")?;
-        let invitation = Invitation::issue(
-            &identity,
-            inviter_device_id,
-            InvitationSpec {
-                group_name: &group.group_name,
-                inviter_name,
-                expires_at_unix,
-                history_policy: group.history_policy,
-                reusable: group.reusable_invitation,
-            },
-            now_unix,
-        )
-        .map_err(|_| "invitation_creation_failed")?;
-        let encoded = Zeroizing::new(
-            invitation
-                .encode()
-                .map_err(|_| "invitation_creation_failed")?,
-        );
+        let spec = InvitationSpec {
+            group_name: &group.group_name,
+            inviter_name,
+            expires_at_unix,
+            history_policy: group.history_policy,
+            reusable: group.reusable_invitation,
+        };
+        let hinted = (!address_hints.is_empty())
+            .then(|| {
+                let invitation = Invitation::issue_with_address_hints(
+                    &identity,
+                    inviter_device_id,
+                    spec,
+                    address_hints,
+                    now_unix,
+                )
+                .ok()?;
+                let encoded = Zeroizing::new(invitation.encode().ok()?);
+                (encoded.len() <= MAX_PROTECTED_INVITATION_BYTES).then_some((invitation, encoded))
+            })
+            .flatten();
+        let (invitation, encoded) = match hinted {
+            Some(hinted) => hinted,
+            None => {
+                let invitation = Invitation::issue(&identity, inviter_device_id, spec, now_unix)
+                    .map_err(|_| "invitation_creation_failed")?;
+                let encoded = Zeroizing::new(
+                    invitation
+                        .encode()
+                        .map_err(|_| "invitation_creation_failed")?,
+                );
+                (invitation, encoded)
+            }
+        };
         if encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
             return Err("invitation_creation_failed");
         }
@@ -1054,12 +1092,14 @@ impl InviteRequestService for MemberInvitationService {
         inviter_name: &str,
         authenticated_peer: PeerId,
         request: &InviteRequest,
+        address_hints: &[Multiaddr],
     ) -> InviteResponse {
         self.groups.answer_invite_request(
             owner_device_id,
             inviter_name,
             authenticated_peer,
             request,
+            address_hints,
             |group_id, peer| self.permissions.may_request_invitation(group_id, peer),
         )
     }
@@ -1446,6 +1486,41 @@ mod tests {
     }
 
     #[test]
+    fn invitation_carries_address_hints_and_drops_invalid_ones() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+        let inviter = DeviceIdentity::generate().peer_id();
+        let hint: libp2p::Multiaddr = "/ip4/198.51.100.7/udp/4001/quic-v1".parse().unwrap();
+
+        let (hinted, _) = service
+            .issue_requested_invitation_at(
+                group_id,
+                inviter,
+                "Maya's PC",
+                None,
+                std::slice::from_ref(&hint),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(hinted.address_hints(), std::slice::from_ref(&hint));
+        service.revoke_invitation(group_id).unwrap();
+
+        // A hint ending in a peer ID is invalid, so the invitation is issued
+        // without hints rather than failing.
+        let invalid = hint.with(libp2p::multiaddr::Protocol::P2p(inviter));
+        let (unhinted, encoded) = service
+            .issue_requested_invitation_at(group_id, inviter, "Maya's PC", None, &[invalid], NOW)
+            .unwrap();
+        assert!(unhinted.address_hints().is_empty());
+        assert!(Invitation::decode(&encoded, NOW)
+            .unwrap()
+            .address_hints()
+            .is_empty());
+    }
+
+    #[test]
     fn owner_can_create_several_groups_with_separate_roots_and_invitations() {
         const NOW: u64 = 1_800_000_000;
         let service = service();
@@ -1608,6 +1683,7 @@ mod tests {
                 "Maya's PC",
                 peer,
                 request,
+                &[],
                 |checked_group, checked_peer| {
                     assert_eq!((checked_group, checked_peer), (group_id, peer));
                     permitted
@@ -1692,6 +1768,7 @@ mod tests {
             "Maya's PC",
             member,
             &request,
+            &[],
             |_, _| Ok(true),
             NOW,
         );
@@ -1755,6 +1832,7 @@ mod tests {
                 owner,
                 "Maya's PC",
                 Some((requester, 86_400)),
+                &[],
                 NOW,
             )
             .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))

@@ -117,7 +117,11 @@ invitation version 3 (ADR-037): one to four distinct direct or circuit-relay
 addresses of at most 256 bytes, without a trailing `/p2p` component. Clients
 append the pinned inviter peer ID, dial the hints before the DHT provider
 search, and fall back to the search when no hint connects. Invitations without
-hints keep the version 2 encoding.
+hints keep the version 2 encoding. The owner takes hints from the current
+listen addresses of its advertising node, circuit-relay addresses first and
+loopback or unspecified addresses excluded, both for its own invitations and
+for invitations issued at a member's request; hints that would make the
+invitation invalid or too large to protect are dropped.
 
 Invitation parsing is bounded and fully validated before network use. An
 invitation is a bearer credential and must be treated as sensitive.

@@ -389,6 +389,7 @@ fn create_group_invitation(
     group_id: String,
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<IssuedInvitation, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let profile = identity_service
@@ -398,7 +399,12 @@ fn create_group_invitation(
     let inviter_name = identity::invitation_device_name(&profile.device_name);
     let inviter_device_id = parse_group_id(&profile.peer_id, "identity_record_invalid")?;
     group_service
-        .issue_invitation(group_id, inviter_device_id, &inviter_name)
+        .issue_invitation(
+            group_id,
+            inviter_device_id,
+            &inviter_name,
+            &network_service.owner_address_hints(),
+        )
         .map_err(str::to_owned)
 }
 

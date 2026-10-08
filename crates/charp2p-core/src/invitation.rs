@@ -36,6 +36,7 @@ pub enum HistoryPolicy {
 }
 
 /// User-selected fields used to issue an invitation.
+#[derive(Clone, Copy)]
 pub struct InvitationSpec<'a> {
     /// Human-readable group name authenticated by the owner signature.
     pub group_name: &'a str,

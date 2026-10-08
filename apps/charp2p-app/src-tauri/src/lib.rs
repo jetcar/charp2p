@@ -546,7 +546,7 @@ async fn synchronize_group(
         .into_iter()
         .filter_map(|address| Multiaddr::try_from(address).ok())
         .collect::<Vec<_>>();
-    let result = network_service
+    let owner_result = network_service
         .synchronize(
             identity,
             discovery_key,
@@ -555,8 +555,32 @@ async fn synchronize_group(
             &known_addresses,
             &bandwidth_service,
         )
-        .await
-        .map_err(str::to_owned)?;
+        .await;
+    let result = match owner_result {
+        Ok(result) => result,
+        // While the owner is unreachable, another current member may serve
+        // the history it holds (ADR-040); the owner's error is reported when
+        // no member can.
+        Err(error) if network::owner_unreachable(error) => {
+            let members = mls_service
+                .group_members(group_id)
+                .map_err(str::to_owned)?
+                .into_iter()
+                .filter_map(|member| member.device_id.parse().ok())
+                .collect::<Vec<_>>();
+            let Ok(member_key) = mls_service.member_rendezvous_key(group_id) else {
+                return Err(error.to_owned());
+            };
+            let identity = identity_service
+                .load_network_identity()
+                .map_err(str::to_owned)?;
+            return network_service
+                .pull_from_members(identity, member_key, group_id, &members, &bandwidth_service)
+                .await
+                .map_err(|_| error.to_owned());
+        }
+        Err(error) => return Err(error.to_owned()),
+    };
     pending_service
         .record_synchronization(group_id, result.synchronized_at_unix)
         .map_err(str::to_owned)?;

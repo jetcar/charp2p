@@ -41,6 +41,8 @@ const LAN_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
 const JOIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_SYNC_EXCHANGES: usize = 4_096;
+/// Member providers tried by one member-served pull (ADR-040).
+const MAX_MEMBER_PROVIDERS: usize = 4;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONTRIBUTION_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -1625,6 +1627,132 @@ impl NetworkService {
         })
     }
 
+    /// Pulls the group history from another current member while the pinned
+    /// owner cannot be reached (ADR-040): searches the member rendezvous key
+    /// of the current epoch and pulls from the first reachable provider in
+    /// `members`, trying at most four. Uploads and head reports stay with the
+    /// owner, so nothing is pushed.
+    pub async fn pull_from_members(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        group_id: PeerId,
+        members: &[PeerId],
+        bandwidth: &BandwidthService,
+    ) -> Result<SynchronizeGroupResult, &'static str> {
+        let local_peer = identity.peer_id();
+        bandwidth.ensure_sync_budget()?;
+        if self.bootstrap_peers().is_empty() {
+            return Err("network_bootstrap_required");
+        }
+        let mut node = self.group_client_node(identity);
+        node.listen_on(
+            "/ip4/0.0.0.0/udp/0/quic-v1"
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+        for bootstrap in &self.bootstrap_peers() {
+            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+        }
+        node.bootstrap().map_err(|_| "network_unavailable")?;
+        node.find_group_peers(key);
+
+        // Providers connected while the search ran need no second dial.
+        let mut connected = Vec::new();
+        let candidates = timeout(PROVIDER_SEARCH_TIMEOUT, async {
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::PeerConnected {
+                        peer_id,
+                        path,
+                        remote_address,
+                    } => connected.push((peer_id, path, remote_address)),
+                    NetworkEvent::GroupPeersFound {
+                        key: found_key,
+                        providers,
+                    } if found_key == key => {
+                        let candidates = providers
+                            .into_iter()
+                            .filter(|provider| {
+                                *provider != local_peer && members.contains(provider)
+                            })
+                            .take(MAX_MEMBER_PROVIDERS)
+                            .collect::<Vec<_>>();
+                        if !candidates.is_empty() {
+                            return Ok(candidates);
+                        }
+                    }
+                    NetworkEvent::GroupPeerSearchFinished { key: found_key }
+                        if found_key == key =>
+                    {
+                        return Err("network_peer_not_found");
+                    }
+                    NetworkEvent::DiscoveryFailed {
+                        key: failed_key, ..
+                    } if failed_key == key => return Err("network_unavailable"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "network_search_timed_out")??;
+
+        let mut last_error = "network_peer_unreachable";
+        for provider in candidates {
+            let already_connected = connected
+                .iter()
+                .find(|(peer_id, _, _)| *peer_id == provider)
+                .map(|(_, path, address)| (*path, address.clone()));
+            let reached = match already_connected {
+                Some(reached) => Some(reached),
+                None if node.dial_peer(provider).is_ok() => timeout(CONNECT_TIMEOUT, async {
+                    loop {
+                        if let NetworkEvent::PeerConnected {
+                            peer_id,
+                            path,
+                            remote_address,
+                        } = node.next_event().await
+                        {
+                            if peer_id == provider {
+                                break (path, remote_address);
+                            }
+                        }
+                    }
+                })
+                .await
+                .ok(),
+                None => None,
+            };
+            let Some((mut path, peer_address)) = reached else {
+                continue;
+            };
+            match self
+                .pull_from_connected_peer(&mut node, provider, group_id, Some(bandwidth), &mut path)
+                .await
+            {
+                Ok(synchronized_events) => {
+                    return Ok(SynchronizeGroupResult {
+                        status: "memberSynchronized",
+                        group_id: group_id.to_string(),
+                        synchronized_events,
+                        uploaded_events: 0,
+                        synchronized_at_unix: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| "system_clock_invalid")?
+                            .as_secs(),
+                        connection_type: connection_type_name(path),
+                        peer_address,
+                    });
+                }
+                // Another member cannot lift the local data limit.
+                Err(error @ "synchronization_bandwidth_limited") => return Err(error),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
     async fn connect_to_group_provider(
         &self,
         identity: DeviceIdentity,
@@ -1930,6 +2058,15 @@ impl NetworkService {
             _ => Err("synchronization_failed"),
         }
     }
+}
+
+/// Whether an owner synchronization failed because the owner could not be
+/// found or reached, so a member-served pull may help (ADR-040).
+pub(crate) fn owner_unreachable(error: &str) -> bool {
+    matches!(
+        error,
+        "network_peer_not_found" | "network_peer_unreachable" | "network_search_timed_out"
+    )
 }
 
 /// Signed event bytes a synchronization request pushes (ADR-033).
@@ -4308,6 +4445,128 @@ mod tests {
             })
             .await
             .expect("dropping the service should stop its advertiser");
+        });
+    }
+
+    #[test]
+    fn only_unreachable_owner_errors_fall_back_to_members() {
+        for error in [
+            "network_peer_not_found",
+            "network_peer_unreachable",
+            "network_search_timed_out",
+        ] {
+            assert!(super::owner_unreachable(error), "{error}");
+        }
+        for error in [
+            "network_unavailable",
+            "network_bootstrap_required",
+            "synchronization_unauthorized",
+            "synchronization_bandwidth_limited",
+        ] {
+            assert!(!super::owner_unreachable(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn member_pull_reaches_only_listed_current_members() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[9; 32]);
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let (puller, puller_again) = identity_pair();
+        let puller_id = puller.peer_id();
+        tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let bootstrap = format!("{address}/p2p/{routing_id}");
+            let service = |expected_peer| {
+                NetworkService::from_sources_with_authorizer(
+                    &[],
+                    &bootstrap,
+                    Arc::new(StaticJoinRequestAuthorizer(
+                        JoinRequestAuthorization::Authorized,
+                    )),
+                    Arc::new(UnavailableMemberAdmissionService),
+                    Arc::new(UnavailablePendingJoinService),
+                    Arc::new(MemberSynchronizationService {
+                        expected_peer,
+                        group_id,
+                    }),
+                )
+                .unwrap()
+                .without_lan_discovery()
+            };
+            let serving = service(puller_id);
+            let pulling = service(member_id);
+            {
+                let serve =
+                    serving.serve_member_group(member, group_id, key, Arc::clone(&bandwidth));
+                tokio::pin!(serve);
+                let status = timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut serve => break result,
+                            _ = routing.next_event() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("member advertisement should complete")
+                .unwrap();
+                assert_eq!(status, "advertising");
+            }
+
+            // A provider outside the current member list is never asked.
+            {
+                let pull = pulling.pull_from_members(puller, key, group_id, &[], &bandwidth);
+                tokio::pin!(pull);
+                let result = timeout(Duration::from_secs(15), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut pull => break result,
+                            _ = routing.next_event() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("member search should end");
+                assert!(matches!(
+                    result,
+                    Err("network_peer_not_found" | "network_search_timed_out")
+                ));
+            }
+
+            let members = [puller_id, member_id];
+            let pull = pulling.pull_from_members(puller_again, key, group_id, &members, &bandwidth);
+            tokio::pin!(pull);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut pull => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("member pull should complete")
+            .unwrap();
+            assert_eq!(result.status, "memberSynchronized");
+            assert_eq!(result.synchronized_events, 3);
+            assert_eq!(result.uploaded_events, 0);
+            assert_eq!(result.group_id, group_id.to_string());
         });
     }
 

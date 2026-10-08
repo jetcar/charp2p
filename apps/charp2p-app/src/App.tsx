@@ -99,7 +99,9 @@ type OwnedGroupDiscoveryStatus = {
   discoveryKeys: number;
 };
 type SynchronizeGroupResult = {
-  status: "synchronized";
+  // "memberSynchronized": pulled from another member while the owner was
+  // unreachable (ADR-040); nothing was shared with the owner.
+  status: "synchronized" | "memberSynchronized";
   groupId: string;
   synchronizedEvents: number;
   uploadedEvents: number;
@@ -2724,9 +2726,12 @@ function App() {
       const refreshedGroups = await invoke<JoinedGroup[]>("joined_groups");
       setJoinedGroups((groups) => groups.map((group) => {
         const refreshed = refreshedGroups.find((candidate) => candidate.groupId === group.groupId);
-        return group.groupId === groupId
-          ? { ...group, groupName: refreshed?.groupName ?? group.groupName, lastSynchronizedAtUnix: result.synchronizedAtUnix }
-          : group;
+        if (group.groupId !== groupId) return group;
+        // Only an owner synchronization counts as last synchronized.
+        const lastSynchronizedAtUnix = result.status === "synchronized"
+          ? result.synchronizedAtUnix
+          : group.lastSynchronizedAtUnix;
+        return { ...group, groupName: refreshed?.groupName ?? group.groupName, lastSynchronizedAtUnix };
       }));
       if (activeGroupIdRef.current === groupId) {
         // Re-advertise under the member key of a newly reached MLS epoch.
@@ -3508,7 +3513,9 @@ function App() {
                   {synchronizingGroup
                     ? "○ Synchronizing…"
                     : synchronizationResult
-                      ? `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
+                      ? synchronizationResult.status === "memberSynchronized"
+                        ? `✓ ${synchronizationResult.synchronizedEvents} received from a member · owner offline · ${connectionTypeDescription(synchronizationResult.connectionType)}`
+                        : `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
                       : "○ Sync not checked"}
                 </span>
               </div>

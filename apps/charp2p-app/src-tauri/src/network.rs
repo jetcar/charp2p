@@ -1065,7 +1065,8 @@ impl NetworkService {
         identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<PeerSearchResult, &'static str> {
-        if self.bootstrap_peers.is_empty() {
+        let hints = pinned_address_hints(invitation);
+        if self.bootstrap_peers.is_empty() && hints.is_empty() {
             return Ok(PeerSearchResult {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
@@ -1083,6 +1084,38 @@ impl NetworkService {
                 .map_err(|_| "network_configuration_invalid")?,
         )
         .map_err(|_| "network_unavailable")?;
+        // Invitation address hints (ADR-037) are dialed before the DHT
+        // search; the transport authenticates the pinned inviter.
+        if !hints.is_empty() && node.dial_peer_at(expected_inviter, hints).is_ok() {
+            let connected = timeout(KNOWN_ADDRESS_CONNECT_TIMEOUT, async {
+                loop {
+                    if let NetworkEvent::PeerConnected { peer_id, path, .. } =
+                        node.next_event().await
+                    {
+                        if peer_id == expected_inviter {
+                            break path;
+                        }
+                    }
+                }
+            })
+            .await;
+            if let Ok(path) = connected {
+                return Ok(PeerSearchResult {
+                    status: "peerReachable",
+                    discovered_peers: 1,
+                    reachable_peers: 1,
+                    connection_type: Some(connection_type_name(path)),
+                });
+            }
+        }
+        if self.bootstrap_peers.is_empty() {
+            return Ok(PeerSearchResult {
+                status: "bootstrapRequired",
+                discovered_peers: 0,
+                reachable_peers: 0,
+                connection_type: None,
+            });
+        }
         for bootstrap in &self.bootstrap_peers {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
@@ -1182,7 +1215,8 @@ impl NetworkService {
         identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<JoinGroupResult, &'static str> {
-        if self.bootstrap_peers.is_empty() {
+        let hints = pinned_address_hints(invitation);
+        if self.bootstrap_peers.is_empty() && hints.is_empty() {
             return Err("network_bootstrap_required");
         }
         let local_peer = identity.peer_id();
@@ -1195,7 +1229,7 @@ impl NetworkService {
             .prepare_join_request(local_peer, invitation)?;
         let key = DiscoveryKey::from_invitation(invitation);
         let ProviderConnection { mut node, .. } = self
-            .connect_to_group_provider(identity, key, expected_inviter, &[])
+            .connect_to_group_provider(identity, key, expected_inviter, &hints)
             .await?;
 
         let request_id = node.send_join_request(expected_inviter, request);
@@ -1991,6 +2025,17 @@ fn address_hint(mut address: Multiaddr) -> Option<Multiaddr> {
     valid.then_some(address)
 }
 
+/// Invitation address hints with the pinned inviter device peer ID
+/// appended (ADR-037), so a dial only succeeds against that device.
+fn pinned_address_hints(invitation: &Invitation) -> Vec<Multiaddr> {
+    let inviter = invitation.inviter_device_id();
+    invitation
+        .address_hints()
+        .iter()
+        .map(|hint| hint.clone().with(Protocol::P2p(inviter)))
+        .collect()
+}
+
 /// Picks at most the invitation hint limit, relay circuit addresses first
 /// because they also reach an owner behind NAT.
 fn select_address_hints(addresses: &[Multiaddr]) -> Vec<Multiaddr> {
@@ -2047,13 +2092,13 @@ mod tests {
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
-        address_hint, discovery_outcome, join_response, parse_bootstrap_peer, record_owner_address,
-        select_address_hints, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
-        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, NetworkService,
-        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
-        SynchronizationService, UnavailableJoinRequestAuthorizer,
-        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
-        MAX_GROUP_CONNECTION_STATES,
+        address_hint, discovery_outcome, join_response, parse_bootstrap_peer, pinned_address_hints,
+        record_owner_address, select_address_hints, upgraded_path, AdvertisementResult,
+        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
+        MemberAdmissionService, NetworkService, NetworkStatus, PeerSearchResult,
+        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
+        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
+        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -2815,6 +2860,197 @@ mod tests {
         );
 
         assert!(matches!(result, Err("network_bootstrap_required")));
+    }
+
+    fn hinted_invitation(
+        group: &GroupIdentity,
+        inviter: PeerId,
+        hints: &[libp2p::Multiaddr],
+        now: u64,
+    ) -> Invitation {
+        Invitation::issue_with_address_hints(
+            group,
+            inviter,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            hints,
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn address_hints_are_pinned_to_the_inviter_device() {
+        let inviter = DeviceIdentity::generate().peer_id();
+        let relay = DeviceIdentity::generate().peer_id();
+        let direct: libp2p::Multiaddr = "/ip4/192.168.1.20/udp/4001/quic-v1".parse().unwrap();
+        let relayed: libp2p::Multiaddr =
+            format!("/ip4/203.0.113.9/udp/4001/quic-v1/p2p/{relay}/p2p-circuit")
+                .parse()
+                .unwrap();
+        let invitation = hinted_invitation(
+            &GroupIdentity::generate(),
+            inviter,
+            &[relayed.clone(), direct.clone()],
+            NOW,
+        );
+
+        assert_eq!(
+            pinned_address_hints(&invitation),
+            vec![
+                relayed.with(libp2p::multiaddr::Protocol::P2p(inviter)),
+                direct.with(libp2p::multiaddr::Protocol::P2p(inviter)),
+            ]
+        );
+        assert!(pinned_address_hints(&join_invitation()).is_empty());
+    }
+
+    #[test]
+    fn reachability_check_dials_address_hints_without_bootstrap_peers() {
+        let now = unix_now();
+        tauri::async_runtime::block_on(async {
+            let mut inviter = NetworkNode::new(DeviceIdentity::generate().into_network_keypair());
+            inviter
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = inviter.next_event().await {
+                    break address;
+                }
+            };
+            let invitation = hinted_invitation(
+                &GroupIdentity::generate(),
+                inviter.peer_id(),
+                &[address],
+                now,
+            );
+            let service = NetworkService::from_sources(&[], "").unwrap();
+            let search = service.search(DeviceIdentity::generate(), &invitation);
+            tokio::pin!(search);
+            let result = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut search => break result,
+                        _ = inviter.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("reachability check should complete")
+            .unwrap();
+
+            assert_eq!(result.status, "peerReachable");
+            assert_eq!(result.reachable_peers, 1);
+        });
+    }
+
+    #[test]
+    fn join_dials_the_hinted_owner_without_bootstrap_peers() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
+        let unhinted = hinted_invitation(&group, owner_id, &[], now);
+
+        tauri::async_runtime::block_on(async {
+            let joiner_identity = DeviceIdentity::generate();
+            let joiner_id = joiner_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let bootstrap = format!("{address}/p2p/{routing_id}");
+            let owner_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstrap,
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(AcceptingMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: joiner_id,
+                    group_id: unhinted.group_id(),
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let advertise = owner_service.advertise(owner, owner_signer, &unhinted);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+            // The owner listens on every interface; its recorded non-loopback
+            // address supplies the port for a loopback hint.
+            let port = timeout(Duration::from_secs(10), async {
+                loop {
+                    let port = owner_service.owner_address_hints().iter().find_map(|hint| {
+                        hint.iter().find_map(|protocol| match protocol {
+                            libp2p::multiaddr::Protocol::Udp(port) => Some(port),
+                            _ => None,
+                        })
+                    });
+                    if let Some(port) = port {
+                        break port;
+                    }
+                    tokio::select! {
+                        _ = routing.next_event() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
+            })
+            .await
+            .expect("owner should record a listen address");
+            let hint: libp2p::Multiaddr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .unwrap();
+            let invitation = hinted_invitation(&group, owner_id, &[hint], now);
+
+            let pending_join = Arc::new(RecordingPendingJoinService::default());
+            let joiner_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                "",
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                pending_join.clone(),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let result = timeout(
+                Duration::from_secs(15),
+                joiner_service.join(joiner_identity, &invitation),
+            )
+            .await
+            .expect("join exchange should complete")
+            .unwrap();
+
+            assert_eq!(result.status, "joined");
+            assert!(pending_join.completed.load(Ordering::SeqCst));
+        });
     }
 
     #[test]

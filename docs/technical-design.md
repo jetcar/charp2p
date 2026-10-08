@@ -116,7 +116,9 @@ Peer and relay hints are root-signed multiaddresses of the inviter device in
 invitation version 3 (ADR-037): one to four distinct direct or circuit-relay
 addresses of at most 256 bytes, without a trailing `/p2p` component. Clients
 append the pinned inviter peer ID, dial the hints before the DHT provider
-search, and fall back to the search when no hint connects. Invitations without
+search, and fall back to the search when no hint connects. The join preview
+reachability check and the join exchange both dial hints first, so a hinted
+invitation works even without bootstrap nodes. Invitations without
 hints keep the version 2 encoding. The owner takes hints from the current
 listen addresses of its advertising node, circuit-relay addresses first and
 loopback or unspecified addresses excluded, both for its own invitations and

@@ -173,6 +173,14 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
   network_bootstrap_required: "Configure a bootstrap node before connecting to peers.",
   network_configuration_invalid: "The peer network configuration is invalid.",
+  network_invite_failed: "The invitation request failed. Try again.",
+  network_invite_timed_out: "The group owner did not answer the invitation request in time. Try again.",
+  invite_busy: "The group owner is busy or another member's invitation is active. Try again later.",
+  invite_permission_missing: "This device is not allowed to invite to this group.",
+  invite_request_invalid: "The invitation request is not valid.",
+  invite_response_invalid: "The group owner sent an invalid invitation.",
+  invite_unauthorized: "The group owner did not allow this invitation request.",
+  received_invitations_unavailable: "Received invitations are temporarily unavailable.",
   network_join_failed: "The secure join exchange failed. Try again.",
   network_join_timed_out: "The group owner did not answer in time. Try again.",
   network_peer_not_found: "The invited group owner is not online yet.",
@@ -447,6 +455,119 @@ function Stepper({ step }: { step: SetupStep }) {
   );
 }
 
+function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupName: string }) {
+  const [invitation, setInvitation] = useState<IssuedInvitation | null>(null);
+  const [requesting, setRequesting] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [qrCode, setQrCode] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setInvitation(null);
+    if (!isTauri()) return;
+    void invoke<IssuedInvitation[]>("received_member_invitations")
+      .then((received) => {
+        if (active) setInvitation(received.find((entry) => entry.groupId === groupId) ?? null);
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [groupId]);
+
+  useEffect(() => {
+    let active = true;
+    setQrCode("");
+    if (!invitation) return;
+    void QRCode.toDataURL(invitation.link, {
+      color: { dark: "#172044", light: "#ffffff" },
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    })
+      .then((dataUrl) => {
+        if (active) setQrCode(dataUrl);
+      })
+      .catch(() => {
+        if (active) setError("The QR code could not be created. Copy the invitation link instead.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [invitation]);
+
+  async function requestInvitation() {
+    if (requesting || !isTauri()) return;
+    setError("");
+    setCopied(false);
+    setRequesting(true);
+    try {
+      setInvitation(await invoke<IssuedInvitation>("request_member_invitation", { groupId }));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  async function copyInvitation() {
+    if (!invitation) return;
+    try {
+      await navigator.clipboard.writeText(invitation.link);
+      setCopied(true);
+      setError("");
+    } catch {
+      setError("The invitation could not be copied. Select the link and copy it manually.");
+    }
+  }
+
+  const current = invitation && invitation.expiresAtUnix * 1000 > Date.now() ? invitation : null;
+
+  return (
+    <section className="member-invitation" aria-label="Invite to this group">
+      <h3>Invite to this group</h3>
+      {current ? (
+        <>
+          <label htmlFor="member-invitation-link">Invitation link</label>
+          <textarea
+            className="invitation-link-box"
+            id="member-invitation-link"
+            readOnly
+            rows={3}
+            value={current.link}
+          />
+          <p className="preview-note">
+            {expiryDescription(current.expiresAtUnix)}
+            {current.reusable ? " · Reusable until expiry" : " · Single use"}
+            {" · Issued by the group owner"}
+          </p>
+          {qrCode && (
+            <figure className="invitation-qr">
+              <img alt={`QR code invitation for ${groupName}`} height="320" src={qrCode} width="320" />
+              <figcaption>Scan with CharP2P to join</figcaption>
+            </figure>
+          )}
+          <button className="primary-button" onClick={copyInvitation} type="button">
+            {copied ? "Invitation copied" : "Copy invitation"}
+          </button>
+        </>
+      ) : (
+        <>
+          <p className="preview-note">The group owner allowed this device to invite. The owner device must be reachable to issue the invitation and still admits every join request.</p>
+          <button className="primary-button" disabled={requesting || !isTauri()} onClick={requestInvitation} type="button">
+            {requesting ? "Requesting invitation…" : "Request invitation"}
+          </button>
+        </>
+      )}
+      {error && <p className="form-error preview-error" role="alert">{error}</p>}
+      <p className="preview-note">This invitation is kept only until the app closes. The owner can revoke it at any time.</p>
+    </section>
+  );
+}
+
 function MembersView({
   groupName,
   members,
@@ -468,6 +589,7 @@ function MembersView({
   invitePermittedDeviceIds,
   changingInvitePermissionId,
   onToggleInvitePermission,
+  joinedGroupId,
   onRename,
   onLeave,
   leaving,
@@ -493,6 +615,7 @@ function MembersView({
   invitePermittedDeviceIds: string[];
   changingInvitePermissionId: string;
   onToggleInvitePermission: (deviceId: string, granted: boolean) => void;
+  joinedGroupId: string | null;
   onRename: (groupName: string) => Promise<void>;
   onLeave: (() => void) | null;
   leaving: boolean;
@@ -655,6 +778,9 @@ function MembersView({
         </div>
       )}
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
+      {joinedGroupId && profile && invitePermittedDeviceIds.includes(profile.peerId) && (
+        <MemberInvitationPanel groupId={joinedGroupId} groupName={groupName} />
+      )}
       <p className="preview-note">Activity times are the latest signed event this device holds from each member, as claimed by that member. They do not show whether a device is online.</p>
       <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
       {canManageMembers && <p className="preview-note">A device allowed to invite can ask this owner device for an invitation to share while this device is reachable. This device still admits every join request. Withdrawing the permission, or removing the device, revokes the invitations it requested.</p>}
@@ -3137,6 +3263,7 @@ function App() {
               invitePermittedDeviceIds={invitePermittedDevices}
               changingInvitePermissionId={changingInvitePermission}
               onToggleInvitePermission={setMemberInvitePermission}
+              joinedGroupId={joinedGroup?.groupId ?? null}
               onRename={renameLocalGroup}
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}

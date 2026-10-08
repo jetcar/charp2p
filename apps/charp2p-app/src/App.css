@@ -191,6 +191,8 @@ button { cursor: pointer; }
 .member-remove:hover:not(:disabled) { border-color: #c84959; background: #ffe8eb; }
 .member-remove:disabled { cursor: wait; opacity: .65; }
 .leave-group { display: grid; justify-items: start; gap: 6px; margin-top: 8px; }
+.member-invitation { display: grid; gap: 8px; margin-top: 12px; }
+.member-invitation h3 { margin: 0; font-size: 20px; }
 .member-block { padding: 7px 11px; border: 1px solid #cad5e2; border-radius: 9px; color: #39445f; background: #f5f8fb; font-size: 13px; font-weight: 700; }
 .member-block:hover:not(:disabled) { border-color: #8d9ab0; background: #edf2f7; }
 .member-block:disabled { cursor: wait; opacity: .65; }

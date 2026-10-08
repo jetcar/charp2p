@@ -86,7 +86,9 @@ type AppInformation = {
   storage: { databaseBytes: number };
 };
 type UnreadMessageCount = { groupId: string; count: number };
-type GroupConnectionStateName = "online" | "relayed" | "waiting" | "offline";
+// "memberServed": the owner was unreachable and another current member served
+// the history (ADR-040).
+type GroupConnectionStateName = "online" | "relayed" | "memberServed" | "waiting" | "offline";
 type GroupConnectionState = {
   groupId: string;
   state: GroupConnectionStateName;
@@ -369,6 +371,7 @@ function connectionTypeDescription(connectionType: "direct" | "lan" | "relayed")
 function groupConnectionDescription(state: GroupConnectionStateName) {
   if (state === "online") return "Online";
   if (state === "relayed") return "Relayed";
+  if (state === "memberServed") return "Member online · owner offline";
   if (state === "offline") return "Offline";
   return "Waiting for peers";
 }

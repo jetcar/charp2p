@@ -269,6 +269,8 @@ const MAX_GROUP_CONNECTION_STATES: usize = 256;
 #[serde(rename_all = "camelCase")]
 pub struct GroupConnectionState {
     pub group_id: String,
+    /// online, relayed, memberServed (pulled from a member while the owner
+    /// was unreachable), waiting or offline.
     pub state: &'static str,
     /// Whether the latest discovery lookup found the group provider's record
     /// ("found") or not ("missing"); absent until a lookup completed.
@@ -714,6 +716,33 @@ impl NetworkService {
             Err("network_unavailable") => "offline",
             Err(_) => "waiting",
         };
+        self.remember_group_state(group_id, state, discovery);
+        result
+    }
+
+    /// Remembers the outcome of a member-served pull made while the owner was
+    /// unreachable (ADR-040): a pull reports "memberServed" separately from an
+    /// owner synchronization, a network failure reports offline, and other
+    /// failures keep the state observed for the owner attempt.
+    fn observe_member_pull<T>(
+        &self,
+        group_id: PeerId,
+        result: Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        match &result {
+            Ok(_) => self.remember_group_state(group_id, "memberServed", None),
+            Err("network_unavailable") => self.remember_group_state(group_id, "offline", None),
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn remember_group_state(
+        &self,
+        group_id: PeerId,
+        state: &'static str,
+        discovery: Option<&'static str>,
+    ) {
         let observed_at_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
@@ -745,7 +774,6 @@ impl NetworkService {
                 observed_at_unix,
             },
         );
-        result
     }
 
     /// Reports the remembered connection state of each requested group;
@@ -1631,8 +1659,24 @@ impl NetworkService {
     /// owner cannot be reached (ADR-040): searches the member rendezvous key
     /// of the current epoch and pulls from the first reachable provider in
     /// `members`, trying at most four. Uploads and head reports stay with the
-    /// owner, so nothing is pushed.
+    /// owner, so nothing is pushed. The outcome is remembered as the group's
+    /// member-served connection state and the device's latest connection.
     pub async fn pull_from_members(
+        &self,
+        identity: DeviceIdentity,
+        key: DiscoveryKey,
+        group_id: PeerId,
+        members: &[PeerId],
+        bandwidth: &BandwidthService,
+    ) -> Result<SynchronizeGroupResult, &'static str> {
+        let result = self
+            .pull_from_member_providers(identity, key, group_id, members, bandwidth)
+            .await;
+        let result = self.observe_connection(result, |pulled| Some(pulled.connection_type));
+        self.observe_member_pull(group_id, result)
+    }
+
+    async fn pull_from_member_providers(
         &self,
         identity: DeviceIdentity,
         key: DiscoveryKey,
@@ -3239,6 +3283,26 @@ mod tests {
         assert_eq!(state(second), Some("waiting"));
         assert_eq!(state(unknown), None);
 
+        // A member-served pull is reported separately from the owner attempt
+        // and keeps its discovery outcome; a failed pull leaves it waiting.
+        let _ = service.observe_group_synchronization::<&str>(
+            second,
+            Err("network_peer_unreachable"),
+            Some("found"),
+            |path| path,
+        );
+        let _ = service.observe_member_pull::<&str>(second, Err("network_peer_not_found"));
+        assert_eq!(state(second), Some("waiting"));
+        let _ = service.observe_member_pull(second, Ok(()));
+        assert_eq!(state(second), Some("memberServed"));
+        assert_eq!(
+            service.group_connection_states(&[second])[0].discovery,
+            Some("found")
+        );
+        let _ = service.observe_member_pull::<&str>(second, Err("network_unavailable"));
+        assert_eq!(state(second), Some("offline"));
+        assert_eq!(state(unknown), None);
+
         let states = service.group_connection_states(&[second, unknown, first]);
         assert_eq!(
             states
@@ -4564,6 +4628,10 @@ mod tests {
             .expect("member pull should complete")
             .unwrap();
             assert_eq!(result.status, "memberSynchronized");
+            assert_eq!(
+                pulling.group_connection_states(&[group_id])[0].state,
+                "memberServed"
+            );
             assert_eq!(result.synchronized_events, 3);
             assert_eq!(result.uploaded_events, 0);
             assert_eq!(result.group_id, group_id.to_string());

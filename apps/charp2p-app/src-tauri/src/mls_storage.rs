@@ -1204,6 +1204,17 @@ impl MlsProviderService {
             .map_err(|_| "message_store_unavailable")
     }
 
+    /// Returns authenticated group icons from applied metadata changes.
+    pub(crate) fn current_group_icons(&self) -> Result<Vec<(PeerId, u8)>, &'static str> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        store
+            .current_group_icons()
+            .map_err(|_| "message_store_unavailable")
+    }
+
     fn create_application_event_at(
         &self,
         group_id: PeerId,
@@ -4218,7 +4229,10 @@ mod tests {
             .change_group_metadata(
                 group_id,
                 &owner,
-                &charp2p_core::GroupMetadata::new("Renamed Crew").unwrap(),
+                &charp2p_core::GroupMetadata::new("Renamed Crew")
+                    .unwrap()
+                    .with_icon(3)
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -4242,6 +4256,10 @@ mod tests {
         assert_eq!(
             member_service.current_group_names().unwrap(),
             vec![(group_id, "Renamed Crew".to_owned())]
+        );
+        assert_eq!(
+            member_service.current_group_icons().unwrap(),
+            vec![(group_id, 3)]
         );
         assert_eq!(
             member_service

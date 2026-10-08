@@ -151,8 +151,10 @@ fn joined_groups(
 ) -> Result<Vec<JoinedGroup>, String> {
     let mut groups = service.joined().map_err(str::to_owned)?;
     let names = mls_service.current_group_names().map_err(str::to_owned)?;
+    let icons = mls_service.current_group_icons().map_err(str::to_owned)?;
     for group in &mut groups {
         apply_current_group_name(&names, &group.group_id, &mut group.group_name);
+        group.icon = current_group_icon(&icons, &group.group_id);
     }
     Ok(groups)
 }
@@ -200,17 +202,20 @@ fn rename_group(
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
-    if !group_service
+    let Some(icon) = group_service
         .list()
         .map_err(str::to_owned)?
-        .iter()
-        .any(|group| group.group_id == group_id.to_string())
-    {
+        .into_iter()
+        .find(|group| group.group_id == group_id.to_string())
+        .map(|group| group.icon)
+    else {
         return Err("group_not_owned".to_owned());
-    }
+    };
     let group_name = groups::normalize_group_name(&group_name).map_err(str::to_owned)?;
-    let metadata =
-        charp2p_core::GroupMetadata::new(&group_name).map_err(|_| "invalid_group_name")?;
+    // Members learn the icon only from metadata, so every rename carries it.
+    let metadata = charp2p_core::GroupMetadata::new(&group_name)
+        .and_then(|metadata| metadata.with_icon(icon))
+        .map_err(|_| "invalid_group_name")?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -1193,6 +1198,13 @@ pub fn run() {
 
 /// Replaces invitation-time display names with the latest authenticated
 /// owner rename applied on this device.
+fn current_group_icon(icons: &[(charp2p_core::PeerId, u8)], group_id: &str) -> Option<u8> {
+    icons
+        .iter()
+        .find(|(candidate, _)| candidate.to_string() == group_id)
+        .map(|(_, icon)| *icon)
+}
+
 fn apply_current_group_name(
     names: &[(charp2p_core::PeerId, String)],
     group_id: &str,
@@ -1227,7 +1239,16 @@ fn parse_event_id(value: &str) -> Result<[u8; 32], String> {
 mod tests {
     use charp2p_core::GroupIdentity;
 
-    use super::{parse_event_id, parse_group_id};
+    use super::{current_group_icon, parse_event_id, parse_group_id};
+
+    #[test]
+    fn joined_group_icons_come_from_matching_metadata_only() {
+        let group_id = GroupIdentity::generate().group_id();
+        let other = GroupIdentity::generate().group_id();
+        let icons = [(other, 1), (group_id, 4)];
+        assert_eq!(current_group_icon(&icons, &group_id.to_string()), Some(4));
+        assert_eq!(current_group_icon(&icons[..1], &group_id.to_string()), None);
+    }
 
     #[test]
     fn webview_group_identifiers_are_bounded_before_parsing() {

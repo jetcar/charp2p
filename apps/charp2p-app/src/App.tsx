@@ -18,6 +18,7 @@ type InvitationPreview = {
 type PendingGroup = InvitationPreview;
 type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable"> & {
   lastSynchronizedAtUnix: number | null;
+  icon: number | null;
 };
 type LocalGroup = {
   groupId: string;

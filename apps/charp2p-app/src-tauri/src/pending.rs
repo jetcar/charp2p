@@ -37,6 +37,8 @@ pub struct JoinedGroup {
     pub group_id: String,
     pub history_policy: &'static str,
     pub last_synchronized_at_unix: Option<u64>,
+    /// Owner-chosen icon from authenticated group metadata, when known.
+    pub icon: Option<u8>,
 }
 
 trait InvitationSecretStore: Send + Sync {
@@ -538,6 +540,7 @@ impl JoinedGroup {
             group_id: metadata.group_id.to_string(),
             history_policy: history_policy_name(metadata.history_policy),
             last_synchronized_at_unix: metadata.last_synchronized_at_unix,
+            icon: None,
         }
     }
 }

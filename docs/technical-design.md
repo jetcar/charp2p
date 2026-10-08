@@ -396,8 +396,10 @@ KeyEpochAdvanced
 InvitePermissionChanged
 ```
 
-A `GroupMetadataChanged` event carries versioned display metadata (currently
-the group name) as an MLS application message. Only the owner device may
+A `GroupMetadataChanged` event carries versioned display metadata as an MLS
+application message: version 1 holds the group name, version 2 adds a built-in
+group icon index (0 to 4). Clients keep the previously known icon when a
+version 1 change arrives. Only the owner device may
 author it: members apply a change only when its author is the owner device that
 admitted them, and the change with the owner's highest author sequence is the
 current name. Metadata changes are delivered by pull synchronization and are

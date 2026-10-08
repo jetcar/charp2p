@@ -19,7 +19,7 @@ mod sync;
 pub use discovery::DiscoveryKey;
 pub use event::{EventError, EventId, EventKind, EventSpec, SignedEvent};
 pub use group_identity::{GroupIdentity, GroupIdentityError, GroupIdentitySecret};
-pub use group_metadata::{GroupMetadata, GroupMetadataError, MAX_GROUP_NAME_BYTES};
+pub use group_metadata::{GroupMetadata, GroupMetadataError, MAX_GROUP_ICON, MAX_GROUP_NAME_BYTES};
 pub use identity::{DeviceIdentity, DeviceIdentityError, DeviceIdentitySecret};
 pub use identity_backup::{
     IdentityBackupError, MAX_BACKUP_PASSPHRASE_BYTES, MAX_IDENTITY_BACKUP_BYTES,

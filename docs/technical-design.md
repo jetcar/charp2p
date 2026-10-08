@@ -112,6 +112,13 @@ The invitation secret is placed in the URL fragment for the HTTPS form so a
 normal web request does not send it to the web server. The landing page must
 not load third-party analytics or resources that could capture it.
 
+Peer and relay hints are root-signed multiaddresses of the inviter device in
+invitation version 3 (ADR-037): one to four distinct direct or circuit-relay
+addresses of at most 256 bytes, without a trailing `/p2p` component. Clients
+append the pinned inviter peer ID, dial the hints before the DHT provider
+search, and fall back to the search when no hint connects. Invitations without
+hints keep the version 2 encoding.
+
 Invitation parsing is bounded and fully validated before network use. An
 invitation is a bearer credential and must be treated as sensitive.
 

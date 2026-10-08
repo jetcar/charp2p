@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use libp2p_identity::{DecodingError, PeerId, PublicKey, SigningError};
+use multiaddr::{Multiaddr, Protocol};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -9,6 +10,10 @@ use url::Url;
 use crate::GroupIdentity;
 
 const INVITATION_VERSION: u16 = 2;
+const HINTED_INVITATION_VERSION: u16 = 3;
+/// Most inviter address hints carried by one invitation.
+pub const MAX_ADDRESS_HINTS: usize = 4;
+const MAX_ADDRESS_HINT_BYTES: usize = 256;
 const DISCOVERY_SECRET_BYTES: usize = 32;
 const INVITATION_ID_BYTES: usize = 16;
 const MAX_INVITER_DEVICE_ID_BYTES: usize = 128;
@@ -17,6 +22,7 @@ const MAX_NAME_BYTES: usize = 80;
 pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
 const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v2\0";
+const HINTED_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v3\0";
 
 /// Controls which retained messages a newly joined member may request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +52,7 @@ pub struct InvitationSpec<'a> {
 /// A verified bearer capability for joining one group.
 pub struct Invitation {
     claims: InvitationClaims,
+    address_hints: Vec<Multiaddr>,
     owner_public_key: PublicKey,
     signature: Vec<u8>,
 }
@@ -74,12 +81,32 @@ impl Invitation {
         spec: InvitationSpec<'_>,
         now_unix: u64,
     ) -> Result<Self, InvitationError> {
+        Self::issue_with_address_hints(owner, inviter_device_id, spec, &[], now_unix)
+    }
+
+    /// Issues a signed invitation that also authenticates inviter device
+    /// addresses, direct or relayed, for joiners to dial before a DHT lookup.
+    /// Hints produce a version 3 invitation; an empty list issues version 2.
+    pub fn issue_with_address_hints(
+        owner: &GroupIdentity,
+        inviter_device_id: PeerId,
+        spec: InvitationSpec<'_>,
+        address_hints: &[Multiaddr],
+        now_unix: u64,
+    ) -> Result<Self, InvitationError> {
         validate_name("group name", spec.group_name)?;
         validate_name("inviter name", spec.inviter_name)?;
         let inviter_device_id = inviter_device_id.to_bytes();
         validate_inviter_device_id(&inviter_device_id)?;
         if spec.expires_at_unix <= now_unix {
             return Err(InvitationError::Expired);
+        }
+        let encoded_hints = address_hints
+            .iter()
+            .map(Multiaddr::to_vec)
+            .collect::<Vec<_>>();
+        if !encoded_hints.is_empty() {
+            validate_address_hints(&encoded_hints)?;
         }
 
         let mut discovery_secret = [0; DISCOVERY_SECRET_BYTES];
@@ -90,7 +117,11 @@ impl Invitation {
 
         let owner_public_key = owner.public_key();
         let claims = InvitationClaims {
-            version: INVITATION_VERSION,
+            version: if encoded_hints.is_empty() {
+                INVITATION_VERSION
+            } else {
+                HINTED_INVITATION_VERSION
+            },
             owner_public_key: owner_public_key.encode_protobuf(),
             inviter_device_id,
             discovery_secret,
@@ -101,22 +132,34 @@ impl Invitation {
             history_policy: spec.history_policy,
             reusable: spec.reusable,
         };
-        let signature = owner.sign(&signing_payload(&claims)?)?;
-
-        Ok(Self {
+        let signature = owner.sign(&signing_payload(&claims, &encoded_hints)?)?;
+        let invitation = Self {
             claims,
+            address_hints: address_hints.to_vec(),
             owner_public_key,
             signature,
-        })
+        };
+        if invitation.encode()?.len() > MAX_INVITATION_ENCODED_BYTES {
+            return Err(InvitationError::InvalidSize);
+        }
+        Ok(invitation)
     }
 
     /// Encodes the invitation as an unpadded URL-safe Base64 payload.
     pub fn encode(&self) -> Result<String, InvitationError> {
-        let wire = SignedInvitation {
-            claims: self.claims.clone(),
-            signature: self.signature.clone(),
+        let bytes = if self.address_hints.is_empty() {
+            postcard::to_allocvec(&SignedInvitation {
+                claims: self.claims.clone(),
+                signature: self.signature.clone(),
+            })?
+        } else {
+            postcard::to_allocvec(&SignedHintedInvitation {
+                claims: self.claims.clone(),
+                address_hints: self.address_hints.iter().map(Multiaddr::to_vec).collect(),
+                signature: self.signature.clone(),
+            })?
         };
-        Ok(URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire)?))
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     /// Encodes the invitation as the application custom URI registered by the
@@ -137,21 +180,38 @@ impl Invitation {
         }
 
         let bytes = URL_SAFE_NO_PAD.decode(encoded)?;
-        let wire: SignedInvitation = postcard::from_bytes(&bytes)?;
-        if postcard::to_allocvec(&wire)? != bytes {
-            return Err(InvitationError::NonCanonical);
-        }
-        validate_claims(&wire.claims, now_unix)?;
+        // The version is the first claim field, so it selects the wire layout.
+        let (version, _) = postcard::take_from_bytes::<u16>(&bytes)?;
+        let (claims, encoded_hints, signature) = if version == HINTED_INVITATION_VERSION {
+            let wire: SignedHintedInvitation = postcard::from_bytes(&bytes)?;
+            if postcard::to_allocvec(&wire)? != bytes {
+                return Err(InvitationError::NonCanonical);
+            }
+            (wire.claims, wire.address_hints, wire.signature)
+        } else {
+            let wire: SignedInvitation = postcard::from_bytes(&bytes)?;
+            if postcard::to_allocvec(&wire)? != bytes {
+                return Err(InvitationError::NonCanonical);
+            }
+            (wire.claims, Vec::new(), wire.signature)
+        };
+        validate_claims(&claims, now_unix)?;
+        let address_hints = if claims.version == HINTED_INVITATION_VERSION {
+            validate_address_hints(&encoded_hints)?
+        } else {
+            Vec::new()
+        };
 
-        let owner_public_key = PublicKey::try_decode_protobuf(&wire.claims.owner_public_key)?;
-        if !owner_public_key.verify(&signing_payload(&wire.claims)?, &wire.signature) {
+        let owner_public_key = PublicKey::try_decode_protobuf(&claims.owner_public_key)?;
+        if !owner_public_key.verify(&signing_payload(&claims, &encoded_hints)?, &signature) {
             return Err(InvitationError::InvalidSignature);
         }
 
         Ok(Self {
-            claims: wire.claims,
+            claims,
+            address_hints,
             owner_public_key,
-            signature: wire.signature,
+            signature,
         })
     }
 
@@ -219,6 +279,12 @@ impl Invitation {
     pub fn is_reusable(&self) -> bool {
         self.claims.reusable
     }
+
+    /// Returns the authenticated inviter address hints, without the trailing
+    /// inviter peer ID. Version 2 invitations carry none.
+    pub fn address_hints(&self) -> &[Multiaddr] {
+        &self.address_hints
+    }
 }
 
 /// Failures produced while issuing, encoding, or validating invitations.
@@ -245,6 +311,9 @@ pub enum InvitationError {
     /// The root-authorized inviter device identifier is malformed.
     #[error("invitation device identifier is invalid")]
     InvalidInviterDevice,
+    /// An inviter address hint is malformed, duplicated, or over the limits.
+    #[error("invitation address hint is invalid")]
+    InvalidAddressHint,
     /// Signing failed.
     #[error("invitation could not be signed")]
     Signing(#[from] SigningError),
@@ -324,16 +393,35 @@ struct SignedInvitation {
     signature: Vec<u8>,
 }
 
-fn signing_payload(claims: &InvitationClaims) -> Result<Vec<u8>, postcard::Error> {
-    let encoded = postcard::to_allocvec(claims)?;
-    let mut payload = Vec::with_capacity(SIGNING_DOMAIN.len() + encoded.len());
-    payload.extend_from_slice(SIGNING_DOMAIN);
+/// Version 3 wire layout: version 2 claims followed by binary multiaddress
+/// hints, all covered by the root signature.
+#[derive(Deserialize, Serialize)]
+struct SignedHintedInvitation {
+    claims: InvitationClaims,
+    address_hints: Vec<Vec<u8>>,
+    signature: Vec<u8>,
+}
+
+fn signing_payload(
+    claims: &InvitationClaims,
+    address_hints: &[Vec<u8>],
+) -> Result<Vec<u8>, postcard::Error> {
+    let (domain, encoded) = if claims.version == HINTED_INVITATION_VERSION {
+        (
+            HINTED_SIGNING_DOMAIN,
+            postcard::to_allocvec(&(claims, address_hints))?,
+        )
+    } else {
+        (SIGNING_DOMAIN, postcard::to_allocvec(claims)?)
+    };
+    let mut payload = Vec::with_capacity(domain.len() + encoded.len());
+    payload.extend_from_slice(domain);
     payload.extend_from_slice(&encoded);
     Ok(payload)
 }
 
 fn validate_claims(claims: &InvitationClaims, now_unix: u64) -> Result<(), InvitationError> {
-    if claims.version != INVITATION_VERSION {
+    if claims.version != INVITATION_VERSION && claims.version != HINTED_INVITATION_VERSION {
         return Err(InvitationError::UnsupportedVersion(claims.version));
     }
     validate_name("group name", &claims.group_name)?;
@@ -355,6 +443,30 @@ fn validate_inviter_device_id(encoded: &[u8]) -> Result<(), InvitationError> {
     Ok(())
 }
 
+/// Parses version 3 hints: one to four distinct multiaddresses, each without a
+/// trailing `/p2p` component because the dialer appends the pinned inviter.
+fn validate_address_hints(encoded: &[Vec<u8>]) -> Result<Vec<Multiaddr>, InvitationError> {
+    if encoded.is_empty() || encoded.len() > MAX_ADDRESS_HINTS {
+        return Err(InvitationError::InvalidAddressHint);
+    }
+    let mut hints: Vec<Multiaddr> = Vec::with_capacity(encoded.len());
+    for bytes in encoded {
+        if bytes.is_empty() || bytes.len() > MAX_ADDRESS_HINT_BYTES {
+            return Err(InvitationError::InvalidAddressHint);
+        }
+        let hint =
+            Multiaddr::try_from(bytes.clone()).map_err(|_| InvitationError::InvalidAddressHint)?;
+        if hint.to_vec() != *bytes
+            || matches!(hint.iter().last(), Some(Protocol::P2p(_)))
+            || hints.contains(&hint)
+        {
+            return Err(InvitationError::InvalidAddressHint);
+        }
+        hints.push(hint);
+    }
+    Ok(hints)
+}
+
 fn validate_name(field: &'static str, value: &str) -> Result<(), InvitationError> {
     if value.is_empty()
         || value.len() > MAX_NAME_BYTES
@@ -370,9 +482,11 @@ fn validate_name(field: &'static str, value: &str) -> Result<(), InvitationError
 mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    use multiaddr::Multiaddr;
+
     use super::{
-        HistoryPolicy, Invitation, InvitationError, InvitationSpec, SignedInvitation,
-        signing_payload,
+        HistoryPolicy, Invitation, InvitationError, InvitationSpec, SignedHintedInvitation,
+        SignedInvitation, signing_payload,
     };
     use crate::{DeviceIdentity, GroupIdentity};
 
@@ -490,7 +604,9 @@ mod tests {
             .unwrap();
         let mut wire: SignedInvitation = postcard::from_bytes(&bytes).unwrap();
         wire.claims.inviter_device_id = vec![0; 129];
-        wire.signature = owner.sign(&signing_payload(&wire.claims).unwrap()).unwrap();
+        wire.signature = owner
+            .sign(&signing_payload(&wire.claims, &[]).unwrap())
+            .unwrap();
         let malformed = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
 
         assert!(matches!(
@@ -629,5 +745,176 @@ mod tests {
             ),
             Err(InvitationError::InvalidLink)
         ));
+    }
+
+    fn hints() -> Vec<Multiaddr> {
+        vec![
+            "/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(),
+            format!(
+                "/ip4/198.51.100.7/udp/4001/quic-v1/p2p/{}/p2p-circuit",
+                DeviceIdentity::generate().peer_id()
+            )
+            .parse()
+            .unwrap(),
+        ]
+    }
+
+    fn hinted_wire(invitation: &Invitation) -> SignedHintedInvitation {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(invitation.encode().unwrap())
+            .unwrap();
+        postcard::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn hinted_invitation_round_trips_as_version_3() {
+        let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let hints = hints();
+        let invitation = Invitation::issue_with_address_hints(
+            &owner,
+            inviter_device_id,
+            spec(NOW + 3_600),
+            &hints,
+            NOW,
+        )
+        .unwrap();
+        let decoded = Invitation::decode_input(&invitation.custom_uri().unwrap(), NOW).unwrap();
+
+        assert_eq!(hinted_wire(&invitation).claims.version, 3);
+        assert_eq!(decoded.address_hints(), hints.as_slice());
+        assert_eq!(decoded.inviter_device_id(), inviter_device_id);
+        assert_eq!(decoded.group_id(), owner.group_id());
+        assert_eq!(decoded.discovery_secret(), invitation.discovery_secret());
+    }
+
+    #[test]
+    fn invitation_without_hints_keeps_the_version_2_encoding() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue_with_address_hints(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            &[],
+            NOW,
+        )
+        .unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(invitation.encode().unwrap())
+            .unwrap();
+        let wire: SignedInvitation = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(wire.claims.version, 2);
+        assert_eq!(postcard::to_allocvec(&wire).unwrap(), bytes);
+        assert!(
+            Invitation::decode(&invitation.encode().unwrap(), NOW)
+                .unwrap()
+                .address_hints()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changing_an_address_hint_invalidates_the_root_signature() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue_with_address_hints(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            &hints(),
+            NOW,
+        )
+        .unwrap();
+        let mut wire = hinted_wire(&invitation);
+        wire.address_hints[0] = "/ip4/203.0.113.66/udp/4001/quic-v1"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .to_vec();
+        let tampered = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
+
+        assert!(matches!(
+            Invitation::decode(&tampered, NOW),
+            Err(InvitationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn hints_cannot_be_stripped_into_a_version_2_invitation() {
+        let owner = GroupIdentity::generate();
+        let invitation = Invitation::issue_with_address_hints(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            spec(NOW + 3_600),
+            &hints(),
+            NOW,
+        )
+        .unwrap();
+        let hinted = hinted_wire(&invitation);
+        let mut claims = hinted.claims;
+        claims.version = 2;
+        let stripped = URL_SAFE_NO_PAD.encode(
+            postcard::to_allocvec(&SignedInvitation {
+                claims,
+                signature: hinted.signature,
+            })
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            Invitation::decode(&stripped, NOW),
+            Err(InvitationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn invalid_address_hints_are_rejected_on_issue_and_decode() {
+        let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let base: Multiaddr = "/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap();
+        let with_peer = base
+            .clone()
+            .with(multiaddr::Protocol::P2p(inviter_device_id));
+        let too_many = (0..5)
+            .map(|port| {
+                format!("/ip4/192.0.2.10/udp/{}/quic-v1", 4001 + port)
+                    .parse()
+                    .unwrap()
+            })
+            .collect::<Vec<Multiaddr>>();
+
+        for invalid in [vec![with_peer], vec![base.clone(), base.clone()], too_many] {
+            assert!(matches!(
+                Invitation::issue_with_address_hints(
+                    &owner,
+                    inviter_device_id,
+                    spec(NOW + 3_600),
+                    &invalid,
+                    NOW
+                ),
+                Err(InvitationError::InvalidAddressHint)
+            ));
+        }
+
+        let invitation = Invitation::issue_with_address_hints(
+            &owner,
+            inviter_device_id,
+            spec(NOW + 3_600),
+            &[base],
+            NOW,
+        )
+        .unwrap();
+        for invalid in [Vec::new(), vec![vec![0xff, 0xff]]] {
+            let mut wire = hinted_wire(&invitation);
+            wire.address_hints = invalid;
+            wire.signature = owner
+                .sign(&signing_payload(&wire.claims, &wire.address_hints).unwrap())
+                .unwrap();
+            let malformed = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
+
+            assert!(matches!(
+                Invitation::decode(&malformed, NOW),
+                Err(InvitationError::InvalidAddressHint)
+            ));
+        }
     }
 }

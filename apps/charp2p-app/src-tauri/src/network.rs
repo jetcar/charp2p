@@ -1875,6 +1875,27 @@ fn encoded_bytes(encoded_events: &[Vec<u8>]) -> u64 {
     encoded_events.iter().map(|event| event.len() as u64).sum()
 }
 
+/// Answers a synchronization request on a member serving node (ADR-040):
+/// served event bytes count toward the synchronization data limit, and the
+/// request is answered `busy` once that budget is spent or unreadable.
+/// Owner answers stay uncounted (ADR-033).
+#[cfg_attr(not(test), allow(dead_code))]
+fn answer_member_sync_request(
+    synchronization: &dyn SynchronizationService,
+    bandwidth: &BandwidthService,
+    authenticated_peer: PeerId,
+    request: &SyncRequest,
+) -> SyncResponse {
+    if bandwidth.ensure_sync_budget().is_err() {
+        return SyncResponse::Rejected {
+            reason: SyncRejectReason::Busy,
+        };
+    }
+    let response = synchronization.answer_sync_request(authenticated_peer, request);
+    bandwidth.charge_sync_bytes(response_event_bytes(&response));
+    response
+}
+
 fn join_response(
     authorization: JoinRequestAuthorization,
     member_admission: &dyn MemberAdmissionService,
@@ -2155,11 +2176,11 @@ mod tests {
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
 
     use super::{
-        address_hint, discovery_outcome, join_response, parse_bootstrap_peer, pinned_address_hints,
-        record_owner_address, select_address_hints, upgraded_path, AdvertisementResult,
-        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
-        MemberAdmissionService, NetworkService, NetworkStatus, PeerSearchResult,
-        PendingJoinService, PullSession, SessionProgress, SynchronizationService,
+        address_hint, answer_member_sync_request, discovery_outcome, join_response,
+        parse_bootstrap_peer, pinned_address_hints, record_owner_address, select_address_hints,
+        upgraded_path, AdvertisementResult, BootstrapNodeStatus, JoinRequestAuthorization,
+        JoinRequestAuthorizer, MemberAdmissionService, NetworkService, NetworkStatus,
+        PeerSearchResult, PendingJoinService, PullSession, SessionProgress, SynchronizationService,
         UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
         UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
     };
@@ -2210,6 +2231,12 @@ mod tests {
                     SyncResponse::Summary {
                         group_id: self.group_id,
                         heads: Vec::new(),
+                    }
+                }
+                SyncRequest::Events { group_id, .. } if *group_id == self.group_id => {
+                    SyncResponse::Events {
+                        group_id: self.group_id,
+                        encoded_events: vec![vec![0; 700 * 1024]],
                     }
                 }
                 SyncRequest::ReportHeads { group_id, .. } if *group_id == self.group_id => {
@@ -2753,6 +2780,79 @@ mod tests {
             service.group_connection_states(&[group_id])[0].state,
             "waiting"
         );
+    }
+
+    #[test]
+    fn member_serving_charges_served_events_and_answers_busy_once_spent() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        bandwidth
+            .set(BandwidthPreference {
+                sync_limit_mib_per_hour: Some(1),
+            })
+            .unwrap();
+        let peer = DeviceIdentity::generate().peer_id();
+        let group_id = DeviceIdentity::generate().peer_id();
+        let synchronization = MemberSynchronizationService {
+            expected_peer: peer,
+            group_id,
+        };
+        let events = SyncRequest::Events {
+            group_id,
+            event_ids: Vec::new(),
+        };
+        let busy = SyncResponse::Rejected {
+            reason: SyncRejectReason::Busy,
+        };
+
+        let summary = answer_member_sync_request(
+            &synchronization,
+            &bandwidth,
+            peer,
+            &SyncRequest::Summary { group_id },
+        );
+        assert!(matches!(summary, SyncResponse::Summary { .. }));
+        assert_eq!(
+            bandwidth.status().unwrap().remaining_sync_bytes,
+            Some(1024 * 1024)
+        );
+
+        let first = answer_member_sync_request(&synchronization, &bandwidth, peer, &events);
+        assert!(matches!(first, SyncResponse::Events { .. }));
+        // The exchange already started completes and overshoots the budget.
+        let second = answer_member_sync_request(&synchronization, &bandwidth, peer, &events);
+        assert!(matches!(second, SyncResponse::Events { .. }));
+        assert_eq!(bandwidth.status().unwrap().remaining_sync_bytes, Some(0));
+
+        let spent = answer_member_sync_request(
+            &synchronization,
+            &bandwidth,
+            peer,
+            &SyncRequest::Summary { group_id },
+        );
+        assert_eq!(spent, busy);
+    }
+
+    #[test]
+    fn member_serving_is_unmetered_without_a_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        let peer = DeviceIdentity::generate().peer_id();
+        let group_id = DeviceIdentity::generate().peer_id();
+        let synchronization = MemberSynchronizationService {
+            expected_peer: peer,
+            group_id,
+        };
+        let events = SyncRequest::Events {
+            group_id,
+            event_ids: Vec::new(),
+        };
+
+        for _ in 0..4 {
+            let response = answer_member_sync_request(&synchronization, &bandwidth, peer, &events);
+            assert!(matches!(response, SyncResponse::Events { .. }));
+        }
+        assert_eq!(bandwidth.status().unwrap().remaining_sync_bytes, None);
     }
 
     #[test]

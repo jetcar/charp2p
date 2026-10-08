@@ -309,6 +309,20 @@ sequence every other current member has reported storing is shown as observed
 by all currently known members. This remains a display state, not a delivery
 guarantee.
 
+Members also serve history to one another (ADR-040). Each member derives a
+member rendezvous key from its current MLS epoch's exporter
+(`"charp2p member rendezvous v1"`, group ID context, 32 bytes) through the
+discovery-key derivation, so the key changes with every commit and a removed
+device cannot follow it. While a joined group is open, a member advertises
+that key and answers summary, event-ID, and event requests from authenticated
+peers that are current MLS members; uploads and head reports stay owner-only
+and are answered `unauthorized`, and served responses are charged to the
+synchronization data limit. When the pinned owner is unreachable, a member
+searches the member key and pulls from the first reachable current member
+other than itself, trying at most four providers. Received events are
+verified as from the owner, and membership commits still apply only when
+authored by the pinned owner device.
+
 The join exchange carries the canonical bearer invitation and one MLS
 KeyPackage in a bounded request. An accepted owner returns one bounded MLS
 Welcome. Invitation payloads are limited to 8 KiB; KeyPackages and Welcomes are

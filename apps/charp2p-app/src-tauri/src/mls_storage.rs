@@ -10,10 +10,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use charp2p_core::{
-    DeviceIdentity, EventId, EventKind, EventSpec, GroupMetadata, Invitation, InvitePermission,
-    JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent, SyncPeerHead,
-    SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS,
-    MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    DeviceIdentity, DiscoveryKey, EventId, EventKind, EventSpec, GroupMetadata, Invitation,
+    InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent,
+    SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES,
+    MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -55,6 +55,8 @@ const MESSAGE_AAD: &[u8] = b"charp2p-local-message-v1\0";
 const JOIN_RESPONSE_AAD: &[u8] = b"charp2p-join-response-v1\0";
 const JOIN_REQUEST_HASH_DOMAIN: &[u8] = b"charp2p-join-request-v1\0";
 const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
+const MEMBER_RENDEZVOUS_LABEL: &str = "charp2p member rendezvous v1";
+const MEMBER_RENDEZVOUS_SECRET_BYTES: usize = 32;
 pub(crate) const MAX_EVIDENCE_EVENTS: usize = 64;
 const EVIDENCE_FORMAT: &str = "charp2p-evidence-v1";
 const EVIDENCE_NOTICE: &str = "Each signed event proves which device signed it and when it claims to have been created. Event payloads are end-to-end encrypted; displayedText is the text shown on the exporting device and is not covered by the signatures.";
@@ -341,6 +343,50 @@ impl MlsProviderService {
             return Err("mls_group_identity_invalid");
         }
         group_member_devices(&group)
+    }
+
+    /// Derives the member rendezvous key of the group's current MLS epoch
+    /// (ADR-040). It changes with every commit, so only devices that are
+    /// members in this epoch share it.
+    // Advertised and searched by member-served synchronization (ADR-040).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn member_rendezvous_key(
+        &self,
+        group_id: PeerId,
+    ) -> Result<DiscoveryKey, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        )
+        .map_err(|_| "mls_group_storage_unavailable")?
+        .ok_or("mls_joined_group_missing")?;
+        validate_group_profile(&group).map_err(|_| "mls_group_profile_invalid")?;
+        if !group.is_active() {
+            return Err("mls_group_inactive");
+        }
+        let secret = Zeroizing::new(
+            group
+                .export_secret(
+                    provider.crypto(),
+                    MEMBER_RENDEZVOUS_LABEL,
+                    &group_id.to_bytes(),
+                    MEMBER_RENDEZVOUS_SECRET_BYTES,
+                )
+                .map_err(|_| "mls_export_failed")?,
+        );
+        let secret: &[u8; MEMBER_RENDEZVOUS_SECRET_BYTES] = secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| "mls_export_failed")?;
+        Ok(DiscoveryKey::derive(group_id, secret))
     }
 
     /// Removes one current device and durably blocks it from reusing an
@@ -2850,9 +2896,9 @@ mod tests {
     };
 
     use charp2p_core::{
-        DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, Invitation,
-        InvitationSpec, PeerId, SignedEvent, SyncAuthorHead, SyncPeerHead, SyncRejectReason,
-        SyncRequest, SyncResponse,
+        DeviceIdentity, DiscoveryKey, EventKind, EventSpec, GroupIdentity, HistoryPolicy,
+        Invitation, InvitationSpec, PeerId, SignedEvent, SyncAuthorHead, SyncPeerHead,
+        SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -3935,6 +3981,108 @@ mod tests {
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
             }
+        );
+    }
+
+    #[test]
+    fn member_rendezvous_key_is_shared_per_epoch_and_left_behind_on_removal() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let first_member = DeviceIdentity::generate();
+        let second_member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let first_service = test_service(directory.path().join("first.sqlite3"));
+        let second_service = test_service(directory.path().join("second.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        assert_eq!(
+            first_service.member_rendezvous_key(group_id),
+            Err("mls_joined_group_missing")
+        );
+
+        let first_join = first_service
+            .prepare_join_request(first_member.peer_id(), &invitation)
+            .unwrap();
+        let first_welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                first_member.peer_id(),
+                first_join.key_package(),
+                41,
+            )
+            .unwrap();
+        first_service
+            .complete_join(group_id, first_welcome.welcome().unwrap())
+            .unwrap();
+        pin_joined_owner(&first_service, group_id, owner.peer_id());
+        let first_epoch_key = owner_service.member_rendezvous_key(group_id).unwrap();
+        assert_eq!(
+            first_service.member_rendezvous_key(group_id).unwrap(),
+            first_epoch_key
+        );
+        assert_ne!(first_epoch_key, DiscoveryKey::from_invitation(&invitation));
+
+        let second_join = second_service
+            .prepare_join_request(second_member.peer_id(), &invitation)
+            .unwrap();
+        let second_welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                second_member.peer_id(),
+                second_join.key_package(),
+                42,
+            )
+            .unwrap();
+        second_service
+            .complete_join(group_id, second_welcome.welcome().unwrap())
+            .unwrap();
+        pin_joined_owner(&second_service, group_id, owner.peer_id());
+        let second_epoch_key = owner_service.member_rendezvous_key(group_id).unwrap();
+        assert_ne!(second_epoch_key, first_epoch_key);
+        assert_eq!(
+            second_service.member_rendezvous_key(group_id).unwrap(),
+            second_epoch_key
+        );
+        // A member behind by a commit still derives the earlier key.
+        assert_eq!(
+            first_service.member_rendezvous_key(group_id).unwrap(),
+            first_epoch_key
+        );
+        pull_all(
+            &owner_service,
+            &first_service,
+            first_member.peer_id(),
+            group_id,
+        );
+        assert_eq!(
+            first_service.member_rendezvous_key(group_id).unwrap(),
+            second_epoch_key
+        );
+
+        owner_service
+            .remove_member_at(group_id, &owner, first_member.peer_id(), 43)
+            .unwrap();
+        pull_all(
+            &owner_service,
+            &second_service,
+            second_member.peer_id(),
+            group_id,
+        );
+        let third_epoch_key = owner_service.member_rendezvous_key(group_id).unwrap();
+        assert_ne!(third_epoch_key, second_epoch_key);
+        assert_eq!(
+            second_service.member_rendezvous_key(group_id).unwrap(),
+            third_epoch_key
+        );
+        assert_ne!(
+            first_service.member_rendezvous_key(group_id).ok(),
+            Some(third_epoch_key)
         );
     }
 

@@ -2308,6 +2308,15 @@ function App() {
     };
   }, [localGroupId, advertisement]);
 
+  const servedJoinedGroupId = joinedGroup?.groupId ?? null;
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    // An open joined group serves its history to other current members
+    // (ADR-040); closing it or opening an owned group stops that node.
+    void invoke("serve_joined_group", { groupId: servedJoinedGroupId }).catch(() => undefined);
+  }, [servedJoinedGroupId]);
+
   useEffect(() => {
     if (!isTauri() || !joinedGroup) return;
 
@@ -2720,6 +2729,8 @@ function App() {
           : group;
       }));
       if (activeGroupIdRef.current === groupId) {
+        // Re-advertise under the member key of a newly reached MLS epoch.
+        void invoke("serve_joined_group", { groupId }).catch(() => undefined);
         setSynchronizationResult(result);
         const page = await invoke<StoredMessagePage>("group_messages", { groupId });
         if (activeGroupIdRef.current === groupId) {

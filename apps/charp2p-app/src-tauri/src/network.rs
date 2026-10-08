@@ -365,6 +365,20 @@ impl Drop for ActiveAdvertisement {
     }
 }
 
+/// Member serving node of the open joined group (ADR-040) and the member
+/// rendezvous key it advertises.
+struct ActiveMemberServing {
+    group_id: PeerId,
+    key: DiscoveryKey,
+    task: JoinHandle<()>,
+}
+
+impl Drop for ActiveMemberServing {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Running opted-in contribution node (ADR-031) and the relay limits it was
 /// started with.
 struct ActiveContribution {
@@ -385,6 +399,7 @@ pub struct NetworkService {
     community_peers: std::sync::RwLock<Vec<BootstrapPeer>>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     contribution: Mutex<Option<ActiveContribution>>,
+    member_serving: Mutex<Option<ActiveMemberServing>>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
     group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedGroupSynchronization>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
@@ -526,6 +541,7 @@ impl NetworkService {
             community_peers: std::sync::RwLock::new(Vec::new()),
             advertisement: Mutex::new(None),
             contribution: Mutex::new(None),
+            member_serving: Mutex::new(None),
             last_connection: std::sync::Mutex::new(None),
             group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
@@ -1106,6 +1122,111 @@ impl NetworkService {
     /// Stops the contribution node, if one is running.
     pub async fn stop_contribution(&self) {
         self.contribution.lock().await.take();
+    }
+
+    /// Advertises the member rendezvous key of a joined group's current MLS
+    /// epoch and serves pull-only synchronization to current members
+    /// (ADR-040). The node restarts only when the group or key changes, so
+    /// calling this again after a synchronization re-advertises once the
+    /// epoch advanced. Served bytes are charged to `bandwidth`.
+    pub async fn serve_member_group(
+        &self,
+        network_identity: DeviceIdentity,
+        group_id: PeerId,
+        key: DiscoveryKey,
+        bandwidth: Arc<BandwidthService>,
+    ) -> Result<&'static str, &'static str> {
+        let mut active = self.member_serving.lock().await;
+        if self.bootstrap_peers().is_empty() {
+            active.take();
+            return Ok("bootstrapRequired");
+        }
+        if let Some(existing) = active.as_ref() {
+            if existing.group_id == group_id && existing.key == key && !existing.task.is_finished()
+            {
+                return Ok("advertising");
+            }
+        }
+        active.take();
+
+        let mut node = self.group_client_node(network_identity);
+        node.listen_on(
+            "/ip4/0.0.0.0/udp/0/quic-v1"
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+        for bootstrap in &self.bootstrap_peers() {
+            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
+            node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
+                .map_err(|_| "network_unavailable")?;
+        }
+        node.bootstrap().map_err(|_| "network_unavailable")?;
+        node.announce_group(key)
+            .map_err(|_| "network_unavailable")?;
+
+        let synchronization = Arc::clone(&self.synchronization);
+        timeout(PROVIDER_SEARCH_TIMEOUT, async {
+            loop {
+                match node.next_event().await {
+                    NetworkEvent::GroupAnnounced { key: announced } if announced == key => {
+                        return Ok(());
+                    }
+                    NetworkEvent::DiscoveryFailed {
+                        key: failed,
+                        operation: charp2p_network::DiscoveryOperation::Announcement,
+                    } if failed == key => return Err("network_unavailable"),
+                    event => answer_member_node_event(
+                        &mut node,
+                        event,
+                        synchronization.as_ref(),
+                        &bandwidth,
+                    ),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "network_advertisement_timed_out")??;
+
+        let task = tokio::spawn(async move {
+            let mut refresh = interval_at(
+                Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
+                ADVERTISEMENT_REFRESH_INTERVAL,
+            );
+            refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = refresh.tick() => {
+                        if node.announce_group(key).is_err() {
+                            break;
+                        }
+                    }
+                    event = node.next_event() => match event {
+                        NetworkEvent::DiscoveryFailed {
+                            key: failed,
+                            operation: charp2p_network::DiscoveryOperation::Announcement,
+                        } if failed == key => break,
+                        event => answer_member_node_event(
+                            &mut node,
+                            event,
+                            synchronization.as_ref(),
+                            &bandwidth,
+                        ),
+                    },
+                }
+            }
+        });
+        *active = Some(ActiveMemberServing {
+            group_id,
+            key,
+            task,
+        });
+        Ok("advertising")
+    }
+
+    /// Stops the member serving node, if one is running.
+    pub async fn stop_member_serving(&self) {
+        self.member_serving.lock().await.take();
     }
 
     /// Stops the local provider and request listener for the active invitation.
@@ -1879,7 +2000,6 @@ fn encoded_bytes(encoded_events: &[Vec<u8>]) -> u64 {
 /// served event bytes count toward the synchronization data limit, and the
 /// request is answered `busy` once that budget is spent or unreadable.
 /// Owner answers stay uncounted (ADR-033).
-#[cfg_attr(not(test), allow(dead_code))]
 fn answer_member_sync_request(
     synchronization: &dyn SynchronizationService,
     bandwidth: &BandwidthService,
@@ -1894,6 +2014,35 @@ fn answer_member_sync_request(
     let response = synchronization.answer_sync_request(authenticated_peer, request);
     bandwidth.charge_sync_bytes(response_event_bytes(&response));
     response
+}
+
+/// Handles an event on a member serving node: synchronization requests
+/// get the metered member answer, while join and invitation requests are
+/// rejected because only the owner admits devices.
+fn answer_member_node_event(
+    node: &mut NetworkNode,
+    event: NetworkEvent,
+    synchronization: &dyn SynchronizationService,
+    bandwidth: &BandwidthService,
+) {
+    match event {
+        NetworkEvent::SyncRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => {
+            let response =
+                answer_member_sync_request(synchronization, bandwidth, peer_id, &request);
+            let _ = node.send_sync_response(request_id, response);
+        }
+        NetworkEvent::JoinRequestReceived { request_id, .. } => {
+            let _ = node.reject_join_request(request_id, JoinRejectReason::Unauthorized);
+        }
+        NetworkEvent::InviteRequestReceived { request_id, .. } => {
+            let _ = node.reject_invite_request(request_id, InviteRejectReason::Unauthorized);
+        }
+        _ => {}
+    }
 }
 
 fn join_response(
@@ -4159,6 +4308,184 @@ mod tests {
             })
             .await
             .expect("dropping the service should stop its advertiser");
+        });
+    }
+
+    #[test]
+    fn member_serving_node_is_discoverable_and_serves_only_pulls() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[7; 32]);
+        let (member, member_again) = identity_pair();
+        let member_id = member.peer_id();
+        tauri::async_runtime::block_on(async {
+            let requester_identity = DeviceIdentity::generate();
+            let requester_id = requester_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &format!("{address}/p2p/{routing_id}"),
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: requester_id,
+                    group_id,
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            {
+                let serve =
+                    service.serve_member_group(member, group_id, key, Arc::clone(&bandwidth));
+                tokio::pin!(serve);
+                let status = timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut serve => break result,
+                            _ = routing.next_event() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("member advertisement should complete")
+                .unwrap();
+                assert_eq!(status, "advertising");
+            }
+            let first_task = service
+                .member_serving
+                .lock()
+                .await
+                .as_ref()
+                .expect("member serving should be active")
+                .task
+                .id();
+            // The same epoch key keeps the running node.
+            assert_eq!(
+                service
+                    .serve_member_group(member_again, group_id, key, Arc::clone(&bandwidth))
+                    .await,
+                Ok("advertising")
+            );
+            assert_eq!(
+                service
+                    .member_serving
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .task
+                    .id(),
+                first_task
+            );
+
+            let mut requester = NetworkNode::new(requester_identity.into_network_keypair());
+            requester
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            requester.add_bootstrap_peer(routing_id, address);
+            requester.bootstrap().unwrap();
+            requester.find_group_peers(key);
+
+            let response = timeout(Duration::from_secs(10), async {
+                let mut request_sent = false;
+                loop {
+                    tokio::select! {
+                        event = requester.next_event() => match event {
+                            NetworkEvent::GroupPeersFound { providers, .. }
+                                if providers.contains(&member_id) && !request_sent =>
+                            {
+                                requester
+                                    .send_sync_request(
+                                        member_id,
+                                        SyncRequest::Summary { group_id },
+                                    )
+                                    .unwrap();
+                                request_sent = true;
+                            }
+                            NetworkEvent::SyncResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } if peer_id == member_id => break response,
+                            _ => {}
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("member serving node should answer the pull");
+            assert_eq!(
+                response,
+                SyncResponse::Summary {
+                    group_id,
+                    heads: Vec::new(),
+                }
+            );
+
+            // Only the owner admits devices, even when the authorizer would.
+            requester.send_join_request(
+                member_id,
+                JoinRequest::from_invitation(&join_invitation(), vec![1]).unwrap(),
+            );
+            let join_response = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = requester.next_event() => {
+                            if let NetworkEvent::JoinResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } = event
+                            {
+                                if peer_id == member_id {
+                                    break response;
+                                }
+                            }
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("join request should receive a response");
+            assert_eq!(
+                join_response.rejection(),
+                Some(JoinRejectReason::Unauthorized)
+            );
+
+            let serving_task = service
+                .member_serving
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .task
+                .abort_handle();
+            service.stop_member_serving().await;
+            timeout(Duration::from_secs(1), async {
+                while !serving_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stopping should end the member serving node");
         });
     }
 

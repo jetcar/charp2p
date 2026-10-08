@@ -527,7 +527,7 @@ async fn synchronize_group(
     pending_service: tauri::State<'_, PendingInvitationService>,
     network_service: tauri::State<'_, NetworkService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
-    bandwidth_service: tauri::State<'_, BandwidthService>,
+    bandwidth_service: tauri::State<'_, Arc<BandwidthService>>,
 ) -> Result<SynchronizeGroupResult, String> {
     let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
     if !mls_service.has_group(group_id).map_err(str::to_owned)? {
@@ -936,7 +936,7 @@ fn set_launch_at_login(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), &'
 /// now (ADR-033).
 #[tauri::command]
 fn bandwidth_status(
-    service: tauri::State<'_, BandwidthService>,
+    service: tauri::State<'_, Arc<BandwidthService>>,
 ) -> Result<BandwidthStatus, String> {
     service.status().map_err(str::to_owned)
 }
@@ -946,7 +946,7 @@ fn bandwidth_status(
 #[tauri::command]
 fn set_bandwidth_preference(
     preference: BandwidthPreference,
-    service: tauri::State<'_, BandwidthService>,
+    service: tauri::State<'_, Arc<BandwidthService>>,
 ) -> Result<BandwidthStatus, String> {
     service.set(preference).map_err(str::to_owned)
 }
@@ -1061,6 +1061,45 @@ async fn apply_contribution(
     let identity = identity_service.load_network_identity()?;
     network_service.start_contribution(identity, relay).await?;
     Ok(())
+}
+
+/// Serves the open joined group's history to its other current members
+/// (ADR-040), advertising the member rendezvous key of the current MLS
+/// epoch. Called again after each synchronization so a new epoch is
+/// re-advertised; no group (or an owned one) stops the member serving node.
+#[tauri::command]
+async fn serve_joined_group(
+    group_id: Option<String>,
+    identity_service: tauri::State<'_, IdentityService>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
+    network_service: tauri::State<'_, NetworkService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    bandwidth_service: tauri::State<'_, Arc<BandwidthService>>,
+) -> Result<&'static str, String> {
+    let Some(group_id) = group_id else {
+        network_service.stop_member_serving().await;
+        return Ok("inactive");
+    };
+    let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
+    if pending_service.joined_sync_target(group_id).is_err() {
+        network_service.stop_member_serving().await;
+        return Ok("inactive");
+    }
+    // A removed or unreadable group stops advertising its earlier epoch key.
+    let key = match mls_service.member_rendezvous_key(group_id) {
+        Ok(key) => key,
+        Err(error) => {
+            network_service.stop_member_serving().await;
+            return Err(error.to_owned());
+        }
+    };
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    network_service
+        .serve_member_group(identity, group_id, key, Arc::clone(&bandwidth_service))
+        .await
+        .map_err(str::to_owned)
 }
 
 /// Advertises every owned group from one background provider, independent of
@@ -1203,7 +1242,9 @@ pub fn run() {
             app.manage(ContributionService::new(
                 data_directory.join("contribution.json"),
             ));
-            app.manage(BandwidthService::new(data_directory.join("bandwidth.json")));
+            app.manage(Arc::new(BandwidthService::new(
+                data_directory.join("bandwidth.json"),
+            )));
             app.manage(RetentionService::new(data_directory.join("retention.json")));
             app.manage(SettingsService::new(database_path));
 
@@ -1279,6 +1320,7 @@ pub fn run() {
             blocked_group_devices,
             set_group_device_blocked,
             advertise_owned_groups,
+            serve_joined_group,
             network_status,
             group_connection_states,
             owned_group_discovery_status,

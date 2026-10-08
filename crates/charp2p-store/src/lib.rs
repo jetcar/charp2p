@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -1008,7 +1008,8 @@ impl EventStore {
 
     /// Atomically stores a decrypted group-metadata change and the advanced
     /// encrypted MLS provider state. The caller authorizes the author; the
-    /// change with the highest author sequence becomes the current name.
+    /// change with the highest author sequence becomes the current name, and
+    /// the highest-sequence change carrying an icon the current icon.
     pub fn put_group_metadata_and_encrypted_mls_provider_snapshot(
         &mut self,
         event: &SignedEvent,
@@ -1026,8 +1027,8 @@ impl EventStore {
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
         transaction.execute(
             "INSERT INTO applied_group_metadata (
-                event_id, group_id, author_id, author_sequence, group_name
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                event_id, group_id, author_id, author_sequence, group_name, icon
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(event_id) DO NOTHING",
             params![
                 event.id().as_bytes().as_slice(),
@@ -1035,6 +1036,7 @@ impl EventStore {
                 event.author_id().to_bytes(),
                 sequence,
                 metadata.group_name(),
+                metadata.icon().map(i64::from),
             ],
         )?;
         transaction.commit()?;
@@ -1150,6 +1152,36 @@ impl EventStore {
             let group_id = PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?;
             charp2p_core::GroupMetadata::new(&group_name).map_err(|_| StoreError::CorruptIndex)?;
             Ok((group_id, group_name))
+        })
+        .collect()
+    }
+
+    /// Returns the current authenticated group icon for every group with an
+    /// applied metadata change carrying one. Version 1 changes without an
+    /// icon keep the previously known icon.
+    pub fn current_group_icons(&self) -> Result<Vec<(PeerId, u8)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT g.group_id, g.icon
+             FROM applied_group_metadata g
+             WHERE g.icon IS NOT NULL
+               AND g.author_sequence = (
+                   SELECT MAX(latest.author_sequence)
+                   FROM applied_group_metadata latest
+                   WHERE latest.group_id = g.group_id AND latest.icon IS NOT NULL
+               )
+             ORDER BY g.group_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (group_id, icon) = row?;
+            let group_id = PeerId::from_bytes(&group_id).map_err(|_| StoreError::CorruptIndex)?;
+            let icon = u8::try_from(icon)
+                .ok()
+                .filter(|icon| *icon <= charp2p_core::MAX_GROUP_ICON)
+                .ok_or(StoreError::CorruptIndex)?;
+            Ok((group_id, icon))
         })
         .collect()
     }
@@ -2194,7 +2226,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=23 => {}
+            6..=24 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2521,6 +2553,24 @@ impl EventStore {
             if has_index && !has_requester {
                 transaction.execute_batch(
                     "ALTER TABLE issued_invitations ADD COLUMN requested_by_device_id BLOB;",
+                )?;
+            }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 24 {
+            let transaction = connection.transaction()?;
+            let has_icon: bool = transaction.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('applied_group_metadata')
+                 WHERE name = 'icon'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_icon {
+                transaction.execute_batch(
+                    "ALTER TABLE applied_group_metadata ADD COLUMN icon INTEGER
+                        CHECK(icon IS NULL OR icon BETWEEN 0 AND 4);",
                 )?;
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -4351,6 +4401,77 @@ mod tests {
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"snapshot one"
         );
+    }
+
+    #[test]
+    fn version_one_metadata_changes_keep_the_known_group_icon() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let metadata_event = |sequence| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::GroupMetadataChanged,
+                    protected_payload: b"protected metadata",
+                },
+            )
+            .unwrap()
+        };
+        let named = |name: &str| charp2p_core::GroupMetadata::new(name).unwrap();
+        let mut put = |sequence, metadata: charp2p_core::GroupMetadata| {
+            let event = metadata_event(sequence);
+            store.put_event(&event).unwrap();
+            store
+                .put_group_metadata_and_encrypted_mls_provider_snapshot(
+                    &event,
+                    b"snapshot",
+                    &metadata,
+                )
+                .unwrap();
+        };
+
+        put(1, named("Crew"));
+        put(2, named("Crew").with_icon(3).unwrap());
+        put(4, named("Renamed Crew"));
+        put(3, named("Crew").with_icon(1).unwrap());
+
+        assert_eq!(
+            store.current_group_names().unwrap(),
+            vec![(group.group_id(), "Renamed Crew".to_owned())]
+        );
+        assert_eq!(
+            store.current_group_icons().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
+    }
+
+    #[test]
+    fn version_twenty_four_database_adds_group_metadata_icons() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE applied_group_metadata DROP COLUMN icon;
+                     PRAGMA user_version = 24;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert!(store.current_group_icons().unwrap().is_empty());
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]

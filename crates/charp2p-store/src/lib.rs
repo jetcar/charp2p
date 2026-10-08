@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -33,6 +33,8 @@ pub const MAX_PEER_ADDRESS_BYTES: usize = 512;
 pub const MAX_PEER_ADDRESSES: usize = 4;
 /// Most conflicting author sequences recorded per group author.
 pub const MAX_SEQUENCE_CONFLICTS_PER_AUTHOR: usize = 64;
+/// Maximum undecided owner approval requests kept for one group (ADR-041).
+pub const MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP: usize = 64;
 
 /// Non-secret local metadata for a group owned by this device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +91,39 @@ pub struct IssuedInvitationMetadata {
     pub expires_at_unix: u64,
     /// Member device whose request made the owner issue it (ADR-036).
     pub requested_by: Option<PeerId>,
+}
+
+/// Owner decision state for a device asking to join an approval-required group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalState {
+    Pending,
+    Approved,
+    Declined,
+}
+
+/// Owner-local record of an authorized join request awaiting approval (ADR-041).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerApprovalRequest {
+    pub group_id: PeerId,
+    pub device_id: PeerId,
+    pub invitation_id: InvitationId,
+    pub expires_at_unix: u64,
+    pub first_requested_at_unix: u64,
+    pub last_requested_at_unix: u64,
+    pub state: ApprovalState,
+}
+
+/// Result of recording one authorized join request for an approval-required group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalRequestOutcome {
+    /// The request is recorded and awaits the owner's decision.
+    Pending,
+    /// The owner approved this device; admission may proceed.
+    Approved,
+    /// The owner declined this device; the request must be rejected.
+    Declined,
+    /// The group already holds the maximum undecided requests.
+    Full,
 }
 
 /// Non-secret index for an owner-side rendezvous key retained after join.
@@ -471,6 +506,16 @@ impl EventStore {
             "UPDATE applied_invite_permissions SET granted = 0
              WHERE group_id = ?1 AND target_device_id = ?2",
             params![event.group_id().to_bytes(), removed_member_id.to_bytes()],
+        )?;
+        // A removed device needs a new approval to join again (ADR-041).
+        transaction.execute(
+            "DELETE FROM owner_approval_requests
+             WHERE group_id = ?1 AND device_id = ?2 AND state = ?3",
+            params![
+                event.group_id().to_bytes(),
+                removed_member_id.to_bytes(),
+                approval_state_code(ApprovalState::Approved),
+            ],
         )?;
         transaction.commit()?;
         Ok(outcome)
@@ -1714,6 +1759,203 @@ impl EventStore {
         Ok(true)
     }
 
+    /// Records an authorized join request for an approval-required group and
+    /// reports the owner's decision for that device. Undecided and approved
+    /// requests expire with their invitation; declines stay until cleared.
+    pub fn record_owner_approval_request(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+        invitation_id: InvitationId,
+        expires_at_unix: u64,
+        now_unix: u64,
+    ) -> Result<ApprovalRequestOutcome, StoreError> {
+        let expires = i64::try_from(expires_at_unix)
+            .map_err(|_| StoreError::TimestampTooLarge(expires_at_unix))?;
+        let now = i64::try_from(now_unix).map_err(|_| StoreError::TimestampTooLarge(now_unix))?;
+        let transaction = self.connection.transaction()?;
+        prune_expired_approval_requests(&transaction, group_id, now)?;
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT state FROM owner_approval_requests
+                 WHERE group_id = ?1 AND device_id = ?2",
+                params![group_id.to_bytes(), device_id.to_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let outcome = match existing.map(approval_state_from_code).transpose()? {
+            Some(ApprovalState::Declined) => ApprovalRequestOutcome::Declined,
+            Some(state) => {
+                transaction.execute(
+                    "UPDATE owner_approval_requests SET last_requested_at_unix = ?3
+                     WHERE group_id = ?1 AND device_id = ?2",
+                    params![group_id.to_bytes(), device_id.to_bytes(), now],
+                )?;
+                if state == ApprovalState::Pending {
+                    // A newer invitation keeps the request alive as long as it.
+                    transaction.execute(
+                        "UPDATE owner_approval_requests
+                         SET invitation_id = ?3, expires_at_unix = ?4
+                         WHERE group_id = ?1 AND device_id = ?2 AND expires_at_unix < ?4",
+                        params![
+                            group_id.to_bytes(),
+                            device_id.to_bytes(),
+                            invitation_id.as_bytes().as_slice(),
+                            expires,
+                        ],
+                    )?;
+                    ApprovalRequestOutcome::Pending
+                } else {
+                    ApprovalRequestOutcome::Approved
+                }
+            }
+            None => {
+                let pending: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM owner_approval_requests
+                     WHERE group_id = ?1 AND state = ?2",
+                    params![
+                        group_id.to_bytes(),
+                        approval_state_code(ApprovalState::Pending)
+                    ],
+                    |row| row.get(0),
+                )?;
+                if usize::try_from(pending).map_err(|_| StoreError::CorruptIndex)?
+                    >= MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP
+                {
+                    ApprovalRequestOutcome::Full
+                } else {
+                    transaction.execute(
+                        "INSERT INTO owner_approval_requests (
+                            group_id, device_id, invitation_id, expires_at_unix,
+                            first_requested_at_unix, last_requested_at_unix, state
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                        params![
+                            group_id.to_bytes(),
+                            device_id.to_bytes(),
+                            invitation_id.as_bytes().as_slice(),
+                            expires,
+                            now,
+                            approval_state_code(ApprovalState::Pending),
+                        ],
+                    )?;
+                    ApprovalRequestOutcome::Pending
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Approves an undecided request so the device's next retry is admitted.
+    /// Returns false when no undecided request exists for the device.
+    pub fn approve_owner_approval_request(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        self.decide_owner_approval_request(group_id, device_id, ApprovalState::Approved)
+    }
+
+    /// Declines an undecided or approved request; later requests from the
+    /// device are rejected until the decline is cleared. Returns false when
+    /// the device has no such request.
+    pub fn decline_owner_approval_request(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        self.decide_owner_approval_request(group_id, device_id, ApprovalState::Declined)
+    }
+
+    fn decide_owner_approval_request(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+        state: ApprovalState,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE owner_approval_requests SET state = ?3
+             WHERE group_id = ?1 AND device_id = ?2 AND state IN (?4, ?5) AND state != ?3",
+            params![
+                group_id.to_bytes(),
+                device_id.to_bytes(),
+                approval_state_code(state),
+                approval_state_code(ApprovalState::Pending),
+                approval_state_code(ApprovalState::Approved),
+            ],
+        )? > 0)
+    }
+
+    /// Clears a declined device so its next request is recorded again.
+    /// Returns false when the device was not declined.
+    pub fn clear_declined_approval_request(
+        &mut self,
+        group_id: PeerId,
+        device_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM owner_approval_requests
+             WHERE group_id = ?1 AND device_id = ?2 AND state = ?3",
+            params![
+                group_id.to_bytes(),
+                device_id.to_bytes(),
+                approval_state_code(ApprovalState::Declined),
+            ],
+        )? > 0)
+    }
+
+    /// Lists unexpired approval requests and declines for one group, oldest
+    /// request first.
+    pub fn owner_approval_requests(
+        &self,
+        group_id: PeerId,
+        now_unix: u64,
+    ) -> Result<Vec<OwnerApprovalRequest>, StoreError> {
+        let now = i64::try_from(now_unix).map_err(|_| StoreError::TimestampTooLarge(now_unix))?;
+        let mut statement = self.connection.prepare(
+            "SELECT device_id, invitation_id, expires_at_unix, first_requested_at_unix,
+                    last_requested_at_unix, state
+             FROM owner_approval_requests
+             WHERE group_id = ?1 AND (state = ?2 OR expires_at_unix > ?3)
+             ORDER BY first_requested_at_unix, device_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                group_id.to_bytes(),
+                approval_state_code(ApprovalState::Declined),
+                now
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        let mut requests = Vec::new();
+        for row in rows {
+            let (device_id, invitation_id, expires, first, last, state) = row?;
+            let invitation_id: [u8; 16] = invitation_id
+                .try_into()
+                .map_err(|_| StoreError::CorruptIndex)?;
+            let timestamp = |value: i64| u64::try_from(value).map_err(|_| StoreError::CorruptIndex);
+            requests.push(OwnerApprovalRequest {
+                group_id,
+                device_id: PeerId::from_bytes(&device_id).map_err(|_| StoreError::CorruptIndex)?,
+                invitation_id: InvitationId::from_bytes(invitation_id),
+                expires_at_unix: timestamp(expires)?,
+                first_requested_at_unix: timestamp(first)?,
+                last_requested_at_unix: timestamp(last)?,
+                state: approval_state_from_code(state)?,
+            });
+        }
+        Ok(requests)
+    }
+
     /// Adds the non-secret index for a newly issued bearer invitation.
     pub fn put_issued_invitation(
         &mut self,
@@ -2226,7 +2468,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=24 => {}
+            6..=25 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2577,6 +2819,26 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 25 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS owner_approval_requests (
+                    group_id BLOB NOT NULL,
+                    device_id BLOB NOT NULL,
+                    invitation_id BLOB NOT NULL CHECK(length(invitation_id) = 16),
+                    expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix >= 0),
+                    first_requested_at_unix INTEGER NOT NULL
+                        CHECK(first_requested_at_unix >= 0),
+                    last_requested_at_unix INTEGER NOT NULL
+                        CHECK(last_requested_at_unix >= first_requested_at_unix),
+                    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 2),
+                    PRIMARY KEY (group_id, device_id)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -2661,6 +2923,40 @@ fn pending_invitation_in_transaction(
         },
     )
     .transpose()
+}
+
+fn approval_state_code(state: ApprovalState) -> i64 {
+    match state {
+        ApprovalState::Pending => 0,
+        ApprovalState::Approved => 1,
+        ApprovalState::Declined => 2,
+    }
+}
+
+fn approval_state_from_code(code: i64) -> Result<ApprovalState, StoreError> {
+    match code {
+        0 => Ok(ApprovalState::Pending),
+        1 => Ok(ApprovalState::Approved),
+        2 => Ok(ApprovalState::Declined),
+        _ => Err(StoreError::CorruptIndex),
+    }
+}
+
+fn prune_expired_approval_requests(
+    transaction: &Transaction<'_>,
+    group_id: PeerId,
+    now: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "DELETE FROM owner_approval_requests
+         WHERE group_id = ?1 AND state != ?2 AND expires_at_unix <= ?3",
+        params![
+            group_id.to_bytes(),
+            approval_state_code(ApprovalState::Declined),
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 fn history_policy_code(policy: HistoryPolicy) -> i64 {
@@ -2803,11 +3099,13 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        AuthorHead, EventStore, IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
-        MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
-        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_PEER_ADDRESS_BYTES,
-        MAX_SEQUENCE_CONFLICTS_PER_AUTHOR, MAX_SYNC_BATCH_EVENTS, OwnerDiscoveryKeyMetadata,
-        PendingInvitationMetadata, PutEventOutcome, SequenceConflictSummary, StoreError,
+        ApprovalRequestOutcome, ApprovalState, AuthorHead, EventStore, IssuedInvitationMetadata,
+        JoinedGroupMetadata, LocalGroupMetadata, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
+        MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+        MAX_PEER_ADDRESS_BYTES, MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP,
+        MAX_SEQUENCE_CONFLICTS_PER_AUTHOR, MAX_SYNC_BATCH_EVENTS, OwnerApprovalRequest,
+        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome,
+        SequenceConflictSummary, StoreError,
     };
 
     fn message_event(
@@ -3482,6 +3780,139 @@ mod tests {
     }
 
     #[test]
+    fn owner_approval_requests_record_decide_and_expire() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate().group_id();
+        let device = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let invitation = InvitationId::from_bytes([3; 16]);
+        let later_invitation = InvitationId::from_bytes([4; 16]);
+
+        let record = |store: &mut EventStore, device, invitation, expires, now| {
+            store
+                .record_owner_approval_request(group, device, invitation, expires, now)
+                .unwrap()
+        };
+        assert_eq!(
+            record(&mut store, device, invitation, 2_000, 1_000),
+            ApprovalRequestOutcome::Pending
+        );
+        assert_eq!(
+            record(&mut store, device, later_invitation, 3_000, 1_100),
+            ApprovalRequestOutcome::Pending
+        );
+        let requests = store.owner_approval_requests(group, 1_100).unwrap();
+        assert_eq!(
+            requests,
+            vec![OwnerApprovalRequest {
+                group_id: group,
+                device_id: device,
+                invitation_id: later_invitation,
+                expires_at_unix: 3_000,
+                first_requested_at_unix: 1_000,
+                last_requested_at_unix: 1_100,
+                state: ApprovalState::Pending,
+            }]
+        );
+
+        assert!(store.approve_owner_approval_request(group, device).unwrap());
+        assert!(!store.approve_owner_approval_request(group, device).unwrap());
+        assert_eq!(
+            record(&mut store, device, later_invitation, 3_000, 1_200),
+            ApprovalRequestOutcome::Approved
+        );
+        assert!(store.decline_owner_approval_request(group, device).unwrap());
+        assert_eq!(
+            record(&mut store, device, later_invitation, 3_000, 1_300),
+            ApprovalRequestOutcome::Declined
+        );
+        // Declines outlive the invitation until the owner clears them.
+        assert_eq!(
+            store.owner_approval_requests(group, 5_000).unwrap()[0].state,
+            ApprovalState::Declined
+        );
+        assert!(
+            store
+                .clear_declined_approval_request(group, device)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .clear_declined_approval_request(group, device)
+                .unwrap()
+        );
+
+        assert_eq!(
+            record(&mut store, other, invitation, 2_000, 1_000),
+            ApprovalRequestOutcome::Pending
+        );
+        assert!(
+            store
+                .owner_approval_requests(group, 2_000)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.approve_owner_approval_request(group, device).unwrap());
+        assert_eq!(
+            record(&mut store, other, invitation, 4_000, 2_500),
+            ApprovalRequestOutcome::Pending
+        );
+        assert_eq!(
+            store.owner_approval_requests(group, 2_500).unwrap()[0].first_requested_at_unix,
+            2_500
+        );
+    }
+
+    #[test]
+    fn owner_approval_requests_are_bounded_per_group() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate().group_id();
+        let invitation = InvitationId::from_bytes([5; 16]);
+        let devices: Vec<_> = (0..=MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP)
+            .map(|_| DeviceIdentity::generate().peer_id())
+            .collect();
+        for device in &devices[..MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP] {
+            assert_eq!(
+                store
+                    .record_owner_approval_request(group, *device, invitation, 2_000, 1_000)
+                    .unwrap(),
+                ApprovalRequestOutcome::Pending
+            );
+        }
+        let extra = devices[MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP];
+        assert_eq!(
+            store
+                .record_owner_approval_request(group, extra, invitation, 2_000, 1_000)
+                .unwrap(),
+            ApprovalRequestOutcome::Full
+        );
+        // Deciding a request frees room, and another group is unaffected.
+        assert!(
+            store
+                .approve_owner_approval_request(group, devices[0])
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .record_owner_approval_request(group, extra, invitation, 2_000, 1_000)
+                .unwrap(),
+            ApprovalRequestOutcome::Pending
+        );
+        assert_eq!(
+            store
+                .record_owner_approval_request(
+                    GroupIdentity::generate().group_id(),
+                    devices[1],
+                    invitation,
+                    2_000,
+                    1_000
+                )
+                .unwrap(),
+            ApprovalRequestOutcome::Pending
+        );
+    }
+
+    #[test]
     fn issued_invitation_index_keeps_requesting_member_device() {
         let file = NamedTempFile::new().unwrap();
         let invitation = IssuedInvitationMetadata {
@@ -3841,8 +4272,28 @@ mod tests {
         .unwrap();
 
         store
+            .record_owner_approval_request(
+                group.group_id(),
+                member_id,
+                InvitationId::from_bytes([9; 16]),
+                2_000_000_000,
+                1_800_000_000,
+            )
+            .unwrap();
+        assert!(
+            store
+                .approve_owner_approval_request(group.group_id(), member_id)
+                .unwrap()
+        );
+        store
             .put_mls_member_removal(&removed, b"removed provider snapshot", member_id)
             .unwrap();
+        assert!(
+            store
+                .owner_approval_requests(group.group_id(), 1_800_000_000)
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(store.get_event(removed.id()).unwrap().is_some());
         assert_eq!(
@@ -4448,6 +4899,35 @@ mod tests {
             store.current_group_icons().unwrap(),
             vec![(group.group_id(), 1)]
         );
+    }
+
+    #[test]
+    fn version_twenty_five_database_adds_owner_approval_requests() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE owner_approval_requests;
+                     PRAGMA user_version = 25;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert!(
+            store
+                .owner_approval_requests(GroupIdentity::generate().group_id(), 0)
+                .unwrap()
+                .is_empty()
+        );
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]

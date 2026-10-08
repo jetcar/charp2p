@@ -17,7 +17,7 @@ use charp2p_core::{
 };
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, connection_limits, identify,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, connection_limits, dcutr, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
@@ -66,6 +66,7 @@ struct Behaviour {
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
+    hole_punching: Toggle<dcutr::Behaviour>,
     lan_discovery: Toggle<mdns::tokio::Behaviour>,
 }
 
@@ -80,6 +81,10 @@ impl Behaviour {
         lan_discovery: bool,
     ) -> Self {
         let peer_id = identity.public().to_peer_id();
+        // Routing and contributor nodes serve inbound peers; only client nodes
+        // upgrade their own relayed connections through coordinated NAT
+        // traversal.
+        let hole_punching = (dht_mode == kad::Mode::Client).then(|| dcutr::Behaviour::new(peer_id));
         // mDNS is an additional discovery path only: when the multicast socket
         // cannot be opened, the node keeps working through the DHT.
         let lan_discovery = lan_discovery
@@ -138,6 +143,7 @@ impl Behaviour {
             relay_server: Toggle::from(
                 relay_server.map(|config| relay::Behaviour::new(peer_id, config)),
             ),
+            hole_punching: Toggle::from(hole_punching),
             lan_discovery: Toggle::from(lan_discovery),
         }
     }
@@ -624,6 +630,14 @@ impl NetworkNode {
                 )) => {
                     return NetworkEvent::RelayReservationAccepted { relay_peer_id };
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::HolePunching(dcutr::Event {
+                    remote_peer_id,
+                    result: Ok(_),
+                })) => {
+                    return NetworkEvent::DirectConnectionUpgraded {
+                        peer_id: remote_peer_id,
+                    };
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Dht(
                     kad::Event::OutboundQueryProgressed {
                         id,
@@ -897,6 +911,13 @@ pub enum NetworkEvent {
     RelayReservationAccepted {
         /// Authenticated relay peer.
         relay_peer_id: PeerId,
+    },
+    /// A relayed connection was upgraded to a direct connection through
+    /// coordinated NAT traversal (DCUtR). The direct connection is also
+    /// reported as `PeerConnected`.
+    DirectConnectionUpgraded {
+        /// Remote peer identity authenticated by the direct connection.
+        peer_id: PeerId,
     },
     /// An authenticated transport connection was established.
     PeerConnected {
@@ -1484,6 +1505,65 @@ mod tests {
         })
         .await
         .expect("peers should connect through the routing node relay");
+    }
+
+    #[tokio::test]
+    async fn client_nodes_upgrade_a_relayed_connection_to_a_direct_one() {
+        let mut relay = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let relay_id = relay.peer_id();
+        relay
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let relay_address = next_listen_address(&mut relay).await;
+
+        let mut destination = NetworkNode::new(Keypair::generate_ed25519());
+        let destination_id = destination.peer_id();
+        destination
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        destination.reserve_relay(relay_id, relay_address).unwrap();
+        let relayed_address = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = destination.next_event() => {
+                        if let NetworkEvent::Listening { address } = event
+                            && address.iter().any(|protocol| protocol == Protocol::P2pCircuit)
+                        {
+                            break address;
+                        }
+                    }
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("relay should grant a listen reservation");
+
+        let mut source = NetworkNode::new(Keypair::generate_ed25519());
+        source
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        source.dial(relayed_address).unwrap();
+
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = source.next_event() => {
+                        if matches!(
+                            event,
+                            NetworkEvent::DirectConnectionUpgraded { peer_id }
+                                if peer_id == destination_id
+                        ) {
+                            break;
+                        }
+                    }
+                    _ = destination.next_event() => {}
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("peers should hole-punch a direct connection over the relay");
     }
 
     #[tokio::test]

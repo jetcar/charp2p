@@ -215,6 +215,13 @@ Preferred connectivity order:
 4. NAT traversal coordinated through an authenticated relay connection.
 5. Circuit relay for the session when direct establishment fails.
 
+Client nodes run Direct Connection Upgrade through Relay (DCUtR): after a
+relayed connection is established, both peers exchange their observed
+external address candidates over the relay and attempt a synchronized direct
+QUIC connection. A successful upgrade is reported as a new direct or LAN
+connection; the relayed connection remains usable until it closes. Routing and
+contributor nodes serve inbound peers and do not run DCUtR.
+
 All peer streams use authenticated transport encryption. The relay sees source
 and destination peer metadata and traffic characteristics but not group
 payloads.

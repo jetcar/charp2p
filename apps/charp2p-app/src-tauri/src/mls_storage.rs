@@ -1416,6 +1416,26 @@ impl MlsProviderService {
                 reason: SyncRejectReason::Busy,
             };
         };
+        // A member device serves only the pull exchanges; uploads and head
+        // reports stay with the owner (ADR-040).
+        if matches!(
+            request,
+            SyncRequest::PushEvents { .. } | SyncRequest::ReportHeads { .. }
+        ) {
+            match store.joined_groups() {
+                Ok(joined) if joined.iter().any(|joined| joined.group_id == group_id) => {
+                    return SyncResponse::Rejected {
+                        reason: SyncRejectReason::Unauthorized,
+                    };
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return SyncResponse::Rejected {
+                        reason: SyncRejectReason::Busy,
+                    };
+                }
+            }
+        }
         if let Some((local_device_id, members)) = membership {
             return record_reported_heads(
                 &mut store,
@@ -3980,6 +4000,96 @@ mod tests {
                 .answer_sync_request(first_member.peer_id(), &SyncRequest::Summary { group_id },),
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
+            }
+        );
+    }
+
+    #[test]
+    fn member_serves_pulls_to_current_members_but_not_uploads() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let first_member = DeviceIdentity::generate();
+        let second_member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let first_service = test_service(directory.path().join("first.sqlite3"));
+        let second_service = test_service(directory.path().join("second.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        for (service, member, at) in [
+            (&first_service, &first_member, 41),
+            (&second_service, &second_member, 42),
+        ] {
+            let join = service
+                .prepare_join_request(member.peer_id(), &invitation)
+                .unwrap();
+            let welcome = owner_service
+                .admit_member_at(group_id, &owner, member.peer_id(), join.key_package(), at)
+                .unwrap();
+            service
+                .complete_join(group_id, welcome.welcome().unwrap())
+                .unwrap();
+            pin_joined_owner(service, group_id, owner.peer_id());
+        }
+        pull_all(
+            &owner_service,
+            &first_service,
+            first_member.peer_id(),
+            group_id,
+        );
+        first_service
+            .create_message_at(group_id, &first_member, "While the owner sleeps", 43)
+            .unwrap();
+
+        // The second member pulls the first member's message from it alone.
+        pull_all(
+            &first_service,
+            &second_service,
+            second_member.peer_id(),
+            group_id,
+        );
+        assert_eq!(
+            second_service
+                .messages(group_id, second_member.peer_id())
+                .unwrap()
+                .messages[0]
+                .text,
+            "While the owner sleeps"
+        );
+        assert_eq!(
+            first_service.answer_sync_request(
+                DeviceIdentity::generate().peer_id(),
+                &SyncRequest::Summary { group_id },
+            ),
+            SyncResponse::Rejected {
+                reason: SyncRejectReason::Unauthorized,
+            }
+        );
+
+        second_service
+            .create_message_at(group_id, &second_member, "Upload attempt", 44)
+            .unwrap();
+        let (push, _) = second_service
+            .next_push_request(group_id, second_member.peer_id(), 0)
+            .unwrap()
+            .unwrap();
+        let heads = second_service.report_heads_request(group_id).unwrap();
+        for request in [&push, &heads] {
+            assert_eq!(
+                first_service.answer_sync_request(second_member.peer_id(), request),
+                SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                }
+            );
+        }
+        assert_eq!(
+            owner_service.answer_sync_request(second_member.peer_id(), &push),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 1,
             }
         );
     }

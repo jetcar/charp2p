@@ -33,6 +33,9 @@ use thiserror::Error;
 use crate::{invite_codec::InviteCodec, join_codec::JoinCodec};
 
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
+/// Kademlia protocol name that keeps the CharP2P DHT separate from the IPFS
+/// network (ADR-039).
+const DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/charp2p/kad/1.0.0");
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const SYNC_PROTOCOL: &str = "/charp2p/sync/2.0.0";
@@ -103,7 +106,7 @@ impl Behaviour {
         // Serving nodes store only validated provider records for opaque
         // discovery keys (see `accepted_provider_record`); value records are
         // never stored because CharP2P does not publish any.
-        let mut dht_config = kad::Config::new(kad::PROTOCOL_NAME);
+        let mut dht_config = kad::Config::new(DHT_PROTOCOL);
         dht_config
             .set_record_filtering(kad::StoreInserts::FilterBoth)
             .set_provider_record_ttl(Some(PROVIDER_RECORD_TTL))
@@ -1285,12 +1288,18 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        ConnectionPath, MAX_PROVIDER_ADDRESSES, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION,
-        RelayLimits, accepted_provider_record, record_key,
+        ConnectionPath, DHT_PROTOCOL, MAX_PROVIDER_ADDRESSES, NetworkEvent, NetworkNode,
+        RELAY_CIRCUIT_DURATION, RelayLimits, accepted_provider_record, record_key,
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn dht_uses_a_dedicated_protocol_name() {
+        assert_eq!(DHT_PROTOCOL.as_ref(), "/charp2p/kad/1.0.0");
+        assert_ne!(DHT_PROTOCOL, kad::PROTOCOL_NAME);
+    }
 
     #[test]
     fn local_ip_addresses_are_classified_as_lan() {

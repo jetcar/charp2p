@@ -156,6 +156,9 @@ permission revokes the active invitations issued at that device's request.
 
 CharP2P uses a dedicated, open libp2p-compatible network rather than storing
 application records in BitTorrent Mainline DHT.
+All nodes speak Kademlia under the protocol name `/charp2p/kad/1.0.0` instead
+of the IPFS default, so the CharP2P DHT stays separate from the IPFS network
+(ADR-039).
 
 An online group member advertises a provider record for an opaque key:
 

@@ -1,5 +1,6 @@
 mod background;
 mod bandwidth;
+mod community;
 mod contribution;
 pub mod groups;
 mod identity;
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use background::{BackgroundPreference, BackgroundService, BackgroundStatus};
 use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
+use community::{CommunityNodesPreference, CommunityNodesService};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{
     CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup, MemberInvitationService,
@@ -989,6 +991,35 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Lists the community bootstrap nodes added on this device (ADR-038).
+#[tauri::command]
+fn community_nodes(
+    service: tauri::State<'_, CommunityNodesService>,
+) -> Result<Vec<String>, String> {
+    service
+        .preference()
+        .map(|preference| preference.addresses)
+        .map_err(str::to_owned)
+}
+
+/// Stores the community bootstrap nodes and uses them for new connections;
+/// the owner advertising provider restarts on its next refresh.
+#[tauri::command]
+async fn set_community_nodes(
+    addresses: Vec<String>,
+    service: tauri::State<'_, CommunityNodesService>,
+    network_service: tauri::State<'_, NetworkService>,
+) -> Result<Vec<String>, String> {
+    let preference = CommunityNodesPreference { addresses };
+    preference.validate().map_err(str::to_owned)?;
+    let peers = network_service
+        .community_peers(&preference.addresses)
+        .map_err(str::to_owned)?;
+    service.set(&preference).map_err(str::to_owned)?;
+    network_service.use_community_peers(peers).await;
+    Ok(preference.addresses)
+}
+
 /// Reports the device-local contribution preference and its worst-case
 /// relayed volume (ADR-031).
 #[tauri::command]
@@ -1138,6 +1169,16 @@ pub fn run() {
                 Arc::new(MemberInvitationService::new(groups.clone(), mls.clone())),
             )
             .map_err(std::io::Error::other)?;
+            // An unreadable or invalid community node list is reported on the
+            // Network page and leaves only built-in and environment nodes.
+            let community = CommunityNodesService::new(data_directory.join("community-nodes.json"));
+            if let Ok(peers) = community
+                .preference()
+                .and_then(|preference| network.community_peers(&preference.addresses))
+            {
+                network.replace_community_peers(peers);
+            }
+            app.manage(community);
             app.manage(identity);
             app.manage(pending);
             app.manage(groups);
@@ -1250,6 +1291,8 @@ pub fn run() {
             set_bandwidth_preference,
             retention_preference,
             set_retention_preference,
+            community_nodes,
+            set_community_nodes,
             contribution_status,
             set_contribution_preference
         ])

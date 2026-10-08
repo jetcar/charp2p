@@ -214,9 +214,9 @@ impl SynchronizationService for MlsProviderService {
 }
 
 #[derive(Clone)]
-struct BootstrapPeer {
-    peer_id: PeerId,
-    address: Multiaddr,
+pub struct BootstrapPeer {
+    pub(crate) peer_id: PeerId,
+    pub(crate) address: Multiaddr,
     source: &'static str,
 }
 
@@ -379,7 +379,10 @@ impl Drop for ActiveContribution {
 }
 
 pub struct NetworkService {
-    bootstrap_peers: Vec<BootstrapPeer>,
+    /// Built-in and environment-configured bootstrap nodes.
+    fixed_bootstrap_peers: Vec<BootstrapPeer>,
+    /// Community bootstrap nodes added on this device (ADR-038).
+    community_peers: std::sync::RwLock<Vec<BootstrapPeer>>,
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     contribution: Mutex<Option<ActiveContribution>>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
@@ -413,6 +416,65 @@ impl NetworkService {
             mls,
         )
         .map(|service| service.with_invite_requests(invite_requests))
+    }
+
+    /// Built-in, environment-configured and community bootstrap nodes, in
+    /// that order.
+    fn bootstrap_peers(&self) -> Vec<BootstrapPeer> {
+        let community = self
+            .community_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.fixed_bootstrap_peers
+            .iter()
+            .chain(community.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// Parses community node addresses validated by the stored preference,
+    /// leaving out nodes the build or environment already configures, and
+    /// refuses a list that would exceed the bootstrap node limit (ADR-038).
+    pub fn community_peers(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<BootstrapPeer>, &'static str> {
+        let mut peers: Vec<BootstrapPeer> = Vec::new();
+        for address in addresses {
+            let mut peer = parse_bootstrap_peer(address).map_err(|_| "community_node_invalid")?;
+            peer.source = "community";
+            let known = self
+                .fixed_bootstrap_peers
+                .iter()
+                .chain(peers.iter())
+                .any(|known| known.peer_id == peer.peer_id && known.address == peer.address);
+            if !known {
+                peers.push(peer);
+            }
+        }
+        if self.fixed_bootstrap_peers.len() + peers.len() > MAX_BOOTSTRAP_PEERS {
+            return Err("community_nodes_limit");
+        }
+        Ok(peers)
+    }
+
+    /// Sets the community nodes used by connections started from now on.
+    pub fn replace_community_peers(&self, peers: Vec<BootstrapPeer>) {
+        *self
+            .community_peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = peers;
+    }
+
+    /// Uses the community nodes for new connections. The owner advertising
+    /// provider stops so its next refresh bootstraps and reserves relays
+    /// through the new list.
+    pub async fn use_community_peers(&self, peers: Vec<BootstrapPeer>) {
+        self.replace_community_peers(peers);
+        if let Some(existing) = self.advertisement.lock().await.take() {
+            existing.task.abort();
+        }
+        clear_owner_addresses(&self.owner_addresses);
     }
 
     /// Lets the owner advertising node answer member invite requests.
@@ -460,7 +522,8 @@ impl NetworkService {
             bootstrap_peers.push(peer);
         }
         Ok(Self {
-            bootstrap_peers,
+            fixed_bootstrap_peers: bootstrap_peers,
+            community_peers: std::sync::RwLock::new(Vec::new()),
             advertisement: Mutex::new(None),
             contribution: Mutex::new(None),
             last_connection: std::sync::Mutex::new(None),
@@ -530,7 +593,7 @@ impl NetworkService {
             .last_connection
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (advertising_status, advertised_discovery_keys) = if self.bootstrap_peers.is_empty() {
+        let (advertising_status, advertised_discovery_keys) = if self.bootstrap_peers().is_empty() {
             ("bootstrapRequired", 0)
         } else {
             match self.advertisement.lock().await.as_ref() {
@@ -553,7 +616,7 @@ impl NetworkService {
             connection_observed_at_unix: observed
                 .map_or(0, |connection| connection.observed_at_unix),
             bootstrap_nodes: self
-                .bootstrap_peers
+                .bootstrap_peers()
                 .iter()
                 .map(|peer| BootstrapNodeStatus {
                     peer_id: peer.peer_id.to_string(),
@@ -695,7 +758,7 @@ impl NetworkService {
     ) -> OwnedGroupDiscoveryStatus {
         let status = if keys.is_empty() {
             "noInvitation"
-        } else if self.bootstrap_peers.is_empty() {
+        } else if self.bootstrap_peers().is_empty() {
             "bootstrapRequired"
         } else {
             match self.advertisement.lock().await.as_ref() {
@@ -755,7 +818,7 @@ impl NetworkService {
             remaining_until_expiry(expiry)?;
         }
         let reported_expiry = expires_at_unix.unwrap_or(0);
-        if self.bootstrap_peers.is_empty() {
+        if self.bootstrap_peers().is_empty() {
             return Ok(AdvertisementResult {
                 status: "bootstrapRequired",
                 expires_at_unix: reported_expiry,
@@ -788,7 +851,7 @@ impl NetworkService {
                 .map_err(|_| "network_configuration_invalid")?,
         )
         .map_err(|_| "network_unavailable")?;
-        for bootstrap in &self.bootstrap_peers {
+        for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
                 .map_err(|_| "network_unavailable")?;
@@ -977,7 +1040,7 @@ impl NetworkService {
             "routing"
         };
         let mut active = self.contribution.lock().await;
-        if self.bootstrap_peers.is_empty() {
+        if self.bootstrap_peers().is_empty() {
             active.take();
             return Ok("bootstrapRequired");
         }
@@ -996,7 +1059,7 @@ impl NetworkService {
                 .map_err(|_| "network_configuration_invalid")?,
         )
         .map_err(|_| "network_unavailable")?;
-        for bootstrap in &self.bootstrap_peers {
+        for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
@@ -1066,7 +1129,7 @@ impl NetworkService {
         invitation: &Invitation,
     ) -> Result<PeerSearchResult, &'static str> {
         let hints = pinned_address_hints(invitation);
-        if self.bootstrap_peers.is_empty() && hints.is_empty() {
+        if self.bootstrap_peers().is_empty() && hints.is_empty() {
             return Ok(PeerSearchResult {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
@@ -1108,7 +1171,7 @@ impl NetworkService {
                 });
             }
         }
-        if self.bootstrap_peers.is_empty() {
+        if self.bootstrap_peers().is_empty() {
             return Ok(PeerSearchResult {
                 status: "bootstrapRequired",
                 discovered_peers: 0,
@@ -1116,7 +1179,7 @@ impl NetworkService {
                 connection_type: None,
             });
         }
-        for bootstrap in &self.bootstrap_peers {
+        for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
@@ -1216,7 +1279,7 @@ impl NetworkService {
         invitation: &Invitation,
     ) -> Result<JoinGroupResult, &'static str> {
         let hints = pinned_address_hints(invitation);
-        if self.bootstrap_peers.is_empty() && hints.is_empty() {
+        if self.bootstrap_peers().is_empty() && hints.is_empty() {
             return Err("network_bootstrap_required");
         }
         let local_peer = identity.peer_id();
@@ -1463,7 +1526,7 @@ impl NetworkService {
         expected_peer: PeerId,
         known_addresses: &[Multiaddr],
     ) -> Result<ProviderConnection, &'static str> {
-        if self.bootstrap_peers.is_empty() && known_addresses.is_empty() {
+        if self.bootstrap_peers().is_empty() && known_addresses.is_empty() {
             return Err("network_bootstrap_required");
         }
         let lan_deadline = Instant::now() + LAN_DISCOVERY_WINDOW;
@@ -1506,10 +1569,10 @@ impl NetworkService {
                 });
             }
         }
-        if self.bootstrap_peers.is_empty() {
+        if self.bootstrap_peers().is_empty() {
             return Err("network_bootstrap_required");
         }
-        for bootstrap in &self.bootstrap_peers {
+        for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
@@ -2051,7 +2114,7 @@ fn select_address_hints(addresses: &[Multiaddr]) -> Vec<Multiaddr> {
         .collect()
 }
 
-fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
+pub(crate) fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'static str> {
     let mut address: Multiaddr = input.parse().map_err(|_| "network_configuration_invalid")?;
     let Some(Protocol::P2p(peer_id)) = address.pop() else {
         return Err("network_configuration_invalid");
@@ -2491,6 +2554,66 @@ mod tests {
                 advertised_discovery_keys: 0,
                 contribution_status: "inactive",
             }
+        );
+    }
+
+    #[test]
+    fn community_nodes_join_the_bootstrap_list_without_repeating_known_nodes() {
+        let built_in_peer = DeviceIdentity::generate().peer_id();
+        let community_peer = DeviceIdentity::generate().peer_id();
+        let built_in = format!("/ip4/127.0.0.1/udp/9000/quic-v1/p2p/{built_in_peer}");
+        let community = format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{community_peer}");
+        let service = NetworkService::from_sources(&[built_in.as_str()], "").unwrap();
+
+        let peers = service
+            .community_peers(&[built_in.clone(), community.clone(), community])
+            .expect("community nodes are accepted");
+        tauri::async_runtime::block_on(service.use_community_peers(peers));
+        let status = tauri::async_runtime::block_on(service.status());
+
+        assert_eq!(
+            status.bootstrap_nodes,
+            vec![
+                BootstrapNodeStatus {
+                    peer_id: built_in_peer.to_string(),
+                    address: "/ip4/127.0.0.1/udp/9000/quic-v1".to_owned(),
+                    source: "builtIn",
+                },
+                BootstrapNodeStatus {
+                    peer_id: community_peer.to_string(),
+                    address: "/ip4/203.0.113.7/udp/4001/quic-v1".to_owned(),
+                    source: "community",
+                },
+            ]
+        );
+
+        service.replace_community_peers(Vec::new());
+        assert_eq!(service.bootstrap_peers().len(), 1);
+    }
+
+    #[test]
+    fn community_nodes_share_the_bootstrap_limit() {
+        let entry = || {
+            let peer_id = DeviceIdentity::generate().peer_id();
+            format!("/ip4/127.0.0.1/udp/9000/quic-v1/p2p/{peer_id}")
+        };
+        let configured = (0..12).map(|_| entry()).collect::<Vec<_>>().join(";");
+        let service = NetworkService::from_sources(&[], &configured).unwrap();
+
+        assert!(service
+            .community_peers(&(0..4).map(|_| entry()).collect::<Vec<_>>())
+            .is_ok());
+        assert_eq!(
+            service
+                .community_peers(&(0..5).map(|_| entry()).collect::<Vec<_>>())
+                .err(),
+            Some("community_nodes_limit")
+        );
+        assert_eq!(
+            service
+                .community_peers(&["not an address".to_owned()])
+                .err(),
+            Some("community_node_invalid")
         );
     }
 

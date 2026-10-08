@@ -50,7 +50,7 @@ type AdvertisementResult = {
 type NetworkStatus = {
   connectionType: "direct" | "lan" | "relayed" | "offline" | null;
   connectionObservedAtUnix: number;
-  bootstrapNodes: { peerId: string; address: string; source: "builtIn" | "configured" }[];
+  bootstrapNodes: { peerId: string; address: string; source: "builtIn" | "configured" | "community" }[];
   advertisingStatus: "advertising" | "bootstrapRequired" | "inactive";
   advertisedDiscoveryKeys: number;
   contributionStatus: "routing" | "routingAndRelay" | "inactive";
@@ -175,6 +175,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   network_advertisement_timed_out: "Peer advertising timed out. Retrying…",
   network_bootstrap_required: "Configure a bootstrap node before connecting to peers.",
   network_configuration_invalid: "The peer network configuration is invalid.",
+  community_node_invalid: "Enter a node address ending in /p2p/ and its peer ID, up to 256 characters.",
+  community_node_duplicate: "That node is already in the list.",
+  community_nodes_limit: "No more nodes can be added on this device.",
+  community_nodes_invalid: "The saved community node list is invalid. Save a new list to replace it.",
+  community_nodes_unavailable: "The community node list could not be read or saved.",
   network_invite_failed: "The invitation request failed. Try again.",
   network_invite_timed_out: "The group owner did not answer the invitation request in time. Try again.",
   invite_busy: "The group owner is busy or another member's invitation is active. Try again later.",
@@ -1071,8 +1076,116 @@ function ContributionSection({ networkStatus }: { networkStatus: NetworkStatus |
   );
 }
 
+const MAX_COMMUNITY_NODES = 8;
+
+function CommunityNodesSection({
+  networkStatus,
+  onChanged,
+}: {
+  networkStatus: NetworkStatus | null;
+  onChanged: () => void;
+}) {
+  const [addresses, setAddresses] = useState<string[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<string[]>("community_nodes")
+      .then((next) => {
+        if (active) setAddresses(next);
+      })
+      .catch((caught) => {
+        if (!active) return;
+        // An invalid saved list can still be replaced by saving a new one.
+        setAddresses([]);
+        setError(errorMessage(caught));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function save(next: string[]) {
+    setSaving(true);
+    setError("");
+    try {
+      const stored = await invoke<string[]>("set_community_nodes", { addresses: next });
+      setAddresses(stored);
+      setDraft("");
+      onChanged();
+      // Restart owner advertising through the new list instead of waiting
+      // for its next refresh.
+      if (networkStatus?.advertisingStatus === "advertising") {
+        void invoke("advertise_owned_groups").catch(() => undefined);
+      }
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function add(event: FormEvent) {
+    event.preventDefault();
+    const address = draft.trim();
+    if (!addresses || !address) return;
+    void save([...addresses, address]);
+  }
+
+  return (
+    <section>
+      <h3>Community nodes on this device</h3>
+      <p>
+        Add bootstrap nodes run by people you trust. They help find group peers and relay connections but never
+        receive group contents. The list stays on this device.
+      </p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {addresses && addresses.length > 0 && (
+        <ul>
+          {addresses.map((address) => (
+            <li key={address}>
+              <code>{address}</code>{" "}
+              <button
+                className="secondary-button"
+                disabled={saving}
+                onClick={() => void save(addresses.filter((item) => item !== address))}
+                type="button"
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={add}>
+        <label>
+          Node address
+          <input
+            disabled={!addresses || saving || addresses.length >= MAX_COMMUNITY_NODES}
+            maxLength={256}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="/ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo…"
+            value={draft}
+          />
+        </label>
+        <button
+          className="secondary-button"
+          disabled={!addresses || saving || !draft.trim() || addresses.length >= MAX_COMMUNITY_NODES}
+          type="submit"
+        >
+          {saving ? "Saving…" : "Add node"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function NetworkView({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const [statusVersion, setStatusVersion] = useState(0);
   const [error, setError] = useState("");
   const [diagnosticsText, setDiagnosticsText] = useState("");
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
@@ -1124,7 +1237,7 @@ function NetworkView({ onClose }: { onClose: () => void }) {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [statusVersion]);
 
   return (
     <section className="setup-form information-card">
@@ -1157,15 +1270,21 @@ function NetworkView({ onClose }: { onClose: () => void }) {
                 <li key={`${node.peerId}-${node.address}`}>
                   <code>{node.address}</code>
                   <span>
-                    {node.source === "builtIn" ? "Built in" : "Configured on this device"} · {node.peerId.slice(0, 12)}…{node.peerId.slice(-6)}
+                    {node.source === "builtIn"
+                      ? "Built in"
+                      : node.source === "community"
+                        ? "Added on this device"
+                        : "Set by environment"}{" "}
+                    · {node.peerId.slice(0, 12)}…{node.peerId.slice(-6)}
                   </span>
                 </li>
               ))}
             </ul>
           ) : (
-            <p>No nodes configured. Set CHARP2P_BOOTSTRAP_NODES to connect beyond the local network.</p>
+            <p>No nodes configured. Add a community node below to connect beyond the local network.</p>
           )}
         </section>
+        <CommunityNodesSection networkStatus={status} onChanged={() => setStatusVersion((version) => version + 1)} />
         <ContributionSection networkStatus={status} />
         <section>
           <h3>Diagnostics</h3>

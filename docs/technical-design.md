@@ -20,7 +20,10 @@ flowchart LR
 
 The project node has no protocol authority. It initially improves availability
 because its addresses ship with the application. Community nodes implement the
-same public protocol and can be added to the routing table.
+same public protocol and can be added to the routing table. Each device may
+add up to 8 community bootstrap nodes from the Network page; they are kept in a
+device-local file, are never synchronized, and share the 16-node bootstrap
+limit with built-in and environment-configured nodes (ADR-038).
 
 ## Node roles
 

@@ -135,6 +135,9 @@ const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
+const BACKGROUND_GROUP_SYNC_INTERVAL_MS = 300_000;
+const BACKGROUND_GROUP_SYNC_STEP_MS = 5_000;
+const BACKGROUND_GROUP_SYNC_START_DELAY_MS = 15_000;
 const PENDING_JOIN_RETRY_INTERVAL_MS = 60_000;
 const PENDING_JOIN_START_DELAY_MS = 1_000;
 // Join failures that mean no group owner answered yet; anything else stops automatic retries.
@@ -2342,6 +2345,40 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [joinedGroup]);
+
+  const backgroundGroupIds = joinedGroups
+    .map((group) => group.groupId)
+    .filter((groupId) => groupId !== joinedGroup?.groupId)
+    .join(",");
+
+  useEffect(() => {
+    if (!isTauri() || !backgroundGroupIds) return;
+
+    // Joined groups that are not open synchronize one at a time, so unread
+    // counts, last synchronization and connection states in the group list
+    // stay current while the app (or its background window) runs.
+    const groupIds = backgroundGroupIds.split(",");
+    let active = true;
+    let timer: number | undefined;
+    let next = 0;
+
+    async function synchronizeNextGroup() {
+      await performJoinedGroupSynchronization(groupIds[next % groupIds.length], false);
+      next += 1;
+      if (active) {
+        const delay = next % groupIds.length === 0
+          ? BACKGROUND_GROUP_SYNC_INTERVAL_MS
+          : BACKGROUND_GROUP_SYNC_STEP_MS;
+        timer = window.setTimeout(synchronizeNextGroup, delay);
+      }
+    }
+
+    timer = window.setTimeout(synchronizeNextGroup, BACKGROUND_GROUP_SYNC_START_DELAY_MS);
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [backgroundGroupIds]);
 
   useEffect(() => {
     let active = true;

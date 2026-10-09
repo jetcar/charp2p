@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import QRCode from "qrcode";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
@@ -318,6 +318,19 @@ function messageTime(createdAtUnixMs: number) {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+function messageClockTime(createdAtUnixMs: number) {
+  return new Date(createdAtUnixMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function messageDayLabel(createdAtUnixMs: number) {
+  const day = new Date(createdAtUnixMs);
+  const today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (day.toDateString() === today.toDateString()) return "Today";
+  if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return day.toLocaleDateString([], { dateStyle: "medium" });
 }
 
 function messageAuthorLabel(
@@ -3229,7 +3242,8 @@ function App() {
     const target = groupMessages.find((candidate) => candidate.eventId === message.replyToEventId);
     return (
       <blockquote className="message-reply-quote">
-        {target ? messageSnippet(target.text) : "Reply to a message not shown on this device"}
+        <span className="message-reply-label">Replying to</span>
+        {target ? messageSnippet(target.text) : "A message not shown on this device"}
       </blockquote>
     );
   }
@@ -3238,7 +3252,7 @@ function App() {
     if (replyingTo?.groupId !== groupId) return null;
     return (
       <div className="message-reply-draft">
-        <blockquote className="message-reply-quote">Replying to: {messageSnippet(replyingTo.text)}</blockquote>
+        <blockquote className="message-reply-quote"><span className="message-reply-label">Replying to</span>{messageSnippet(replyingTo.text)}</blockquote>
         <button disabled={sendingMessage} onClick={() => setReplyingTo(null)} type="button">Cancel reply</button>
       </div>
     );
@@ -3261,6 +3275,76 @@ function App() {
           </button>
         </div>
       </form>
+    );
+  }
+
+  function renderMessageMenu(message: StoredMessage) {
+    const own = message.authorId === profile?.peerId;
+    return (
+      <details className="message-menu">
+        <summary aria-label="Message actions" title="Message actions">⋯</summary>
+        {/* Close the menu once an action is chosen. */}
+        <div className="message-menu-list" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>
+          <button onClick={() => setReplyingTo(message)} type="button">Reply</button>
+          <button onClick={() => void copyMessage(message)} type="button">Copy</button>
+          {own && editingMessage?.eventId !== message.eventId && (
+            <button
+              disabled={savingEdit}
+              onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
+              type="button"
+            >
+              Edit
+            </button>
+          )}
+          <button disabled={Boolean(deletingMessage)} onClick={() => void hideMessage(message)} type="button">
+            {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
+          </button>
+        </div>
+      </details>
+    );
+  }
+
+  function renderMessageTimeline(groupId: string, joined: JoinedGroup | null, ownerDeviceId: string) {
+    if (groupMessages.length === 0) return null;
+    return (
+      <section className="message-timeline" aria-label="Messages saved on this device">
+        <h3>Messages</h3>
+        {renderEvidenceControls(groupId)}
+        {renderEvidenceResult()}
+        {groupMessages.map((message, index) => {
+          const own = message.authorId === profile?.peerId;
+          const day = messageDayLabel(message.createdAtUnixMs);
+          const showDay = index === 0 || messageDayLabel(groupMessages[index - 1].createdAtUnixMs) !== day;
+          return (
+            <Fragment key={message.eventId}>
+              {showDay && <p className="message-day-chip">{day}</p>}
+              <article className={`message-bubble ${own ? "own-message" : ""}`}>
+                {renderEvidenceCheckbox(message)}
+                {!own && (
+                  <p className="message-author">
+                    {messageAuthorLabel(message, profile, joined)}
+                    {" "}<code title={message.authorId}>{shortPeerId(message.authorId)}</code>
+                    {renderMessageDeviceState(message, ownerDeviceId)}
+                  </p>
+                )}
+                {renderReplyQuote(message)}
+                {renderMessageText(message)}
+                <footer className="message-meta">
+                  <time dateTime={new Date(message.createdAtUnixMs).toISOString()} title={messageTime(message.createdAtUnixMs)}>
+                    {messageClockTime(message.createdAtUnixMs)}
+                  </time>
+                  {message.edited && " · Edited"}
+                  {own && <>{" · "}{messageDeliveryLabel(message)}</>}
+                  {renderMessageMenu(message)}
+                </footer>
+              </article>
+            </Fragment>
+          );
+        })}
+        {hasEarlierMessages && (
+          <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
+        )}
+      </section>
     );
   }
 
@@ -3885,55 +3969,7 @@ function App() {
               <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
                 Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
               </button>
-              {groupMessages.length > 0 && (
-                <section className="message-timeline" aria-label="Messages saved on this device">
-                  <h3>Messages</h3>
-                  {renderEvidenceControls(joinedGroup.groupId)}
-                  {renderEvidenceResult()}
-                  {groupMessages.map((message) => (
-                    <article
-                      className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
-                      key={message.eventId}
-                    >
-                      {renderEvidenceCheckbox(message)}
-                      {renderReplyQuote(message)}
-                      {renderMessageText(message)}
-                      <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
-                        {messageAuthorLabel(message, profile, joinedGroup)}
-                        {renderMessageDeviceState(message, joinedGroup.inviterDeviceId)}
-                        {" · "}{messageTime(message.createdAtUnixMs)}
-                        {message.edited && " · Edited"}
-                        {message.authorId === profile?.peerId && (
-                          <>{" · "}{messageDeliveryLabel(message)}</>
-                        )}
-                      </time>
-                      <div className="message-actions">
-                        <button onClick={() => setReplyingTo(message)} type="button">Reply</button>
-                        <button onClick={() => void copyMessage(message)} type="button">Copy</button>
-                        {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
-                          <button
-                            disabled={savingEdit}
-                            onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
-                            type="button"
-                          >
-                            Edit
-                          </button>
-                        )}
-                        <button
-                          disabled={Boolean(deletingMessage)}
-                          onClick={() => void hideMessage(message)}
-                          type="button"
-                        >
-                          {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                  {hasEarlierMessages && (
-                    <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
-                  )}
-                </section>
-              )}
+              {renderMessageTimeline(joinedGroup.groupId, joinedGroup, joinedGroup.inviterDeviceId)}
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 {renderReplyDraft(joinedGroup.groupId)}
                 <label htmlFor="joined-outgoing-message">Protected message</label>
@@ -4038,55 +4074,7 @@ function App() {
                   </p>
                 )}
               </form>
-              {groupMessages.length > 0 && (
-                <section className="message-timeline" aria-label="Messages saved on this device">
-                  <h3>Messages</h3>
-                  {renderEvidenceControls(localGroup.groupId)}
-                  {renderEvidenceResult()}
-                  {groupMessages.map((message) => (
-                    <article
-                      className={`message-bubble ${message.authorId === profile?.peerId ? "own-message" : ""}`}
-                      key={message.eventId}
-                    >
-                      {renderEvidenceCheckbox(message)}
-                      {renderReplyQuote(message)}
-                      {renderMessageText(message)}
-                      <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
-                        {messageAuthorLabel(message, profile)}
-                        {renderMessageDeviceState(message, profile?.peerId ?? "")}
-                        {" · "}{messageTime(message.createdAtUnixMs)}
-                        {message.edited && " · Edited"}
-                        {message.authorId === profile?.peerId && (
-                          <>{" · "}{messageDeliveryLabel(message)}</>
-                        )}
-                      </time>
-                      <div className="message-actions">
-                        <button onClick={() => setReplyingTo(message)} type="button">Reply</button>
-                        <button onClick={() => void copyMessage(message)} type="button">Copy</button>
-                        {message.authorId === profile?.peerId && editingMessage?.eventId !== message.eventId && (
-                          <button
-                            disabled={savingEdit}
-                            onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
-                            type="button"
-                          >
-                            Edit
-                          </button>
-                        )}
-                        <button
-                          disabled={Boolean(deletingMessage)}
-                          onClick={() => void hideMessage(message)}
-                          type="button"
-                        >
-                          {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                  {hasEarlierMessages && (
-                    <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
-                  )}
-                </section>
-              )}
+              {renderMessageTimeline(localGroup.groupId, null, profile?.peerId ?? "")}
               {issuedInvitation && (
                 <>
                   <label htmlFor="issued-invitation">Invitation link</label>

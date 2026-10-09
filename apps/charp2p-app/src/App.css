@@ -192,21 +192,33 @@ button { cursor: pointer; }
 .message-receipt { margin: 14px 0 0; color: #087d75; font-size: 14px; font-weight: 700; text-align: center; }
 .message-timeline { display: grid; gap: 12px; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #fff; }
 .message-timeline h3 { margin: 0 0 4px; color: #172044; font-size: 18px; }
-.message-bubble { width: min(82%, 560px); padding: 14px 16px 11px; border-radius: 16px 16px 5px 16px; color: white; background: linear-gradient(120deg, #12ada3, #098f88); box-shadow: 0 8px 18px rgba(9, 143, 136, .14); }
-.message-bubble:not(.own-message) { border-radius: 16px 16px 16px 5px; color: #172044; background: #edf2f7; box-shadow: none; }
+.message-bubble { width: fit-content; max-width: min(82%, 560px); padding: 10px 14px 8px; border: 1px solid #cdeee9; border-radius: 16px 16px 5px 16px; color: #172044; background: #e3f6f3; }
+.message-bubble:not(.own-message) { border-color: transparent; border-radius: 16px 16px 16px 5px; background: #edf2f7; }
 .message-bubble.own-message { justify-self: end; }
 .message-bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
-.message-bubble time { display: block; margin-top: 7px; color: rgba(255, 255, 255, .78); font-size: 12px; text-align: right; }
-.message-bubble:not(.own-message) time { color: #68748f; text-align: left; }
+.message-bubble .message-author { margin-bottom: 4px; color: #52607d; font-size: 12px; font-weight: 600; line-height: 1.4; }
+.message-author code { color: #68748f; font-weight: 400; }
+.message-day-chip { justify-self: center; margin: 6px 0 0; padding: 3px 12px; border-radius: 999px; color: #52607d; background: #edf2f7; font-size: 12px; font-weight: 600; }
+.message-meta { display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 4px; color: #68748f; font-size: 12px; }
 .message-device-warning { color: #b42318; font-weight: 600; }
+.message-menu { position: relative; margin-left: 6px; }
+.message-menu summary { padding: 0 6px; border-radius: 6px; color: #52607d; font-size: 16px; line-height: 1.2; list-style: none; cursor: pointer; opacity: 0; transition: opacity .12s; }
+.message-menu summary::-webkit-details-marker { display: none; }
+.message-bubble:hover .message-menu summary, .message-menu summary:focus-visible, .message-menu[open] summary { opacity: 1; }
+.message-menu summary:hover { background: rgba(23, 32, 68, .08); }
+@media (hover: none) { .message-menu summary { opacity: 1; } }
+.message-menu-list { position: absolute; z-index: 5; right: 0; bottom: calc(100% + 4px); display: grid; min-width: 140px; padding: 6px; border: 1px solid #dce4ec; border-radius: 10px; background: white; box-shadow: 0 10px 24px rgba(23, 32, 68, .14); }
+.message-bubble:not(.own-message) .message-menu-list { right: auto; left: 0; }
+.message-menu-list button { padding: 7px 10px; border: 0; border-radius: 6px; color: #172044; background: transparent; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.message-menu-list button:hover { background: #f0f4f8; }
+.message-menu-list button:disabled { opacity: .48; cursor: wait; }
 .message-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
-.message-bubble:not(.own-message) .message-actions { justify-content: flex-start; }
-.message-actions button { padding: 0; border: 0; color: rgba(255, 255, 255, .82); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
-.message-bubble:not(.own-message) .message-actions button { color: #52607d; }
+.message-actions button { padding: 0; border: 0; color: #52607d; background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
 .message-actions button:hover { text-decoration: underline; }
 .message-actions button:disabled { opacity: .48; cursor: wait; }
 .message-edit textarea { width: 100%; min-height: 72px; padding: 8px 10px; resize: vertical; border: 0; border-radius: 10px; color: #1d2740; background: white; font: inherit; }
-.message-reply-quote { margin: 0 0 6px; padding: 4px 8px; border-left: 3px solid #8aa0d6; color: #5a6684; font-size: 0.85rem; overflow-wrap: anywhere; }
+.message-reply-quote { margin: 0 0 6px; padding: 6px 10px; border-left: 3px solid #10a89f; border-radius: 6px; color: #2c3753; background: rgba(255, 255, 255, .7); font-size: 0.85rem; overflow-wrap: anywhere; }
+.message-reply-label { display: block; color: #087d75; font-size: 11px; font-weight: 700; }
 .message-reply-draft { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .message-reply-draft .message-reply-quote { flex: 1; margin: 0; }
 .invitation-link-box { width: 100%; min-height: 104px; margin: 0 0 18px; padding: 16px 18px; resize: none; border: 1px solid #ced9e5; border-radius: 12px; outline: none; color: #33415f; background: #f5f8fb; font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }

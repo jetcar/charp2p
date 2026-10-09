@@ -389,6 +389,7 @@ fn issued_invitations(
 #[tauri::command]
 fn create_group_invitation(
     group_id: String,
+    reusable: Option<bool>,
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     network_service: tauri::State<'_, NetworkService>,
@@ -405,6 +406,7 @@ fn create_group_invitation(
             group_id,
             inviter_device_id,
             &inviter_name,
+            reusable,
             &network_service.owner_address_hints(),
         )
         .map_err(str::to_owned)

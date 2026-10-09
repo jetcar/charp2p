@@ -357,7 +357,11 @@ device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
 lets a valid invitation grant access directly unless the group requires owner
 approval. Group creation rejects the retained-history option until its
-enforcement path exists; a single-use invitation default is accepted.
+enforcement path exists; a single-use invitation default is accepted. The
+owner may override the group's reuse default for each invitation it issues;
+invitations issued for a member's invite request always use the group default.
+The Invitations page treats a single-use invitation that leaves the issued list
+before its expiry as consumed and says so.
 Owner approval follows ADR-041: an authorized bearer whose device the owner has
 not approved yet is recorded as a bounded approval request and answered with
 the `awaiting approval` category (code 4), which the joiner treats like `busy`

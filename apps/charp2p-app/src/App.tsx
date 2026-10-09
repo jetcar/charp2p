@@ -142,6 +142,7 @@ type DeviceSequenceConflict = { deviceId: string; conflictingSequences: number; 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
+const SINGLE_USE_INVITATION_CHECK_INTERVAL_MS = 15_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
 const BACKGROUND_GROUP_SYNC_INTERVAL_MS = 300_000;
@@ -2094,6 +2095,9 @@ function App() {
   const [groupIcon, setGroupIcon] = useState(0);
   const [invitationLifetime, setInvitationLifetime] = useState(604800);
   const [groupApprovalRequired, setGroupApprovalRequired] = useState(false);
+  const [groupReusableInvitation, setGroupReusableInvitation] = useState(true);
+  const [invitationReusable, setInvitationReusable] = useState(true);
+  const [usedInvitationGroupIds, setUsedInvitationGroupIds] = useState<string[]>([]);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
   const [revokingInvitation, setRevokingInvitation] = useState(false);
@@ -2192,6 +2196,39 @@ function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    setInvitationReusable(localGroup?.reusableInvitation ?? true);
+  }, [localGroup?.groupId, localGroup?.reusableInvitation]);
+
+  // The owner retires a single-use invitation once a device is admitted
+  // through it (ADR-042), so its disappearance before expiry means it was used.
+  useEffect(() => {
+    if (!issuedInvitation || issuedInvitation.reusable || !isTauri()) return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      void invoke<IssuedInvitation[]>("issued_invitations")
+        .then((invitations) => {
+          if (!active) return;
+          const current = issuedInvitation;
+          if (invitations.some(({ invitationId }) => invitationId === current.invitationId)) return;
+          if (current.expiresAtUnix * 1000 <= Date.now()) return;
+          setIssuedInvitations((issued) => issued.filter(
+            ({ invitationId }) => invitationId !== current.invitationId,
+          ));
+          setUsedInvitationGroupIds((groupIds) => [
+            ...groupIds.filter((groupId) => groupId !== current.groupId),
+            current.groupId,
+          ]);
+          setInvitationCopied(false);
+        })
+        .catch(() => undefined);
+    }, SINGLE_USE_INVITATION_CHECK_INTERVAL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [issuedInvitation]);
 
   useEffect(() => {
     if (!issuedInvitation) return;
@@ -3297,7 +3334,7 @@ function App() {
         historyPolicy: "none",
         approvalRequired: groupApprovalRequired,
         invitationLifetimeSeconds: invitationLifetime,
-        reusableInvitation: true,
+        reusableInvitation: groupReusableInvitation,
       });
       setLocalGroups((groups) => [
         ...groups.filter(({ groupId }) => groupId !== created.groupId),
@@ -3323,7 +3360,9 @@ function App() {
     try {
       const invitation = await invoke<IssuedInvitation>("create_group_invitation", {
         groupId: localGroup.groupId,
+        reusable: invitationReusable,
       });
+      setUsedInvitationGroupIds((current) => current.filter((groupId) => groupId !== invitation.groupId));
       setIssuedInvitations((current) => [
         ...current.filter(({ groupId }) => groupId !== invitation.groupId),
         invitation,
@@ -3944,7 +3983,36 @@ function App() {
                 </>
               ) : (
                 <>
+                  {usedInvitationGroupIds.includes(localGroup.groupId) && (
+                    <p className="preview-note">The single-use invitation was used by a joining device and no longer works.</p>
+                  )}
                   <p className="preview-note">Create a signed invitation to share this group.</p>
+                  <fieldset className="choice-group">
+                    <legend>Invitation use</legend>
+                    <label className="contribution-option">
+                      <input
+                        checked={invitationReusable}
+                        name="invitation-use"
+                        onChange={() => setInvitationReusable(true)}
+                        type="radio"
+                      />
+                      Reusable until expiry
+                    </label>
+                    <label className="contribution-option">
+                      <input
+                        checked={!invitationReusable}
+                        name="invitation-use"
+                        onChange={() => setInvitationReusable(false)}
+                        type="radio"
+                      />
+                      Single use
+                    </label>
+                    <p className="preview-note">
+                      {invitationReusable
+                        ? "Any number of devices can join with this link until it expires."
+                        : "Only the first device admitted with this link can join; the link then stops working."}
+                    </p>
+                  </fieldset>
                   {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">
                     {creatingInvitation ? "Creating invitation…" : "Create invitation"}
@@ -3990,7 +4058,7 @@ function App() {
 
               <fieldset className="choice-group">
                 <legend>Current secure group profile</legend>
-                <p className="preview-note">A valid invitation grants access until it expires. New members receive messages sent after they join.</p>
+                <p className="preview-note">New members receive messages sent after they join.</p>
                 <label className="contribution-option">
                   <input
                     checked={groupApprovalRequired}
@@ -4015,6 +4083,19 @@ function App() {
                   <option value={2592000}>30 days</option>
                 </select>
                 <p className="preview-note">Invitation links remain valid for their selected lifetime.</p>
+                <label className="contribution-option">
+                  <input
+                    checked={!groupReusableInvitation}
+                    onChange={(event) => setGroupReusableInvitation(!event.target.checked)}
+                    type="checkbox"
+                  />
+                  Make invitations single use by default
+                </label>
+                <p className="preview-note">
+                  {groupReusableInvitation
+                    ? "A new invitation can admit several devices until it expires; you can still choose single use for each invitation."
+                    : "A new invitation admits only the first device; you can still choose reusable for each invitation."}
+                </p>
               </div>
 
               {error && <p className="form-error preview-error" role="alert">{error}</p>}

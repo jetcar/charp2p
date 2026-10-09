@@ -400,12 +400,14 @@ impl GroupService {
     }
 
     /// `address_hints` are the inviter device's current addresses, carried
-    /// in the invitation as root-signed hints (ADR-037).
+    /// in the invitation as root-signed hints (ADR-037). `reusable` overrides
+    /// the group's default reuse policy for this invitation (ADR-042).
     pub fn issue_invitation(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
+        reusable: Option<bool>,
         address_hints: &[Multiaddr],
     ) -> Result<IssuedInvitation, &'static str> {
         let now_unix = SystemTime::now()
@@ -417,6 +419,7 @@ impl GroupService {
             inviter_device_id,
             inviter_name,
             None,
+            reusable,
             address_hints,
             now_unix,
         )
@@ -487,6 +490,7 @@ impl GroupService {
             owner_device_id,
             inviter_name,
             Some((authenticated_peer, u64::from(request.lifetime_seconds()))),
+            None,
             address_hints,
             now_unix,
         ) {
@@ -970,11 +974,24 @@ impl GroupService {
         inviter_name: &str,
         now_unix: u64,
     ) -> Result<IssuedInvitation, &'static str> {
+        self.issue_reuse_invitation_at(group_id, inviter_device_id, inviter_name, None, now_unix)
+    }
+
+    #[cfg(test)]
+    fn issue_reuse_invitation_at(
+        &self,
+        group_id: PeerId,
+        inviter_device_id: PeerId,
+        inviter_name: &str,
+        reusable: Option<bool>,
+        now_unix: u64,
+    ) -> Result<IssuedInvitation, &'static str> {
         self.issue_requested_invitation_at(
             group_id,
             inviter_device_id,
             inviter_name,
             None,
+            reusable,
             &[],
             now_unix,
         )
@@ -985,15 +1002,18 @@ impl GroupService {
     /// so withdrawing that member's permission can revoke it (ADR-036). A
     /// member request may only shorten the group's invitation lifetime, and
     /// a repeated request from the same member returns its still-active
-    /// invitation instead of failing. Address hints are dropped when they
+    /// invitation instead of failing. Member requests always use the group's
+    /// default reuse policy; only the owner may override it. Address hints are dropped when they
     /// would make the invitation invalid or too large to protect, since they
     /// are only an optimization.
+    #[allow(clippy::too_many_arguments)]
     fn issue_requested_invitation_at(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
         requested: Option<(PeerId, u64)>,
+        reusable: Option<bool>,
         address_hints: &[Multiaddr],
         now_unix: u64,
     ) -> Result<(Invitation, Zeroizing<String>), &'static str> {
@@ -1090,7 +1110,7 @@ impl GroupService {
             inviter_name,
             expires_at_unix,
             history_policy: group.history_policy,
-            reusable: group.reusable_invitation,
+            reusable: reusable.unwrap_or(group.reusable_invitation),
         };
         let hinted = (!address_hints.is_empty())
             .then(|| {
@@ -1795,6 +1815,7 @@ mod tests {
                 inviter,
                 "Maya's PC",
                 None,
+                None,
                 std::slice::from_ref(&hint),
                 NOW,
             )
@@ -1806,7 +1827,15 @@ mod tests {
         // without hints rather than failing.
         let invalid = hint.with(libp2p::multiaddr::Protocol::P2p(inviter));
         let (unhinted, encoded) = service
-            .issue_requested_invitation_at(group_id, inviter, "Maya's PC", None, &[invalid], NOW)
+            .issue_requested_invitation_at(
+                group_id,
+                inviter,
+                "Maya's PC",
+                None,
+                None,
+                &[invalid],
+                NOW,
+            )
             .unwrap();
         assert!(unhinted.address_hints().is_empty());
         assert!(Invitation::decode(&encoded, NOW)
@@ -1961,6 +1990,45 @@ mod tests {
             JoinRequestAuthorization::Authorized
         );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owner_overrides_group_reuse_default_per_invitation() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+
+        let single_use = service
+            .issue_reuse_invitation_at(group_id, owner, "Maya's PC", Some(false), NOW)
+            .unwrap();
+        assert!(!single_use.reusable);
+        let request = join_request(&single_use.link, NOW);
+        assert!(!service
+            .authorize_join_request_at(&request, NOW)
+            .unwrap()
+            .is_reusable());
+        assert!(!service.issued_invitations_at(NOW).unwrap()[0].reusable);
+
+        service.revoke_invitation(group_id).unwrap();
+        let mut single_use_group = spec("Design Crew");
+        single_use_group.reusable_invitation = false;
+        let single_use_group = service.create(single_use_group).unwrap();
+        let single_use_group_id = single_use_group.group_id.parse().unwrap();
+        assert!(
+            !service
+                .issue_invitation_at(single_use_group_id, owner, "Maya's PC", NOW)
+                .unwrap()
+                .reusable
+        );
+        service.revoke_invitation(single_use_group_id).unwrap();
+        assert!(
+            service
+                .issue_reuse_invitation_at(single_use_group_id, owner, "Maya's PC", Some(true), NOW)
+                .unwrap()
+                .reusable
+        );
     }
 
     #[test]
@@ -2384,6 +2452,7 @@ mod tests {
                 owner,
                 "Maya's PC",
                 Some((requester, 86_400)),
+                None,
                 &[],
                 NOW,
             )

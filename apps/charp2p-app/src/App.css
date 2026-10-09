@@ -216,6 +216,7 @@ button { cursor: pointer; }
 .message-bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .message-bubble time { display: block; margin-top: 7px; color: rgba(255, 255, 255, .78); font-size: 12px; text-align: right; }
 .message-bubble:not(.own-message) time { color: #68748f; text-align: left; }
+.message-device-warning { color: #b42318; font-weight: 600; }
 .message-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
 .message-bubble:not(.own-message) .message-actions { justify-content: flex-start; }
 .message-actions button { padding: 0; border: 0; color: rgba(255, 255, 255, .82); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }

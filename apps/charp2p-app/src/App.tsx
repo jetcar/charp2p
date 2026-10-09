@@ -325,6 +325,23 @@ function messageAuthorLabel(
   return `Peer ${shortPeerId(message.authorId)}`;
 }
 
+function messageDeviceState(
+  authorId: string,
+  ownerDeviceId: string,
+  members: GroupMemberDevice[],
+  removedDevices: string[],
+  sequenceConflicts: Record<string, DeviceSequenceConflict>,
+): { label: string; warning: boolean } | null {
+  // Derived from the membership data the Members page already loads; nothing
+  // is shown until the verified membership is known.
+  if (sequenceConflicts[authorId]) return { label: "Conflicting events from this device", warning: true };
+  if (authorId === ownerDeviceId) return { label: "Owner device", warning: false };
+  if (members.some((member) => member.deviceId === authorId)) return { label: "Verified member", warning: false };
+  if (removedDevices.includes(authorId)) return { label: "Removed from the group", warning: true };
+  if (members.length > 0) return { label: "No longer a member", warning: true };
+  return null;
+}
+
 function messageDeliveryLabel(message: StoredMessage) {
   if (message.deliveryState === "observedByAll") {
     return "Observed by all known members";
@@ -3168,6 +3185,18 @@ function App() {
     return text.length > 80 ? `${text.slice(0, 80)}…` : text;
   }
 
+  function renderMessageDeviceState(message: StoredMessage, ownerDeviceId: string) {
+    if (message.authorId === profile?.peerId) return null;
+    const state = messageDeviceState(message.authorId, ownerDeviceId, groupMembers, removedDevices, sequenceConflicts);
+    if (!state) return null;
+    return (
+      <>
+        {" · "}
+        <span className={state.warning ? "message-device-warning" : undefined}>{state.label}</span>
+      </>
+    );
+  }
+
   function renderReplyQuote(message: StoredMessage) {
     if (!message.replyToEventId) return null;
     const target = groupMessages.find((candidate) => candidate.eventId === message.replyToEventId);
@@ -3768,6 +3797,7 @@ function App() {
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
                         {messageAuthorLabel(message, profile, joinedGroup)}
+                        {renderMessageDeviceState(message, joinedGroup.inviterDeviceId)}
                         {" · "}{messageTime(message.createdAtUnixMs)}
                         {message.edited && " · Edited"}
                         {message.authorId === profile?.peerId && (
@@ -3919,7 +3949,9 @@ function App() {
                       {renderReplyQuote(message)}
                       {renderMessageText(message)}
                       <time dateTime={new Date(message.createdAtUnixMs).toISOString()}>
-                        {messageAuthorLabel(message, profile)} · {messageTime(message.createdAtUnixMs)}
+                        {messageAuthorLabel(message, profile)}
+                        {renderMessageDeviceState(message, profile?.peerId ?? "")}
+                        {" · "}{messageTime(message.createdAtUnixMs)}
                         {message.edited && " · Edited"}
                         {message.authorId === profile?.peerId && (
                           <>{" · "}{messageDeliveryLabel(message)}</>

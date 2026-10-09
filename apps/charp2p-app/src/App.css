@@ -244,13 +244,26 @@ button { cursor: pointer; }
 .icon-3 { background: linear-gradient(145deg, #fa6d83, #dc405e); }
 .icon-4 { background: linear-gradient(145deg, #f8b733, #e2930c); }
 
-.create-group-form { padding-bottom: 24px; }
-.create-group-form header { margin-bottom: 30px; }
-.create-group-form h2 { font-size: clamp(36px, 3.7vw, 52px); }
-.create-group-form header > p:last-child { font-size: 20px; }
-.create-group-form fieldset { min-width: 0; margin: 0 0 30px; padding: 0; border: 0; }
-.create-group-form legend { margin-bottom: 12px; color: #4d5a7d; font-size: 17px; font-weight: 700; }
-.create-group-form input { margin-bottom: 28px; }
+/* Create group page: header, Group details and Invitation defaults cards, bottom-right actions. */
+.create-group-page { display: flex; flex-direction: column; gap: 24px; max-width: 1200px; }
+.page-header { display: flex; align-items: center; gap: 18px; padding-bottom: 20px; border-bottom: 1px solid #e3e8ee; }
+.page-header h2 { margin: 0 0 4px; color: #06113e; font-size: 30px; letter-spacing: -.8px; }
+.page-header p { margin: 0; color: #6d7695; font-size: 17px; }
+.page-header-icon { width: 60px; height: 60px; display: grid; flex: none; place-items: center; border-radius: 50%; color: #1d2c4f; background: #e9eef4; font-size: 15px; font-weight: 800; letter-spacing: -4px; }
+.create-group-cards { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+.create-group-card { display: flex; flex-direction: column; padding: 24px; border: 1px solid #e0e6ee; border-radius: 16px; background: white; }
+.create-group-card h3 { margin: 0 0 18px; color: #0b163f; font-size: 22px; }
+.create-group-card fieldset { min-width: 0; margin: 0 0 24px; padding: 0; border: 0; }
+.create-group-card legend, .create-group-card label, .create-group-label { margin: 0 0 10px; color: #172044; font-size: 16px; font-weight: 700; }
+.create-group-card input:not([type]) { width: 100%; height: 52px; margin: 0 0 24px; padding: 0 16px; border: 1px solid #cad5e2; border-radius: 10px; outline: none; color: #07113d; font-size: 17px; }
+.create-group-card input:not([type]):focus { border-color: #10a89f; box-shadow: 0 0 0 4px rgba(16, 168, 159, .12); }
+.create-group-card .preview-note { margin: 0 0 24px; }
+.create-group-card select { height: 52px; margin: 0 0 24px; padding: 0 15px; border: 1px solid #cad5e2; border-radius: 10px; color: #172044; background: white; font-size: 16px; }
+.create-group-card .toggle-row { padding-top: 20px; border-top: 1px solid #e3e8ee; }
+.icon-picker .icon-picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 22px; }
+.icon-picker-row .group-avatar { width: 110px; height: 110px; margin: 0; border-radius: 50%; font-size: 30px; }
+.create-group-actions { display: flex; justify-content: flex-end; gap: 16px; }
+.create-group-actions button { width: auto; min-width: 160px; min-height: 56px; margin: 0; padding: 0 28px; font-size: 18px; }
 .icon-picker > div { display: flex; flex-wrap: wrap; gap: 12px; }
 .icon-picker button { width: 54px; height: 54px; border: 3px solid transparent; border-radius: 50%; color: white; font-size: 17px; font-weight: 800; letter-spacing: -4px; box-shadow: 0 0 0 1px #d7dfe9; }
 .icon-picker button.selected { border-color: white; box-shadow: 0 0 0 3px #0aa198; }
@@ -326,6 +339,7 @@ button { cursor: pointer; }
   .stepper { margin-bottom: 62px; }
   .setup-form h2 { font-size: 42px; }
   .setup-form header > p:last-child { font-size: 21px; }
+  .create-group-cards { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 680px) {
@@ -335,6 +349,8 @@ button { cursor: pointer; }
   .sidebar-groups ul { display: flex; overflow-x: auto; }
   .sidebar-groups li button { width: auto; max-width: 220px; }
   .sidebar-footer { display: flex; flex-wrap: wrap; }
+  .join-options { grid-template-columns: 1fr; }
+  .create-group-actions button { flex: 1; min-width: 0; }
   .app-main { padding: 24px 18px; }
   .onboarding-shell { display: block; background: #fbfcfd; }
   .brand-panel { min-height: auto; padding: 24px; background: #122940; }

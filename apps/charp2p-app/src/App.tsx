@@ -4384,85 +4384,115 @@ function App() {
           )}
 
           {step === 3 && createGroupMode && !joinMode && (
-            <form className="setup-form create-group-form" onSubmit={createGroup}>
-              <header>
-                <p className="eyebrow">New private group</p>
-                <h2>Create a group</h2>
-                <p>Set the local group identity and invitation defaults.</p>
+            <form className="create-group-page" onSubmit={createGroup}>
+              <header className="page-header">
+                <span aria-hidden="true" className="page-header-icon">●●●</span>
+                <div>
+                  <h2>Create a group</h2>
+                  <p>Set up your group and invitation settings.</p>
+                </div>
               </header>
 
-              <fieldset className="icon-picker">
-                <legend>Group icon</legend>
-                <div>
-                  {GROUP_ICONS.map((icon, index) => (
-                    <button
-                      aria-label={`Group icon ${index + 1}`}
-                      aria-pressed={groupIcon === index}
-                      className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
-                      key={icon}
-                      onClick={() => setGroupIcon(index)}
-                      type="button"
-                    >{icon}</button>
-                  ))}
-                </div>
-              </fieldset>
+              <div className="create-group-cards">
+                <section aria-labelledby="group-details-title" className="create-group-card">
+                  <h3 id="group-details-title">Group details</h3>
 
-              <label htmlFor="group-name">Group name</label>
-              <input
-                autoFocus
-                id="group-name"
-                maxLength={80}
-                onChange={(event) => setGroupName(event.target.value)}
-                placeholder="Project Atlas"
-                value={groupName}
-              />
+                  <fieldset className="icon-picker">
+                    <legend>Group icon</legend>
+                    <div className="icon-picker-row">
+                      <span aria-hidden="true" className={`group-avatar icon-${groupIcon}`}>{GROUP_ICONS[groupIcon]}</span>
+                      <div>
+                        {GROUP_ICONS.map((icon, index) => (
+                          <button
+                            aria-label={`Group icon ${index + 1}`}
+                            aria-pressed={groupIcon === index}
+                            className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
+                            key={icon}
+                            onClick={() => setGroupIcon(index)}
+                            type="button"
+                          >{icon}</button>
+                        ))}
+                      </div>
+                    </div>
+                  </fieldset>
 
-              <fieldset className="choice-group">
-                <legend>Current secure group profile</legend>
-                <p className="preview-note">New members receive messages sent after they join.</p>
-                <label className="contribution-option">
+                  <label htmlFor="group-name">Group name</label>
                   <input
-                    checked={groupApprovalRequired}
-                    onChange={(event) => setGroupApprovalRequired(event.target.checked)}
-                    type="checkbox"
+                    autoFocus
+                    id="group-name"
+                    maxLength={80}
+                    onChange={(event) => setGroupName(event.target.value)}
+                    placeholder="Project Atlas"
+                    value={groupName}
                   />
-                  Require owner approval
-                </label>
-                <p className="preview-note">
-                  {groupApprovalRequired
-                    ? "Each new device waits until you approve it on the Members page; this device must be online to receive the request and admit the device."
-                    : "Anyone with a valid invitation joins without waiting for you."}
-                </p>
-              </fieldset>
 
-              <div className="invitation-defaults">
-                <label htmlFor="invitation-lifetime">Invitation expires after</label>
-                <select id="invitation-lifetime" onChange={(event) => setInvitationLifetime(Number(event.target.value))} value={invitationLifetime}>
-                  {INVITATION_LIFETIMES.map(({ label, seconds }) => (
-                    <option key={seconds} value={seconds}>{label}</option>
-                  ))}
-                </select>
-                <p className="preview-note">Invitation links remain valid for their selected lifetime.</p>
-                <label className="contribution-option">
-                  <input
-                    checked={!groupReusableInvitation}
-                    onChange={(event) => setGroupReusableInvitation(!event.target.checked)}
-                    type="checkbox"
-                  />
-                  Make invitations single use by default
-                </label>
-                <p className="preview-note">
-                  {groupReusableInvitation
-                    ? "A new invitation can admit several devices until it expires; you can still choose single use for each invitation."
-                    : "A new invitation admits only the first device; you can still choose reusable for each invitation."}
-                </p>
+                  <p className="create-group-label">History for new members</p>
+                  <p className="preview-note">New members receive messages sent after joining.</p>
+
+                  <fieldset>
+                    <legend>Join mode</legend>
+                    <div className="join-options" role="radiogroup">
+                      <button
+                        aria-checked={!groupApprovalRequired}
+                        className={groupApprovalRequired ? "" : "selected"}
+                        onClick={() => setGroupApprovalRequired(false)}
+                        role="radio"
+                        type="button"
+                      >
+                        Invite grants access
+                        <span>Anyone with a valid invitation joins without waiting for you.</span>
+                      </button>
+                      <button
+                        aria-checked={groupApprovalRequired}
+                        className={groupApprovalRequired ? "selected" : ""}
+                        onClick={() => setGroupApprovalRequired(true)}
+                        role="radio"
+                        type="button"
+                      >
+                        Owner approval required
+                        <span>Each new device waits until you approve it on the Members page; this device must be online to admit it.</span>
+                      </button>
+                    </div>
+                  </fieldset>
+                </section>
+
+                <section aria-labelledby="invitation-defaults-title" className="create-group-card">
+                  <h3 id="invitation-defaults-title">Invitation defaults</h3>
+                  <p className="preview-note">Applied to invitations you create for this group; you can still change them for each invitation.</p>
+
+                  <label htmlFor="invitation-lifetime">Expires after</label>
+                  <select id="invitation-lifetime" onChange={(event) => setInvitationLifetime(Number(event.target.value))} value={invitationLifetime}>
+                    {INVITATION_LIFETIMES.map(({ label, seconds }) => (
+                      <option key={seconds} value={seconds}>{label}</option>
+                    ))}
+                  </select>
+
+                  <label className="toggle-row">
+                    <span>
+                      Reusable link
+                      <small>
+                        {groupReusableInvitation
+                          ? "An invitation can admit several devices until it expires."
+                          : "An invitation admits only the first device."}
+                      </small>
+                    </span>
+                    <input
+                      checked={groupReusableInvitation}
+                      onChange={(event) => setGroupReusableInvitation(event.target.checked)}
+                      role="switch"
+                      type="checkbox"
+                    />
+                  </label>
+                </section>
               </div>
 
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
-              <button className="primary-button join-button" disabled={!groupName.trim() || creatingGroup || !isTauri()} type="submit">
-                {creatingGroup ? "Creating group…" : "Create group"}
-              </button>
-              <button className="text-button" onClick={() => { setCreateGroupMode(false); setError(""); }} type="button">Cancel</button>
+              <div className="create-group-actions">
+                <button className="secondary-button" onClick={() => { setCreateGroupMode(false); setError(""); }} type="button">Cancel</button>
+                <button className="primary-button join-button" disabled={!groupName.trim() || creatingGroup || !isTauri()} type="submit">
+                  {creatingGroup ? "Creating group…" : "Create group"}
+                </button>
+              </div>
             </form>
           )}
 

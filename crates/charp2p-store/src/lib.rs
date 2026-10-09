@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -682,6 +682,12 @@ impl EventStore {
                    SELECT 1 FROM blocked_local_devices b
                    WHERE b.group_id = m.group_id AND b.device_id = m.author_id
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM applied_message_deletions d
+                   WHERE d.target_event_id = m.event_id
+                     AND d.group_id = m.group_id
+                     AND d.author_id = m.author_id
+               )
              ORDER BY m.created_at_unix_ms DESC, m.event_id DESC
              LIMIT ?2",
         )?;
@@ -951,6 +957,12 @@ impl EventStore {
                    SELECT 1 FROM blocked_local_devices b
                    WHERE b.group_id = m.group_id AND b.device_id = m.author_id
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM applied_message_deletions d
+                   WHERE d.target_event_id = m.event_id
+                     AND d.group_id = m.group_id
+                     AND d.author_id = m.author_id
+               )
              GROUP BY u.group_id
              ORDER BY u.group_id",
         )?;
@@ -1086,6 +1098,63 @@ impl EventStore {
                 encrypted_body,
             ],
         )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Atomically stores a decrypted group-wide message deletion and the
+    /// advanced encrypted MLS provider state. The tombstone hides only a
+    /// target message by the same author, whether that message is already
+    /// readable here (its local copy is removed) or arrives later.
+    pub fn put_message_deletion_and_encrypted_mls_provider_snapshot(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        target_event_id: &[u8; 32],
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::MessageDeleted {
+            return Err(StoreError::InvalidMessageDeletionEvent);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let sequence = i64::try_from(event.author_sequence())
+            .map_err(|_| StoreError::SequenceTooLarge(event.author_sequence()))?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.execute(
+            "INSERT INTO applied_message_deletions (
+                event_id, group_id, author_id, author_sequence, target_event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+                sequence,
+                target_event_id.as_slice(),
+            ],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM materialized_messages
+             WHERE event_id = ?1 AND group_id = ?2 AND author_id = ?3",
+            params![
+                target_event_id.as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes()
+            ],
+        )?;
+        if removed == 1 {
+            transaction.execute(
+                "DELETE FROM unread_local_messages WHERE event_id = ?1",
+                [target_event_id.as_slice()],
+            )?;
+            transaction.execute(
+                "INSERT INTO hidden_local_messages (event_id, group_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(event_id) DO NOTHING",
+                params![target_event_id.as_slice(), event.group_id().to_bytes()],
+            )?;
+        }
         transaction.commit()?;
         Ok(outcome)
     }
@@ -1270,8 +1339,8 @@ impl EventStore {
         .collect()
     }
 
-    /// Returns at most `limit` verified message, edit, group-metadata, and
-    /// invite-permission events that
+    /// Returns at most `limit` verified message, edit, deletion,
+    /// group-metadata, and invite-permission events that
     /// have not been decrypted locally yet. Events are ordered by author and
     /// sequence so each sender ratchet advances consistently.
     pub fn unmaterialized_message_events(
@@ -1290,8 +1359,10 @@ impl EventStore {
              LEFT JOIN applied_group_metadata g ON g.event_id = e.event_id
              LEFT JOIN applied_message_edits x ON x.event_id = e.event_id
              LEFT JOIN applied_invite_permissions p ON p.event_id = e.event_id
+             LEFT JOIN applied_message_deletions d ON d.event_id = e.event_id
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
                AND g.event_id IS NULL AND x.event_id IS NULL AND p.event_id IS NULL
+               AND d.event_id IS NULL
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
@@ -1305,6 +1376,7 @@ impl EventStore {
                 event.kind(),
                 charp2p_core::EventKind::MessageCreated
                     | charp2p_core::EventKind::MessageEdited
+                    | charp2p_core::EventKind::MessageDeleted
                     | charp2p_core::EventKind::GroupMetadataChanged
                     | charp2p_core::EventKind::InvitePermissionChanged
             ) {
@@ -2507,7 +2579,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=26 => {}
+            6..=27 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2893,6 +2965,26 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 27 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS applied_message_deletions (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                    target_event_id BLOB NOT NULL CHECK(length(target_event_id) = 32)
+                 ) STRICT;
+
+                 CREATE INDEX IF NOT EXISTS applied_message_deletions_by_target
+                    ON applied_message_deletions(target_event_id);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3118,6 +3210,9 @@ pub enum StoreError {
     /// Only a signed message-edit event can replace message text.
     #[error("event is not a message edit")]
     InvalidMessageEditEvent,
+    /// Only a signed message-deletion event can hide a message group-wide.
+    #[error("event is not a message deletion")]
+    InvalidMessageDeletionEvent,
     /// Only a signed metadata-change event can update group metadata.
     #[error("event is not a group metadata change")]
     InvalidGroupMetadataEvent,
@@ -5226,6 +5321,154 @@ mod tests {
                 .is_empty()
         );
         assert!(store.unread_message_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_author_deletion_hides_message_before_or_after_it_arrives() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let deletion_event = |device: &DeviceIdentity, sequence| {
+            SignedEvent::create(
+                device,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::MessageDeleted,
+                    protected_payload: b"protected deletion",
+                },
+            )
+            .unwrap()
+        };
+        let first = message_event(&author, &group, 1, b"first message");
+        let second = message_event(&author, &group, 2, b"second message");
+        let foreign_deletion = deletion_event(&other, 1);
+        let first_deletion = deletion_event(&author, 3);
+        let second_deletion = deletion_event(&author, 4);
+        for event in [&first, &second, &foreign_deletion, &first_deletion] {
+            store.put_event(event).unwrap();
+        }
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(matches!(
+            store.put_message_deletion_and_encrypted_mls_provider_snapshot(
+                &first,
+                b"snapshot",
+                first.id().as_bytes(),
+            ),
+            Err(StoreError::InvalidMessageDeletionEvent)
+        ));
+        store
+            .put_received_message_and_encrypted_mls_provider_snapshot(&first, b"snapshot", b"one")
+            .unwrap();
+        assert_eq!(
+            store.unread_message_counts().unwrap(),
+            vec![(group.group_id(), 1)]
+        );
+
+        let first_target = *first.id().as_bytes();
+        store
+            .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                &foreign_deletion,
+                b"snapshot",
+                &first_target,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .len(),
+            1,
+            "other devices cannot delete"
+        );
+
+        store
+            .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                &first_deletion,
+                b"snapshot",
+                &first_target,
+            )
+            .unwrap();
+        assert!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(store.unread_message_counts().unwrap().is_empty());
+        assert_eq!(
+            store
+                .materialized_message_author(group.group_id(), &first_target)
+                .unwrap(),
+            None
+        );
+
+        // A tombstone that arrives before its message still hides it.
+        store
+            .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                &second_deletion,
+                b"snapshot",
+                second.id().as_bytes(),
+            )
+            .unwrap();
+        store
+            .put_received_message_and_encrypted_mls_provider_snapshot(&second, b"snapshot", b"two")
+            .unwrap();
+        assert!(
+            store
+                .encrypted_messages(group.group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(store.unread_message_counts().unwrap().is_empty());
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn version_twenty_seven_database_adds_message_deletions() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_message_deletions;
+                     PRAGMA user_version = 27;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert!(
+            store
+                .encrypted_messages(GroupIdentity::generate().group_id())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]

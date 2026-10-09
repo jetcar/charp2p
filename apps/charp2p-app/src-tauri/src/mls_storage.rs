@@ -11,8 +11,8 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, EventId, EventKind, EventSpec, GroupMetadata, Invitation,
-    InvitationId, InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId,
-    SignedEvent, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
+    InvitationId, InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageDeletion,
+    MessageEdit, PeerId, SignedEvent, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
     MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
@@ -1070,6 +1070,57 @@ impl MlsProviderService {
         Ok(())
     }
 
+    /// Protects a group-wide deletion request for one of this device's
+    /// readable messages as an MLS application message and stores the signed
+    /// `MessageDeleted` tombstone with the advanced provider state in one
+    /// transaction, which also removes the local readable copy.
+    pub(crate) fn delete_message(
+        &self,
+        group_id: PeerId,
+        author: &DeviceIdentity,
+        target_event_id: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        let encoded = MessageDeletion::new(*target_event_id)
+            .encode()
+            .map_err(|_| "message_invalid")?;
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            let target_author = store
+                .materialized_message_author(group_id, target_event_id)
+                .map_err(|_| "message_store_unavailable")?
+                .ok_or("message_not_found")?;
+            if target_author != author.peer_id() {
+                return Err("message_not_own");
+            }
+        }
+        self.create_application_event_at(
+            group_id,
+            author,
+            EventKind::MessageDeleted,
+            &encoded,
+            created_at_unix_ms,
+            |store, event, encrypted_snapshot, _key| {
+                store
+                    .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                        event,
+                        encrypted_snapshot,
+                        target_event_id,
+                    )
+                    .map_err(|_| "message_store_unavailable")?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     /// Protects owner-authored display metadata as an MLS application message
     /// and stores the signed `GroupMetadataChanged` event with the advanced
     /// provider state in one transaction.
@@ -1522,7 +1573,7 @@ impl MlsProviderService {
             };
             if !matches!(
                 event.kind(),
-                EventKind::MessageCreated | EventKind::MessageEdited
+                EventKind::MessageCreated | EventKind::MessageEdited | EventKind::MessageDeleted
             ) {
                 last_sequence = event.author_sequence();
                 continue;
@@ -1766,6 +1817,14 @@ impl MlsProviderService {
         } else {
             None
         };
+        let deletion = if event.kind() == EventKind::MessageDeleted {
+            Some(
+                MessageDeletion::decode(&plaintext)
+                    .map_err(|_| MaterializeMessageError::Unreadable)?,
+            )
+        } else {
+            None
+        };
         let metadata = if event.kind() == EventKind::GroupMetadataChanged {
             Some(
                 GroupMetadata::decode(&plaintext)
@@ -1782,7 +1841,11 @@ impl MlsProviderService {
         } else {
             None
         };
-        let body = if edit.is_none() && metadata.is_none() && permission.is_none() {
+        let body = if edit.is_none()
+            && deletion.is_none()
+            && metadata.is_none()
+            && permission.is_none()
+        {
             Some(MessageBody::decode(&plaintext).map_err(|_| MaterializeMessageError::Unreadable)?)
         } else {
             None
@@ -1811,6 +1874,16 @@ impl MlsProviderService {
                     event,
                     &encrypted_snapshot,
                     &permission,
+                )
+                .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
+            return Ok(());
+        }
+        if let Some(deletion) = deletion {
+            store
+                .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                    event,
+                    &encrypted_snapshot,
+                    deletion.target_event_id(),
                 )
                 .map_err(|_| MaterializeMessageError::Unavailable("message_store_unavailable"))?;
             return Ok(());
@@ -5116,6 +5189,90 @@ mod tests {
                     ("Member fixed".to_owned(), true),
                     ("Owner fixed".to_owned(), true)
                 ]
+            );
+        }
+    }
+
+    #[test]
+    fn own_message_deletions_reach_peers_and_foreign_deletions_are_refused() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+
+        let owner_message = owner_service
+            .create_message_at(group_id, &owner, "Owner kept", 43)
+            .unwrap();
+        let member_message = member_service
+            .create_message_at(group_id, &member, "Member regret", 44)
+            .unwrap();
+        member_service
+            .create_message_at(group_id, &member, "Member kept", 45)
+            .unwrap();
+        let owner_target = *owner_message.id().as_bytes();
+        let member_target = *member_message.id().as_bytes();
+        member_service
+            .delete_message(group_id, &member, &member_target)
+            .unwrap();
+        assert_eq!(
+            member_service.delete_message(group_id, &member, &member_target),
+            Err("message_not_found")
+        );
+        assert_eq!(
+            member_service.delete_message(group_id, &member, &owner_target),
+            Err("message_not_found")
+        );
+
+        let (push, sequence) = member_service
+            .next_push_request(group_id, member_id, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequence, 3);
+        assert_eq!(
+            owner_service.answer_sync_request(member_id, &push),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 3,
+            }
+        );
+        assert_eq!(
+            owner_service.delete_message(group_id, &owner, &member_target),
+            Err("message_not_found")
+        );
+        pull_all(&owner_service, &member_service, member_id, group_id);
+
+        for (service, local) in [
+            (&owner_service, owner.peer_id()),
+            (&member_service, member_id),
+        ] {
+            let mut messages = service
+                .messages(group_id, local)
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect::<Vec<_>>();
+            messages.sort();
+            assert_eq!(
+                messages,
+                vec!["Member kept".to_owned(), "Owner kept".to_owned()]
             );
         }
     }

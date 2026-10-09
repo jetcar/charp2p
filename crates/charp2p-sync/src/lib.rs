@@ -143,7 +143,7 @@ pub fn accept_pushed_events(
         }
         if !matches!(
             event.kind(),
-            EventKind::MessageCreated | EventKind::MessageEdited
+            EventKind::MessageCreated | EventKind::MessageEdited | EventKind::MessageDeleted
         ) {
             return Err(SynchronizationError::UnsupportedPushedEvent);
         }
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn push_accepts_message_edits_and_rejects_membership_events() {
+    fn push_accepts_message_edits_and_deletions_and_rejects_membership_events() {
         let group = GroupIdentity::generate();
         let author = DeviceIdentity::generate();
         let event_of = |sequence, kind| {
@@ -650,18 +650,19 @@ mod tests {
                     .encode()
                     .unwrap(),
                 event_of(2, EventKind::MessageEdited).encode().unwrap(),
+                event_of(3, EventKind::MessageDeleted).encode().unwrap(),
             ],
         };
         assert_eq!(
             accept_pushed_events(&mut store, author.peer_id(), &edits)
                 .unwrap()
                 .inserted,
-            2
+            3
         );
         let metadata = SyncRequest::PushEvents {
             group_id: group.group_id(),
             encoded_events: vec![
-                event_of(3, EventKind::GroupMetadataChanged)
+                event_of(4, EventKind::GroupMetadataChanged)
                     .encode()
                     .unwrap(),
             ],

@@ -489,7 +489,13 @@ created for a message readable on the sending device; receivers display a
 reply whose target is not available locally as a reply to an unseen message.
 
 Deletion is a signed tombstone request. It hides content in conforming clients
-but cannot guarantee erasure from devices that already received it.
+but cannot guarantee erasure from devices that already received it. A
+`MessageDeleted` event carries a versioned deletion (target `MessageCreated`
+event identifier) as an MLS application message. Clients hide the target only
+when the deletion's author is the target message's author, whether the target
+is already readable (its local display copy is removed) or arrives later. The
+original signed event is retained. Members may push their own deletions in the
+same way as their own messages.
 
 Creating an owner MLS group also creates the owner's sequence-one
 `GroupCreated` event. The event and initial encrypted provider snapshot commit

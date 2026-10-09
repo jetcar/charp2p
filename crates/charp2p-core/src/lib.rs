@@ -13,6 +13,7 @@ mod invite_permission;
 mod invite_request;
 mod join;
 mod message_body;
+mod message_deletion;
 mod message_edit;
 mod sync;
 
@@ -44,6 +45,7 @@ pub use libp2p_identity::{PeerId, PublicKey, SigningError};
 pub use message_body::{
     MAX_MESSAGE_BODY_BYTES, MAX_MESSAGE_TEXT_BYTES, MessageBody, MessageBodyError,
 };
+pub use message_deletion::{MessageDeletion, MessageDeletionError};
 pub use message_edit::{MAX_MESSAGE_EDIT_TEXT_BYTES, MessageEdit, MessageEditError};
 pub use sync::{
     MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_EVENT_BYTES, MAX_SYNC_RESPONSE_BYTES,

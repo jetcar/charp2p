@@ -644,6 +644,24 @@ fn edit_group_message(
         .map_err(str::to_owned)
 }
 
+/// Sends a signed group-wide tombstone for one of this device's messages.
+#[tauri::command]
+fn delete_group_message(
+    group_id: String,
+    event_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let event_id = parse_event_id(&event_id)?;
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .delete_message(group_id, &identity, &event_id)
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn group_messages(
     group_id: String,
@@ -1373,6 +1391,7 @@ pub fn run() {
             synchronize_group,
             send_group_message,
             edit_group_message,
+            delete_group_message,
             group_messages,
             export_message_evidence,
             hide_group_message,

@@ -3848,8 +3848,8 @@ function App() {
               </header>
               <dl className="preview-facts">
                 <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
-                <div><dt>Join mode</dt><dd>Valid invitation grants access</dd></div>
-                <div><dt>Invitation expiry</dt><dd>{localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
+                <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Valid invitation, then owner approval" : "Valid invitation grants access"}</dd></div>
+                <div><dt>Invitations</dt><dd>{localGroup.reusableInvitation ? "Reusable" : "Single use"} by default · expire after {localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
                 <div><dt>Discovery</dt><dd>{ownedDiscoveryDescription(ownedDiscovery)}</dd></div>
               </dl>

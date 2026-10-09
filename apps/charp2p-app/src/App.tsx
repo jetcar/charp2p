@@ -3278,12 +3278,31 @@ function App() {
     );
   }
 
-  function renderComposer(groupId: string, idPrefix: string, receipt: string | null) {
+  // Shown above the composer while a joined group's last connection check
+  // reached no member: new messages stay local until a peer connects.
+  function renderWaitingBanner(synchronizedAtUnix: number | null) {
+    return (
+      <div className="waiting-banner" role="status">
+        <span className="waiting-banner-icon" aria-hidden="true">⟳</span>
+        <div>
+          <strong>Waiting for a group member</strong>
+          <p>Messages will sync when another member comes online.</p>
+          <p className="waiting-banner-synced">{lastSynchronizationLabel(synchronizedAtUnix)}</p>
+        </div>
+        <button disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
+          {synchronizingGroup ? "Retrying…" : "Retry now"}
+        </button>
+      </div>
+    );
+  }
+
+  function renderComposer(groupId: string, idPrefix: string, receipt: string | null, waiting = false) {
     const overLimit = outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES;
     const nearLimit = outgoingMessageBytes >= MESSAGE_TEXT_LIMIT_BYTES * MESSAGE_SIZE_HINT_RATIO;
     const sizeId = `${idPrefix}-message-size`;
     return (
       <form className="message-composer" onSubmit={sendGroupMessage}>
+        {waiting && joinedGroup && renderWaitingBanner(joinedGroup.lastSynchronizedAtUnix)}
         {renderReplyDraft(groupId)}
         <div className="message-composer-row">
           <input
@@ -3293,7 +3312,7 @@ function App() {
             id={`${idPrefix}-outgoing-message`}
             maxLength={16384}
             onChange={(event) => setOutgoingMessage(event.target.value)}
-            placeholder="Write a message"
+            placeholder={waiting ? "New messages stay on this device until a peer connects." : "Write a message"}
             type="text"
             value={outgoingMessage}
           />
@@ -4208,6 +4227,7 @@ function App() {
                   ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
                   : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`
                 ),
+                !joinedSyncPill(connectionStates[joinedGroup.groupId], joinedGroup.lastSynchronizedAtUnix).reachable,
               )}
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>

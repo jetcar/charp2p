@@ -3470,18 +3470,190 @@ function App() {
     setError("");
   }
 
-  return (
-    <main className="onboarding-shell">
-      <section className="brand-panel" aria-labelledby="brand-title">
-        <div className="brand-lockup">
-          <BrandMark decorative />
-          <h1 id="brand-title">Char<span>P2P</span></h1>
-        </div>
-        <p>Private groups. Direct connections.</p>
-        <NetworkArtwork />
-      </section>
+  // After setup the app uses the chat shell: a sidebar with groups and
+  // navigation; the onboarding layout stays for identity setup only.
+  const appShell = step === 3 && !loading && Boolean(profile);
 
-      <section className="setup-panel">
+  function closeSecondaryViews() {
+    setInformationView(null);
+    setNetworkView(false);
+    setSettingsView(false);
+    setBackupView(false);
+  }
+
+  function openShellPage(page: "network" | "settings" | "privacy" | "identity") {
+    closeSecondaryViews();
+    if (page === "network") setNetworkView(true);
+    else if (page === "settings") setSettingsView(true);
+    else setInformationView(page);
+  }
+
+  function openGroupFromSidebar(groupId: string) {
+    closeSecondaryViews();
+    closeJoinFlow();
+    setCreateGroupMode(false);
+    setShowMembers(false);
+    setOpenPendingGroupId("");
+    setPeerSearchResult(null);
+    setActiveGroupId(groupId);
+    setInvitationCopied(false);
+    setSynchronizationResult(null);
+    setSynchronizingGroup(false);
+    setCreatedMessage(null);
+  }
+
+  function openPendingFromSidebar(groupId: string) {
+    closeSecondaryViews();
+    closeJoinFlow();
+    setCreateGroupMode(false);
+    setShowMembers(false);
+    setOpenPendingGroupId(groupId);
+    setPeerSearchResult(null);
+  }
+
+  const groupPageOpen =
+    !informationView && !networkView && !settingsView && !backupView && !joinMode && !createGroupMode;
+
+  return (
+    <main className={appShell ? "app-shell" : "onboarding-shell"}>
+      {appShell && profile ? (
+        <aside className="app-sidebar" aria-label="CharP2P navigation">
+          <div className="sidebar-brand">
+            <BrandMark decorative />
+            <strong>Char<span>P2P</span></strong>
+          </div>
+          <div className="sidebar-device" title={profile.peerId}>
+            <span className="sidebar-device-avatar" aria-hidden="true">{profile.deviceName.trim().charAt(0).toUpperCase() || "?"}</span>
+            <span><strong>{profile.deviceName}</strong> · This device</span>
+          </div>
+          <button
+            className={`sidebar-action primary${createGroupMode ? " active" : ""}`}
+            onClick={() => {
+              closeSecondaryViews();
+              closeJoinFlow();
+              setShowMembers(false);
+              setOpenPendingGroupId("");
+              setCreateGroupMode(true);
+            }}
+            type="button"
+          >
+            <span aria-hidden="true">＋</span> Create group
+          </button>
+          <button
+            className={`sidebar-action${joinMode ? " active" : ""}`}
+            onClick={() => {
+              closeSecondaryViews();
+              setCreateGroupMode(false);
+              setShowMembers(false);
+              setOpenPendingGroupId("");
+              setJoinMode(true);
+              setError("");
+            }}
+            type="button"
+          >
+            <span aria-hidden="true">⛓</span> Join with link
+          </button>
+          <nav className="sidebar-groups" aria-label="Your groups">
+            <h2>Groups</h2>
+            {availableGroups.length === 0 && pendingGroups.length === 0 && (
+              <p className="sidebar-empty">No groups yet</p>
+            )}
+            <ul>
+              {availableGroups.map((group) => {
+                const current = groupPageOpen && !pendingGroup && group.groupId === activeGroupId;
+                const unread = unreadCounts[group.groupId] ?? 0;
+                return (
+                  <li key={group.groupId}>
+                    <button
+                      aria-current={current ? "page" : undefined}
+                      className={current ? "active" : ""}
+                      onClick={() => openGroupFromSidebar(group.groupId)}
+                      title={`${group.role}${group.lastSynchronizedAtUnix !== undefined ? ` · ${lastSynchronizationLabel(group.lastSynchronizedAtUnix)} (${synchronizationDescription(group.lastSynchronizedAtUnix)})` : ""}`}
+                      type="button"
+                    >
+                      <i aria-hidden="true" className={`sidebar-group-icon icon-${group.icon ?? 0}`}>
+                        {GROUP_ICONS[group.icon ?? 0]}
+                      </i>
+                      <span className="sidebar-group-name">{group.groupName}</span>
+                      {group.groupId !== activeGroupId && unread > 0 && (
+                        <em aria-label={`${unread} unread`} className="unread-count">
+                          {unread > 99 ? "99+" : unread}
+                        </em>
+                      )}
+                      {connectionStates[group.groupId] && (
+                        <i
+                          aria-label={groupConnectionDescription(connectionStates[group.groupId])}
+                          className={`sidebar-state ${connectionStates[group.groupId]}`}
+                          title={groupConnectionDescription(connectionStates[group.groupId])}
+                        />
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+              {pendingGroups.map((group) => {
+                const current = groupPageOpen && group.groupId === openPendingGroupId;
+                const state = awaitingApprovalIds.includes(group.groupId)
+                  ? "Awaiting owner approval"
+                  : autoJoinWaitingIds.includes(group.groupId)
+                    ? "Waiting for owner"
+                    : expiryDescription(group.expiresAtUnix);
+                return (
+                  <li key={`pending-${group.groupId}`}>
+                    <button
+                      aria-current={current ? "page" : undefined}
+                      className={`pending${current ? " active" : ""}`}
+                      onClick={() => openPendingFromSidebar(group.groupId)}
+                      title={`Pending invitation · ${state}`}
+                      type="button"
+                    >
+                      <i aria-hidden="true" className="sidebar-group-icon pending-icon-small">⌁</i>
+                      <span className="sidebar-group-name">
+                        {group.groupName}
+                        <small>Pending · {state}</small>
+                      </span>
+                      <i aria-label={state} className="sidebar-state waiting" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
+          <div className="sidebar-footer">
+            <button
+              aria-current={networkView ? "page" : undefined}
+              className={networkView ? "active" : ""}
+              onClick={() => openShellPage("network")}
+              type="button"
+            >
+              <span aria-hidden="true">⌘</span> Network
+            </button>
+            <button
+              aria-current={settingsView || backupView ? "page" : undefined}
+              className={settingsView || backupView ? "active" : ""}
+              onClick={() => openShellPage("settings")}
+              type="button"
+            >
+              <span aria-hidden="true">⚙</span> Settings
+            </button>
+            <div className="sidebar-links">
+              <button onClick={() => openShellPage("privacy")} type="button">Privacy</button>
+              <button onClick={() => openShellPage("identity")} type="button">How identity works</button>
+            </div>
+          </div>
+        </aside>
+      ) : (
+        <section className="brand-panel" aria-labelledby="brand-title">
+          <div className="brand-lockup">
+            <BrandMark decorative />
+            <h1 id="brand-title">Char<span>P2P</span></h1>
+          </div>
+          <p>Private groups. Direct connections.</p>
+          <NetworkArtwork />
+        </section>
+      )}
+
+      <section className={appShell ? "app-main" : "setup-panel"}>
         <div className="setup-content">
           {informationView ? (
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
@@ -3513,7 +3685,7 @@ function App() {
             />
           ) : (
             <>
-              <Stepper step={step} />
+              {!appShell && <Stepper step={step} />}
 
           {loading && (
             <div className="loading-state" role="status">
@@ -3638,104 +3810,6 @@ function App() {
                 {pendingGroups.length > 1 ? "Show all groups and invitations" : "Back to groups"}
               </button>
             </section>
-          )}
-
-          {step === 3 && !pendingGroup && !joinMode && !createGroupMode && !showMembers && (availableGroups.length > 0 || pendingGroups.length > 0) && (
-            <nav className="group-switcher" aria-label="Your groups">
-              <div className="group-switcher-list">
-                {availableGroups.map((group) => (
-                  <button
-                    aria-current={group.groupId === activeGroupId ? "page" : undefined}
-                    className={group.groupId === activeGroupId ? "active" : ""}
-                    key={group.groupId}
-                    onClick={() => {
-                      setActiveGroupId(group.groupId);
-                      setError("");
-                      setInvitationCopied(false);
-                      setSynchronizationResult(null);
-                      setSynchronizingGroup(false);
-                      setCreatedMessage(null);
-                    }}
-                    type="button"
-                  >
-                    <strong>
-                      {group.icon !== null && (
-                        <i aria-hidden="true" className={`group-switcher-icon icon-${group.icon}`}>{GROUP_ICONS[group.icon]}</i>
-                      )}
-                      {group.groupName}
-                    </strong>
-                    <span>
-                      {group.role}
-                      {group.lastSynchronizedAtUnix !== undefined && (
-                        <i
-                          className="group-last-sync"
-                          title={`Last synchronized: ${synchronizationDescription(group.lastSynchronizedAtUnix)}`}
-                        >
-                          {lastSynchronizationLabel(group.lastSynchronizedAtUnix)}
-                        </i>
-                      )}
-                      {connectionStates[group.groupId] && (
-                        <i className={`group-connection ${connectionStates[group.groupId]}`}>
-                          {groupConnectionDescription(connectionStates[group.groupId])}
-                        </i>
-                      )}
-                      {group.groupId !== activeGroupId && (unreadCounts[group.groupId] ?? 0) > 0 && (
-                        <em
-                          aria-label={`${unreadCounts[group.groupId]} unread`}
-                          className="unread-count"
-                        >
-                          {unreadCounts[group.groupId] > 99 ? "99+" : unreadCounts[group.groupId]}
-                        </em>
-                      )}
-                    </span>
-                  </button>
-                ))}
-                {pendingGroups.map((group) => (
-                  <button
-                    className="pending"
-                    key={`pending-${group.groupId}`}
-                    onClick={() => {
-                      setOpenPendingGroupId(group.groupId);
-                      setPeerSearchResult(null);
-                      setError("");
-                    }}
-                    type="button"
-                  >
-                    <strong>{group.groupName}</strong>
-                    <span>
-                      Pending invitation
-                      <i className="group-connection waiting">
-                        {awaitingApprovalIds.includes(group.groupId)
-                          ? "Awaiting owner approval"
-                          : autoJoinWaitingIds.includes(group.groupId)
-                            ? "Waiting for owner"
-                            : expiryDescription(group.expiresAtUnix)}
-                      </i>
-                    </span>
-                  </button>
-                ))}
-              </div>
-              <button
-                className="group-switcher-join"
-                onClick={() => {
-                  setJoinMode(true);
-                  setError("");
-                }}
-                type="button"
-              >
-                ＋ Join another group
-              </button>
-              <button
-                className="group-switcher-join"
-                onClick={() => {
-                  setCreateGroupMode(true);
-                  setError("");
-                }}
-                type="button"
-              >
-                ＋ Create a group
-              </button>
-            </nav>
           )}
 
           {step === 3 && showMembers && !pendingGroup && !joinMode && !createGroupMode && (joinedGroup || localGroup) && (
@@ -4341,45 +4415,47 @@ function App() {
           )}
         </div>
 
-        <footer className="setup-footer">
-          <button onClick={() => setInformationView("privacy")} type="button">Privacy</button>
-          <button
-            onClick={() => {
-              setInformationView(null);
-              setBackupView(false);
-              setSettingsView(false);
-              setNetworkView(true);
-            }}
-            type="button"
-          >
-            Network
-          </button>
-          <button
-            onClick={() => {
-              setInformationView(null);
-              setBackupView(false);
-              setNetworkView(false);
-              setSettingsView(true);
-            }}
-            type="button"
-          >
-            Settings
-          </button>
-          <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
-          {profile && (
+        {!appShell && (
+          <footer className="setup-footer">
+            <button onClick={() => setInformationView("privacy")} type="button">Privacy</button>
             <button
               onClick={() => {
                 setInformationView(null);
-                setNetworkView(false);
+                setBackupView(false);
                 setSettingsView(false);
-                setBackupView(true);
+                setNetworkView(true);
               }}
               type="button"
             >
-              Identity backup
+              Network
             </button>
-          )}
-        </footer>
+            <button
+              onClick={() => {
+                setInformationView(null);
+                setBackupView(false);
+                setNetworkView(false);
+                setSettingsView(true);
+              }}
+              type="button"
+            >
+              Settings
+            </button>
+            <button onClick={() => setInformationView("identity")} type="button">How identity works</button>
+            {profile && (
+              <button
+                onClick={() => {
+                  setInformationView(null);
+                  setNetworkView(false);
+                  setSettingsView(false);
+                  setBackupView(true);
+                }}
+                type="button"
+              >
+                Identity backup
+              </button>
+            )}
+          </footer>
+        )}
       </section>
     </main>
   );

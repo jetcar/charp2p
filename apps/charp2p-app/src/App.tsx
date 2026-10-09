@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import QRCode from "qrcode";
-import { ChangeEvent, FormEvent, Fragment, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
@@ -2109,7 +2109,12 @@ function App() {
   const [exportingEvidence, setExportingEvidence] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
-  const [showGroupInfo, setShowGroupInfo] = useState(false);
+  // The group details pane is always open on wide windows and opens from the
+  // conversation header on tablet widths.
+  const [showGroupInfo, setShowGroupInfo] = useState(
+    () => typeof window !== "undefined" && window.matchMedia?.("(min-width: 1200px)").matches === true,
+  );
+  const [fingerprintCopied, setFingerprintCopied] = useState(false);
   const [membersError, setMembersError] = useState("");
   const [removingMember, setRemovingMember] = useState("");
   const [blockedDevices, setBlockedDevices] = useState<string[]>([]);
@@ -2209,6 +2214,7 @@ function App() {
 
   useEffect(() => {
     activeGroupIdRef.current = activeGroupId;
+    setFingerprintCopied(false);
   }, [activeGroupId]);
 
   useEffect(() => {
@@ -3371,39 +3377,187 @@ function App() {
     group: { groupName: string; icon: number | null },
     connection: string,
     sync: { reachable: boolean; label: string; title?: string },
-    details: ReactNode,
   ) {
     const memberCount = groupMembers.length;
     return (
-      <>
-        <header className="conversation-header">
-          <div className={`conversation-icon ${group.icon !== null ? `icon-${group.icon}` : ""}`} aria-hidden="true">
-            {group.icon !== null ? GROUP_ICONS[group.icon] : "✓"}
-          </div>
-          <div className="conversation-title">
-            <h2>{group.groupName}</h2>
-            <p>
-              {memberCount > 0 ? `${memberCount} ${memberCount === 1 ? "member" : "members"} · ` : ""}
-              {connection}
-            </p>
-          </div>
-          <span className={`sync-pill ${sync.reachable ? "" : "unreachable"}`} role="status" title={sync.title}>
-            {sync.label}
-          </span>
+      <header className="conversation-header">
+        <div className={`conversation-icon ${group.icon !== null ? `icon-${group.icon}` : ""}`} aria-hidden="true">
+          {group.icon !== null ? GROUP_ICONS[group.icon] : "✓"}
+        </div>
+        <div className="conversation-title">
+          <h2>{group.groupName}</h2>
+          <p>
+            {memberCount > 0 ? `${memberCount} ${memberCount === 1 ? "member" : "members"} · ` : ""}
+            {connection}
+          </p>
+        </div>
+        <span className={`sync-pill ${sync.reachable ? "" : "unreachable"}`} role="status" title={sync.title}>
+          {sync.label}
+        </span>
+        <button
+          aria-expanded={showGroupInfo}
+          className="conversation-info-button"
+          onClick={() => setShowGroupInfo((shown) => !shown)}
+          type="button"
+        >
+          {showGroupInfo ? "Hide details" : "Details"}
+        </button>
+        <button className="conversation-info-button" onClick={() => setShowMembers(true)} type="button">
+          Members{memberCount > 0 ? ` (${memberCount})` : ""}
+        </button>
+      </header>
+    );
+  }
+
+  async function copyGroupFingerprint(groupId: string) {
+    try {
+      await navigator.clipboard.writeText(groupId);
+      setFingerprintCopied(true);
+    } catch {
+      setMembersError("The group fingerprint could not be copied.");
+    }
+  }
+
+  function openGroupInvitations() {
+    if (localGroup) {
+      if (!window.matchMedia?.("(min-width: 1200px)").matches) setShowGroupInfo(false);
+      document.getElementById("owner-invitations")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("invitation-expiry")?.focus({ preventScroll: true });
+    } else {
+      setShowMembers(true);
+    }
+  }
+
+  // Side pane for the open conversation: identity, members, connection and the
+  // group facts that used to sit above the timeline.
+  function renderGroupDetailsPane(group: LocalGroup | JoinedGroup) {
+    const joined = joinedGroup?.groupId === group.groupId ? joinedGroup : null;
+    const ownerDeviceId = joined?.inviterDeviceId ?? profile?.peerId ?? "";
+    const ownerName = joined?.inviterName ?? profile?.deviceName ?? "Owner";
+    const memberCount = groupMembers.length;
+    const connectionState = joined ? connectionStates[joined.groupId] : undefined;
+    const connection = joined
+      ? connectionState ? groupConnectionDescription(connectionState) : "Connection not checked"
+      : "You own this group";
+    const sync = joined
+      ? joinedSyncPill(connectionState, joined.lastSynchronizedAtUnix)
+      : ownerSyncPill(advertisement?.status ?? null, advertisementRetrying);
+    const canInvite = !joined || Boolean(profile && invitePermittedDevices.includes(profile.peerId));
+    const members = [...groupMembers].sort((left, right) => {
+      if (left.deviceId === right.deviceId) return 0;
+      if (left.deviceId === ownerDeviceId) return -1;
+      if (right.deviceId === ownerDeviceId) return 1;
+      if (left.deviceId === profile?.peerId) return -1;
+      if (right.deviceId === profile?.peerId) return 1;
+      return left.deviceId.localeCompare(right.deviceId);
+    });
+    return (
+      <aside aria-labelledby="group-details-title" className="group-details-pane">
+        <header>
+          <h2 id="group-details-title">Group details</h2>
+          <button aria-label="Close group details" className="details-close" onClick={() => setShowGroupInfo(false)} type="button">×</button>
+        </header>
+        <div className={`details-icon ${group.icon !== null ? `icon-${group.icon}` : ""}`} aria-hidden="true">
+          {group.icon !== null ? GROUP_ICONS[group.icon] : "✓"}
+        </div>
+        <h3 className="details-name">{group.groupName}</h3>
+        <p className="details-subtitle">
+          {memberCount > 0 ? `${memberCount} ${memberCount === 1 ? "member" : "members"} · ` : ""}
+          {connection}
+        </p>
+        <span className="details-label">Group fingerprint</span>
+        <div className="details-fingerprint">
+          <code title={group.groupId}>{shortPeerId(group.groupId)}</code>
           <button
-            aria-expanded={showGroupInfo}
-            className="conversation-info-button"
-            onClick={() => setShowGroupInfo((shown) => !shown)}
+            aria-label="Copy group fingerprint"
+            onClick={() => void copyGroupFingerprint(group.groupId)}
+            title={fingerprintCopied ? "Copied" : "Copy"}
             type="button"
           >
-            {showGroupInfo ? "Hide details" : "Details"}
+            {fingerprintCopied ? "✓" : "⧉"}
           </button>
-          <button className="conversation-info-button" onClick={() => setShowMembers(true)} type="button">
-            Members{memberCount > 0 ? ` (${memberCount})` : ""}
-          </button>
-        </header>
-        {showGroupInfo && <div className="conversation-details">{details}</div>}
-      </>
+        </div>
+        <section className="details-section" aria-labelledby="details-members-title">
+          <h3 id="details-members-title">Members{memberCount > 0 ? ` (${memberCount})` : ""}</h3>
+          {members.length === 0 ? (
+            <p className="preview-note">Loading verified membership…</p>
+          ) : (
+            <ul className="details-members">
+              {members.map((member) => {
+                const isOwner = member.deviceId === ownerDeviceId;
+                const isLocal = member.deviceId === profile?.peerId;
+                return (
+                  <li key={member.deviceId} title={member.deviceId}>
+                    <span className="details-member-avatar" aria-hidden="true">{isOwner ? "♛" : "●"}</span>
+                    <span className="details-member-name">
+                      {isLocal
+                        ? `${profile?.deviceName ?? "This device"} (You)`
+                        : isOwner ? ownerName : `Member ${shortPeerId(member.deviceId)}`}
+                    </span>
+                    <span className="details-member-role">{isOwner ? "Owner" : "Member"}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+        <section className="details-section" aria-labelledby="details-connection-title">
+          <h3 id="details-connection-title">Connection</h3>
+          <p className={`details-connection ${sync.reachable ? "" : "unreachable"}`}>
+            <strong>
+              {joined && connectionState
+                ? `${groupConnectionDescription(connectionState)}${
+                  synchronizationResult ? ` · ${connectionTypeDescription(synchronizationResult.connectionType)}` : ""
+                }`
+                : sync.label.replace(/^[●○] /, "")}
+            </strong>
+            <span>{joined ? synchronizationDescription(joined.lastSynchronizedAtUnix) : ownedDiscoveryDescription(ownedDiscovery)}</span>
+          </p>
+        </section>
+        <section className="details-section details-facts" aria-label="Group facts">
+          {joined ? (
+            <>
+              <div className="status-row" aria-label="Group status">
+                <span className="status-chip">✓ Secure membership ready</span>
+                <span className={`status-chip ${synchronizationResult ? "" : "muted"}`}>
+                  {synchronizingGroup
+                    ? "○ Synchronizing…"
+                    : synchronizationResult
+                      ? synchronizationResult.status === "memberSynchronized"
+                        ? `✓ ${synchronizationResult.synchronizedEvents} received from a member · owner offline · ${connectionTypeDescription(synchronizationResult.connectionType)}`
+                        : `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
+                      : "○ Sync not checked"}
+                </span>
+              </div>
+              <dl className="preview-facts">
+                <div><dt>Invited by</dt><dd>{joined.inviterName}</dd></div>
+                <div><dt>History</dt><dd>{historyDescription(joined.historyPolicy)}</dd></div>
+                <div><dt>Inviter device</dt><dd><code title={joined.inviterDeviceId}>{shortPeerId(joined.inviterDeviceId)}</code></dd></div>
+                <div><dt>Discovery</dt><dd>{joinedDiscoveryDescription(discoveryStates[joined.groupId])}</dd></div>
+              </dl>
+            </>
+          ) : localGroup ? (
+            <>
+              <dl className="preview-facts">
+                <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
+                <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Valid invitation, then owner approval" : "Valid invitation grants access"}</dd></div>
+                <div><dt>Invitations</dt><dd>{localGroup.reusableInvitation ? "Reusable" : "Single use"} by default · expire after {localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
+              </dl>
+            </>
+          ) : null}
+        </section>
+        {membersError && <p className="form-error preview-error" role="alert">{membersError}</p>}
+        <div className="details-actions">
+          {canInvite && (
+            <button className="primary-button" onClick={openGroupInvitations} type="button">Invite member</button>
+          )}
+          {joined && (
+            <button className="details-leave" disabled={leavingGroup} onClick={() => void leaveJoinedGroup()} type="button">
+              {leavingGroup ? "Leaving…" : "Leave group"}
+            </button>
+          )}
+        </div>
+      </aside>
     );
   }
 
@@ -3700,9 +3854,11 @@ function App() {
 
   const groupPageOpen =
     !informationView && !networkView && !settingsView && !backupView && !joinMode && !createGroupMode;
+  const detailsGroup =
+    appShell && groupPageOpen && showGroupInfo && !pendingGroup && !showMembers ? joinedGroup ?? localGroup : null;
 
   return (
-    <main className={appShell ? "app-shell" : "onboarding-shell"}>
+    <main className={appShell ? `app-shell${detailsGroup ? " with-details" : ""}` : "onboarding-shell"}>
       {appShell && profile ? (
         <aside className="app-sidebar" aria-label="CharP2P navigation">
           <div className="sidebar-brand">
@@ -4042,29 +4198,6 @@ function App() {
                   ? groupConnectionDescription(connectionStates[joinedGroup.groupId])
                   : "Connection not checked",
                 joinedSyncPill(connectionStates[joinedGroup.groupId], joinedGroup.lastSynchronizedAtUnix),
-                <>
-              <div className="status-row" aria-label="Group status">
-                <span className="status-chip">✓ Secure membership ready</span>
-                <span className={`status-chip ${synchronizationResult ? "" : "muted"}`}>
-                  {synchronizingGroup
-                    ? "○ Synchronizing…"
-                    : synchronizationResult
-                      ? synchronizationResult.status === "memberSynchronized"
-                        ? `✓ ${synchronizationResult.synchronizedEvents} received from a member · owner offline · ${connectionTypeDescription(synchronizationResult.connectionType)}`
-                        : `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
-                      : "○ Sync not checked"}
-                </span>
-              </div>
-              <dl className="preview-facts">
-                <div><dt>Invited by</dt><dd>{joinedGroup.inviterName}</dd></div>
-                <div><dt>History</dt><dd>{historyDescription(joinedGroup.historyPolicy)}</dd></div>
-                <div><dt>Group fingerprint</dt><dd><code title={joinedGroup.groupId}>{shortPeerId(joinedGroup.groupId)}</code></dd></div>
-                <div><dt>Inviter device</dt><dd><code title={joinedGroup.inviterDeviceId}>{shortPeerId(joinedGroup.inviterDeviceId)}</code></dd></div>
-                <div><dt>Last synchronized</dt><dd>{synchronizationDescription(joinedGroup.lastSynchronizedAtUnix)}</dd></div>
-                <div><dt>Connection</dt><dd>{connectionStates[joinedGroup.groupId] ? groupConnectionDescription(connectionStates[joinedGroup.groupId]) : "Not checked"}</dd></div>
-                <div><dt>Discovery</dt><dd>{joinedDiscoveryDescription(discoveryStates[joinedGroup.groupId])}</dd></div>
-              </dl>
-                </>,
               )}
               {renderMessageTimeline(joinedGroup.groupId, joinedGroup, joinedGroup.inviterDeviceId)}
               {renderComposer(
@@ -4090,15 +4223,6 @@ function App() {
                 localGroup,
                 "You own this group",
                 ownerSyncPill(advertisement?.status ?? null, advertisementRetrying),
-                <>
-              <dl className="preview-facts">
-                <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
-                <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Valid invitation, then owner approval" : "Valid invitation grants access"}</dd></div>
-                <div><dt>Invitations</dt><dd>{localGroup.reusableInvitation ? "Reusable" : "Single use"} by default · expire after {localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
-                <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
-                <div><dt>Discovery</dt><dd>{ownedDiscoveryDescription(ownedDiscovery)}</dd></div>
-              </dl>
-                </>,
               )}
               {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
               {renderMessageTimeline(localGroup.groupId, null, profile?.peerId ?? "")}
@@ -4192,7 +4316,7 @@ function App() {
               {usedInvitationGroupIds.includes(localGroup.groupId) && (
                 <p className="preview-note">A single-use invitation was used by a joining device and no longer works.</p>
               )}
-              <p className="preview-note">
+              <p className="preview-note" id="owner-invitations">
                 {groupInvitations.length > 0
                   ? "Create another signed invitation, for example with a different expiry or use."
                   : "Create a signed invitation to share this group."}
@@ -4477,6 +4601,7 @@ function App() {
           </footer>
         )}
       </section>
+      {detailsGroup && renderGroupDetailsPane(detailsGroup)}
     </main>
   );
 }

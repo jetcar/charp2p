@@ -5,10 +5,11 @@
 mod invite_codec;
 mod ip_limits;
 mod join_codec;
+mod request_limits;
 
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use charp2p_core::{
@@ -30,7 +31,7 @@ use libp2p::{
 };
 use thiserror::Error;
 
-use crate::{invite_codec::InviteCodec, join_codec::JoinCodec};
+use crate::{invite_codec::InviteCodec, join_codec::JoinCodec, request_limits::PeerRequestLimiter};
 
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 /// Kademlia protocol name that keeps the CharP2P DHT separate from the IPFS
@@ -55,6 +56,10 @@ const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 4;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP: u32 = 16;
+/// Serving nodes accept a burst of this many join, invitation, and
+/// synchronization requests from one peer, then refill at the per-second rate.
+const MAX_INBOUND_REQUEST_BURST_PER_PEER: u32 = 64;
+const MAX_INBOUND_REQUESTS_PER_PEER_PER_SECOND: u32 = 8;
 /// Provider records expire quickly; online advertisers republish well
 /// within the lifetime and the app refreshes its own publication every five
 /// minutes.
@@ -257,6 +262,9 @@ pub struct NetworkNode {
         HashMap<InboundJoinRequestId, request_response::ResponseChannel<JoinResponse>>,
     pending_invite_responses:
         HashMap<InboundInviteRequestId, request_response::ResponseChannel<InviteResponse>>,
+    /// Present on serving nodes only; client nodes answer just the peers they
+    /// dialled or share groups with.
+    request_limits: Option<PeerRequestLimiter>,
 }
 
 impl NetworkNode {
@@ -328,6 +336,12 @@ impl NetworkNode {
         lan_discovery: bool,
     ) -> Self {
         let relay_server_enabled = relay_server.is_some();
+        let request_limits = (dht_mode == kad::Mode::Server).then(|| {
+            PeerRequestLimiter::new(
+                MAX_INBOUND_REQUEST_BURST_PER_PEER,
+                MAX_INBOUND_REQUESTS_PER_PEER_PER_SECOND,
+            )
+        });
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_quic()
@@ -358,6 +372,7 @@ impl NetworkNode {
             pending_sync_responses: HashMap::new(),
             pending_join_responses: HashMap::new(),
             pending_invite_responses: HashMap::new(),
+            request_limits,
         }
     }
 
@@ -591,6 +606,13 @@ impl NetworkNode {
         self.send_sync_response(request_id, SyncResponse::Rejected { reason })
     }
 
+    /// Charges one inbound request to the peer's rate bound on serving nodes.
+    fn allow_inbound_request(&mut self, peer: PeerId) -> bool {
+        self.request_limits
+            .as_mut()
+            .is_none_or(|limits| limits.allow(peer, Instant::now()))
+    }
+
     /// Waits for the next application-relevant network event.
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
@@ -619,7 +641,16 @@ impl NetworkNode {
                         remote_address,
                     };
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    num_established,
+                    ..
+                } => {
+                    if num_established == 0
+                        && let Some(limits) = self.request_limits.as_mut()
+                    {
+                        limits.forget(&peer_id);
+                    }
                     return NetworkEvent::PeerDisconnected { peer_id };
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
@@ -744,6 +775,14 @@ impl NetworkNode {
                         },
                     ..
                 })) => {
+                    if !self.allow_inbound_request(peer) {
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .join
+                            .send_response(channel, JoinResponse::rejected(JoinRejectReason::Busy));
+                        continue;
+                    }
                     let request_id = InboundJoinRequestId(request_id);
                     self.pending_join_responses.insert(request_id, channel);
                     return NetworkEvent::JoinRequestReceived {
@@ -799,6 +838,13 @@ impl NetworkNode {
                         ..
                     },
                 )) => {
+                    if !self.allow_inbound_request(peer) {
+                        let _ = self.swarm.behaviour_mut().invite.send_response(
+                            channel,
+                            InviteResponse::rejected(InviteRejectReason::Busy),
+                        );
+                        continue;
+                    }
                     let request_id = InboundInviteRequestId(request_id);
                     self.pending_invite_responses.insert(request_id, channel);
                     return NetworkEvent::InviteRequestReceived {
@@ -854,6 +900,15 @@ impl NetworkNode {
                         },
                     ..
                 })) => {
+                    if !self.allow_inbound_request(peer) {
+                        let _ = self.swarm.behaviour_mut().sync.send_response(
+                            channel,
+                            SyncResponse::Rejected {
+                                reason: SyncRejectReason::Busy,
+                            },
+                        );
+                        continue;
+                    }
                     if request.validate().is_err() {
                         let _ = self.swarm.behaviour_mut().sync.send_response(
                             channel,
@@ -1352,6 +1407,37 @@ mod tests {
         assert_eq!(response_peer, listener_id);
         assert_eq!(received_id, outbound_id);
         assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn serving_node_answers_busy_beyond_the_per_peer_request_rate() {
+        let (mut listener, mut dialer, listener_id, dialer_id) = connected_nodes().await;
+        // A bucket that never refills makes the second request exceed it.
+        listener.request_limits = Some(super::PeerRequestLimiter::new(1, 0));
+        let group_id = GroupIdentity::generate().group_id();
+        dialer
+            .send_sync_request(listener_id, SyncRequest::Summary { group_id })
+            .unwrap();
+        let (request_peer, _, _) =
+            timeout(TEST_TIMEOUT, next_sync_request(&mut listener, &mut dialer))
+                .await
+                .expect("listener should receive the first sync request");
+        assert_eq!(request_peer, dialer_id);
+
+        let limited_id = dialer
+            .send_sync_request(listener_id, SyncRequest::Summary { group_id })
+            .unwrap();
+        let (_, received_id, received) =
+            timeout(TEST_TIMEOUT, next_sync_response(&mut dialer, &mut listener))
+                .await
+                .expect("dialer should receive the busy answer");
+        assert_eq!(received_id, limited_id);
+        assert_eq!(
+            received,
+            SyncResponse::Rejected {
+                reason: super::SyncRejectReason::Busy
+            }
+        );
     }
 
     #[tokio::test]

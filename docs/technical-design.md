@@ -750,8 +750,10 @@ identities' connections on that node only.
 Routing nodes and opted-in desktop contributors bound inbound connections: at
 most 128 pending and 1,024 established inbound connections, 16 established
 direct inbound connections per remote IP address, and 4 established
-connections per peer. Client nodes dial only the peers they need and keep no
-inbound bound.
+connections per peer. They also bound each peer's inbound join, invitation,
+and synchronization requests to a shared burst of 64 refilled at 8 per second,
+answering excess requests `busy`. Client nodes dial only the peers they need
+and keep no inbound bound.
 Load-tested quotas, metrics, and deployment
 packaging remain production gates.
 

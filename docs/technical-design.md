@@ -338,10 +338,13 @@ bearer record. It returns only non-secret invitation metadata. This proves that
 the owner currently recognizes the bearer. Revocation removes the protected
 bearer first and then its SQLite index while holding the shared storage lock,
 so authorization fails closed if either deletion is interrupted. It also stops
-the active provider and request-listener task. The current MVP issues only
-expiring reusable invitations; single-use consumption follows ADR-042, and the
-store already records a consumed single-use invitation in the admission
-transaction so a second admission through it persists nothing.
+the active provider and request-listener task. Single-use consumption follows
+ADR-042: the owner records a consumed single-use invitation in the admission
+transaction so a second admission through it persists nothing, then retires
+the invitation as for revocation (repeated on the next attempt if
+interrupted). A retired consumed bearer still reaches admission so only the
+consuming device's exact retry is answered from its cached response; it skips
+owner approval and every other device is answered `unauthorized`.
 An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
 with a valid profile proceeds through durable admission and receives a Welcome;
 temporary authorization, MLS, or storage failures return `busy`. These public
@@ -353,8 +356,8 @@ that response even after restart. A different KeyPackage for an already present
 device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
 lets a valid invitation grant access directly unless the group requires owner
-approval. Group creation rejects single-use and retained-history options until
-their enforcement paths exist.
+approval. Group creation rejects the retained-history option until its
+enforcement path exists; a single-use invitation default is accepted.
 Owner approval follows ADR-041: an authorized bearer whose device the owner has
 not approved yet is recorded as a bounded approval request and answered with
 the `awaiting approval` category (code 4), which the joiner treats like `busy`

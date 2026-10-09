@@ -260,7 +260,7 @@ impl GroupService {
             return Err("invalid_group_icon");
         }
         let history_policy = parse_history_policy(spec.history_policy)?;
-        if history_policy != HistoryPolicy::None || !spec.reusable_invitation {
+        if history_policy != HistoryPolicy::None {
             return Err("group_option_unsupported");
         }
         if !ALLOWED_INVITATION_LIFETIMES.contains(&spec.invitation_lifetime_seconds) {
@@ -613,6 +613,62 @@ impl GroupService {
         self.remove_invitations(&mut store, invitations)
     }
 
+    /// Reports whether the owner recorded the consumption of a single-use
+    /// invitation of this group (ADR-042).
+    pub fn single_use_invitation_consumed(
+        &self,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<bool, &'static str> {
+        Ok(self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?
+            .single_use_invitation_consumer(group_id, invitation_id)
+            .map_err(|_| "group_store_unavailable")?
+            .is_some())
+    }
+
+    /// Retires a single-use invitation after the owner recorded its
+    /// consumption: it is no longer advertised and its protected bearer
+    /// record and index are removed as for revocation, while the consumption
+    /// record stays (ADR-042). Does nothing for an unconsumed or already
+    /// retired invitation, so it is safe to repeat after an interruption.
+    pub fn retire_consumed_invitation(
+        &self,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<bool, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        if store
+            .single_use_invitation_consumer(group_id, invitation_id)
+            .map_err(|_| "group_store_unavailable")?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let invitations = store
+            .issued_invitations()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .filter(|invitation| {
+                invitation.group_id == group_id && invitation.invitation_id == invitation_id
+            })
+            .collect::<Vec<_>>();
+        if invitations.is_empty() {
+            return Ok(false);
+        }
+        self.remove_invitations(&mut store, invitations)?;
+        Ok(true)
+    }
+
     /// Revokes the invitations a member device requested from a locally owned
     /// group, after its invite permission is withdrawn or it is removed
     /// (ADR-036). Returns how many invitations were revoked.
@@ -718,12 +774,34 @@ impl GroupService {
             return Err(Unavailable);
         }
 
-        let indexed = store
+        let Some(indexed) = store
             .issued_invitations()
             .map_err(|_| Unavailable)?
             .into_iter()
             .find(|indexed| indexed.invitation_id == invitation.invitation_id())
-            .ok_or(Unauthorized)?;
+        else {
+            // A consumed single-use invitation is retired like a revoked one,
+            // but its group-signed bearer still reaches admission so the
+            // consuming device's exact retry is answered from its cached
+            // response; admission refuses every other device (ADR-042).
+            let consumed = !invitation.is_reusable()
+                && store
+                    .single_use_invitation_consumer(
+                        invitation.group_id(),
+                        invitation.invitation_id(),
+                    )
+                    .map_err(|_| Unavailable)?
+                    .is_some();
+            return if consumed {
+                Ok(AuthorizedJoinInvitation {
+                    invitation_id: invitation.invitation_id(),
+                    group_id: invitation.group_id(),
+                    reusable: false,
+                })
+            } else {
+                Err(Unauthorized)
+            };
+        };
         if indexed.group_id != invitation.group_id()
             || indexed.expires_at_unix != invitation.expires_at_unix()
             || indexed.expires_at_unix <= now_unix
@@ -1271,8 +1349,6 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
         authenticated_peer: PeerId,
     ) -> Result<JoinResponse, MemberAdmissionError> {
         let group_id = request.group_id();
-        self.groups
-            .admission_approval(request, authenticated_peer)?;
         // The signed reuse claim is authoritative (ADR-042); the invitation
         // was already authorized against the issued bearer record.
         let now_unix = unix_now().map_err(|_| MemberAdmissionError::Unavailable)?;
@@ -1282,6 +1358,19 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             return Err(MemberAdmissionError::Unauthorized);
         }
         let single_use_invitation = (!invitation.is_reusable()).then(|| invitation.invitation_id());
+        // A consumed invitation no longer asks for approval: admission only
+        // replays the consuming device's exact retry and refuses the rest.
+        let consumed = match single_use_invitation {
+            Some(invitation_id) => self
+                .groups
+                .single_use_invitation_consumed(group_id, invitation_id)
+                .map_err(|_| MemberAdmissionError::Unavailable)?,
+            None => false,
+        };
+        if !consumed {
+            self.groups
+                .admission_approval(request, authenticated_peer)?;
+        }
         let group = self
             .groups
             .list()
@@ -1289,7 +1378,7 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             .into_iter()
             .find(|group| group.group_id == group_id.to_string())
             .ok_or(MemberAdmissionError::Unavailable)?;
-        self.mls.admit_member_sharing_metadata(
+        let admission = self.mls.admit_member_sharing_metadata(
             group_id,
             owner_identity,
             authenticated_peer,
@@ -1297,7 +1386,15 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             single_use_invitation,
             &group.group_name,
             group.icon,
-        )
+        );
+        if let Some(invitation_id) = single_use_invitation {
+            // The admission is already committed; a failed retirement is
+            // repeated by the next join attempt through the same invitation.
+            let _ = self
+                .groups
+                .retire_consumed_invitation(group_id, invitation_id);
+        }
+        admission
     }
 }
 
@@ -1864,6 +1961,95 @@ mod tests {
             JoinRequestAuthorization::Authorized
         );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn consumed_single_use_invitation_is_retired_but_still_reaches_admission() {
+        use charp2p_core::{EventKind, EventSpec, SignedEvent};
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut single_use = spec("Project Atlas");
+        single_use.reusable_invitation = false;
+        let created = service.create(single_use).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let issued = service
+            .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", NOW)
+            .unwrap();
+        assert!(!issued.reusable);
+        let request = join_request(&issued.link, NOW);
+        let invitation_id = request_invitation_id(&request, NOW);
+        assert!(!service
+            .authorize_join_request_at(&request, NOW)
+            .unwrap()
+            .is_reusable());
+
+        // An unconsumed invitation is neither retired nor reported consumed.
+        assert!(!service
+            .retire_consumed_invitation(group_id, invitation_id)
+            .unwrap());
+        assert!(!service
+            .single_use_invitation_consumed(group_id, invitation_id)
+            .unwrap());
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+
+        let added = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id,
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: NOW * 1000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_join_admission(
+                &added,
+                b"snapshot",
+                DeviceIdentity::generate().peer_id(),
+                &[1; 32],
+                b"response",
+                Some(invitation_id),
+            )
+            .unwrap();
+        assert!(service
+            .single_use_invitation_consumed(group_id, invitation_id)
+            .unwrap());
+
+        assert!(service
+            .retire_consumed_invitation(group_id, invitation_id)
+            .unwrap());
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+        assert!(service
+            .invitation_secrets
+            .get_optional(invitation_id)
+            .unwrap()
+            .is_none());
+        // As for revocation, the owner stays reachable for the consumer's retry.
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 1);
+        assert!(!service
+            .retire_consumed_invitation(group_id, invitation_id)
+            .unwrap());
+        // The retired bearer still reaches admission, which answers only the
+        // consuming device's exact retry (ADR-042).
+        let authorized = service.authorize_join_request_at(&request, NOW).unwrap();
+        assert_eq!(authorized.invitation_id(), invitation_id);
+        assert!(!authorized.is_reusable());
+        assert_eq!(
+            service.authorize_join_request_at(
+                &request,
+                Invitation::decode(request.invitation(), NOW)
+                    .unwrap()
+                    .expires_at_unix()
+            ),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
     }
 
     #[test]
@@ -2469,7 +2655,7 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_history_and_invitation_options_are_rejected() {
+    fn unimplemented_history_option_is_rejected_and_single_use_is_accepted() {
         let service = service();
         let mut unsupported_history = spec("Design Crew");
         unsupported_history.history_policy = "allRetained";
@@ -2480,10 +2666,7 @@ mod tests {
 
         let mut single_use = spec("Design Crew");
         single_use.reusable_invitation = false;
-        assert!(matches!(
-            service.create(single_use),
-            Err("group_option_unsupported")
-        ));
+        assert!(!service.create(single_use).unwrap().reusable_invitation);
     }
 
     #[test]

@@ -3471,6 +3471,9 @@ function App() {
                 <h2>Set up this device</h2>
                 <p>Your identity stays on this device.</p>
               </header>
+              <p className="identity-warning">
+                There is no account server to recover it. Losing every authorized device and backup can permanently lose access.
+              </p>
 
               <label htmlFor="device-name">Device name</label>
               <input
@@ -3503,6 +3506,9 @@ function App() {
                 <h2>Protect your identity</h2>
                 <p>Save an encrypted recovery copy before joining a group.</p>
               </header>
+              <p className="identity-warning">
+                Without a recovery copy, losing this device can permanently lose access to your identity and groups.
+              </p>
               <div className="device-summary">
                 <BrandMark decorative />
                 <div>

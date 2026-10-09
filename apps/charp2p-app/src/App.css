@@ -97,6 +97,7 @@ button { cursor: pointer; }
 .danger-button:disabled { cursor: wait; opacity: .55; }
 .text-button { align-self: center; margin-top: 20px; padding: 12px 20px; border: 0; color: #536181; background: transparent; font-weight: 600; }
 
+.identity-warning { margin: -24px 0 32px; color: #8a5a12; font-size: 15px; line-height: 1.45; }
 .form-error { margin: -26px 0 24px; color: #a43143; font-size: 15px; font-weight: 600; }
 .loading-state { min-height: 290px; display: flex; align-items: center; justify-content: center; gap: 14px; color: #68748f; font-size: 18px; }
 .loading-state span { width: 24px; height: 24px; border: 3px solid #d9e0e9; border-top-color: #0ba69d; border-radius: 50%; animation: spin .8s linear infinite; }

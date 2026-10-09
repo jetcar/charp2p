@@ -91,12 +91,24 @@
 - [x] Group details (owned group): show the group's actual join mode (owner approval required or not) and invitation reuse default instead of a fixed "Valid invitation grants access".
 - [x] Routing node: per-peer inbound request-rate bound on serving nodes (technical-design node policy 'per-IP and per-peer ... bandwidth limits'; connection and relay byte bounds already exist).
 
+- [x] Welcome: warn on identity creation and the recovery-copy step that losing every authorized device and backup can permanently lose access (product page 1).
+- [ ] Conversation: show author device state per message (owner device, verified current member, removed or no longer a member, sequence conflict) from already-loaded members data (product page 5 'Author and device verification state').
+- [ ] Invitations: owner picks a shorter expiry per invitation (capped at the group lifetime) when creating it (product pages 3/8 'selected expiry', 'expire').
+- [ ] Several active invitations per group, part 1/2: owner issuance and member requests no longer refuse while another device's invitation is active; issued invitations record and expose the requesting device; revoke takes an invitation id.
+- [ ] Several active invitations per group, part 2/2: Invitations page lists every active invitation with who requested it and revokes each separately.
+- [ ] Signed group-wide delete, part 1/2: core `MessageDeleted` payload (target event, author-only), store tombstones applied like edits, pushes accepted by the owner.
+- [ ] Signed group-wide delete, part 2/2: "Delete for everyone" on own messages; conforming clients hide tombstoned content.
+- [ ] Synchronization summary carries the current membership state (e.g. MLS epoch / membership commit head) so peers detect stale or newer membership before pulling (technical-design Synchronization).
+- [ ] Join preview shows whether owner approval is needed: ADR and invitation version carrying the root-signed approval flag (product pages 4/8).
+- [ ] KeyEpochAdvanced: ADR and owner-committed MLS key refresh (technical-design event types; compromised-device future access).
+
 ## Needs human
 
 - [ ] Android emulator and physical-device validation of the arm64 build (implementation gate 1).
 - [ ] Manual UI testing of cold-start and running-instance deep links on Windows and Android.
 - [ ] Decide supported Windows and Android versions (implementation gate 6).
 - [ ] Choose the project licence, third-party licence notice process, and security contact to show on the Settings page.
+- [ ] Android background retry of pending invitations (WorkManager/foreground service) needs device validation.
 - [ ] Measure worst-case Welcome size to set the product group-size limit.
 
 ## Blocked
@@ -189,3 +201,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-09T06:35:45Z Single-use invitations 4/4: create_group_invitation takes an optional reusable flag overriding the group default (member invite requests keep the default); Invitations page offers Reusable/Single use (defaulting to the group option), and a single-use invitation that leaves the issued list before expiry (checked every 15 s) is shown as used; Create group offers 'single use by default'. Test: owner_overrides_group_reuse_default_per_invitation. fmt, clippy, workspace tests, npm build, src-tauri clippy/test pass (apt webkit2gtk installed).
 2026-10-09T07:29:12Z Owned group details join mode: re-derived backlog (gap: owner's group details always said 'Valid invitation grants access' even for approval-required or single-use groups). Group details now show 'Valid invitation, then owner approval' when approval is required and the reusable/single-use invitation default with the lifetime; queued per-peer request-rate bound on routing nodes. Frontend-only; fmt, clippy, workspace tests (207 passed), npm build pass.
 2026-10-09T09:32:54Z Routing node per-peer inbound request-rate bound: serving nodes share a per-peer token bucket (burst 64, 8/s) across join, invite and sync requests and answer excess `busy` before the application; bucket dropped when the peer's last connection closes; unit + two-node tests; technical-design updated. fmt/clippy/tests/npm build pass.
+2026-10-09T10:29:01Z Welcome device-loss warning: re-derived backlog (9 new gaps: per-message author device state, per-invitation expiry, several active invitations per group, MessageDeleted tombstones, membership state in sync summary, approval flag in invitations, KeyEpochAdvanced). Welcome steps 1 and 2 now state that losing every authorized device and backup can permanently lose access. Frontend-only; fmt, clippy, workspace tests (210 passed), npm build pass.

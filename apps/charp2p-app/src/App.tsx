@@ -162,6 +162,8 @@ const RETRYABLE_JOIN_ERRORS = new Set(["network_join_failed", "network_join_time
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
+// The composer shows its byte counter only once a draft reaches this share of the limit.
+const MESSAGE_SIZE_HINT_RATIO = 0.9;
 const EVIDENCE_EVENT_LIMIT = 64;
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -3270,6 +3272,45 @@ function App() {
     );
   }
 
+  function renderComposer(groupId: string, idPrefix: string, receipt: string | null) {
+    const overLimit = outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES;
+    const nearLimit = outgoingMessageBytes >= MESSAGE_TEXT_LIMIT_BYTES * MESSAGE_SIZE_HINT_RATIO;
+    const sizeId = `${idPrefix}-message-size`;
+    return (
+      <form className="message-composer" onSubmit={sendGroupMessage}>
+        {renderReplyDraft(groupId)}
+        <div className="message-composer-row">
+          <input
+            aria-describedby={nearLimit ? sizeId : undefined}
+            aria-label="Message"
+            autoComplete="off"
+            id={`${idPrefix}-outgoing-message`}
+            maxLength={16384}
+            onChange={(event) => setOutgoingMessage(event.target.value)}
+            placeholder="Write a message"
+            type="text"
+            value={outgoingMessage}
+          />
+          <button
+            aria-label={sendingMessage ? "Protecting message" : "Send message"}
+            className="message-send-button"
+            disabled={!outgoingMessage.trim() || overLimit || sendingMessage || !isTauri()}
+            title={sendingMessage ? "Protecting message…" : "Send"}
+            type="submit"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 12 20 4l-6 16-3-7-7-1Z" /></svg>
+          </button>
+        </div>
+        {nearLimit && (
+          <p className={`message-size ${overLimit ? "over-limit" : ""}`} id={sizeId}>
+            {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
+          </p>
+        )}
+        {receipt && <p className="message-receipt" role="status">{receipt}</p>}
+      </form>
+    );
+  }
+
   function renderReplyDraft(groupId: string) {
     if (replyingTo?.groupId !== groupId) return null;
     return (
@@ -4026,39 +4067,15 @@ function App() {
                 </>,
               )}
               {renderMessageTimeline(joinedGroup.groupId, joinedGroup, joinedGroup.inviterDeviceId)}
-              <form className="message-composer" onSubmit={sendGroupMessage}>
-                {renderReplyDraft(joinedGroup.groupId)}
-                <label htmlFor="joined-outgoing-message">Protected message</label>
-                <textarea
-                  aria-describedby="joined-message-size"
-                  id="joined-outgoing-message"
-                  maxLength={16384}
-                  onChange={(event) => setOutgoingMessage(event.target.value)}
-                  placeholder="Write a message for the group"
-                  rows={3}
-                  value={outgoingMessage}
-                />
-                <p
-                  className={`message-size ${outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES ? "over-limit" : ""}`}
-                  id="joined-message-size"
-                >
-                  {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
-                </p>
-                <button
-                  className="secondary-button"
-                  disabled={!outgoingMessage.trim() || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES || sendingMessage || !isTauri()}
-                  type="submit"
-                >
-                  {sendingMessage ? "Protecting message…" : "Protect and send"}
-                </button>
-                {createdMessage && (
-                  <p className="message-receipt" role="status">
-                    {(groupMessages.find(({ eventId }) => eventId === createdMessage.eventId)?.deliveryState ?? "local") !== "local"
-                      ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
-                      : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`}
-                  </p>
-                )}
-              </form>
+              {renderComposer(
+                joinedGroup.groupId,
+                "joined",
+                createdMessage && (
+                  (groupMessages.find(({ eventId }) => eventId === createdMessage.eventId)?.deliveryState ?? "local") !== "local"
+                  ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
+                  : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`
+                ),
+              )}
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>
               <button className="secondary-button" disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
@@ -4084,38 +4101,12 @@ function App() {
                 </>,
               )}
               {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
-              <form className="message-composer" onSubmit={sendGroupMessage}>
-                {renderReplyDraft(localGroup.groupId)}
-                <label htmlFor="outgoing-message">Protected message</label>
-                <textarea
-                  aria-describedby="owner-message-size"
-                  id="outgoing-message"
-                  maxLength={16384}
-                  onChange={(event) => setOutgoingMessage(event.target.value)}
-                  placeholder="Write a message for the group"
-                  rows={3}
-                  value={outgoingMessage}
-                />
-                <p
-                  className={`message-size ${outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES ? "over-limit" : ""}`}
-                  id="owner-message-size"
-                >
-                  {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
-                </p>
-                <button
-                  className="secondary-button"
-                  disabled={!outgoingMessage.trim() || outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES || sendingMessage || !isTauri()}
-                  type="submit"
-                >
-                  {sendingMessage ? "Protecting message…" : "Save encrypted message"}
-                </button>
-                {createdMessage && (
-                  <p className="message-receipt" role="status">
-                    ✓ Encrypted event {createdMessage.authorSequence} saved securely.
-                  </p>
-                )}
-              </form>
               {renderMessageTimeline(localGroup.groupId, null, profile?.peerId ?? "")}
+              {renderComposer(
+                localGroup.groupId,
+                "owner",
+                createdMessage && `✓ Encrypted event ${createdMessage.authorSequence} saved securely.`,
+              )}
               {issuedInvitation && (
                 <>
                   <label htmlFor="issued-invitation">Invitation link</label>

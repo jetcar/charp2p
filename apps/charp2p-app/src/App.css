@@ -183,13 +183,17 @@ button { cursor: pointer; }
 .member-block:disabled { cursor: wait; opacity: .65; }
 .status-chip.blocked-chip { color: #9e2838; background: #fff5f6; }
 .status-chip.conflict-chip { color: #8a4b00; background: #fff6e8; }
-.message-composer { display: grid; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #f5f8fb; }
-.message-composer textarea { width: 100%; min-height: 96px; margin: 10px 0 0; padding: 14px 16px; resize: vertical; border: 1px solid #cad5e2; border-radius: 11px; outline: none; color: #172044; background: white; line-height: 1.5; }
-.message-composer textarea:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); }
-.message-size { margin: 7px 2px 0; color: #68748f; font-size: 12px; text-align: right; }
+.message-composer { position: sticky; bottom: 0; z-index: 1; display: grid; gap: 8px; margin: 16px 0 0; padding: 12px 0 14px; border-top: 1px solid #dce4ec; background: white; }
+.message-composer-row { display: flex; align-items: center; gap: 10px; }
+.message-composer-row input { flex: 1; min-width: 0; height: 46px; padding: 0 18px; border: 1px solid #cad5e2; border-radius: 23px; outline: none; color: #172044; background: #f5f8fb; }
+.message-composer-row input:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); background: white; }
+.message-send-button { display: grid; flex: none; width: 46px; height: 46px; place-items: center; padding: 0; border: 0; border-radius: 50%; color: white; background: #10a89f; cursor: pointer; }
+.message-send-button:hover:not(:disabled) { background: #0b8f87; }
+.message-send-button:disabled { cursor: default; opacity: .45; }
+.message-send-button svg { width: 20px; height: 20px; fill: currentColor; }
+.message-size { margin: 0 4px; color: #68748f; font-size: 12px; text-align: right; }
 .message-size.over-limit { color: #a43143; font-weight: 700; }
-.message-composer .secondary-button { min-height: 58px; margin-top: 12px; font-size: 18px; }
-.message-receipt { margin: 14px 0 0; color: #087d75; font-size: 14px; font-weight: 700; text-align: center; }
+.message-receipt { margin: 0; color: #087d75; font-size: 14px; font-weight: 700; text-align: center; }
 .message-timeline { display: grid; gap: 12px; margin: 0 0 26px; padding: 20px; border: 1px solid #dce4ec; border-radius: 16px; background: #fff; }
 .message-timeline h3 { margin: 0 0 4px; color: #172044; font-size: 18px; }
 .message-bubble { width: fit-content; max-width: min(82%, 560px); padding: 10px 14px 8px; border: 1px solid #cdeee9; border-radius: 16px 16px 5px 16px; color: #172044; background: #e3f6f3; }

@@ -417,11 +417,14 @@ fn create_group_invitation(
 #[tauri::command]
 async fn revoke_group_invitation(
     group_id: String,
+    invitation_id: String,
     group_service: tauri::State<'_, Arc<GroupService>>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let invitation_id = groups::parse_invitation_id(&invitation_id)
+        .ok_or_else(|| "issued_invitation_not_found".to_owned())?;
     group_service
-        .revoke_invitation(group_id)
+        .revoke_invitation(group_id, invitation_id)
         .map_err(str::to_owned)?;
     Ok(())
 }

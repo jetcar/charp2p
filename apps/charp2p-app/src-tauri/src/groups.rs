@@ -34,6 +34,8 @@ const MAX_GROUP_NAME_BYTES: usize = 80;
 const MAX_GROUP_SECRET_BYTES: usize = 512;
 const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
 const MAX_OWNER_DISCOVERY_KEYS: usize = 64;
+/// Active invitations one owned group may hold at once (ADR-043).
+const MAX_ACTIVE_INVITATIONS_PER_GROUP: usize = 16;
 /// Upper bound on rendezvous keys advertised together for all owned groups.
 pub const MAX_ADVERTISED_DISCOVERY_KEYS: usize = 256;
 const ALLOWED_INVITATION_LIFETIMES: [u64; 4] = [86_400, 604_800, 1_209_600, 2_592_000];
@@ -79,6 +81,9 @@ pub struct IssuedInvitation {
     pub link: String,
     pub expires_at_unix: u64,
     pub reusable: bool,
+    /// Member device that asked the owner for this invitation (ADR-036), or
+    /// `None` when the owner created it.
+    pub requested_by: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,7 +432,7 @@ impl GroupService {
             address_hints,
             now_unix,
         )
-        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
+        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str(), None))
     }
 
     /// Answers a permitted member's invite request (ADR-036): the group must
@@ -589,11 +594,16 @@ impl GroupService {
         Ok(keys)
     }
 
-    /// Revokes the active invitation for one locally owned group.
+    /// Revokes one active invitation of a locally owned group; the group's
+    /// other invitations stay active (ADR-043).
     ///
     /// The protected bearer is removed before its index so any interrupted
     /// operation fails closed during authorization.
-    pub fn revoke_invitation(&self, group_id: PeerId) -> Result<(), &'static str> {
+    pub fn revoke_invitation(
+        &self,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<(), &'static str> {
         let _operation = self
             .operations
             .lock()
@@ -614,7 +624,9 @@ impl GroupService {
             .issued_invitations()
             .map_err(|_| "group_store_unavailable")?
             .into_iter()
-            .filter(|invitation| invitation.group_id == group_id)
+            .filter(|invitation| {
+                invitation.group_id == group_id && invitation.invitation_id == invitation_id
+            })
             .collect::<Vec<_>>();
         if invitations.is_empty() {
             return Err("issued_invitation_not_found");
@@ -1001,14 +1013,15 @@ impl GroupService {
             &[],
             now_unix,
         )
-        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
+        .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str(), None))
     }
 
     /// Issues an invitation, recording the member device that requested it
     /// so withdrawing that member's permission can revoke it (ADR-036). A
     /// member request may only shorten the group's invitation lifetime, and
     /// a repeated request from the same member returns its still-active
-    /// invitation instead of failing. Member requests always use the group's
+    /// invitation instead of issuing another. Other active invitations of the
+    /// group stay valid, up to a per-group bound (ADR-043). Member requests always use the group's
     /// default reuse policy; only the owner may override it or select a
     /// shorter allowed lifetime. Address hints are dropped when they
     /// would make the invitation invalid or too large to protect, since they
@@ -1048,6 +1061,7 @@ impl GroupService {
         if lifetime_seconds.is_some_and(|lifetime| lifetime > group.invitation_lifetime_seconds) {
             return Err("invalid_invitation_lifetime");
         }
+        let mut active = 0;
         for existing in store
             .issued_invitations()
             .map_err(|_| "group_store_unavailable")?
@@ -1080,12 +1094,16 @@ impl GroupService {
                     );
                     return Ok((invitation, encoded));
                 }
-                return Err("invitation_already_exists");
+                active += 1;
+                continue;
             }
             self.invitation_secrets.remove(existing.invitation_id)?;
             store
                 .remove_issued_invitation(existing.invitation_id)
                 .map_err(|_| "group_store_unavailable")?;
+        }
+        if active >= MAX_ACTIVE_INVITATIONS_PER_GROUP {
+            return Err("invitation_limit_reached");
         }
         if store
             .owner_discovery_keys(group_id)
@@ -1257,7 +1275,11 @@ impl GroupService {
                     .map_err(|_| "group_store_unavailable")?;
                 continue;
             }
-            invitations.push(issued_invitation(&invitation, encoded));
+            invitations.push(issued_invitation(
+                &invitation,
+                encoded,
+                indexed.requested_by,
+            ));
         }
         Ok(invitations)
     }
@@ -1529,13 +1551,35 @@ fn decode_issued_invitation(
     Ok((invitation, encoded))
 }
 
-fn issued_invitation(invitation: &Invitation, encoded: &str) -> IssuedInvitation {
+/// Parses an invitation identifier as shown to the interface: exactly the
+/// lowercase hexadecimal form produced for `IssuedInvitation`.
+pub(crate) fn parse_invitation_id(text: &str) -> Option<InvitationId> {
+    let mut bytes = [0u8; 16];
+    if text.len() != bytes.len() * 2
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(InvitationId::from_bytes(bytes))
+}
+
+fn issued_invitation(
+    invitation: &Invitation,
+    encoded: &str,
+    requested_by: Option<PeerId>,
+) -> IssuedInvitation {
     IssuedInvitation {
         invitation_id: encode_identifier(invitation.invitation_id()),
         group_id: invitation.group_id().to_string(),
         link: format!("charp2p://join/{encoded}"),
         expires_at_unix: invitation.expires_at_unix(),
         reusable: invitation.is_reusable(),
+        requested_by: requested_by.map(|device| device.to_string()),
     }
 }
 
@@ -1560,7 +1604,7 @@ pub(crate) fn requested_invitation(
     if invitation.group_id() != group_id || invitation.inviter_device_id() != owner_device_id {
         return Err("invite_response_invalid");
     }
-    Ok(issued_invitation(&invitation, encoded))
+    Ok(issued_invitation(&invitation, encoded, None))
 }
 
 /// Invitations the owner issued at this member device's request, kept in
@@ -1650,9 +1694,10 @@ mod tests {
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
     use super::{
-        issued_invitation, requested_invitation, ApprovalDecision, ApprovalRequest,
-        CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
-        JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore, ReceivedInvitationCache,
+        encode_identifier, issued_invitation, parse_invitation_id, requested_invitation,
+        ApprovalDecision, ApprovalRequest, CreateGroupSpec, GroupSecretStore, GroupService,
+        IssuedInvitationSecretStore, JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
+        ReceivedInvitationCache, MAX_ACTIVE_INVITATIONS_PER_GROUP,
     };
     use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
@@ -1806,6 +1851,22 @@ mod tests {
             .invitation_id()
     }
 
+    fn revoke_group_invitations(service: &GroupService, group_id: PeerId) {
+        let invitation_ids = service
+            .metadata
+            .lock()
+            .unwrap()
+            .issued_invitations()
+            .unwrap()
+            .into_iter()
+            .filter(|invitation| invitation.group_id == group_id)
+            .map(|invitation| invitation.invitation_id)
+            .collect::<Vec<_>>();
+        for invitation_id in invitation_ids {
+            service.revoke_invitation(group_id, invitation_id).unwrap();
+        }
+    }
+
     #[test]
     fn created_group_restores_with_the_same_protected_root() {
         let service = service();
@@ -1838,7 +1899,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hinted.address_hints(), std::slice::from_ref(&hint));
-        service.revoke_invitation(group_id).unwrap();
+        revoke_group_invitations(&service, group_id);
 
         // A hint ending in a peer ID is invalid, so the invitation is issued
         // without hints rather than failing.
@@ -1891,7 +1952,7 @@ mod tests {
         assert_eq!(advertised.len(), all_keys.len());
         assert!(all_keys.iter().all(|key| advertised.contains(key)));
 
-        service.revoke_invitation(first_id).unwrap();
+        revoke_group_invitations(&service, first_id);
         let remaining = service.issued_invitations_at(NOW).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].invitation_id, second_invitation.invitation_id);
@@ -1956,16 +2017,8 @@ mod tests {
         assert_eq!(restored[0].group_id, issued.group_id);
         assert_eq!(restored[0].expires_at_unix, issued.expires_at_unix);
         assert_eq!(restored[0].reusable, issued.reusable);
+        assert_eq!(restored[0].requested_by, None);
         assert!(Invitation::decode_input(&restored[0].link, NOW).is_ok());
-        assert!(matches!(
-            service.issue_invitation_at(
-                group_id,
-                DeviceIdentity::generate().peer_id(),
-                "Maya's PC",
-                NOW + 1
-            ),
-            Err("invitation_already_exists")
-        ));
 
         assert!(service
             .issued_invitations_at(NOW + 604_800)
@@ -1978,6 +2031,101 @@ mod tests {
             .issued_invitations()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn group_keeps_several_active_invitations_and_revokes_each_separately() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+        let requester = DeviceIdentity::generate().peer_id();
+
+        let first = service
+            .issue_invitation_at(group_id, owner, "Maya's PC", NOW)
+            .unwrap();
+        let (requested, _) = service
+            .issue_requested_invitation_at(
+                group_id,
+                owner,
+                "Maya's PC",
+                Some((requester, 86_400)),
+                None,
+                None,
+                &[],
+                NOW,
+            )
+            .unwrap();
+        let second = service
+            .issue_invitation_at(group_id, owner, "Maya's PC", NOW + 1)
+            .unwrap();
+        assert_ne!(first.invitation_id, second.invitation_id);
+
+        let listed = service.issued_invitations_at(NOW + 1).unwrap();
+        assert_eq!(listed.len(), 3);
+        let requested_id = encode_identifier(requested.invitation_id());
+        for invitation in &listed {
+            let expected =
+                (invitation.invitation_id == requested_id).then(|| requester.to_string());
+            assert_eq!(invitation.requested_by, expected);
+        }
+        let first_request = join_request(&first.link, NOW + 1);
+        let second_request = join_request(&second.link, NOW + 1);
+        assert!(service
+            .authorize_join_request_at(&first_request, NOW + 1)
+            .is_ok());
+        assert!(service
+            .authorize_join_request_at(&second_request, NOW + 1)
+            .is_ok());
+
+        let first_id = parse_invitation_id(&first.invitation_id).unwrap();
+        service.revoke_invitation(group_id, first_id).unwrap();
+        assert_eq!(
+            service.authorize_join_request_at(&first_request, NOW + 1),
+            Err(JoinInvitationAuthorizationError::Unauthorized)
+        );
+        assert!(service
+            .authorize_join_request_at(&second_request, NOW + 1)
+            .is_ok());
+        assert_eq!(service.issued_invitations_at(NOW + 1).unwrap().len(), 2);
+        assert_eq!(
+            service.revoke_invitation(DeviceIdentity::generate().peer_id(), first_id),
+            Err("group_not_found")
+        );
+
+        for offset in 2..MAX_ACTIVE_INVITATIONS_PER_GROUP as u64 {
+            service
+                .issue_invitation_at(group_id, owner, "Maya's PC", NOW + offset)
+                .unwrap();
+        }
+        assert!(matches!(
+            service.issue_invitation_at(group_id, owner, "Maya's PC", NOW + 100),
+            Err("invitation_limit_reached")
+        ));
+        // The member's repeated request still returns its active invitation.
+        let (repeated, _) = service
+            .issue_requested_invitation_at(
+                group_id,
+                owner,
+                "Maya's PC",
+                Some((requester, 86_400)),
+                None,
+                None,
+                &[],
+                NOW + 100,
+            )
+            .unwrap();
+        assert_eq!(repeated.invitation_id(), requested.invitation_id());
+    }
+
+    #[test]
+    fn invitation_ids_parse_only_in_their_displayed_form() {
+        let id = InvitationId::from_bytes([0xab; 16]);
+        assert_eq!(parse_invitation_id(&encode_identifier(id)), Some(id));
+        assert_eq!(parse_invitation_id(&"AB".repeat(16)), None);
+        assert_eq!(parse_invitation_id(&"ab".repeat(15)), None);
+        assert_eq!(parse_invitation_id(&"gg".repeat(16)), None);
     }
 
     #[test]
@@ -2057,7 +2205,7 @@ mod tests {
             service.issued_invitations_at(NOW).unwrap()[0].expires_at_unix,
             NOW + 86_400
         );
-        service.revoke_invitation(group_id).unwrap();
+        revoke_group_invitations(&service, group_id);
         assert_eq!(issue(None), Ok(NOW + 604_800));
     }
 
@@ -2080,7 +2228,7 @@ mod tests {
             .is_reusable());
         assert!(!service.issued_invitations_at(NOW).unwrap()[0].reusable);
 
-        service.revoke_invitation(group_id).unwrap();
+        revoke_group_invitations(&service, group_id);
         let mut single_use_group = spec("Design Crew");
         single_use_group.reusable_invitation = false;
         let single_use_group = service.create(single_use_group).unwrap();
@@ -2091,7 +2239,7 @@ mod tests {
                 .unwrap()
                 .reusable
         );
-        service.revoke_invitation(single_use_group_id).unwrap();
+        revoke_group_invitations(&service, single_use_group_id);
         assert!(
             service
                 .issue_reuse_invitation_at(single_use_group_id, owner, "Maya's PC", Some(true), NOW)
@@ -2409,7 +2557,8 @@ mod tests {
         assert_eq!(invitation.expires_at_unix(), NOW + 86_400);
         assert!(invitation.is_reusable());
 
-        // A lost response can be retried; another member must wait.
+        // A lost response can be retried; another member gets its own
+        // invitation while the first stays active.
         let repeated = answer(member, &request, Ok(true));
         assert_eq!(
             Invitation::decode(repeated.invitation().unwrap(), NOW)
@@ -2417,10 +2566,14 @@ mod tests {
                 .invitation_id(),
             invitation.invitation_id()
         );
-        assert_eq!(
-            answer(other, &request, Ok(true)).rejection(),
-            Some(InviteRejectReason::Busy)
+        let other_issued = answer(other, &request, Ok(true));
+        assert_ne!(
+            Invitation::decode(other_issued.invitation().unwrap(), NOW)
+                .unwrap()
+                .invitation_id(),
+            invitation.invitation_id()
         );
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 2);
 
         let join = JoinRequest::from_invitation(&invitation, vec![1]).unwrap();
         assert!(service.authorize_join_request_at(&join, NOW).is_ok());
@@ -2526,7 +2679,9 @@ mod tests {
                 &[],
                 NOW,
             )
-            .map(|(invitation, encoded)| issued_invitation(&invitation, encoded.as_str()))
+            .map(|(invitation, encoded)| {
+                issued_invitation(&invitation, encoded.as_str(), Some(requester))
+            })
             .unwrap();
         let request = join_request(&issued.link, NOW);
         assert!(service.authorize_join_request_at(&request, NOW).is_ok());
@@ -2586,7 +2741,7 @@ mod tests {
             vec![expected_discovery_key]
         );
 
-        service.revoke_invitation(group_id).unwrap();
+        service.revoke_invitation(group_id, invitation_id).unwrap();
 
         assert_eq!(
             service.authorize_join_request_at(&request, NOW),
@@ -2603,7 +2758,7 @@ mod tests {
             vec![expected_discovery_key]
         );
         assert_eq!(
-            service.revoke_invitation(group_id),
+            service.revoke_invitation(group_id, invitation_id),
             Err("issued_invitation_not_found")
         );
     }

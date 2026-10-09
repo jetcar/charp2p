@@ -42,6 +42,7 @@ type IssuedInvitation = {
   link: string;
   expiresAtUnix: number;
   reusable: boolean;
+  requestedBy: string | null;
 };
 type PeerSearchResult = {
   status: "bootstrapRequired" | "peerReachable" | "peersFound" | "noPeers" | "unavailable";
@@ -181,7 +182,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   group_store_unavailable: "The group could not be saved on this device.",
   group_not_found: "This local group is no longer available.",
   invitation_creation_failed: "The invitation could not be created.",
-  invitation_already_exists: "This group already has an active invitation.",
+  invitation_limit_reached: "This group already has the maximum number of active invitations. Revoke one first.",
   issued_invitation_record_invalid: "A saved group invitation is damaged.",
   issued_invitation_not_found: "Create an invitation before advertising this group.",
   issued_invitation_store_unavailable: "The invitation could not be saved securely.",
@@ -3432,9 +3433,9 @@ function App() {
     setError("");
     setRevokingInvitation(true);
     try {
-      const groupId = localGroup.groupId;
-      await invoke("revoke_group_invitation", { groupId });
-      setIssuedInvitations((current) => current.filter((invitation) => invitation.groupId !== groupId));
+      const { groupId, invitationId } = issuedInvitation;
+      await invoke("revoke_group_invitation", { groupId, invitationId });
+      setIssuedInvitations((current) => current.filter((invitation) => invitation.invitationId !== invitationId));
       setInvitationCopied(false);
       setAdvertisement(null);
       setAdvertisementError("");

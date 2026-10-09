@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted; invitation revocation is superseded by ADR-021.
+Accepted; invitation revocation is superseded by ADR-021 and the one-active-invitation
+rule by ADR-043.
 
 ## Date
 

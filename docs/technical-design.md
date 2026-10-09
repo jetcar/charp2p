@@ -338,7 +338,10 @@ bearer record. It returns only non-secret invitation metadata. This proves that
 the owner currently recognizes the bearer. Revocation removes the protected
 bearer first and then its SQLite index while holding the shared storage lock,
 so authorization fails closed if either deletion is interrupted. It also stops
-the active provider and request-listener task. Single-use consumption follows
+the active provider and request-listener task. Following ADR-043, a group holds
+up to 16 active invitations, revocation names one invitation and leaves the
+others active, and the owner's issued list shows the member device that
+requested each member invitation. Single-use consumption follows
 ADR-042: the owner records a consumed single-use invitation in the admission
 transaction so a second admission through it persists nothing, then retires
 the invitation as for revocation (repeated on the next attempt if

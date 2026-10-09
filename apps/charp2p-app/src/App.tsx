@@ -697,6 +697,7 @@ function MembersView({
   onChangeIcon,
   onLeave,
   leaving,
+  onInvite,
   onClose,
 }: {
   groupName: string;
@@ -728,6 +729,7 @@ function MembersView({
   onChangeIcon: (icon: number) => Promise<void>;
   onLeave: (() => void) | null;
   leaving: boolean;
+  onInvite: (() => void) | null;
   onClose: () => void;
 }) {
   const [renameInput, setRenameInput] = useState(groupName);
@@ -764,6 +766,27 @@ function MembersView({
     }
   }
 
+  const [search, setSearch] = useState("");
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [copiedDeviceId, setCopiedDeviceId] = useState("");
+  const [copyError, setCopyError] = useState("");
+
+  async function copyFingerprint(deviceId: string) {
+    setCopyError("");
+    try {
+      await navigator.clipboard.writeText(deviceId);
+      setCopiedDeviceId(deviceId);
+    } catch {
+      setCopyError("The device fingerprint could not be copied.");
+    }
+  }
+
+  function memberName(deviceId: string) {
+    if (deviceId === profile?.peerId) return `${profile?.deviceName ?? "This device"} (You)`;
+    if (deviceId === ownerDeviceId) return ownerName;
+    return `Member ${shortPeerId(deviceId)}`;
+  }
+
   const ordered = [...members].sort((left, right) => {
     if (left.deviceId === right.deviceId) return 0;
     if (left.deviceId === ownerDeviceId) return -1;
@@ -772,127 +795,172 @@ function MembersView({
     if (right.deviceId === profile?.peerId) return 1;
     return left.deviceId.localeCompare(right.deviceId);
   });
+  const query = search.trim().toLowerCase();
+  const visible = query
+    ? ordered.filter((member) =>
+      member.deviceId.toLowerCase().includes(query) || memberName(member.deviceId).toLowerCase().includes(query))
+    : ordered;
+  // A removed or departed device closes its details pane on the next refresh.
+  const selected = members.find((member) => member.deviceId === selectedDeviceId) ?? null;
+  const localMayInvite = Boolean(joinedGroupId && profile && invitePermittedDeviceIds.includes(profile.peerId));
+  const inviteAction = onInvite
+    ?? (localMayInvite
+      ? () => document.getElementById("member-invitation-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })
+      : null);
+
+  function renderMemberDetails(member: GroupMemberDevice) {
+    const isOwner = member.deviceId === ownerDeviceId;
+    const isLocal = member.deviceId === profile?.peerId;
+    const isBlocked = blockedDeviceIds.includes(member.deviceId);
+    const mayInvite = invitePermittedDeviceIds.includes(member.deviceId);
+    const conflict = sequenceConflicts[member.deviceId];
+    return (
+      <aside className="member-details-pane" aria-labelledby="member-details-title">
+        <header>
+          <h2 id="member-details-title">Member details</h2>
+          <button aria-label="Close member details" className="details-close" onClick={() => setSelectedDeviceId(null)} type="button">×</button>
+        </header>
+        <div className="member-details-avatar" aria-hidden="true">{isOwner ? "♛" : "●"}</div>
+        <h3 className="details-name">{memberName(member.deviceId)}</h3>
+        <p className="details-subtitle">{isOwner ? "Owner device" : "Member device"}{isLocal ? " · This device" : ""}</p>
+        <span className="details-label">Peer fingerprint</span>
+        <div className="details-fingerprint">
+          <code title={member.deviceId}>{shortPeerId(member.deviceId)}</code>
+          <button
+            aria-label={copiedDeviceId === member.deviceId ? "Device fingerprint copied" : "Copy device fingerprint"}
+            onClick={() => void copyFingerprint(member.deviceId)}
+            title={copiedDeviceId === member.deviceId ? "Copied" : "Copy device fingerprint"}
+            type="button"
+          >{copiedDeviceId === member.deviceId ? "✓" : "⧉"}</button>
+        </div>
+        <span className="details-label">Role</span>
+        <p className="member-details-value">
+          {isOwner ? "Owner · admits and removes devices" : mayInvite ? "Member · may invite" : "Member"}
+        </p>
+        <span className="details-label">Last signed activity</span>
+        <p className="member-details-value">{signedActivityDescription(memberActivity[member.deviceId])}</p>
+        {conflict && <p className="member-conflict" role="alert">{sequenceConflictDescription(conflict)}</p>}
+        <div className="member-details-actions">
+          {!isLocal && (
+            <button
+              className="member-block"
+              disabled={Boolean(blockingDeviceId)}
+              onClick={() => onToggleBlock(member.deviceId, !isBlocked)}
+              type="button"
+            >
+              {blockingDeviceId === member.deviceId ? "Saving…" : isBlocked ? "Unblock" : "Block on this device"}
+            </button>
+          )}
+          {canManageMembers && !isOwner && (
+            <button
+              className="member-block"
+              disabled={Boolean(changingInvitePermissionId)}
+              onClick={() => onToggleInvitePermission(member.deviceId, !mayInvite)}
+              type="button"
+            >
+              {changingInvitePermissionId === member.deviceId
+                ? "Saving…"
+                : mayInvite ? "Withdraw invite permission" : "Allow inviting"}
+            </button>
+          )}
+        </div>
+        {!isLocal && (
+          <p className="preview-note">Blocking hides this device's messages only on this device. Its signed events are kept and other members still see its messages.</p>
+        )}
+        {canManageMembers && !isOwner && (
+          <div className="member-details-danger">
+            <button
+              className="member-remove-wide"
+              disabled={Boolean(removingDeviceId)}
+              onClick={() => onRemove(member.deviceId)}
+              type="button"
+            >
+              {removingDeviceId === member.deviceId ? "Removing…" : "Remove from group"}
+            </button>
+            <p className="preview-note">Removal protects future messages. Previously received messages cannot be erased.</p>
+          </div>
+        )}
+      </aside>
+    );
+  }
 
   return (
+    <div className={`members-page${selected ? " with-member-details" : ""}`}>
     <section className="setup-form members-card">
-      <header className="members-header">
-        <div>
-          <p className="eyebrow">{groupName}</p>
+      <header className="members-page-header">
+        <div className="members-page-icon" aria-hidden="true">👥</div>
+        <div className="members-page-title">
           <h2>Members &amp; devices</h2>
-          <p>{members.length > 0 ? `${members.length} verified ${members.length === 1 ? "device" : "devices"}` : "Loading verified membership…"}</p>
+          <p>
+            {groupName} · {members.length > 0
+              ? `${members.length} verified ${members.length === 1 ? "device" : "devices"}`
+              : "Loading verified membership…"}
+          </p>
         </div>
-        <button aria-label="Close members and devices" className="member-close" onClick={onClose} type="button">×</button>
+        <input
+          aria-label="Search members"
+          className="members-search"
+          onChange={(event) => setSearch(event.currentTarget.value)}
+          placeholder="Search members…"
+          type="search"
+          value={search}
+        />
+        {inviteAction && (
+          <button className="members-invite" onClick={inviteAction} type="button">＋ Invite member</button>
+        )}
+        <button aria-label="Close members and devices" className="details-close" onClick={onClose} type="button">×</button>
       </header>
-      {canManageMembers && (
-        <form className="rename-group-form" onSubmit={submitRename}>
-          <label htmlFor="rename-group">Group name</label>
-          <div className="rename-group-row">
-            <input
-              id="rename-group"
-              maxLength={80}
-              onChange={(event) => setRenameInput(event.currentTarget.value)}
-              value={renameInput}
-            />
-            <button
-              className="secondary-button"
-              disabled={renaming || !renameInput.trim() || renameInput.trim() === groupName}
-              type="submit"
-            >
-              {renaming ? "Saving…" : "Rename"}
-            </button>
-          </div>
-          <p className="preview-note">The new name is signed by this owner device and reaches members when they synchronize.</p>
-          {renameError && <p className="form-error preview-error" role="alert">{renameError}</p>}
-        </form>
-      )}
-      {canManageMembers && (
-        <fieldset className="icon-picker group-icon-change">
-          <legend>Group icon</legend>
-          <div>
-            {GROUP_ICONS.map((icon, index) => (
-              <button
-                aria-label={`Group icon ${index + 1}`}
-                aria-pressed={groupIcon === index}
-                className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
-                disabled={changingIcon !== null}
-                key={icon}
-                onClick={() => void changeIcon(index)}
-                type="button"
-              >{icon}</button>
-            ))}
-          </div>
-          <p className="preview-note">The icon is signed with the group name and reaches members when they synchronize.</p>
-          {iconError && <p className="form-error preview-error" role="alert">{iconError}</p>}
-        </fieldset>
-      )}
-      <p className="preview-note">Each membership belongs to one cryptographic device identity.</p>
+      <p className="preview-note">Each membership belongs to one cryptographic device identity. Device names other than this device's and the owner's are not known, so members are shown by fingerprint.</p>
       <div className="member-list" role="list">
-        {ordered.map((member) => {
+        {visible.length === 0 && members.length > 0 && <p className="preview-note">No member device matches “{search.trim()}”.</p>}
+        {visible.map((member) => {
           const isOwner = member.deviceId === ownerDeviceId;
           const isLocal = member.deviceId === profile?.peerId;
           const isBlocked = blockedDeviceIds.includes(member.deviceId);
           const mayInvite = invitePermittedDeviceIds.includes(member.deviceId);
-          const name = isLocal
-            ? `${profile?.deviceName ?? "This device"} (You)`
-            : isOwner
-              ? ownerName
-              : `Member ${shortPeerId(member.deviceId)}`;
+          const isSelected = member.deviceId === selected?.deviceId;
           return (
-            <article className={`member-row ${isLocal ? "local-member" : ""}`} key={member.deviceId} role="listitem">
+            <article
+              className={`member-card${isLocal ? " local-member" : ""}${isSelected ? " selected" : ""}`}
+              key={member.deviceId}
+              role="listitem"
+            >
               <div className="member-avatar" aria-hidden="true">{isOwner ? "♛" : "●"}</div>
               <div className="member-identity">
-                <strong>{name}</strong>
-                <span>{isOwner ? "Owner device" : "Member device"}</span>
+                <strong>
+                  {memberName(member.deviceId)}
+                  {isOwner && <span className="member-crown" aria-hidden="true"> ♛</span>}
+                </strong>
+                <span>{isOwner ? "Owner" : "Member"} · {signedActivityDescription(memberActivity[member.deviceId])}</span>
+                <div className="member-badges">
+                  <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
+                  {isBlocked && <span className="status-chip blocked-chip">Blocked here</span>}
+                  {mayInvite && <span className="status-chip">May invite</span>}
+                  {sequenceConflicts[member.deviceId] && <span className="status-chip conflict-chip">Conflicting events</span>}
+                </div>
+              </div>
+              <div className="member-fingerprint">
+                <span>Fingerprint</span>
                 <code title={member.deviceId}>{shortPeerId(member.deviceId)}</code>
-                <span className="member-activity">{signedActivityDescription(memberActivity[member.deviceId])}</span>
-                {sequenceConflicts[member.deviceId] && (
-                  <span className="member-conflict" role="alert">
-                    {sequenceConflictDescription(sequenceConflicts[member.deviceId])}
-                  </span>
-                )}
               </div>
-              <div className="member-actions">
-                <span className="status-chip">✓ {isLocal ? "This device" : "Verified"}</span>
-                {isBlocked && <span className="status-chip blocked-chip">Blocked here</span>}
-                {mayInvite && <span className="status-chip">May invite</span>}
-                {sequenceConflicts[member.deviceId] && <span className="status-chip conflict-chip">Conflicting events</span>}
-                {!isLocal && (
-                  <button
-                    className="member-block"
-                    disabled={Boolean(blockingDeviceId)}
-                    onClick={() => onToggleBlock(member.deviceId, !isBlocked)}
-                    type="button"
-                  >
-                    {blockingDeviceId === member.deviceId ? "Saving…" : isBlocked ? "Unblock" : "Block on this device"}
-                  </button>
-                )}
-                {canManageMembers && !isOwner && (
-                  <button
-                    className="member-block"
-                    disabled={Boolean(changingInvitePermissionId)}
-                    onClick={() => onToggleInvitePermission(member.deviceId, !mayInvite)}
-                    type="button"
-                  >
-                    {changingInvitePermissionId === member.deviceId
-                      ? "Saving…"
-                      : mayInvite ? "Withdraw invite permission" : "Allow inviting"}
-                  </button>
-                )}
-                {canManageMembers && !isOwner && (
-                  <button
-                    className="member-remove"
-                    disabled={Boolean(removingDeviceId)}
-                    onClick={() => onRemove(member.deviceId)}
-                    type="button"
-                  >
-                    {removingDeviceId === member.deviceId ? "Removing…" : "Remove device"}
-                  </button>
-                )}
-              </div>
+              <button
+                aria-label={copiedDeviceId === member.deviceId ? "Device fingerprint copied" : `Copy fingerprint of ${memberName(member.deviceId)}`}
+                className="member-copy"
+                onClick={() => void copyFingerprint(member.deviceId)}
+                type="button"
+              >{copiedDeviceId === member.deviceId ? "✓" : "⧉"}</button>
+              <button
+                aria-expanded={isSelected}
+                aria-label={`${isSelected ? "Hide" : "Show"} details for ${memberName(member.deviceId)}`}
+                className="member-open"
+                onClick={() => setSelectedDeviceId(isSelected ? null : member.deviceId)}
+                type="button"
+              >{isSelected ? "‹" : "›"}</button>
             </article>
           );
         })}
       </div>
+      {copyError && <p className="form-error preview-error" role="alert">{copyError}</p>}
       {canManageMembers && approvalRequests.length > 0 && (
         <div className="removed-devices">
           <h3>Join requests</h3>
@@ -972,13 +1040,56 @@ function MembersView({
         </div>
       )}
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
-      {joinedGroupId && profile && invitePermittedDeviceIds.includes(profile.peerId) && (
-        <MemberInvitationPanel groupId={joinedGroupId} groupName={groupName} />
+      {localMayInvite && joinedGroupId && (
+        <div id="member-invitation-panel">
+          <MemberInvitationPanel groupId={joinedGroupId} groupName={groupName} />
+        </div>
+      )}
+      {canManageMembers && (
+        <div className="members-settings">
+          <h3>Group settings</h3>
+          <form className="rename-group-form" onSubmit={submitRename}>
+            <label htmlFor="rename-group">Group name</label>
+            <div className="rename-group-row">
+              <input
+                id="rename-group"
+                maxLength={80}
+                onChange={(event) => setRenameInput(event.currentTarget.value)}
+                value={renameInput}
+              />
+              <button
+                className="secondary-button"
+                disabled={renaming || !renameInput.trim() || renameInput.trim() === groupName}
+                type="submit"
+              >
+                {renaming ? "Saving…" : "Rename"}
+              </button>
+            </div>
+            <p className="preview-note">The new name is signed by this owner device and reaches members when they synchronize.</p>
+            {renameError && <p className="form-error preview-error" role="alert">{renameError}</p>}
+          </form>
+          <fieldset className="icon-picker group-icon-change">
+            <legend>Group icon</legend>
+            <div>
+              {GROUP_ICONS.map((icon, index) => (
+                <button
+                  aria-label={`Group icon ${index + 1}`}
+                  aria-pressed={groupIcon === index}
+                  className={groupIcon === index ? `selected icon-${index}` : `icon-${index}`}
+                  disabled={changingIcon !== null}
+                  key={icon}
+                  onClick={() => void changeIcon(index)}
+                  type="button"
+                >{icon}</button>
+              ))}
+            </div>
+            <p className="preview-note">The icon is signed with the group name and reaches members when they synchronize.</p>
+            {iconError && <p className="form-error preview-error" role="alert">{iconError}</p>}
+          </fieldset>
+        </div>
       )}
       <p className="preview-note">Activity times are the latest signed event this device holds from each member, as claimed by that member. They do not show whether a device is online.</p>
-      <p className="preview-note">Blocking hides a device's messages only on this device. Its signed events are kept, it stays a group member, and other members still see its messages.</p>
       {canManageMembers && <p className="preview-note">A device allowed to invite can ask this owner device for an invitation to share while this device is reachable. This device still admits every join request. Withdrawing the permission, or removing the device, revokes the invitations it requested.</p>}
-      {canManageMembers && <p className="preview-note">Removing a device blocks future group messages and invitation reuse. Messages already saved on that device cannot be erased.</p>}
       {onLeave && (
         <div className="leave-group">
           <button className="member-remove" disabled={leaving} onClick={onLeave} type="button">
@@ -989,6 +1100,8 @@ function MembersView({
       )}
       <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
     </section>
+    {selected && renderMemberDetails(selected)}
+    </div>
   );
 }
 
@@ -3448,6 +3561,16 @@ function App() {
     }
   }
 
+  // The owner's invitation form lives under the conversation, so leave the
+  // Members page first and scroll once the conversation has rendered.
+  function openOwnerInvitationsFromMembers() {
+    setShowMembers(false);
+    window.setTimeout(() => {
+      document.getElementById("owner-invitations")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("invitation-expiry")?.focus({ preventScroll: true });
+    }, 0);
+  }
+
   function openGroupInvitations() {
     if (localGroup) {
       if (!window.matchMedia?.("(min-width: 1200px)").matches) setShowGroupInfo(false);
@@ -4213,6 +4336,7 @@ function App() {
               onChangeIcon={changeLocalGroupIcon}
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}
+              onInvite={localGroup ? openOwnerInvitationsFromMembers : null}
               onClose={() => setShowMembers(false)}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}

@@ -366,3 +366,20 @@ button { cursor: pointer; }
 .setup-form .contribution-option { display: flex; align-items: center; gap: 10px; font-size: 16px; }
 .setup-form .contribution-option input { width: auto; height: auto; margin: 0; }
 .setup-form .contribution-limits input { height: 52px; margin: 6px 0 16px; font-size: 18px; }
+
+/* Conversation header: group identity, connection, sync pill and details toggle. */
+.conversation-header { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 0 0 16px; border-bottom: 1px solid #e6ebf0; text-align: left; }
+.conversation-icon { display: grid; flex: none; place-items: center; width: 44px; height: 44px; border-radius: 50%; color: white; font-size: 22px; }
+.conversation-icon:not([class*="icon-"]) { color: #087d75; background: #e2f8f4; }
+.conversation-title { flex: 1; min-width: 0; }
+.conversation-title h2 { margin: 0; overflow: hidden; color: #172044; font-size: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-title p { margin: 2px 0 0; color: #6a7691; font-size: 14px; }
+.sync-pill { flex: none; padding: 6px 12px; border-radius: 999px; color: #087d75; background: #e2f8f4; font-size: 13px; font-weight: 700; }
+.sync-pill.unreachable { color: #8a4b00; background: #fff6e8; }
+.conversation-info-button { flex: none; padding: 6px 12px; border: 1px solid #dce4ec; border-radius: 10px; color: #172044; background: white; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
+.conversation-info-button:hover { background: #f4f7fa; }
+.conversation-details { margin: 0 0 18px; }
+@media (max-width: 720px) {
+  .conversation-header { flex-wrap: wrap; }
+  .conversation-title { flex-basis: calc(100% - 58px); }
+}

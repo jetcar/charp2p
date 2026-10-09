@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import QRCode from "qrcode";
-import { ChangeEvent, FormEvent, Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type SetupStep = 1 | 2 | 3;
@@ -401,6 +401,27 @@ function lastSynchronizationLabel(synchronizedAtUnix: number | null) {
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `Synced ${hours} h ago`;
   return `Synced ${Math.floor(hours / 24)} days ago`;
+}
+
+// Sync pill for a joined group's conversation header: a member is reachable
+// when the last connection check reached the owner or another member.
+function joinedSyncPill(state: GroupConnectionStateName | undefined, synchronizedAtUnix: number | null) {
+  const title = synchronizedAtUnix === null ? undefined : synchronizationDescription(synchronizedAtUnix);
+  if (state === "online" || state === "relayed" || state === "memberServed") {
+    return { reachable: true, label: `● ${state === "memberServed" ? "Synced with a member" : "Synced with peers"}`, title };
+  }
+  if (state === undefined) return { reachable: true, label: `○ ${lastSynchronizationLabel(synchronizedAtUnix)}`, title };
+  return { reachable: false, label: "● No peers reachable", title };
+}
+
+// Sync pill for the owner's conversation header: members can sync only while
+// this device advertises the group's rendezvous key.
+function ownerSyncPill(status: AdvertisementResult["status"] | null, retrying: boolean) {
+  if (status === "advertising") return { reachable: true, label: "● Available for member sync" };
+  if (status === "bootstrapRequired") return { reachable: false, label: "● Bootstrap node needed" };
+  if (retrying) return { reachable: false, label: "● Peer advertising failed · Retrying…" };
+  if (status === null) return { reachable: false, label: "● No member rendezvous key yet" };
+  return { reachable: false, label: "● Not reachable by members" };
 }
 
 function signedActivityDescription(lastSignedAtUnixMs: number | undefined) {
@@ -2086,6 +2107,7 @@ function App() {
   const [exportingEvidence, setExportingEvidence] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
   const [groupMembers, setGroupMembers] = useState<GroupMemberDevice[]>([]);
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [membersError, setMembersError] = useState("");
   const [removingMember, setRemovingMember] = useState("");
   const [blockedDevices, setBlockedDevices] = useState<string[]>([]);
@@ -3304,6 +3326,46 @@ function App() {
     );
   }
 
+  function renderConversationHeader(
+    group: { groupName: string; icon: number | null },
+    connection: string,
+    sync: { reachable: boolean; label: string; title?: string },
+    details: ReactNode,
+  ) {
+    const memberCount = groupMembers.length;
+    return (
+      <>
+        <header className="conversation-header">
+          <div className={`conversation-icon ${group.icon !== null ? `icon-${group.icon}` : ""}`} aria-hidden="true">
+            {group.icon !== null ? GROUP_ICONS[group.icon] : "✓"}
+          </div>
+          <div className="conversation-title">
+            <h2>{group.groupName}</h2>
+            <p>
+              {memberCount > 0 ? `${memberCount} ${memberCount === 1 ? "member" : "members"} · ` : ""}
+              {connection}
+            </p>
+          </div>
+          <span className={`sync-pill ${sync.reachable ? "" : "unreachable"}`} role="status" title={sync.title}>
+            {sync.label}
+          </span>
+          <button
+            aria-expanded={showGroupInfo}
+            className="conversation-info-button"
+            onClick={() => setShowGroupInfo((shown) => !shown)}
+            type="button"
+          >
+            {showGroupInfo ? "Hide details" : "Details"}
+          </button>
+          <button className="conversation-info-button" onClick={() => setShowMembers(true)} type="button">
+            Members{memberCount > 0 ? ` (${memberCount})` : ""}
+          </button>
+        </header>
+        {showGroupInfo && <div className="conversation-details">{details}</div>}
+      </>
+    );
+  }
+
   function renderMessageTimeline(groupId: string, joined: JoinedGroup | null, ownerDeviceId: string) {
     if (groupMessages.length === 0) return null;
     return (
@@ -3933,18 +3995,13 @@ function App() {
 
           {step === 3 && joinedGroup && !pendingGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form joined-card">
-              {joinedGroup.icon !== null ? (
-                <div className={`group-avatar icon-${joinedGroup.icon}`} aria-hidden="true">
-                  {GROUP_ICONS[joinedGroup.icon]}
-                </div>
-              ) : (
-                <div className="ready-check" aria-hidden="true">✓</div>
-              )}
-              <header>
-                <p className="eyebrow">Joined securely</p>
-                <h2>{joinedGroup.groupName}</h2>
-                <p>Your membership is protected on this device.</p>
-              </header>
+              {renderConversationHeader(
+                joinedGroup,
+                connectionStates[joinedGroup.groupId]
+                  ? groupConnectionDescription(connectionStates[joinedGroup.groupId])
+                  : "Connection not checked",
+                joinedSyncPill(connectionStates[joinedGroup.groupId], joinedGroup.lastSynchronizedAtUnix),
+                <>
               <div className="status-row" aria-label="Group status">
                 <span className="status-chip">✓ Secure membership ready</span>
                 <span className={`status-chip ${synchronizationResult ? "" : "muted"}`}>
@@ -3966,9 +4023,8 @@ function App() {
                 <div><dt>Connection</dt><dd>{connectionStates[joinedGroup.groupId] ? groupConnectionDescription(connectionStates[joinedGroup.groupId]) : "Not checked"}</dd></div>
                 <div><dt>Discovery</dt><dd>{joinedDiscoveryDescription(discoveryStates[joinedGroup.groupId])}</dd></div>
               </dl>
-              <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
-                Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
-              </button>
+                </>,
+              )}
               {renderMessageTimeline(joinedGroup.groupId, joinedGroup, joinedGroup.inviterDeviceId)}
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 {renderReplyDraft(joinedGroup.groupId)}
@@ -4013,14 +4069,11 @@ function App() {
 
           {step === 3 && localGroup && !pendingGroup && !joinedGroup && !joinMode && !createGroupMode && !showMembers && (
             <section className="setup-form group-ready-card">
-              <div className={`group-avatar icon-${localGroup.icon}`} aria-hidden="true">
-                {GROUP_ICONS[localGroup.icon]}
-              </div>
-              <header>
-                <p className="eyebrow">Group created</p>
-                <h2>{localGroup.groupName}</h2>
-                <p>The owner identity is protected on this device.</p>
-              </header>
+              {renderConversationHeader(
+                localGroup,
+                "You own this group",
+                ownerSyncPill(advertisement?.status ?? null, advertisementRetrying),
+                <>
               <dl className="preview-facts">
                 <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
                 <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Valid invitation, then owner approval" : "Valid invitation grants access"}</dd></div>
@@ -4028,20 +4081,8 @@ function App() {
                 <div><dt>Group fingerprint</dt><dd><code title={localGroup.groupId}>{shortPeerId(localGroup.groupId)}</code></dd></div>
                 <div><dt>Discovery</dt><dd>{ownedDiscoveryDescription(ownedDiscovery)}</dd></div>
               </dl>
-              <button className="secondary-button members-button" onClick={() => setShowMembers(true)} type="button">
-                Members &amp; devices{groupMembers.length > 0 ? ` (${groupMembers.length})` : ""}
-              </button>
-              <div className="status-row" aria-label="Member synchronization status">
-                <span className={`status-chip ${advertisement?.status === "advertising" ? "" : "muted"}`}>
-                  {advertisement?.status === "advertising"
-                    ? "● Available for member sync"
-                    : advertisement?.status === "bootstrapRequired"
-                      ? "○ Bootstrap node needed"
-                      : advertisementRetrying
-                        ? "○ Peer advertising failed · Retrying…"
-                        : "○ No member rendezvous key yet"}
-                </span>
-              </div>
+                </>,
+              )}
               {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}
               <form className="message-composer" onSubmit={sendGroupMessage}>
                 {renderReplyDraft(localGroup.groupId)}

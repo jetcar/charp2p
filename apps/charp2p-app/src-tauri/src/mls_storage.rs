@@ -2112,6 +2112,7 @@ impl MlsProviderService {
                     authenticated_peer,
                     &request_hash,
                     &encrypted_response,
+                    None,
                 )
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
             Ok((response, true))

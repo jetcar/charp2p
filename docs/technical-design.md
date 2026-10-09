@@ -339,8 +339,9 @@ the owner currently recognizes the bearer. Revocation removes the protected
 bearer first and then its SQLite index while holding the shared storage lock,
 so authorization fails closed if either deletion is interrupted. It also stops
 the active provider and request-listener task. The current MVP issues only
-expiring reusable invitations; single-use consumption remains a future state
-transition.
+expiring reusable invitations; single-use consumption follows ADR-042, and the
+store already records a consumed single-use invitation in the admission
+transaction so a second admission through it persists nothing.
 An owner returns `unauthorized` for unrecognized bearers. A recognized bearer
 with a valid profile proceeds through durable admission and receives a Welcome;
 temporary authorization, MLS, or storage failures return `busy`. These public

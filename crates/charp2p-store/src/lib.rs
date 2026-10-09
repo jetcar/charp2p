@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -362,6 +362,8 @@ impl EventStore {
 
     /// Atomically persists an admitted member event, the advanced MLS state,
     /// and the encrypted response used to retry that exact join request.
+    /// A single-use invitation is consumed in the same transaction; if it was
+    /// already consumed nothing is stored.
     pub fn put_mls_join_admission(
         &mut self,
         event: &SignedEvent,
@@ -369,6 +371,7 @@ impl EventStore {
         member_id: PeerId,
         request_hash: &[u8; 32],
         encrypted_response: &[u8],
+        single_use_invitation: Option<InvitationId>,
     ) -> Result<PutEventOutcome, StoreError> {
         if event.kind() != charp2p_core::EventKind::MemberAdded {
             return Err(StoreError::CorruptIndex);
@@ -390,8 +393,44 @@ impl EventStore {
                 event.id().as_bytes().as_slice(),
             ],
         )?;
+        if let Some(invitation_id) = single_use_invitation {
+            let inserted = transaction.execute(
+                "INSERT INTO consumed_single_use_invitations (
+                    invitation_id, group_id, member_id, event_id
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(invitation_id) DO NOTHING",
+                params![
+                    invitation_id.as_bytes().as_slice(),
+                    event.group_id().to_bytes(),
+                    member_id.to_bytes(),
+                    event.id().as_bytes().as_slice(),
+                ],
+            )?;
+            if inserted == 0 {
+                return Err(StoreError::InvitationConsumed);
+            }
+        }
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Returns the device that consumed a single-use invitation of this
+    /// group, if any.
+    pub fn single_use_invitation_consumer(
+        &self,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<Option<PeerId>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT member_id FROM consumed_single_use_invitations
+                 WHERE invitation_id = ?1 AND group_id = ?2",
+                params![invitation_id.as_bytes().as_slice(), group_id.to_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|member_id| PeerId::from_bytes(&member_id).map_err(|_| StoreError::CorruptIndex))
+            .transpose()
     }
 
     /// Loads the cached response for a previously admitted device.
@@ -2468,7 +2507,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=25 => {}
+            6..=26 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -2839,6 +2878,21 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 26 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS consumed_single_use_invitations (
+                    invitation_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(invitation_id) = 16),
+                    group_id BLOB NOT NULL,
+                    member_id BLOB NOT NULL,
+                    event_id BLOB NOT NULL CHECK(length(event_id) = 32)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3073,6 +3127,9 @@ pub enum StoreError {
     /// A remembered peer address is empty or above the local bound.
     #[error("invalid peer address size {0}")]
     InvalidPeerAddressSize(usize),
+    /// A single-use invitation already admitted a device.
+    #[error("single-use invitation already consumed")]
+    InvitationConsumed,
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -4205,6 +4262,7 @@ mod tests {
                 member_id,
                 &request_hash,
                 b"encrypted accepted response",
+                None,
             )
             .unwrap();
 
@@ -4226,9 +4284,87 @@ mod tests {
                 member_id,
                 &request_hash,
                 &vec![0; MAX_ENCRYPTED_JOIN_RESPONSE_BYTES + 1],
+                None,
             ),
             Err(StoreError::InvalidEncryptedJoinResponseSize(_))
         ));
+    }
+
+    #[test]
+    fn single_use_invitation_is_consumed_with_its_admission() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let invitation_id = InvitationId::from_bytes([3; 16]);
+        let added = |sequence| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::MemberAdded,
+                    protected_payload: b"MLS commit",
+                },
+            )
+            .unwrap()
+        };
+        let first = DeviceIdentity::generate().peer_id();
+        let second = DeviceIdentity::generate().peer_id();
+        assert_eq!(
+            store
+                .single_use_invitation_consumer(group.group_id(), invitation_id)
+                .unwrap(),
+            None
+        );
+
+        store
+            .put_mls_join_admission(
+                &added(1),
+                b"first snapshot",
+                first,
+                &[1; 32],
+                b"first response",
+                Some(invitation_id),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .single_use_invitation_consumer(group.group_id(), invitation_id)
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            store
+                .single_use_invitation_consumer(GroupIdentity::generate().group_id(), invitation_id)
+                .unwrap(),
+            None
+        );
+
+        let second_event = added(2);
+        assert!(matches!(
+            store.put_mls_join_admission(
+                &second_event,
+                b"second snapshot",
+                second,
+                &[2; 32],
+                b"second response",
+                Some(invitation_id),
+            ),
+            Err(StoreError::InvitationConsumed)
+        ));
+        assert!(store.get_event(second_event.id()).unwrap().is_none());
+        assert!(
+            store
+                .mls_join_admission(group.group_id(), second)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"first snapshot"
+        );
     }
 
     #[test]
@@ -4256,6 +4392,7 @@ mod tests {
                 member_id,
                 &[7; 32],
                 b"encrypted accepted response",
+                None,
             )
             .unwrap();
         let removed = SignedEvent::create(
@@ -4899,6 +5036,38 @@ mod tests {
             store.current_group_icons().unwrap(),
             vec![(group.group_id(), 1)]
         );
+    }
+
+    #[test]
+    fn version_twenty_six_database_adds_consumed_single_use_invitations() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE consumed_single_use_invitations;
+                     PRAGMA user_version = 26;",
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        assert_eq!(
+            store
+                .single_use_invitation_consumer(
+                    GroupIdentity::generate().group_id(),
+                    InvitationId::from_bytes([1; 16])
+                )
+                .unwrap(),
+            None
+        );
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]

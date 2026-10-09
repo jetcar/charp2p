@@ -127,6 +127,15 @@ type StoredMessage = CreatedMessage & {
 };
 type StoredMessagePage = { messages: StoredMessage[]; hasEarlier: boolean };
 type GroupMemberDevice = { deviceId: string };
+type ApprovalRequest = {
+  deviceId: string;
+  invitationId: string;
+  expiresAtUnix: number;
+  firstRequestedAtUnix: number;
+  lastRequestedAtUnix: number;
+  state: "pending" | "approved" | "declined";
+};
+type ApprovalDecision = "approve" | "decline" | "allow";
 type MemberActivity = { deviceId: string; lastSignedAtUnixMs: number };
 type DeviceSequenceConflict = { deviceId: string; conflictingSequences: number; firstSequence: number };
 
@@ -268,6 +277,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   member_removal_failed: "The device could not be removed securely.",
   member_removal_not_allowed: "Only this group's owner can remove devices.",
   member_readmission_not_allowed: "Only this group's owner can allow removed devices to join again.",
+  approval_request_not_found: "This join request changed. The list is refreshed.",
+  approval_not_required: "This group admits devices without owner approval.",
+  approval_decision_invalid: "This join request decision is not supported.",
   member_not_removed: "This device is no longer blocked from joining.",
   device_block_failed: "The block setting could not be saved on this device.",
   device_block_self: "This device cannot block itself.",
@@ -359,6 +371,16 @@ function signedActivityDescription(lastSignedAtUnixMs: number | undefined) {
     dateStyle: "medium",
     timeStyle: "short",
   })}`;
+}
+
+function approvalRequestDescription(request: ApprovalRequest) {
+  const requested = new Date(request.lastRequestedAtUnix * 1000).toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  if (request.state === "approved") return `Approved · joins on its next retry (last asked ${requested})`;
+  if (request.state === "declined") return "Declined · cannot join with any invitation";
+  return `Waiting for approval · last asked ${requested}`;
 }
 
 function sequenceConflictDescription(conflict: DeviceSequenceConflict) {
@@ -602,6 +624,9 @@ function MembersView({
   removedDeviceIds,
   readmittingDeviceId,
   onAllowReadmission,
+  approvalRequests,
+  decidingApprovalDeviceId,
+  onDecideApproval,
   invitePermittedDeviceIds,
   changingInvitePermissionId,
   onToggleInvitePermission,
@@ -630,6 +655,9 @@ function MembersView({
   removedDeviceIds: string[];
   readmittingDeviceId: string;
   onAllowReadmission: (deviceId: string) => void;
+  approvalRequests: ApprovalRequest[];
+  decidingApprovalDeviceId: string;
+  onDecideApproval: (deviceId: string, decision: ApprovalDecision) => void;
   invitePermittedDeviceIds: string[];
   changingInvitePermissionId: string;
   onToggleInvitePermission: (deviceId: string, granted: boolean) => void;
@@ -804,6 +832,56 @@ function MembersView({
           );
         })}
       </div>
+      {canManageMembers && approvalRequests.length > 0 && (
+        <div className="removed-devices">
+          <h3>Join requests</h3>
+          <div className="member-list" role="list">
+            {approvalRequests.map((request) => (
+              <article className="member-row" key={request.deviceId} role="listitem">
+                <div className="member-avatar" aria-hidden="true">?</div>
+                <div className="member-identity">
+                  <strong>{`Device ${shortPeerId(request.deviceId)}`}</strong>
+                  <span>{approvalRequestDescription(request)}</span>
+                  <code title={request.deviceId}>{shortPeerId(request.deviceId)}</code>
+                </div>
+                <div className="member-actions">
+                  {request.state === "pending" && (
+                    <button
+                      className="member-block"
+                      disabled={Boolean(decidingApprovalDeviceId)}
+                      onClick={() => onDecideApproval(request.deviceId, "approve")}
+                      type="button"
+                    >
+                      {decidingApprovalDeviceId === request.deviceId ? "Saving…" : "Approve"}
+                    </button>
+                  )}
+                  {request.state !== "declined" && (
+                    <button
+                      className="member-remove"
+                      disabled={Boolean(decidingApprovalDeviceId)}
+                      onClick={() => onDecideApproval(request.deviceId, "decline")}
+                      type="button"
+                    >
+                      {decidingApprovalDeviceId === request.deviceId ? "Saving…" : "Decline"}
+                    </button>
+                  )}
+                  {request.state === "declined" && (
+                    <button
+                      className="member-block"
+                      disabled={Boolean(decidingApprovalDeviceId)}
+                      onClick={() => onDecideApproval(request.deviceId, "allow")}
+                      type="button"
+                    >
+                      {decidingApprovalDeviceId === request.deviceId ? "Saving…" : "Allow to ask again"}
+                    </button>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+          <p className="preview-note">Devices holding an invitation ask to join this group. An approved device is admitted the next time it retries while this device is reachable. Device IDs are not names: confirm with the person who should join before approving.</p>
+        </div>
+      )}
       {canManageMembers && removedDeviceIds.length > 0 && (
         <div className="removed-devices">
           <h3>Removed devices</h3>
@@ -1978,6 +2056,8 @@ function App() {
   const [blockingDevice, setBlockingDevice] = useState("");
   const [removedDevices, setRemovedDevices] = useState<string[]>([]);
   const [readmittingDevice, setReadmittingDevice] = useState("");
+  const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([]);
+  const [decidingApproval, setDecidingApproval] = useState("");
   const [invitePermittedDevices, setInvitePermittedDevices] = useState<string[]>([]);
   const [changingInvitePermission, setChangingInvitePermission] = useState("");
   const [showMembers, setShowMembers] = useState(false);
@@ -2500,6 +2580,7 @@ function App() {
       setGroupMembers([]);
       setBlockedDevices([]);
       setRemovedDevices([]);
+      setApprovalRequests([]);
       setInvitePermittedDevices([]);
       setMemberActivity({});
       setSequenceConflicts({});
@@ -2513,18 +2594,22 @@ function App() {
 
     async function refreshMembers() {
       try {
-        const [members, blocked, activity, conflicts, removed, permitted] = await Promise.all([
+        const [members, blocked, activity, conflicts, removed, permitted, approvals] = await Promise.all([
           invoke<GroupMemberDevice[]>("group_members", { groupId }),
           invoke<string[]>("blocked_group_devices", { groupId }),
           invoke<MemberActivity[]>("group_member_activity", { groupId }),
           invoke<DeviceSequenceConflict[]>("group_sequence_conflicts", { groupId }),
           localGroup ? invoke<string[]>("removed_group_members", { groupId }) : Promise.resolve([]),
           invoke<string[]>("invite_permitted_devices", { groupId }),
+          localGroup?.approvalRequired
+            ? invoke<ApprovalRequest[]>("group_approval_requests", { groupId })
+            : Promise.resolve([]),
         ]);
         if (active) {
           setGroupMembers(members);
           setBlockedDevices(blocked);
           setRemovedDevices(removed);
+          setApprovalRequests(approvals);
           setInvitePermittedDevices(permitted);
           setMemberActivity(Object.fromEntries(activity.map((entry) => [entry.deviceId, entry.lastSignedAtUnixMs])));
           setSequenceConflicts(Object.fromEntries(conflicts.map((entry) => [entry.deviceId, entry])));
@@ -2842,6 +2927,30 @@ function App() {
       setMembersError(errorMessage(reason));
     } finally {
       setReadmittingDevice("");
+    }
+  }
+
+  async function decideApprovalRequest(deviceId: string, decision: ApprovalDecision) {
+    if (!localGroup || decidingApproval || !isTauri()) return;
+    if (decision === "approve" && !window.confirm("Approve this device? It joins the group and can read new messages the next time it retries.")) return;
+    if (decision === "decline" && !window.confirm("Decline this device? It cannot join with any invitation until you allow it to ask again.")) return;
+    setMembersError("");
+    setDecidingApproval(deviceId);
+    try {
+      setApprovalRequests(await invoke<ApprovalRequest[]>("decide_group_approval_request", {
+        groupId: localGroup.groupId,
+        deviceId,
+        decision,
+      }));
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+      try {
+        setApprovalRequests(await invoke<ApprovalRequest[]>("group_approval_requests", { groupId: localGroup.groupId }));
+      } catch {
+        // The periodic member refresh retries.
+      }
+    } finally {
+      setDecidingApproval("");
     }
   }
 
@@ -3518,6 +3627,9 @@ function App() {
               removedDeviceIds={removedDevices}
               readmittingDeviceId={readmittingDevice}
               onAllowReadmission={allowGroupMemberReadmission}
+              approvalRequests={approvalRequests}
+              decidingApprovalDeviceId={decidingApproval}
+              onDecideApproval={decideApprovalRequest}
               invitePermittedDeviceIds={invitePermittedDevices}
               changingInvitePermissionId={changingInvitePermission}
               onToggleInvitePermission={setMemberInvitePermission}

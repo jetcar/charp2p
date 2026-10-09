@@ -19,8 +19,8 @@ use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
 use community::{CommunityNodesPreference, CommunityNodesService};
 use contribution::{ContributionPreference, ContributionService, ContributionStatus};
 use groups::{
-    CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup, MemberInvitationService,
-    OwnerMemberAdmissionService, ReceivedInvitationCache,
+    ApprovalDecision, ApprovalRequest, CreateGroupSpec, GroupService, IssuedInvitation, LocalGroup,
+    MemberInvitationService, OwnerMemberAdmissionService, ReceivedInvitationCache,
 };
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
@@ -799,6 +799,41 @@ fn remove_group_member(
         .map_err(str::to_owned)
 }
 
+/// Lists join requests and declined devices for a locally owned group
+/// created with approval required (ADR-041).
+#[tauri::command]
+fn group_approval_requests(
+    group_id: String,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+) -> Result<Vec<ApprovalRequest>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    group_service
+        .approval_requests(group_id)
+        .map_err(str::to_owned)
+}
+
+/// Approves or declines a join request, or allows a declined device to ask
+/// again, and returns the updated requests.
+#[tauri::command]
+fn decide_group_approval_request(
+    group_id: String,
+    device_id: String,
+    decision: String,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+) -> Result<Vec<ApprovalRequest>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let device_id = parse_group_id(&device_id, "approval_request_not_found")?;
+    let decision = match decision.as_str() {
+        "approve" => ApprovalDecision::Approve,
+        "decline" => ApprovalDecision::Decline,
+        "allow" => ApprovalDecision::Allow,
+        _ => return Err("approval_decision_invalid".to_owned()),
+    };
+    group_service
+        .decide_approval_request(group_id, device_id, decision)
+        .map_err(str::to_owned)
+}
+
 /// Lists devices removed from a locally owned group that stay blocked from
 /// joining again.
 #[tauri::command]
@@ -1338,6 +1373,8 @@ pub fn run() {
             group_members,
             remove_group_member,
             removed_group_members,
+            group_approval_requests,
+            decide_group_approval_request,
             allow_group_member_readmission,
             group_member_activity,
             group_sequence_conflicts,

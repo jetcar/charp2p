@@ -11,8 +11,8 @@ use charp2p_core::{
     JoinResponse, PeerId,
 };
 use charp2p_store::{
-    ApprovalRequestOutcome, EventStore, IssuedInvitationMetadata, LocalGroupMetadata,
-    OwnerDiscoveryKeyMetadata,
+    ApprovalRequestOutcome, ApprovalState, EventStore, IssuedInvitationMetadata,
+    LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
 };
 use keyring_core::Error as KeyringError;
 use libp2p::Multiaddr;
@@ -48,6 +48,27 @@ pub struct LocalGroup {
     pub approval_required: bool,
     pub invitation_lifetime_seconds: u64,
     pub reusable_invitation: bool,
+}
+
+/// Owner-local join request for an approval-required group (ADR-041).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub device_id: String,
+    pub invitation_id: String,
+    pub expires_at_unix: u64,
+    pub first_requested_at_unix: u64,
+    pub last_requested_at_unix: u64,
+    pub state: &'static str,
+}
+
+/// Owner decision on one recorded approval request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    Approve,
+    Decline,
+    /// Clears a decline so the device's next request is recorded again.
+    Allow,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -798,6 +819,71 @@ impl GroupService {
         }
     }
 
+    /// Lists unexpired join requests and declined devices for a locally
+    /// owned approval-required group, oldest request first.
+    pub fn approval_requests(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Vec<ApprovalRequest>, &'static str> {
+        self.approval_requests_at(group_id, unix_now()?)
+    }
+
+    fn approval_requests_at(
+        &self,
+        group_id: PeerId,
+        now_unix: u64,
+    ) -> Result<Vec<ApprovalRequest>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        owned_approval_requests(&store, group_id, now_unix)
+    }
+
+    /// Applies the owner's decision to a recorded request and returns the
+    /// updated list. Approval admits the device on its next retry.
+    pub fn decide_approval_request(
+        &self,
+        group_id: PeerId,
+        device_id: PeerId,
+        decision: ApprovalDecision,
+    ) -> Result<Vec<ApprovalRequest>, &'static str> {
+        self.decide_approval_request_at(group_id, device_id, decision, unix_now()?)
+    }
+
+    fn decide_approval_request_at(
+        &self,
+        group_id: PeerId,
+        device_id: PeerId,
+        decision: ApprovalDecision,
+        now_unix: u64,
+    ) -> Result<Vec<ApprovalRequest>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        // Checks ownership and approval before changing any record.
+        owned_approval_requests(&store, group_id, now_unix)?;
+        let changed = match decision {
+            ApprovalDecision::Approve => store.approve_owner_approval_request(group_id, device_id),
+            ApprovalDecision::Decline => store.decline_owner_approval_request(group_id, device_id),
+            ApprovalDecision::Allow => store.clear_declined_approval_request(group_id, device_id),
+        }
+        .map_err(|_| "group_store_unavailable")?;
+        if !changed {
+            return Err("approval_request_not_found");
+        }
+        owned_approval_requests(&store, group_id, now_unix)
+    }
+
     #[cfg(test)]
     fn issue_invitation_at(
         &self,
@@ -1237,6 +1323,48 @@ fn owner_discovery_credential_user(invitation_id: InvitationId) -> String {
     )
 }
 
+fn unix_now() -> Result<u64, &'static str> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system_clock_invalid")?
+        .as_secs())
+}
+
+/// Loads approval requests only for a locally owned group created with
+/// approval required.
+fn owned_approval_requests(
+    store: &EventStore,
+    group_id: PeerId,
+    now_unix: u64,
+) -> Result<Vec<ApprovalRequest>, &'static str> {
+    let group = store
+        .local_groups()
+        .map_err(|_| "group_store_unavailable")?
+        .into_iter()
+        .find(|group| group.group_id == group_id)
+        .ok_or("group_not_found")?;
+    if !group.approval_required {
+        return Err("approval_not_required");
+    }
+    Ok(store
+        .owner_approval_requests(group_id, now_unix)
+        .map_err(|_| "group_store_unavailable")?
+        .into_iter()
+        .map(|request| ApprovalRequest {
+            device_id: request.device_id.to_string(),
+            invitation_id: encode_identifier(request.invitation_id),
+            expires_at_unix: request.expires_at_unix,
+            first_requested_at_unix: request.first_requested_at_unix,
+            last_requested_at_unix: request.last_requested_at_unix,
+            state: match request.state {
+                ApprovalState::Pending => "pending",
+                ApprovalState::Approved => "approved",
+                ApprovalState::Declined => "declined",
+            },
+        })
+        .collect())
+}
+
 fn encode_identifier(invitation_id: InvitationId) -> String {
     invitation_id
         .as_bytes()
@@ -1379,9 +1507,9 @@ mod tests {
     use charp2p_store::{EventStore, LocalGroupMetadata};
 
     use super::{
-        issued_invitation, requested_invitation, CreateGroupSpec, GroupSecretStore, GroupService,
-        IssuedInvitationSecretStore, JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore,
-        ReceivedInvitationCache,
+        issued_invitation, requested_invitation, ApprovalDecision, ApprovalRequest,
+        CreateGroupSpec, GroupSecretStore, GroupService, IssuedInvitationSecretStore,
+        JoinInvitationAuthorizationError, OwnerDiscoveryKeyStore, ReceivedInvitationCache,
     };
     use crate::network::{JoinRequestAuthorization, JoinRequestAuthorizer};
 
@@ -1802,6 +1930,98 @@ mod tests {
             .owner_approval_requests(open.group_id.parse().unwrap(), NOW)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn owner_lists_and_decides_approval_requests() {
+        use crate::mls_storage::MemberAdmissionError;
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut approval = spec("Design Crew");
+        approval.approval_required = true;
+        let group_id: PeerId = service.create(approval).unwrap().group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        let device = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        assert!(service
+            .approval_requests_at(group_id, NOW)
+            .unwrap()
+            .is_empty());
+        for joining in [device, other] {
+            assert_eq!(
+                service.admission_approval_at(&request, joining, NOW),
+                Err(MemberAdmissionError::AwaitingApproval)
+            );
+        }
+
+        let listed = service.approval_requests_at(group_id, NOW).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].invitation_id, issued.invitation_id);
+        assert_eq!(listed[0].expires_at_unix, issued.expires_at_unix);
+        assert!(listed.iter().all(|request| request.state == "pending"));
+
+        let approved = service
+            .decide_approval_request_at(group_id, device, ApprovalDecision::Approve, NOW)
+            .unwrap();
+        let state = |requests: &[ApprovalRequest], id: PeerId| {
+            requests
+                .iter()
+                .find(|request| request.device_id == id.to_string())
+                .map(|request| request.state)
+        };
+        assert_eq!(state(&approved, device), Some("approved"));
+        assert_eq!(
+            service.decide_approval_request_at(group_id, device, ApprovalDecision::Approve, NOW),
+            Err("approval_request_not_found")
+        );
+        assert_eq!(
+            service.decide_approval_request_at(group_id, device, ApprovalDecision::Allow, NOW),
+            Err("approval_request_not_found")
+        );
+
+        let declined = service
+            .decide_approval_request_at(group_id, other, ApprovalDecision::Decline, NOW)
+            .unwrap();
+        assert_eq!(state(&declined, other), Some("declined"));
+        assert_eq!(
+            service.admission_approval_at(&request, other, NOW),
+            Err(MemberAdmissionError::Unauthorized)
+        );
+        let allowed = service
+            .decide_approval_request_at(group_id, other, ApprovalDecision::Allow, NOW)
+            .unwrap();
+        assert_eq!(state(&allowed, other), None);
+        assert_eq!(
+            service.admission_approval_at(&request, other, NOW),
+            Err(MemberAdmissionError::AwaitingApproval)
+        );
+
+        let open: PeerId = service
+            .create(spec("Open Crew"))
+            .unwrap()
+            .group_id
+            .parse()
+            .unwrap();
+        assert_eq!(
+            service.approval_requests_at(open, NOW),
+            Err("approval_not_required")
+        );
+        assert_eq!(
+            service.decide_approval_request_at(open, device, ApprovalDecision::Approve, NOW),
+            Err("approval_not_required")
+        );
+        assert_eq!(
+            service.approval_requests_at(DeviceIdentity::generate().peer_id(), NOW),
+            Err("group_not_found")
+        );
     }
 
     #[test]

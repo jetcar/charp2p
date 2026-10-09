@@ -2125,7 +2125,8 @@ function App() {
   const [usedInvitationGroupIds, setUsedInvitationGroupIds] = useState<string[]>([]);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
-  const [revokingInvitation, setRevokingInvitation] = useState(false);
+  const [revokingInvitationId, setRevokingInvitationId] = useState("");
+  const [selectedInvitationId, setSelectedInvitationId] = useState("");
   const [invitationCopied, setInvitationCopied] = useState(false);
   const [invitationQrCode, setInvitationQrCode] = useState("");
   const [invitationQrError, setInvitationQrError] = useState("");
@@ -2138,9 +2139,17 @@ function App() {
   );
   const joinedGroup = joinedGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
   const localGroup = localGroups.find(({ groupId }) => groupId === activeGroupId) ?? null;
-  const issuedInvitation = localGroup
-    ? issuedInvitations.find(({ groupId }) => groupId === localGroup.groupId) ?? null
-    : null;
+  // An owned group can have several active invitations (ADR-043); one of
+  // them is shown with its link and QR code, defaulting to the newest.
+  const groupInvitations = useMemo(
+    () => (localGroup
+      ? issuedInvitations.filter(({ groupId }) => groupId === localGroup.groupId)
+      : []),
+    [issuedInvitations, localGroup],
+  );
+  const issuedInvitation = groupInvitations.find(
+    ({ invitationId }) => invitationId === selectedInvitationId,
+  ) ?? groupInvitations[groupInvitations.length - 1] ?? null;
   const availableGroups = useMemo(
     () => [
       ...localGroups.map((group) => ({
@@ -2233,21 +2242,25 @@ function App() {
   // The owner retires a single-use invitation once a device is admitted
   // through it (ADR-042), so its disappearance before expiry means it was used.
   useEffect(() => {
-    if (!issuedInvitation || issuedInvitation.reusable || !isTauri()) return;
+    const watched = issuedInvitations.filter(({ reusable }) => !reusable);
+    if (watched.length === 0 || !isTauri()) return;
     let active = true;
     const timer = window.setInterval(() => {
       void invoke<IssuedInvitation[]>("issued_invitations")
         .then((invitations) => {
           if (!active) return;
-          const current = issuedInvitation;
-          if (invitations.some(({ invitationId }) => invitationId === current.invitationId)) return;
-          if (current.expiresAtUnix * 1000 <= Date.now()) return;
+          const used = watched.filter((current) =>
+            current.expiresAtUnix * 1000 > Date.now()
+            && !invitations.some(({ invitationId }) => invitationId === current.invitationId));
+          if (used.length === 0) return;
+          const usedIds = used.map(({ invitationId }) => invitationId);
+          const usedGroupIds = used.map(({ groupId }) => groupId);
           setIssuedInvitations((issued) => issued.filter(
-            ({ invitationId }) => invitationId !== current.invitationId,
+            ({ invitationId }) => !usedIds.includes(invitationId),
           ));
           setUsedInvitationGroupIds((groupIds) => [
-            ...groupIds.filter((groupId) => groupId !== current.groupId),
-            current.groupId,
+            ...groupIds.filter((groupId) => !usedGroupIds.includes(groupId)),
+            ...usedGroupIds,
           ]);
           setInvitationCopied(false);
         })
@@ -2257,33 +2270,32 @@ function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [issuedInvitation]);
+  }, [issuedInvitations]);
 
   useEffect(() => {
-    if (!issuedInvitation) return;
+    if (issuedInvitations.length === 0) return;
     let active = true;
     let timer: number | undefined;
     const scheduleExpiry = () => {
-      const remainingMs = issuedInvitation.expiresAtUnix * 1000 - Date.now();
-      if (remainingMs <= 0) {
+      const nowMs = Date.now();
+      const expired = issuedInvitations.filter(({ expiresAtUnix }) => expiresAtUnix * 1000 <= nowMs);
+      if (expired.length > 0) {
         const cleanup = isTauri()
           ? invoke<IssuedInvitation[]>("issued_invitations")
           : Promise.resolve([]);
         void cleanup
           .then((invitations) => {
             if (!active) return;
-            const refreshed = invitations.find(
-              (invitation) => invitation.invitationId === issuedInvitation.invitationId,
-            );
-            if (refreshed) {
-              setIssuedInvitations((current) => current.map((invitation) =>
-                invitation.invitationId === refreshed.invitationId ? refreshed : invitation));
-              timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
-            } else {
+            const removedIds = expired
+              .filter((current) => !invitations.some(({ invitationId }) => invitationId === current.invitationId))
+              .map(({ invitationId }) => invitationId);
+            if (removedIds.length > 0) {
               setIssuedInvitations((current) => current.filter(
-                ({ invitationId }) => invitationId !== issuedInvitation.invitationId,
+                ({ invitationId }) => !removedIds.includes(invitationId),
               ));
               setInvitationCopied(false);
+            } else {
+              timer = window.setTimeout(scheduleExpiry, INVITATION_EXPIRY_CHECK_INTERVAL_MS);
             }
           })
           .catch((reason) => {
@@ -2294,6 +2306,9 @@ function App() {
           });
         return;
       }
+      const remainingMs = Math.min(
+        ...issuedInvitations.map(({ expiresAtUnix }) => expiresAtUnix * 1000 - nowMs),
+      );
       timer = window.setTimeout(
         scheduleExpiry,
         Math.min(remainingMs, INVITATION_EXPIRY_CHECK_INTERVAL_MS),
@@ -2304,7 +2319,7 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [issuedInvitation]);
+  }, [issuedInvitations]);
 
   useEffect(() => {
     openPendingGroupIdRef.current = openPendingGroupId;
@@ -3406,9 +3421,10 @@ function App() {
       });
       setUsedInvitationGroupIds((current) => current.filter((groupId) => groupId !== invitation.groupId));
       setIssuedInvitations((current) => [
-        ...current.filter(({ groupId }) => groupId !== invitation.groupId),
+        ...current.filter(({ invitationId }) => invitationId !== invitation.invitationId),
         invitation,
       ]);
+      setSelectedInvitationId(invitation.invitationId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -3427,23 +3443,23 @@ function App() {
     }
   }
 
-  async function revokeInvitation() {
-    if (!localGroup || !issuedInvitation || revokingInvitation || !isTauri()) return;
-    if (!window.confirm("Revoke this invitation? Anyone who has not joined yet will lose access.")) return;
+  async function revokeInvitation(revoked: IssuedInvitation) {
+    if (revokingInvitationId || !isTauri()) return;
+    if (!window.confirm("Revoke this invitation? Anyone who has not joined with it yet will lose access.")) return;
     setError("");
-    setRevokingInvitation(true);
+    setRevokingInvitationId(revoked.invitationId);
     try {
-      const { groupId, invitationId } = issuedInvitation;
+      const { groupId, invitationId } = revoked;
       await invoke("revoke_group_invitation", { groupId, invitationId });
       setIssuedInvitations((current) => current.filter((invitation) => invitation.invitationId !== invitationId));
-      setInvitationCopied(false);
+      if (issuedInvitation?.invitationId === invitationId) setInvitationCopied(false);
       setAdvertisement(null);
       setAdvertisementError("");
       setAdvertisementRetrying(false);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
-      setRevokingInvitation(false);
+      setRevokingInvitationId("");
     }
   }
 
@@ -3997,7 +4013,7 @@ function App() {
                   )}
                 </section>
               )}
-              {issuedInvitation && issuedInvitation.groupId === localGroup.groupId ? (
+              {issuedInvitation && (
                 <>
                   <label htmlFor="issued-invitation">Invitation link</label>
                   <textarea
@@ -4024,61 +4040,108 @@ function App() {
                     </figure>
                   )}
                   {invitationQrError && <p className="form-error preview-error" role="alert">{invitationQrError}</p>}
-                  {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" onClick={copyInvitation} type="button">
                     {invitationCopied ? "Invitation copied" : "Copy invitation"}
                   </button>
-                  <button className="danger-button" disabled={revokingInvitation} onClick={revokeInvitation} type="button">
-                    {revokingInvitation ? "Revoking invitation…" : "Revoke invitation"}
-                  </button>
-                </>
-              ) : (
-                <>
-                  {usedInvitationGroupIds.includes(localGroup.groupId) && (
-                    <p className="preview-note">The single-use invitation was used by a joining device and no longer works.</p>
-                  )}
-                  <p className="preview-note">Create a signed invitation to share this group.</p>
-                  <fieldset className="choice-group">
-                    <legend>Invitation use</legend>
-                    <label className="contribution-option">
-                      <input
-                        checked={invitationReusable}
-                        name="invitation-use"
-                        onChange={() => setInvitationReusable(true)}
-                        type="radio"
-                      />
-                      Reusable until expiry
-                    </label>
-                    <label className="contribution-option">
-                      <input
-                        checked={!invitationReusable}
-                        name="invitation-use"
-                        onChange={() => setInvitationReusable(false)}
-                        type="radio"
-                      />
-                      Single use
-                    </label>
-                    <p className="preview-note">
-                      {invitationReusable
-                        ? "Any number of devices can join with this link until it expires."
-                        : "Only the first device admitted with this link can join; the link then stops working."}
-                    </p>
-                  </fieldset>
-                  <div className="invitation-defaults">
-                    <label htmlFor="invitation-expiry">This invitation expires after</label>
-                    <select id="invitation-expiry" onChange={(event) => setInvitationExpiry(Number(event.target.value))} value={invitationExpiry}>
-                      {INVITATION_LIFETIMES.filter(({ seconds }) => seconds <= localGroup.invitationLifetimeSeconds).map(({ label, seconds }) => (
-                        <option key={seconds} value={seconds}>{label}</option>
-                      ))}
-                    </select>
-                    <p className="preview-note">The group allows invitations of up to {localGroup.invitationLifetimeSeconds / 86400} days.</p>
-                  </div>
-                  {error && <p className="form-error preview-error" role="alert">{error}</p>}
-                  <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">
-                    {creatingInvitation ? "Creating invitation…" : "Create invitation"}
-                  </button>
                 </>
               )}
+              {groupInvitations.length > 0 && (
+                <section className="member-invitation" aria-labelledby="active-invitations-title">
+                  <h3 id="active-invitations-title">Active invitations ({groupInvitations.length})</h3>
+                  <div className="member-list" role="list">
+                    {groupInvitations.map((invitation) => (
+                      <article
+                        className={`member-row ${invitation.invitationId === issuedInvitation?.invitationId ? "local-member" : ""}`}
+                        key={invitation.invitationId}
+                        role="listitem"
+                      >
+                        <div className="member-avatar" aria-hidden="true">✉</div>
+                        <div className="member-identity">
+                          <strong>
+                            {invitation.requestedBy
+                              ? `Requested by Member ${shortPeerId(invitation.requestedBy)}`
+                              : "Created on this device"}
+                          </strong>
+                          <span>
+                            {expiryDescription(invitation.expiresAtUnix)}
+                            {invitation.reusable ? " · Reusable until expiry" : " · Single use"}
+                          </span>
+                          <code title={invitation.invitationId}>{shortPeerId(invitation.invitationId)}</code>
+                        </div>
+                        <div className="member-actions">
+                          {invitation.invitationId !== issuedInvitation?.invitationId && (
+                            <button
+                              className="member-block"
+                              onClick={() => {
+                                setSelectedInvitationId(invitation.invitationId);
+                                setInvitationCopied(false);
+                              }}
+                              type="button"
+                            >
+                              Show link
+                            </button>
+                          )}
+                          <button
+                            className="member-remove"
+                            disabled={Boolean(revokingInvitationId)}
+                            onClick={() => void revokeInvitation(invitation)}
+                            type="button"
+                          >
+                            {revokingInvitationId === invitation.invitationId ? "Revoking…" : "Revoke"}
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+              {usedInvitationGroupIds.includes(localGroup.groupId) && (
+                <p className="preview-note">A single-use invitation was used by a joining device and no longer works.</p>
+              )}
+              <p className="preview-note">
+                {groupInvitations.length > 0
+                  ? "Create another signed invitation, for example with a different expiry or use."
+                  : "Create a signed invitation to share this group."}
+              </p>
+              <fieldset className="choice-group">
+                <legend>Invitation use</legend>
+                <label className="contribution-option">
+                  <input
+                    checked={invitationReusable}
+                    name="invitation-use"
+                    onChange={() => setInvitationReusable(true)}
+                    type="radio"
+                  />
+                  Reusable until expiry
+                </label>
+                <label className="contribution-option">
+                  <input
+                    checked={!invitationReusable}
+                    name="invitation-use"
+                    onChange={() => setInvitationReusable(false)}
+                    type="radio"
+                  />
+                  Single use
+                </label>
+                <p className="preview-note">
+                  {invitationReusable
+                    ? "Any number of devices can join with this link until it expires."
+                    : "Only the first device admitted with this link can join; the link then stops working."}
+                </p>
+              </fieldset>
+              <div className="invitation-defaults">
+                <label htmlFor="invitation-expiry">This invitation expires after</label>
+                <select id="invitation-expiry" onChange={(event) => setInvitationExpiry(Number(event.target.value))} value={invitationExpiry}>
+                  {INVITATION_LIFETIMES.filter(({ seconds }) => seconds <= localGroup.invitationLifetimeSeconds).map(({ label, seconds }) => (
+                    <option key={seconds} value={seconds}>{label}</option>
+                  ))}
+                </select>
+                <p className="preview-note">The group allows invitations of up to {localGroup.invitationLifetimeSeconds / 86400} days.</p>
+              </div>
+              {error && <p className="form-error preview-error" role="alert">{error}</p>}
+              <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">
+                {creatingInvitation ? "Creating invitation…" : "Create invitation"}
+              </button>
             </section>
           )}
 

@@ -2143,6 +2143,7 @@ function App() {
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
   const [previewReachability, setPreviewReachability] = useState<PeerSearchResult | null>(null);
+  const [previewCopied, setPreviewCopied] = useState<"inviter" | "group" | null>(null);
   const [checkingPreviewReachability, setCheckingPreviewReachability] = useState(false);
 
   useEffect(() => {
@@ -2151,6 +2152,7 @@ function App() {
 
   useEffect(() => {
     setPreviewReachability(null);
+    setPreviewCopied(null);
   }, [invitationPreview]);
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
   const [activeGroupId, setActiveGroupId] = useState("");
@@ -2837,6 +2839,15 @@ function App() {
       setError(errorMessage(reason));
     } finally {
       setVerifyingInvite(false);
+    }
+  }
+
+  async function copyPreviewValue(field: "inviter" | "group", value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setPreviewCopied(field);
+    } catch {
+      setError("The fingerprint could not be copied.");
     }
   }
 
@@ -4552,57 +4563,93 @@ function App() {
           )}
 
           {step === 3 && joinMode && invitationPreview && (
-            <section className="setup-form join-preview">
-              <div className="join-icon" aria-hidden="true"><BrandMark decorative /></div>
-              <header>
-                <p className="eyebrow">Invitation verified</p>
-                <h2>Join {invitationPreview.groupName}</h2>
-                <p>Invited by {invitationPreview.inviterName}</p>
-              </header>
-
-              <div className="status-row" aria-label="Invitation status">
-                <span className="status-chip">✓ Verified invitation</span>
-                <span className="status-chip muted">
-                  ○ {checkingPreviewReachability
-                    ? "Checking connection…"
-                    : previewReachability
-                      ? peerSearchDescription(previewReachability)
-                      : "Connection not checked"}
-                </span>
+            <section className="join-preview" aria-labelledby="join-preview-title">
+              <div className="join-preview-head">
+                <div className="join-avatar" aria-hidden="true">{GROUP_ICONS[0]}</div>
+                <div>
+                  <h2 id="join-preview-title">Join {invitationPreview.groupName}</h2>
+                  <div className="join-pills" aria-label="Invitation status">
+                    <span className={`join-pill${previewReachability?.status === "peerReachable" ? " available" : ""}`}>
+                      <span className="join-pill-dot" aria-hidden="true" />
+                      {checkingPreviewReachability
+                        ? "Checking connection…"
+                        : previewReachability?.status === "peerReachable"
+                          ? "Peer available"
+                          : previewReachability
+                            ? peerSearchDescription(previewReachability)
+                            : "Connection not checked"}
+                    </span>
+                    <span className="join-verified"><span aria-hidden="true">✓</span> Verified invitation</span>
+                  </div>
+                </div>
               </div>
 
-              <dl className="preview-facts">
-                <div><dt>Messages</dt><dd>You can send messages</dd></div>
-                <div><dt>History</dt><dd>{historyDescription(invitationPreview.historyPolicy)}</dd></div>
-                <div><dt>Invitation</dt><dd>{expiryDescription(invitationPreview.expiresAtUnix)}{invitationPreview.reusable ? " · Reusable" : " · Single use"}</dd></div>
-                <div><dt>Group fingerprint</dt><dd><code title={invitationPreview.groupId}>{shortPeerId(invitationPreview.groupId)}</code></dd></div>
-                <div><dt>Inviter device</dt><dd><code title={invitationPreview.inviterDeviceId}>{shortPeerId(invitationPreview.inviterDeviceId)}</code></dd></div>
+              <div className="join-inviter">
+                <span>Invited by <strong>{invitationPreview.inviterName}</strong></span>
+                <div className="join-copy-row">
+                  <code title={invitationPreview.inviterDeviceId}>{shortPeerId(invitationPreview.inviterDeviceId)}</code>
+                  <button
+                    aria-label="Copy inviter device fingerprint"
+                    onClick={() => void copyPreviewValue("inviter", invitationPreview.inviterDeviceId)}
+                    title={previewCopied === "inviter" ? "Copied" : "Copy"}
+                    type="button"
+                  >
+                    {previewCopied === "inviter" ? "✓" : "⧉"}
+                  </button>
+                </div>
+              </div>
+
+              <dl className="join-facts">
+                <div><span className="join-fact-icon" aria-hidden="true">✉</span><dt>Messages</dt><dd>You can send messages</dd></div>
+                <div><span className="join-fact-icon" aria-hidden="true">◷</span><dt>History</dt><dd>{historyDescription(invitationPreview.historyPolicy)}</dd></div>
+                <div><span className="join-fact-icon" aria-hidden="true">▦</span><dt>Invitation</dt><dd>{expiryDescription(invitationPreview.expiresAtUnix)}{invitationPreview.reusable ? " · Reusable" : " · Single use"}</dd></div>
+                <div>
+                  <span className="join-fact-icon" aria-hidden="true">⌘</span>
+                  <dt>Group fingerprint</dt>
+                  <dd className="join-copy-row">
+                    <code title={invitationPreview.groupId}>{shortPeerId(invitationPreview.groupId)}</code>
+                    <button
+                      aria-label="Copy group fingerprint"
+                      onClick={() => void copyPreviewValue("group", invitationPreview.groupId)}
+                      title={previewCopied === "group" ? "Copied" : "Copy"}
+                      type="button"
+                    >
+                      {previewCopied === "group" ? "✓" : "⧉"}
+                    </button>
+                  </dd>
+                </div>
               </dl>
 
-              <p className="preview-note">Your peer identity will be visible to group members.</p>
+              <p className="join-info-note"><span aria-hidden="true">i</span>Your peer identity will be visible to group members.</p>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
-              <button
-                className="secondary-button"
-                disabled={checkingPreviewReachability}
-                onClick={() => void checkPreviewReachability()}
-                type="button"
-              >
-                {checkingPreviewReachability ? "Checking connection…" : "Check whether the inviter is reachable"}
-              </button>
-              <p className="preview-note">Checking looks up the invitation's discovery key on the network. Joining still waits until a group member is reachable.</p>
-              <button className="primary-button join-button" disabled={acceptingInvite} onClick={acceptInvitation} type="button">
-                {acceptingInvite ? "Saving invitation…" : "Join group"}
-              </button>
-              <button
-                className="text-button"
-                onClick={() => {
-                  setInvitationPreview(null);
-                  setError("");
-                }}
-                type="button"
-              >
-                Use another invitation
-              </button>
+              <div className="join-reachability">
+                <button
+                  className="text-button"
+                  disabled={checkingPreviewReachability}
+                  onClick={() => void checkPreviewReachability()}
+                  type="button"
+                >
+                  {checkingPreviewReachability ? "Checking connection…" : "Check whether the inviter is reachable"}
+                </button>
+                <p className="preview-note">Checking looks up the invitation's discovery key on the network. Joining still waits until a group member is reachable.</p>
+              </div>
+
+              <div className="join-actions">
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    setInvitationPreview(null);
+                    setError("");
+                  }}
+                  type="button"
+                >
+                  Use another invitation
+                </button>
+                <button className="primary-button join-button" disabled={acceptingInvite} onClick={acceptInvitation} type="button">
+                  {acceptingInvite ? "Saving invitation…" : "Join group"}
+                </button>
+                <button className="secondary-button" onClick={closeJoinFlow} type="button">Cancel</button>
+              </div>
             </section>
           )}
             </>

@@ -114,14 +114,37 @@ button { cursor: pointer; }
 .ready-check { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 30px; border-radius: 50%; color: white; background: linear-gradient(145deg, #20c1ad, #008f88); font-size: 34px; box-shadow: 0 14px 30px rgba(0, 151, 145, .2); }
 .ready-identity { display: grid; gap: 4px; margin: -12px 0 30px; padding: 17px; border: 1px solid #dde5ec; border-radius: 14px; background: #fff; }
 .ready-identity span { font-weight: 700; }
-.join-preview { align-items: stretch; }
 .pending-card { align-items: stretch; }
 .pending-card header { margin-bottom: 26px; text-align: center; }
 .pending-card header > p:last-child { font-size: 20px; }
-.join-preview header { margin-bottom: 26px; text-align: center; }
-.join-preview header > p:last-child { font-size: 20px; }
-.join-icon { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 24px; border-radius: 20px; background: #e6faf7; }
-.join-icon .brand-mark { width: 48px; height: 48px; stroke-width: 5.5; }
+.join-preview { width: min(900px, 100%); display: flex; flex-direction: column; margin: 0 auto; padding: 32px 40px 28px; border: 1px solid #e0e6ee; border-radius: 16px; background: white; box-shadow: 0 18px 40px rgba(11, 22, 63, .06); }
+.join-preview-head { display: flex; align-items: center; gap: 28px; padding-bottom: 24px; }
+.join-preview-head h2 { margin: 0 0 14px; color: #06113e; font-size: clamp(28px, 3vw, 38px); line-height: 1.1; letter-spacing: -1px; overflow-wrap: anywhere; }
+.join-avatar { flex: 0 0 auto; width: 120px; height: 120px; display: grid; place-items: center; border-radius: 50%; color: #087d75; background: #e2f6f3; font-size: 30px; font-weight: 700; letter-spacing: -2px; }
+.join-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; }
+.join-pill { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px; border-radius: 10px; color: #63708b; background: #edf1f5; font-size: 16px; font-weight: 600; }
+.join-pill-dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa6b8; }
+.join-pill.available { color: #105c46; background: #e4f6ec; }
+.join-pill.available .join-pill-dot { background: #20b85c; }
+.join-verified { display: inline-flex; align-items: center; gap: 10px; padding-left: 18px; border-left: 1px solid #dfe5ec; color: #172044; font-size: 17px; }
+.join-verified span { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; color: white; background: #0b9f96; font-size: 16px; font-weight: 700; }
+.join-inviter { display: grid; gap: 6px; padding: 20px 0; border-top: 1px solid #e3e8ee; border-bottom: 1px solid #e3e8ee; color: #172044; font-size: 18px; }
+.join-copy-row { display: flex; align-items: center; gap: 8px; }
+.join-copy-row code { color: #50617c; font-family: "Cascadia Mono", Consolas, monospace; font-size: 15px; }
+.join-copy-row button { width: 32px; height: 32px; border: 0; border-radius: 8px; color: #55627e; background: transparent; font-size: 18px; }
+.join-copy-row button:hover { background: #e9eef3; }
+.join-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin: 0; padding: 22px 0; }
+.join-facts > div { display: grid; grid-template-columns: 44px minmax(0, 1fr); grid-template-rows: auto auto; column-gap: 12px; align-items: center; }
+.join-fact-icon { grid-row: 1 / 3; width: 44px; height: 44px; display: grid; place-items: center; border-radius: 50%; color: #3c4a68; background: #eff3f7; font-size: 18px; }
+.join-facts dt { color: #6a7691; font-size: 13px; font-weight: 600; }
+.join-facts dd { margin: 0; color: #172044; font-size: 15px; line-height: 1.35; }
+.join-info-note { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 14px 18px; border-radius: 10px; color: #233154; background: #eef4fb; font-size: 16px; }
+.join-info-note span { flex: 0 0 auto; width: 24px; height: 24px; display: grid; place-items: center; border-radius: 50%; color: white; background: #1f5fae; font-size: 14px; font-weight: 700; font-style: italic; }
+.join-reachability { display: grid; justify-items: center; }
+.join-reachability .preview-note { margin: 4px 0 18px; font-size: 14px; }
+.join-actions { display: flex; align-items: center; justify-content: flex-end; gap: 16px; padding-top: 22px; border-top: 1px solid #e3e8ee; }
+.join-actions .text-button { margin-right: auto; }
+.join-actions .primary-button, .join-actions .secondary-button { width: auto; min-width: 180px; min-height: 56px; height: 56px; margin: 0; padding: 0 28px; font-size: 18px; }
 .pending-icon { width: 74px; height: 74px; display: grid; place-items: center; align-self: center; margin: 0 0 24px; border-radius: 50%; color: #0b9f96; background: #e6faf7; font-size: 42px; font-weight: 700; }
 .status-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 24px; }
 .status-chip { padding: 8px 13px; border-radius: 999px; color: #087d75; background: #e2f8f4; font-size: 14px; font-weight: 700; }
@@ -340,6 +363,7 @@ button { cursor: pointer; }
   .setup-form h2 { font-size: 42px; }
   .setup-form header > p:last-child { font-size: 21px; }
   .create-group-cards { grid-template-columns: 1fr; }
+  .join-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 680px) {
@@ -351,6 +375,14 @@ button { cursor: pointer; }
   .sidebar-footer { display: flex; flex-wrap: wrap; }
   .join-options { grid-template-columns: 1fr; }
   .create-group-actions button { flex: 1; min-width: 0; }
+  .join-preview { padding: 22px 18px; }
+  .join-preview-head { flex-direction: column; text-align: center; gap: 16px; }
+  .join-avatar { width: 88px; height: 88px; font-size: 24px; }
+  .join-pills { justify-content: center; }
+  .join-facts { grid-template-columns: 1fr; }
+  .join-actions { flex-wrap: wrap; }
+  .join-actions .text-button { width: 100%; margin: 0; }
+  .join-actions .primary-button, .join-actions .secondary-button { flex: 1; min-width: 0; }
   .app-main { padding: 24px 18px; }
   .onboarding-shell { display: block; background: #fbfcfd; }
   .brand-panel { min-height: auto; padding: 24px; background: #122940; }

@@ -11,9 +11,9 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, EventId, EventKind, EventSpec, GroupMetadata, Invitation,
-    InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId, SignedEvent,
-    SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse, MAX_JOIN_RESPONSE_WIRE_BYTES,
-    MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
+    InvitationId, InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageEdit, PeerId,
+    SignedEvent, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
@@ -24,7 +24,7 @@ use charp2p_mls::{
     ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
-    EventStore, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
+    EventStore, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
     MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
 use charp2p_sync::{
@@ -1857,12 +1857,15 @@ impl MlsProviderService {
     /// call made a new admission, it then re-authors the current group metadata in the
     /// joiner's first epoch. A joiner cannot decrypt metadata changes from
     /// before its Welcome, so this is how it learns the current name and icon.
+    /// A single-use invitation is consumed by the admission (ADR-042).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_member_sharing_metadata(
         &self,
         group_id: PeerId,
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
+        single_use_invitation: Option<InvitationId>,
         local_group_name: &str,
         icon: u8,
     ) -> Result<JoinResponse, MemberAdmissionError> {
@@ -1876,6 +1879,7 @@ impl MlsProviderService {
             owner_identity,
             authenticated_peer,
             encoded_key_package,
+            single_use_invitation,
             local_group_name,
             icon,
             created_at_unix_ms,
@@ -1889,6 +1893,7 @@ impl MlsProviderService {
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
+        single_use_invitation: Option<InvitationId>,
         local_group_name: &str,
         icon: u8,
         created_at_unix_ms: u64,
@@ -1898,6 +1903,7 @@ impl MlsProviderService {
             owner_identity,
             authenticated_peer,
             encoded_key_package,
+            single_use_invitation,
             created_at_unix_ms,
         )?;
         if admitted {
@@ -1972,6 +1978,7 @@ impl MlsProviderService {
             owner_identity,
             authenticated_peer,
             encoded_key_package,
+            None,
             created_at_unix_ms,
         )
         .map(|(response, _)| response)
@@ -1979,12 +1986,16 @@ impl MlsProviderService {
 
     /// Returns the Welcome response and whether this call admitted the
     /// device, as opposed to replaying a stored admission for a retry.
+    /// Only the consuming device's exact retry passes a consumed single-use
+    /// invitation; every other device, including a concurrent loser of the
+    /// consuming transaction, is answered `unauthorized` (ADR-042).
     fn admit_member_once_at(
         &self,
         group_id: PeerId,
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
+        single_use_invitation: Option<InvitationId>,
         created_at_unix_ms: u64,
     ) -> Result<(JoinResponse, bool), MemberAdmissionError> {
         let _operation = self
@@ -2032,6 +2043,15 @@ impl MlsProviderService {
                 return Err(MemberAdmissionError::Unavailable);
             }
             return Ok((response, false));
+        }
+        if let Some(invitation_id) = single_use_invitation {
+            if store
+                .single_use_invitation_consumer(group_id, invitation_id)
+                .map_err(|_| MemberAdmissionError::Unavailable)?
+                .is_some()
+            {
+                return Err(MemberAdmissionError::Unauthorized);
+            }
         }
         let previous = provider
             .snapshot()
@@ -2112,9 +2132,12 @@ impl MlsProviderService {
                     authenticated_peer,
                     &request_hash,
                     &encrypted_response,
-                    None,
+                    single_use_invitation,
                 )
-                .map_err(|_| MemberAdmissionError::Unavailable)?;
+                .map_err(|error| match error {
+                    StoreError::InvitationConsumed => MemberAdmissionError::Unauthorized,
+                    _ => MemberAdmissionError::Unavailable,
+                })?;
             Ok((response, true))
         })();
 
@@ -3500,6 +3523,90 @@ mod tests {
     }
 
     #[test]
+    fn single_use_invitation_admits_one_device_and_replays_only_its_retry() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation_id = invitation(&group_identity).invitation_id();
+        let owner = DeviceIdentity::generate();
+        let first_id = DeviceIdentity::generate().peer_id();
+        let second_id = DeviceIdentity::generate().peer_id();
+        let (_, first_package) = member_key_package(first_id);
+        let (_, second_package) = member_key_package(second_id);
+        let service = test_service(&path);
+        service.initialize_owner_group(group_id, &owner).unwrap();
+
+        let (welcome, admitted) = service
+            .admit_member_once_at(
+                group_id,
+                &owner,
+                first_id,
+                first_package.encoded(),
+                Some(invitation_id),
+                42,
+            )
+            .unwrap();
+        assert!(admitted);
+        let (retried, admitted) = service
+            .admit_member_once_at(
+                group_id,
+                &owner,
+                first_id,
+                first_package.encoded(),
+                Some(invitation_id),
+                43,
+            )
+            .unwrap();
+        assert!(!admitted);
+        assert_eq!(retried.encode().unwrap(), welcome.encode().unwrap());
+        assert!(matches!(
+            service.admit_member_once_at(
+                group_id,
+                &owner,
+                second_id,
+                second_package.encoded(),
+                Some(invitation_id),
+                44,
+            ),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
+        assert_eq!(service.group_members(group_id).unwrap().len(), 2);
+        let store = EventStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .single_use_invitation_consumer(group_id, invitation_id)
+                .unwrap(),
+            Some(first_id)
+        );
+        assert!(store
+            .mls_join_admission(group_id, second_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .event_ids_after(group_id, owner.peer_id(), 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(store);
+
+        // A reusable invitation keeps admitting other devices.
+        service
+            .admit_member_once_at(
+                group_id,
+                &owner,
+                second_id,
+                second_package.encoded(),
+                None,
+                45,
+            )
+            .unwrap();
+        assert_eq!(service.group_members(group_id).unwrap().len(), 3);
+    }
+
+    #[test]
     fn owner_removal_persists_and_blocks_invitation_reuse() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("charp2p.sqlite3");
@@ -4557,6 +4664,7 @@ mod tests {
                 &owner,
                 member_id,
                 request.key_package(),
+                None,
                 "Design Crew",
                 4,
                 42,
@@ -4568,6 +4676,7 @@ mod tests {
                 &owner,
                 member_id,
                 request.key_package(),
+                None,
                 "Design Crew",
                 4,
                 43,

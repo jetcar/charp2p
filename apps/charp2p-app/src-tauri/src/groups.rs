@@ -1273,6 +1273,15 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
         let group_id = request.group_id();
         self.groups
             .admission_approval(request, authenticated_peer)?;
+        // The signed reuse claim is authoritative (ADR-042); the invitation
+        // was already authorized against the issued bearer record.
+        let now_unix = unix_now().map_err(|_| MemberAdmissionError::Unavailable)?;
+        let invitation = Invitation::decode(request.invitation(), now_unix)
+            .map_err(|_| MemberAdmissionError::Unauthorized)?;
+        if invitation.group_id() != group_id {
+            return Err(MemberAdmissionError::Unauthorized);
+        }
+        let single_use_invitation = (!invitation.is_reusable()).then(|| invitation.invitation_id());
         let group = self
             .groups
             .list()
@@ -1285,6 +1294,7 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             owner_identity,
             authenticated_peer,
             request.key_package(),
+            single_use_invitation,
             &group.group_name,
             group.icon,
         )

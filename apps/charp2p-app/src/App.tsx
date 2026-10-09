@@ -16,6 +16,12 @@ type InvitationPreview = {
   reusable: boolean;
 };
 const GROUP_ICONS = ["●●●", "◆", "▲", "♥", "★"];
+const INVITATION_LIFETIMES = [
+  { label: "1 day", seconds: 86400 },
+  { label: "7 days", seconds: 604800 },
+  { label: "14 days", seconds: 1209600 },
+  { label: "30 days", seconds: 2592000 },
+];
 type PendingGroup = InvitationPreview;
 type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable"> & {
   lastSynchronizedAtUnix: number | null;
@@ -2114,6 +2120,7 @@ function App() {
   const [groupApprovalRequired, setGroupApprovalRequired] = useState(false);
   const [groupReusableInvitation, setGroupReusableInvitation] = useState(true);
   const [invitationReusable, setInvitationReusable] = useState(true);
+  const [invitationExpiry, setInvitationExpiry] = useState(604800);
   const [usedInvitationGroupIds, setUsedInvitationGroupIds] = useState<string[]>([]);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
@@ -2217,6 +2224,10 @@ function App() {
   useEffect(() => {
     setInvitationReusable(localGroup?.reusableInvitation ?? true);
   }, [localGroup?.groupId, localGroup?.reusableInvitation]);
+
+  useEffect(() => {
+    setInvitationExpiry(localGroup?.invitationLifetimeSeconds ?? 604800);
+  }, [localGroup?.groupId, localGroup?.invitationLifetimeSeconds]);
 
   // The owner retires a single-use invitation once a device is admitted
   // through it (ADR-042), so its disappearance before expiry means it was used.
@@ -3390,6 +3401,7 @@ function App() {
       const invitation = await invoke<IssuedInvitation>("create_group_invitation", {
         groupId: localGroup.groupId,
         reusable: invitationReusable,
+        lifetimeSeconds: invitationExpiry,
       });
       setUsedInvitationGroupIds((current) => current.filter((groupId) => groupId !== invitation.groupId));
       setIssuedInvitations((current) => [
@@ -4051,6 +4063,15 @@ function App() {
                         : "Only the first device admitted with this link can join; the link then stops working."}
                     </p>
                   </fieldset>
+                  <div className="invitation-defaults">
+                    <label htmlFor="invitation-expiry">This invitation expires after</label>
+                    <select id="invitation-expiry" onChange={(event) => setInvitationExpiry(Number(event.target.value))} value={invitationExpiry}>
+                      {INVITATION_LIFETIMES.filter(({ seconds }) => seconds <= localGroup.invitationLifetimeSeconds).map(({ label, seconds }) => (
+                        <option key={seconds} value={seconds}>{label}</option>
+                      ))}
+                    </select>
+                    <p className="preview-note">The group allows invitations of up to {localGroup.invitationLifetimeSeconds / 86400} days.</p>
+                  </div>
                   {error && <p className="form-error preview-error" role="alert">{error}</p>}
                   <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">
                     {creatingInvitation ? "Creating invitation…" : "Create invitation"}
@@ -4115,10 +4136,9 @@ function App() {
               <div className="invitation-defaults">
                 <label htmlFor="invitation-lifetime">Invitation expires after</label>
                 <select id="invitation-lifetime" onChange={(event) => setInvitationLifetime(Number(event.target.value))} value={invitationLifetime}>
-                  <option value={86400}>1 day</option>
-                  <option value={604800}>7 days</option>
-                  <option value={1209600}>14 days</option>
-                  <option value={2592000}>30 days</option>
+                  {INVITATION_LIFETIMES.map(({ label, seconds }) => (
+                    <option key={seconds} value={seconds}>{label}</option>
+                  ))}
                 </select>
                 <p className="preview-note">Invitation links remain valid for their selected lifetime.</p>
                 <label className="contribution-option">

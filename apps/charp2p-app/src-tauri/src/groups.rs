@@ -401,13 +401,16 @@ impl GroupService {
 
     /// `address_hints` are the inviter device's current addresses, carried
     /// in the invitation as root-signed hints (ADR-037). `reusable` overrides
-    /// the group's default reuse policy for this invitation (ADR-042).
+    /// the group's default reuse policy for this invitation (ADR-042), and
+    /// `lifetime_seconds` selects a shorter expiry than the group's
+    /// invitation lifetime.
     pub fn issue_invitation(
         &self,
         group_id: PeerId,
         inviter_device_id: PeerId,
         inviter_name: &str,
         reusable: Option<bool>,
+        lifetime_seconds: Option<u64>,
         address_hints: &[Multiaddr],
     ) -> Result<IssuedInvitation, &'static str> {
         let now_unix = SystemTime::now()
@@ -420,6 +423,7 @@ impl GroupService {
             inviter_name,
             None,
             reusable,
+            lifetime_seconds,
             address_hints,
             now_unix,
         )
@@ -490,6 +494,7 @@ impl GroupService {
             owner_device_id,
             inviter_name,
             Some((authenticated_peer, u64::from(request.lifetime_seconds()))),
+            None,
             None,
             address_hints,
             now_unix,
@@ -992,6 +997,7 @@ impl GroupService {
             inviter_name,
             None,
             reusable,
+            None,
             &[],
             now_unix,
         )
@@ -1003,7 +1009,8 @@ impl GroupService {
     /// member request may only shorten the group's invitation lifetime, and
     /// a repeated request from the same member returns its still-active
     /// invitation instead of failing. Member requests always use the group's
-    /// default reuse policy; only the owner may override it. Address hints are dropped when they
+    /// default reuse policy; only the owner may override it or select a
+    /// shorter allowed lifetime. Address hints are dropped when they
     /// would make the invitation invalid or too large to protect, since they
     /// are only an optimization.
     #[allow(clippy::too_many_arguments)]
@@ -1014,9 +1021,15 @@ impl GroupService {
         inviter_name: &str,
         requested: Option<(PeerId, u64)>,
         reusable: Option<bool>,
+        lifetime_seconds: Option<u64>,
         address_hints: &[Multiaddr],
         now_unix: u64,
     ) -> Result<(Invitation, Zeroizing<String>), &'static str> {
+        if let Some(lifetime) = lifetime_seconds {
+            if requested.is_some() || !ALLOWED_INVITATION_LIFETIMES.contains(&lifetime) {
+                return Err("invalid_invitation_lifetime");
+            }
+        }
         let requested_by = requested.map(|(requester, _)| requester);
         let _operation = self
             .operations
@@ -1032,6 +1045,9 @@ impl GroupService {
             .into_iter()
             .find(|group| group.group_id == group_id)
             .ok_or("group_not_found")?;
+        if lifetime_seconds.is_some_and(|lifetime| lifetime > group.invitation_lifetime_seconds) {
+            return Err("invalid_invitation_lifetime");
+        }
         for existing in store
             .issued_invitations()
             .map_err(|_| "group_store_unavailable")?
@@ -1098,10 +1114,10 @@ impl GroupService {
         if identity.group_id() != group_id {
             return Err("group_identity_record_invalid");
         }
-        let lifetime_seconds = requested
-            .map_or(group.invitation_lifetime_seconds, |(_, lifetime)| {
-                lifetime.min(group.invitation_lifetime_seconds)
-            });
+        let lifetime_seconds = requested.map_or(
+            lifetime_seconds.unwrap_or(group.invitation_lifetime_seconds),
+            |(_, lifetime)| lifetime.min(group.invitation_lifetime_seconds),
+        );
         let expires_at_unix = now_unix
             .checked_add(lifetime_seconds)
             .ok_or("system_clock_invalid")?;
@@ -1816,6 +1832,7 @@ mod tests {
                 "Maya's PC",
                 None,
                 None,
+                None,
                 std::slice::from_ref(&hint),
                 NOW,
             )
@@ -1831,6 +1848,7 @@ mod tests {
                 group_id,
                 inviter,
                 "Maya's PC",
+                None,
                 None,
                 None,
                 &[invalid],
@@ -1990,6 +2008,57 @@ mod tests {
             JoinRequestAuthorization::Authorized
         );
         assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owner_selects_a_shorter_invitation_expiry_capped_at_the_group_lifetime() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate().peer_id();
+        let issue = |lifetime| {
+            service
+                .issue_requested_invitation_at(
+                    group_id,
+                    owner,
+                    "Maya's PC",
+                    None,
+                    None,
+                    lifetime,
+                    &[],
+                    NOW,
+                )
+                .map(|(invitation, _)| invitation.expires_at_unix())
+        };
+
+        for refused in [1_209_600, 3_600] {
+            assert_eq!(issue(Some(refused)), Err("invalid_invitation_lifetime"));
+        }
+        assert_eq!(
+            service
+                .issue_requested_invitation_at(
+                    group_id,
+                    owner,
+                    "Maya's PC",
+                    Some((owner, 86_400)),
+                    None,
+                    Some(86_400),
+                    &[],
+                    NOW,
+                )
+                .err(),
+            Some("invalid_invitation_lifetime")
+        );
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+
+        assert_eq!(issue(Some(86_400)), Ok(NOW + 86_400));
+        assert_eq!(
+            service.issued_invitations_at(NOW).unwrap()[0].expires_at_unix,
+            NOW + 86_400
+        );
+        service.revoke_invitation(group_id).unwrap();
+        assert_eq!(issue(None), Ok(NOW + 604_800));
     }
 
     #[test]
@@ -2452,6 +2521,7 @@ mod tests {
                 owner,
                 "Maya's PC",
                 Some((requester, 86_400)),
+                None,
                 None,
                 &[],
                 NOW,

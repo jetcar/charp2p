@@ -11,7 +11,8 @@ use charp2p_core::{
     JoinResponse, PeerId,
 };
 use charp2p_store::{
-    EventStore, IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
+    ApprovalRequestOutcome, EventStore, IssuedInvitationMetadata, LocalGroupMetadata,
+    OwnerDiscoveryKeyMetadata,
 };
 use keyring_core::Error as KeyringError;
 use libp2p::Multiaddr;
@@ -238,10 +239,7 @@ impl GroupService {
             return Err("invalid_group_icon");
         }
         let history_policy = parse_history_policy(spec.history_policy)?;
-        if history_policy != HistoryPolicy::None
-            || spec.approval_required
-            || !spec.reusable_invitation
-        {
+        if history_policy != HistoryPolicy::None || !spec.reusable_invitation {
             return Err("group_option_unsupported");
         }
         if !ALLOWED_INVITATION_LIFETIMES.contains(&spec.invitation_lifetime_seconds) {
@@ -740,6 +738,66 @@ impl GroupService {
         })
     }
 
+    /// Checks owner approval for an authorized join request (ADR-041).
+    /// Groups created without approval admit directly; otherwise the request
+    /// is recorded and only devices the owner approved proceed.
+    pub(crate) fn admission_approval(
+        &self,
+        request: &JoinRequest,
+        device_id: PeerId,
+    ) -> Result<(), MemberAdmissionError> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+            .as_secs();
+        self.admission_approval_at(request, device_id, now_unix)
+    }
+
+    fn admission_approval_at(
+        &self,
+        request: &JoinRequest,
+        device_id: PeerId,
+        now_unix: u64,
+    ) -> Result<(), MemberAdmissionError> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| MemberAdmissionError::Unavailable)?;
+        let group = store
+            .local_groups()
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+            .into_iter()
+            .find(|group| group.group_id == request.group_id())
+            .ok_or(MemberAdmissionError::Unauthorized)?;
+        if !group.approval_required {
+            return Ok(());
+        }
+        let invitation = Invitation::decode(request.invitation(), now_unix)
+            .map_err(|_| MemberAdmissionError::Unauthorized)?;
+        if invitation.group_id() != group.group_id {
+            return Err(MemberAdmissionError::Unauthorized);
+        }
+        match store
+            .record_owner_approval_request(
+                group.group_id,
+                device_id,
+                invitation.invitation_id(),
+                invitation.expires_at_unix(),
+                now_unix,
+            )
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+        {
+            ApprovalRequestOutcome::Approved => Ok(()),
+            ApprovalRequestOutcome::Pending => Err(MemberAdmissionError::AwaitingApproval),
+            ApprovalRequestOutcome::Declined => Err(MemberAdmissionError::Unauthorized),
+            ApprovalRequestOutcome::Full => Err(MemberAdmissionError::Unavailable),
+        }
+    }
+
     #[cfg(test)]
     fn issue_invitation_at(
         &self,
@@ -1122,11 +1180,13 @@ impl OwnerMemberAdmissionService {
 impl MemberAdmissionService for OwnerMemberAdmissionService {
     fn admit_member(
         &self,
-        group_id: PeerId,
+        request: &JoinRequest,
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
-        encoded_key_package: &[u8],
     ) -> Result<JoinResponse, MemberAdmissionError> {
+        let group_id = request.group_id();
+        self.groups
+            .admission_approval(request, authenticated_peer)?;
         let group = self
             .groups
             .list()
@@ -1138,7 +1198,7 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             group_id,
             owner_identity,
             authenticated_peer,
-            encoded_key_package,
+            request.key_package(),
             &group.group_name,
             group.icon,
         )
@@ -1669,6 +1729,82 @@ mod tests {
     }
 
     #[test]
+    fn approval_required_group_admits_only_approved_devices() {
+        use crate::mls_storage::MemberAdmissionError;
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut approval = spec("Design Crew");
+        approval.approval_required = true;
+        let created = service.create(approval).unwrap();
+        assert!(created.approval_required);
+        let group_id: PeerId = created.group_id.parse().unwrap();
+        let issued = service
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        let device = DeviceIdentity::generate().peer_id();
+        let declined = DeviceIdentity::generate().peer_id();
+
+        for _ in 0..2 {
+            assert_eq!(
+                service.admission_approval_at(&request, device, NOW),
+                Err(MemberAdmissionError::AwaitingApproval)
+            );
+        }
+        assert_eq!(
+            service.admission_approval_at(&request, declined, NOW),
+            Err(MemberAdmissionError::AwaitingApproval)
+        );
+        {
+            let mut store = service.metadata.lock().unwrap();
+            let requests = store.owner_approval_requests(group_id, NOW).unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0].invitation_id,
+                request_invitation_id(&request, NOW)
+            );
+            assert!(store
+                .approve_owner_approval_request(group_id, device)
+                .unwrap());
+            assert!(store
+                .decline_owner_approval_request(group_id, declined)
+                .unwrap());
+        }
+        assert_eq!(service.admission_approval_at(&request, device, NOW), Ok(()));
+        assert_eq!(
+            service.admission_approval_at(&request, declined, NOW),
+            Err(MemberAdmissionError::Unauthorized)
+        );
+
+        let open = service.create(spec("Open Crew")).unwrap();
+        let open_issued = service
+            .issue_invitation_at(
+                open.group_id.parse().unwrap(),
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
+            .unwrap();
+        let open_request = join_request(&open_issued.link, NOW);
+        assert_eq!(
+            service.admission_approval_at(&open_request, device, NOW),
+            Ok(())
+        );
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .owner_approval_requests(open.group_id.parse().unwrap(), NOW)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn permitted_member_invite_request_issues_owner_pinned_invitation() {
         const NOW: u64 = 1_800_000_000;
         let service = service();
@@ -2103,19 +2239,12 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_access_and_history_options_are_rejected() {
+    fn unimplemented_history_and_invitation_options_are_rejected() {
         let service = service();
         let mut unsupported_history = spec("Design Crew");
         unsupported_history.history_policy = "allRetained";
         assert!(matches!(
             service.create(unsupported_history),
-            Err("group_option_unsupported")
-        ));
-
-        let mut approval = spec("Design Crew");
-        approval.approval_required = true;
-        assert!(matches!(
-            service.create(approval),
             Err("group_option_unsupported")
         ));
 

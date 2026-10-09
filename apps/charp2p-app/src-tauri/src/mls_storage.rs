@@ -200,6 +200,8 @@ pub(crate) enum MemberAdmissionError {
     Unauthorized,
     UnsupportedProfile,
     Unavailable,
+    /// The owner has not approved the device yet (ADR-041).
+    AwaitingApproval,
 }
 
 impl MlsProviderService {

@@ -94,10 +94,9 @@ impl InviteRequestService for RejectingInviteRequestService {
 pub(crate) trait MemberAdmissionService: Send + Sync {
     fn admit_member(
         &self,
-        group_id: PeerId,
+        request: &JoinRequest,
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
-        encoded_key_package: &[u8],
     ) -> Result<JoinResponse, MemberAdmissionError>;
 }
 
@@ -2244,23 +2243,23 @@ fn join_response(
             request.key_package(),
             authenticated_peer,
         ) {
-            Ok(_) => match member_admission.admit_member(
-                request.group_id(),
-                owner_identity,
-                authenticated_peer,
-                request.key_package(),
-            ) {
-                Ok(response) => response,
-                Err(MemberAdmissionError::Unauthorized) => {
-                    JoinResponse::rejected(JoinRejectReason::Unauthorized)
+            Ok(_) => {
+                match member_admission.admit_member(request, owner_identity, authenticated_peer) {
+                    Ok(response) => response,
+                    Err(MemberAdmissionError::Unauthorized) => {
+                        JoinResponse::rejected(JoinRejectReason::Unauthorized)
+                    }
+                    Err(MemberAdmissionError::UnsupportedProfile) => {
+                        JoinResponse::rejected(JoinRejectReason::UnsupportedProfile)
+                    }
+                    Err(MemberAdmissionError::Unavailable) => {
+                        JoinResponse::rejected(JoinRejectReason::Busy)
+                    }
+                    Err(MemberAdmissionError::AwaitingApproval) => {
+                        JoinResponse::rejected(JoinRejectReason::AwaitingApproval)
+                    }
                 }
-                Err(MemberAdmissionError::UnsupportedProfile) => {
-                    JoinResponse::rejected(JoinRejectReason::UnsupportedProfile)
-                }
-                Err(MemberAdmissionError::Unavailable) => {
-                    JoinResponse::rejected(JoinRejectReason::Busy)
-                }
-            },
+            }
             Err(
                 ProfileKeyPackageError::UnsupportedCiphersuite
                 | ProfileKeyPackageError::UnsupportedCapabilities,
@@ -2287,10 +2286,9 @@ struct UnavailableMemberAdmissionService;
 impl MemberAdmissionService for UnavailableMemberAdmissionService {
     fn admit_member(
         &self,
-        _group_id: PeerId,
+        _request: &JoinRequest,
         _owner_identity: &DeviceIdentity,
         _authenticated_peer: PeerId,
-        _encoded_key_package: &[u8],
     ) -> Result<JoinResponse, MemberAdmissionError> {
         Err(MemberAdmissionError::Unavailable)
     }
@@ -2532,12 +2530,24 @@ mod tests {
     impl MemberAdmissionService for AcceptingMemberAdmissionService {
         fn admit_member(
             &self,
-            _group_id: PeerId,
+            _request: &JoinRequest,
             _owner_identity: &DeviceIdentity,
             _authenticated_peer: PeerId,
-            _encoded_key_package: &[u8],
         ) -> Result<JoinResponse, MemberAdmissionError> {
             JoinResponse::accepted(vec![4, 5, 6]).map_err(|_| MemberAdmissionError::Unavailable)
+        }
+    }
+
+    struct AwaitingApprovalMemberAdmissionService;
+
+    impl MemberAdmissionService for AwaitingApprovalMemberAdmissionService {
+        fn admit_member(
+            &self,
+            _request: &JoinRequest,
+            _owner_identity: &DeviceIdentity,
+            _authenticated_peer: PeerId,
+        ) -> Result<JoinResponse, MemberAdmissionError> {
+            Err(MemberAdmissionError::AwaitingApproval)
         }
     }
 
@@ -2845,6 +2855,18 @@ mod tests {
             )
             .rejection(),
             Some(JoinRejectReason::UnsupportedProfile)
+        );
+
+        assert_eq!(
+            join_response(
+                JoinRequestAuthorization::Authorized,
+                &AwaitingApprovalMemberAdmissionService,
+                &owner,
+                &request,
+                peer_id,
+            )
+            .rejection(),
+            Some(JoinRejectReason::AwaitingApproval)
         );
 
         let accepted = join_response(

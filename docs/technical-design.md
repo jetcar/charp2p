@@ -351,14 +351,16 @@ and an encrypted accepted response in one transaction. An exact retry returns
 that response even after restart. A different KeyPackage for an already present
 device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
-lets a valid invitation grant access directly. Group creation rejects approval,
-single-use, and retained-history options until their enforcement paths exist.
+lets a valid invitation grant access directly unless the group requires owner
+approval. Group creation rejects single-use and retained-history options until
+their enforcement paths exist.
 Owner approval follows ADR-041: an authorized bearer whose device the owner has
 not approved yet is recorded as a bounded approval request and answered with
 the `awaiting approval` category (code 4), which the joiner treats like `busy`
-and retries with the same pending KeyPackage. The wire category is defined;
-approval-required groups stay rejected until the owner-side request records
-and approval controls exist.
+and retries with the same pending KeyPackage. The check runs after KeyPackage
+validation and before any MLS change; a declined device is answered
+`unauthorized`, and a group already holding the maximum undecided requests
+answers `busy`.
 The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before

@@ -362,7 +362,9 @@ validation and before any MLS change; a declined device is answered
 `unauthorized`, and a group already holding the maximum undecided requests
 answers `busy`. The owner lists requests on the Members page and approves,
 declines, or allows a declined device to ask again; decisions stay on the owner
-device.
+device. Create group offers the approval option, and the joiner's pending
+invitation and Groups page show that owner approval is awaited after an
+`awaiting approval` answer.
 The exchange uses `/charp2p/join/1.0.0` over the authenticated libp2p
 connection, with a 30-second request timeout and 16 concurrent streams per
 connection. The transport reads one byte beyond each outer bound before

@@ -2069,6 +2069,7 @@ function App() {
   const [joiningGroup, setJoiningGroup] = useState(false);
   const [cancellingPending, setCancellingPending] = useState(false);
   const [autoJoinWaitingIds, setAutoJoinWaitingIds] = useState<string[]>([]);
+  const [awaitingApprovalIds, setAwaitingApprovalIds] = useState<string[]>([]);
   const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
   const pendingExpiryRefreshAtRef = useRef(0);
@@ -2092,6 +2093,7 @@ function App() {
   const [groupName, setGroupName] = useState("");
   const [groupIcon, setGroupIcon] = useState(0);
   const [invitationLifetime, setInvitationLifetime] = useState(604800);
+  const [groupApprovalRequired, setGroupApprovalRequired] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creatingInvitation, setCreatingInvitation] = useState(false);
   const [revokingInvitation, setRevokingInvitation] = useState(false);
@@ -2300,12 +2302,14 @@ function App() {
   useEffect(() => {
     if (!isTauri() || !pendingJoinGroupIds) {
       setAutoJoinWaitingIds([]);
+      setAwaitingApprovalIds([]);
       return;
     }
     let active = true;
     let timer: number | undefined;
     const groupIds = pendingJoinGroupIds.split(",");
     setAutoJoinWaitingIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
+    setAwaitingApprovalIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
 
     async function retryJoins() {
       let retry = false;
@@ -2793,12 +2797,19 @@ function App() {
       setPendingGroups((groups) => groups.filter((group) => group.groupId !== groupId));
       setOpenPendingGroupId((current) => current === groupId ? "" : current);
       setAutoJoinWaitingIds((current) => current.filter((id) => id !== groupId));
+      setAwaitingApprovalIds((current) => current.filter((id) => id !== groupId));
       return false;
     } catch (reason) {
       const retryable = typeof reason === "string" && RETRYABLE_JOIN_ERRORS.has(reason);
       setAutoJoinWaitingIds((current) => [
         ...current.filter((id) => id !== groupId),
         ...(automatic && retryable ? [groupId] : []),
+      ]);
+      // The owner recorded the request; the answer stays until a later
+      // attempt is admitted or fails differently.
+      setAwaitingApprovalIds((current) => [
+        ...current.filter((id) => id !== groupId),
+        ...(reason === "join_awaiting_approval" ? [groupId] : []),
       ]);
       if (!(automatic && retryable)) {
         setError(errorMessage(reason));
@@ -3284,7 +3295,7 @@ function App() {
         groupName,
         icon: groupIcon,
         historyPolicy: "none",
-        approvalRequired: false,
+        approvalRequired: groupApprovalRequired,
         invitationLifetimeSeconds: invitationLifetime,
         reusableInvitation: true,
       });
@@ -3482,7 +3493,16 @@ function App() {
                 <span className="status-chip">✓ Verified invitation</span>
                 <span className="status-chip muted">○ {searchingPeers ? "Searching…" : peerSearchDescription(peerSearchResult)}</span>
                 {(joiningGroup || autoJoinWaitingIds.includes(pendingGroup.groupId)) && (
-                  <span className="status-chip muted">{joiningGroup ? "Joining…" : "Waiting for the group owner · retrying every minute"}</span>
+                  <span className="status-chip muted">
+                    {joiningGroup
+                      ? "Joining…"
+                      : awaitingApprovalIds.includes(pendingGroup.groupId)
+                        ? "Awaiting owner approval · retrying every minute"
+                        : "Waiting for the group owner · retrying every minute"}
+                  </span>
+                )}
+                {!joiningGroup && !autoJoinWaitingIds.includes(pendingGroup.groupId) && awaitingApprovalIds.includes(pendingGroup.groupId) && (
+                  <span className="status-chip muted">Awaiting owner approval</span>
                 )}
               </div>
               <dl className="preview-facts">
@@ -3582,7 +3602,11 @@ function App() {
                     <span>
                       Pending invitation
                       <i className="group-connection waiting">
-                        {autoJoinWaitingIds.includes(group.groupId) ? "Waiting for owner" : expiryDescription(group.expiresAtUnix)}
+                        {awaitingApprovalIds.includes(group.groupId)
+                          ? "Awaiting owner approval"
+                          : autoJoinWaitingIds.includes(group.groupId)
+                            ? "Waiting for owner"
+                            : expiryDescription(group.expiresAtUnix)}
                       </i>
                     </span>
                   </button>
@@ -3967,6 +3991,19 @@ function App() {
               <fieldset className="choice-group">
                 <legend>Current secure group profile</legend>
                 <p className="preview-note">A valid invitation grants access until it expires. New members receive messages sent after they join.</p>
+                <label className="contribution-option">
+                  <input
+                    checked={groupApprovalRequired}
+                    onChange={(event) => setGroupApprovalRequired(event.target.checked)}
+                    type="checkbox"
+                  />
+                  Require owner approval
+                </label>
+                <p className="preview-note">
+                  {groupApprovalRequired
+                    ? "Each new device waits until you approve it on the Members page; this device must be online to receive the request and admit the device."
+                    : "Anyone with a valid invitation joins without waiting for you."}
+                </p>
               </fieldset>
 
               <div className="invitation-defaults">

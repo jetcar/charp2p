@@ -666,6 +666,7 @@ impl NetworkNode {
                     }
                     return NetworkEvent::PeerIdentified {
                         peer_id,
+                        serves_routing: info.protocols.contains(&DHT_PROTOCOL),
                         listen_addresses: info.listen_addrs,
                     };
                 }
@@ -1038,6 +1039,9 @@ pub enum NetworkEvent {
     PeerIdentified {
         /// Remote peer identity.
         peer_id: PeerId,
+        /// Whether the peer advertises the CharP2P DHT protocol, which only
+        /// routing-mode nodes do (ADR-046).
+        serves_routing: bool,
         /// Addresses advertised by the remote Identify behaviour.
         listen_addresses: Vec<Multiaddr>,
     },
@@ -1754,6 +1758,52 @@ mod tests {
         assert_eq!(peer_id, listener_id);
         assert_eq!(path, ConnectionPath::Lan);
         assert_eq!(remote_address, listen_address);
+    }
+
+    #[tokio::test]
+    async fn identify_reports_whether_a_peer_serves_routing() {
+        let mut routing = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let mut client = NetworkNode::new(Keypair::generate_ed25519());
+        let routing_id = routing.peer_id();
+        let client_id = client.peer_id();
+        routing
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let routing_address = next_listen_address(&mut routing).await;
+
+        client.dial(routing_address).unwrap();
+        let (client_saw_routing, routing_saw_client) = timeout(TEST_TIMEOUT, async {
+            let mut client_saw_routing = None;
+            let mut routing_saw_client = None;
+            loop {
+                tokio::select! {
+                    event = client.next_event() => {
+                        if let NetworkEvent::PeerIdentified { peer_id, serves_routing, .. } = event
+                            && peer_id == routing_id
+                        {
+                            client_saw_routing = Some(serves_routing);
+                        }
+                    }
+                    event = routing.next_event() => {
+                        if let NetworkEvent::PeerIdentified { peer_id, serves_routing, .. } = event
+                            && peer_id == client_id
+                        {
+                            routing_saw_client = Some(serves_routing);
+                        }
+                    }
+                }
+                if let (Some(client_saw_routing), Some(routing_saw_client)) =
+                    (client_saw_routing, routing_saw_client)
+                {
+                    break (client_saw_routing, routing_saw_client);
+                }
+            }
+        })
+        .await
+        .expect("both peers should identify each other");
+
+        assert!(client_saw_routing);
+        assert!(!routing_saw_client);
     }
 
     #[tokio::test]

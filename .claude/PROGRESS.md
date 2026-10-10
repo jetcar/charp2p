@@ -124,7 +124,9 @@
 - [x] Conversation history 2/2: "Show earlier messages" button in the conversation using the cursor.
 - [x] Docs: reconcile docs/threat-model.md with implemented approval joins (ADR-041), MessageDeleted pushes and member-served history/invite permission/key refresh (ADR-040/036/045).
 - [x] Docs: mark InvitationCreated, InvitationRevoked, DeviceAdded and DeviceRevoked as reserved event kinds in the technical design (ADR-020/021).
-- [ ] Discovery: bounded device-local list of recently successful routing peers dialled at node start as extra entry points (technical-design Discovery).
+- [x] Discovery 1/3: ADR-046 and NetworkEvent::PeerIdentified reports whether the peer serves the CharP2P DHT protocol (routing mode).
+- [ ] Discovery 2/3: app module storing the bounded remembered routing peer list (8 entries, most recent first, invalid file treated as empty) with tests.
+- [ ] Discovery 3/3: app nodes record identified routing peers and add remembered peers as extra DHT entry points at node start (ADR-046).
 - [ ] Connectivity 1/2: TCP+noise+yamux transport beside QUIC in charp2p-network, QUIC preferred (technical-design Connectivity, ADR-0005).
 - [ ] Connectivity 2/2: nodes listen on TCP and include TCP address hints in invitations (check ADR-037 hint format).
 
@@ -262,3 +264,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-10T14:28Z Conversation history 2/2: Show earlier messages button loads older pages via the before cursor; periodic refreshes keep loaded earlier messages; npm build, fmt, clippy, tests pass.
 - 2026-10-10T15:26:51Z Docs threat model: trust structure now covers member-served pulls, KeyEpochAdvanced and MessageDeleted pushes; join rows cover approval (ADR-041/044), single-use consumption, approval request bounds and member-requested invitations; removal/conflict rows cover member rendezvous key, key refresh, deletion authorship, invite permission and member-served pull verification; lost owner row updated. fmt, clippy, tests, npm build pass
 - 2026-10-10T16:27:25Z Docs reserved event kinds: technical design marks InvitationCreated, InvitationRevoked, DeviceAdded and DeviceRevoked as reserved (ADR-013/020/021): never authored, rejected in pushes, stored but not applied when pulled; EventKind rustdoc notes the same; fmt, clippy, tests, npm build pass.
+- 2026-10-10T17:38:20Z Discovery 1/3: item split into 1/3..3/3; ADR-046 (remembered routing peers: 8 entries, routing-mode peers only, cache file, extra DHT entry points outside the 16-node bootstrap limit, no relay use) and technical-design Discovery note; NetworkEvent::PeerIdentified gains serves_routing from Identify protocols containing the CharP2P DHT protocol; test identify_reports_whether_a_peer_serves_routing. fmt, clippy, workspace tests and npm build pass; src-tauri unchanged.

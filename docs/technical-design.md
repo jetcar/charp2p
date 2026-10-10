@@ -195,7 +195,9 @@ quotas will be fixed through load testing.
 
 Clients enter the network through a versioned list of built-in bootstrap
 multiaddresses. Invitations and learned routing tables provide additional
-entry points. No internet address scanning occurs.
+entry points: a client remembers up to 8 routing peers it recently reached in a
+device-local file and adds them as extra DHT entry points when its node starts
+(ADR-046). No internet address scanning occurs.
 
 The client bounds bootstrap configuration to 16 entries, provider searches to
 8 seconds, and direct reachability checks to 32 providers and 4 seconds. When

@@ -10,6 +10,9 @@ mod network;
 mod pending;
 mod preference_file;
 mod retention;
+// Wired into node start by the next discovery increment (ADR-046).
+#[cfg_attr(not(test), allow(dead_code))]
+mod routing_peers;
 mod settings;
 
 use std::sync::{Arc, Mutex};

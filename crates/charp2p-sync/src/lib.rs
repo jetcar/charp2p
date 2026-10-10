@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 
 use charp2p_core::{
     EventError, EventKind, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId, SignedEvent,
-    SyncAuthorHead, SyncError, SyncPeerHead, SyncRequest, SyncResponse,
+    SyncAuthorHead, SyncError, SyncMembershipState, SyncPeerHead, SyncRequest, SyncResponse,
 };
 use charp2p_store::{EventStore, PutEventsOutcome, StoreError};
 use thiserror::Error;
@@ -22,6 +22,7 @@ pub fn build_authorized_response(
         SyncRequest::Summary { group_id } => SyncResponse::Summary {
             group_id: *group_id,
             heads: store.synchronization_summary(*group_id)?,
+            membership: store.membership_state(*group_id)?,
         },
         SyncRequest::EventIds {
             group_id,
@@ -176,6 +177,33 @@ pub struct PullSession {
     group_id: PeerId,
     phase: PullPhase,
     remaining_authors: VecDeque<SyncAuthorHead>,
+    membership: Option<MembershipComparison>,
+}
+
+/// How the local membership state compared with the peer's summary before
+/// the pull started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipComparison {
+    /// Both devices store the same newest membership commit.
+    Same,
+    /// The peer stores membership commits this device has not stored yet.
+    RemoteNewer,
+    /// This device stores membership commits the peer has not stored yet.
+    RemoteStale,
+    /// Both store the same number of commits but a different newest commit.
+    Diverged,
+}
+
+impl MembershipComparison {
+    /// Compares the local membership state with a peer's reported state.
+    pub fn between(local: &SyncMembershipState, remote: &SyncMembershipState) -> Self {
+        match remote.commits.cmp(&local.commits) {
+            std::cmp::Ordering::Greater => Self::RemoteNewer,
+            std::cmp::Ordering::Less => Self::RemoteStale,
+            std::cmp::Ordering::Equal if remote.latest_commit == local.latest_commit => Self::Same,
+            std::cmp::Ordering::Equal => Self::Diverged,
+        }
+    }
 }
 
 impl PullSession {
@@ -186,6 +214,7 @@ impl PullSession {
                 group_id,
                 phase: PullPhase::AwaitingSummary,
                 remaining_authors: VecDeque::new(),
+                membership: None,
             },
             SyncRequest::Summary { group_id },
         )
@@ -202,8 +231,19 @@ impl PullSession {
         let mut applied = ApplyOutcome::default();
 
         let next_request = match (phase, response) {
-            (PullPhase::AwaitingSummary, SyncResponse::Summary { group_id, heads }) => {
+            (
+                PullPhase::AwaitingSummary,
+                SyncResponse::Summary {
+                    group_id,
+                    heads,
+                    membership,
+                },
+            ) => {
                 self.ensure_group(*group_id)?;
+                self.membership = Some(MembershipComparison::between(
+                    &store.membership_state(self.group_id)?,
+                    membership,
+                ));
                 let local: HashMap<_, _> = store
                     .synchronization_summary(self.group_id)?
                     .into_iter()
@@ -289,6 +329,12 @@ impl PullSession {
     /// Returns whether the remote summary snapshot has been fully pulled.
     pub fn is_complete(&self) -> bool {
         matches!(self.phase, PullPhase::Complete)
+    }
+
+    /// Returns how local membership compared with the peer's summary, once
+    /// the summary has been received.
+    pub fn membership_comparison(&self) -> Option<MembershipComparison> {
+        self.membership
     }
 
     /// Returns the group scope fixed when this pull session started.
@@ -438,14 +484,14 @@ fn local_author_head(
 #[cfg(test)]
 mod tests {
     use charp2p_core::{
-        DeviceIdentity, EventKind, EventSpec, GroupIdentity, SignedEvent, SyncAuthorHead,
-        SyncPeerHead, SyncRequest, SyncResponse,
+        DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity, SignedEvent, SyncAuthorHead,
+        SyncMembershipState, SyncPeerHead, SyncRequest, SyncResponse,
     };
     use charp2p_store::EventStore;
 
     use super::{
-        ApplyOutcome, PullSession, SynchronizationError, accept_pushed_events, apply_response,
-        build_authorized_response, record_reported_heads,
+        ApplyOutcome, MembershipComparison, PullSession, SynchronizationError,
+        accept_pushed_events, apply_response, build_authorized_response, record_reported_heads,
     };
 
     #[test]
@@ -723,6 +769,77 @@ mod tests {
         assert_eq!(
             target.synchronization_summary(group.group_id()).unwrap(),
             source.synchronization_summary(group.group_id()).unwrap()
+        );
+    }
+
+    #[test]
+    fn pull_session_compares_membership_before_pulling() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let commit = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"membership commit",
+            },
+        )
+        .unwrap();
+        let mut source = EventStore::in_memory().unwrap();
+        let mut target = EventStore::in_memory().unwrap();
+        source.put_event(&commit).unwrap();
+
+        let (mut session, request) = PullSession::start(group.group_id());
+        assert_eq!(session.membership_comparison(), None);
+        let summary = build_authorized_response(&source, &request).unwrap();
+        let SyncResponse::Summary { membership, .. } = &summary else {
+            panic!("summary request must return membership state");
+        };
+        assert_eq!(
+            membership,
+            &SyncMembershipState {
+                commits: 1,
+                latest_commit: Some(commit.id()),
+            }
+        );
+        session.handle_response(&mut target, &summary).unwrap();
+        assert_eq!(
+            session.membership_comparison(),
+            Some(MembershipComparison::RemoteNewer)
+        );
+
+        let (mut reverse, request) = PullSession::start(group.group_id());
+        let summary = build_authorized_response(&target, &request).unwrap();
+        reverse.handle_response(&mut source, &summary).unwrap();
+        assert_eq!(
+            reverse.membership_comparison(),
+            Some(MembershipComparison::RemoteStale)
+        );
+    }
+
+    #[test]
+    fn membership_comparison_detects_same_and_diverged_heads() {
+        let state = |commits, byte| SyncMembershipState {
+            commits,
+            latest_commit: Some(EventId::from_bytes([byte; 32])),
+        };
+        assert_eq!(
+            MembershipComparison::between(&state(2, 1), &state(2, 1)),
+            MembershipComparison::Same
+        );
+        assert_eq!(
+            MembershipComparison::between(&state(2, 1), &state(2, 2)),
+            MembershipComparison::Diverged
+        );
+        assert_eq!(
+            MembershipComparison::between(
+                &SyncMembershipState::default(),
+                &SyncMembershipState::default()
+            ),
+            MembershipComparison::Same
         );
     }
 

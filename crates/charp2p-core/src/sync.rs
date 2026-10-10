@@ -33,6 +33,27 @@ pub struct SyncPeerHead {
     pub contiguous_sequence: u64,
 }
 
+/// Membership commit state a peer reports alongside its author heads, so the
+/// receiver can tell whether its own membership view is stale or newer
+/// before pulling events.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncMembershipState {
+    /// Number of membership commits stored for the group.
+    pub commits: u64,
+    /// Newest stored membership commit, absent when no commit is stored.
+    pub latest_commit: Option<EventId>,
+}
+
+impl SyncMembershipState {
+    /// Checks that the commit count and newest commit agree.
+    pub fn validate(&self) -> Result<(), SyncError> {
+        if (self.commits == 0) != self.latest_commit.is_none() {
+            return Err(SyncError::InvalidMembershipState);
+        }
+        Ok(())
+    }
+}
+
 /// Bounded synchronization request sent over an authenticated peer stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SyncRequest {
@@ -90,10 +111,11 @@ impl SyncRequest {
 /// Bounded synchronization response returned over an authenticated peer stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SyncResponse {
-    /// Gap-free author heads for the requested group.
+    /// Gap-free author heads and membership state for the requested group.
     Summary {
         group_id: PeerId,
         heads: Vec<SyncAuthorHead>,
+        membership: SyncMembershipState,
     },
     /// Ordered event identifiers for one author.
     EventIds {
@@ -123,7 +145,12 @@ impl SyncResponse {
     /// Checks bounds, uniqueness, signatures, and group scope before use.
     pub fn validate(&self) -> Result<(), SyncError> {
         match self {
-            Self::Summary { heads, .. } => validate_heads(heads),
+            Self::Summary {
+                heads, membership, ..
+            } => {
+                membership.validate()?;
+                validate_heads(heads)
+            }
             Self::EventIds { event_ids, .. } => {
                 if event_ids.len() > MAX_SYNC_BATCH_ITEMS {
                     return Err(SyncError::TooManyEventIds);
@@ -180,6 +207,9 @@ pub enum SyncError {
     /// A response carries too many author heads.
     #[error("synchronization summary contains too many authors")]
     TooManyAuthors,
+    /// A summary's membership commit count and newest commit disagree.
+    #[error("synchronization summary has inconsistent membership state")]
+    InvalidMembershipState,
     /// The same author appears more than once in a summary.
     #[error("synchronization summary repeats an author")]
     DuplicateAuthor,
@@ -274,11 +304,11 @@ fn validate_events(group_id: &PeerId, encoded_events: &[Vec<u8>]) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use crate::{DeviceIdentity, EventKind, EventSpec, GroupIdentity};
+    use crate::{DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity};
 
     use super::{
-        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncPeerHead,
-        SyncRequest, SyncResponse,
+        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncMembershipState,
+        SyncPeerHead, SyncRequest, SyncResponse,
     };
 
     #[test]
@@ -308,6 +338,31 @@ mod tests {
     }
 
     #[test]
+    fn summaries_reject_inconsistent_membership_state() {
+        let group = GroupIdentity::generate();
+        let summary = |commits, latest_commit| SyncResponse::Summary {
+            group_id: group.group_id(),
+            heads: Vec::new(),
+            membership: SyncMembershipState {
+                commits,
+                latest_commit,
+            },
+        };
+        let commit = EventId::from_bytes([7; 32]);
+
+        assert!(summary(0, None).validate().is_ok());
+        assert!(summary(3, Some(commit)).validate().is_ok());
+        assert!(matches!(
+            summary(0, Some(commit)).validate(),
+            Err(SyncError::InvalidMembershipState)
+        ));
+        assert!(matches!(
+            summary(2, None).validate(),
+            Err(SyncError::InvalidMembershipState)
+        ));
+    }
+
+    #[test]
     fn summaries_reject_duplicate_and_excessive_authors() {
         let group = GroupIdentity::generate();
         let author = DeviceIdentity::generate();
@@ -319,6 +374,7 @@ mod tests {
             SyncResponse::Summary {
                 group_id: group.group_id(),
                 heads: vec![duplicate.clone(), duplicate],
+                membership: SyncMembershipState::default(),
             }
             .validate(),
             Err(SyncError::DuplicateAuthor)
@@ -334,6 +390,7 @@ mod tests {
             SyncResponse::Summary {
                 group_id: group.group_id(),
                 heads,
+                membership: SyncMembershipState::default(),
             }
             .validate(),
             Err(SyncError::TooManyAuthors)

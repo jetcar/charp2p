@@ -10,7 +10,7 @@ use std::{
 
 use charp2p_core::{
     EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
-    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent, SyncMembershipState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -1533,6 +1533,34 @@ impl EventStore {
             .collect();
         summary.sort_by_key(|head| head.author_id.to_bytes());
         Ok(summary)
+    }
+
+    /// Returns the stored membership commit count and newest commit for the
+    /// synchronization summary.
+    ///
+    /// Membership commits are owner-authored, so the newest one is the commit
+    /// with the highest author sequence.
+    pub fn membership_state(&self, group_id: PeerId) -> Result<SyncMembershipState, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT encoded FROM events WHERE group_id = ?1
+             ORDER BY author_sequence, event_id",
+        )?;
+        let encoded = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut state = SyncMembershipState::default();
+        for bytes in encoded {
+            let event = SignedEvent::decode(&bytes?)?;
+            if event.group_id() != group_id {
+                return Err(StoreError::CorruptIndex);
+            }
+            if matches!(
+                event.kind(),
+                charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
+            ) {
+                state.commits += 1;
+                state.latest_commit = Some(event.id());
+            }
+        }
+        Ok(state)
     }
 
     /// Returns each author's latest signed creation time among stored events.
@@ -3262,7 +3290,7 @@ fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
 mod tests {
     use charp2p_core::{
         DeviceIdentity, EventKind, EventSpec, GroupIdentity, HistoryPolicy, InvitationId,
-        MAX_JOIN_MLS_MESSAGE_BYTES, SignedEvent,
+        MAX_JOIN_MLS_MESSAGE_BYTES, SignedEvent, SyncMembershipState,
     };
     use rusqlite::{Connection, params};
     use tempfile::NamedTempFile;
@@ -3477,6 +3505,55 @@ mod tests {
             .find(|head| head.author_id == first_author.peer_id())
             .unwrap();
         assert_eq!(first_head.contiguous_sequence, 3);
+    }
+
+    #[test]
+    fn membership_state_counts_commits_and_reports_the_newest() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let owner_event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"membership commit",
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            store.membership_state(group.group_id()).unwrap(),
+            SyncMembershipState::default()
+        );
+
+        let added = owner_event(1, EventKind::MemberAdded);
+        let removed = owner_event(3, EventKind::MemberRemoved);
+        store.put_event(&removed).unwrap();
+        store.put_event(&added).unwrap();
+        store
+            .put_event(&owner_event(2, EventKind::MessageCreated))
+            .unwrap();
+        store
+            .put_event(&message_event(
+                &DeviceIdentity::generate(),
+                &GroupIdentity::generate(),
+                1,
+                b"other group",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store.membership_state(group.group_id()).unwrap(),
+            SyncMembershipState {
+                commits: 2,
+                latest_commit: Some(removed.id()),
+            }
+        );
     }
 
     #[test]

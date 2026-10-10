@@ -2491,8 +2491,8 @@ mod tests {
 
     use charp2p_core::{
         DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncPeerHead, SyncRejectReason,
-        SyncRequest, SyncResponse,
+        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncMembershipState, SyncPeerHead,
+        SyncRejectReason, SyncRequest, SyncResponse,
     };
     use charp2p_mls::{
         device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
@@ -2572,6 +2572,7 @@ mod tests {
                     SyncResponse::Summary {
                         group_id: self.group_id,
                         heads: Vec::new(),
+                        membership: SyncMembershipState::default(),
                     }
                 }
                 SyncRequest::Events { group_id, .. } if *group_id == self.group_id => {
@@ -4484,6 +4485,7 @@ mod tests {
                 SyncResponse::Summary {
                     group_id: invitation.group_id(),
                     heads: Vec::new(),
+                    membership: SyncMembershipState::default(),
                 }
             );
 
@@ -4786,6 +4788,7 @@ mod tests {
                 SyncResponse::Summary {
                     group_id,
                     heads: Vec::new(),
+                    membership: SyncMembershipState::default(),
                 }
             );
 

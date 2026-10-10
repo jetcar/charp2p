@@ -1334,8 +1334,8 @@ mod tests {
 
     use charp2p_core::{
         DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec, InviteRejectReason,
-        InviteRequest, InviteResponse, JoinRequest, JoinResponse, SyncAuthorHead, SyncRequest,
-        SyncResponse,
+        InviteRequest, InviteResponse, JoinRequest, JoinResponse, SyncAuthorHead,
+        SyncMembershipState, SyncRequest, SyncResponse,
     };
     use libp2p::{
         Multiaddr, PeerId, connection_limits, identity::Keypair, kad, multiaddr::Protocol,
@@ -1395,6 +1395,7 @@ mod tests {
                 author_id: dialer_id,
                 contiguous_sequence: 4,
             }],
+            membership: SyncMembershipState::default(),
         };
         listener
             .send_sync_response(inbound_id, response.clone())

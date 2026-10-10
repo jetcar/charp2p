@@ -4593,6 +4593,7 @@ mod tests {
         let SyncResponse::Summary {
             group_id: response_group,
             heads,
+            membership,
         } = response
         else {
             panic!("member should receive a synchronization summary");
@@ -4601,6 +4602,8 @@ mod tests {
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].author_id, owner.peer_id());
         assert_eq!(heads[0].contiguous_sequence, 2);
+        assert_eq!(membership.commits, 1);
+        assert!(membership.latest_commit.is_some());
         assert_eq!(
             service.answer_sync_request(DeviceIdentity::generate().peer_id(), &request),
             SyncResponse::Rejected {

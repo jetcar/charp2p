@@ -2276,6 +2276,8 @@ function App() {
   const [awaitingApprovalIds, setAwaitingApprovalIds] = useState<string[]>([]);
   const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
+  const [refreshingKeys, setRefreshingKeys] = useState(false);
+  const [keysRefreshed, setKeysRefreshed] = useState(false);
   const pendingExpiryRefreshAtRef = useRef(0);
   const [peerSearchResult, setPeerSearchResult] = useState<PeerSearchResult | null>(null);
   const [searchingPeers, setSearchingPeers] = useState(false);
@@ -2355,6 +2357,7 @@ function App() {
   useEffect(() => {
     activeGroupIdRef.current = activeGroupId;
     setFingerprintCopied(false);
+    setKeysRefreshed(false);
   }, [activeGroupId]);
 
   useEffect(() => {
@@ -3291,6 +3294,22 @@ function App() {
     }
   }
 
+  async function refreshLocalGroupKeys() {
+    if (!localGroup || refreshingKeys || !isTauri()) return;
+    if (!window.confirm(`Refresh the keys of ${localGroup.groupName}? Membership does not change. Members switch to the new keys when they next synchronize with this device.`)) return;
+    setMembersError("");
+    setKeysRefreshed(false);
+    setRefreshingKeys(true);
+    try {
+      await invoke("refresh_group_keys", { groupId: localGroup.groupId });
+      setKeysRefreshed(true);
+    } catch (reason) {
+      setMembersError(errorMessage(reason));
+    } finally {
+      setRefreshingKeys(false);
+    }
+  }
+
   async function leaveJoinedGroup() {
     if (!joinedGroup || leavingGroup || !isTauri()) return;
     if (!window.confirm(`Leave ${joinedGroup.groupName}? Its messages and keys will be deleted from this device. You need a new invitation to join again.`)) return;
@@ -3754,9 +3773,15 @@ function App() {
           ) : null}
         </section>
         {membersError && <p className="form-error preview-error" role="alert">{membersError}</p>}
+        {keysRefreshed && !joined && <p className="preview-note" role="status">Group keys refreshed. Members pick up the new keys from this device when they synchronize.</p>}
         <div className="details-actions">
           {canInvite && (
             <button className="primary-button" onClick={openGroupInvitations} type="button">Invite member</button>
+          )}
+          {!joined && localGroup?.groupId === group.groupId && (
+            <button className="secondary-button" disabled={refreshingKeys} onClick={() => void refreshLocalGroupKeys()} type="button">
+              {refreshingKeys ? "Refreshing keys…" : "Refresh group keys"}
+            </button>
           )}
           {joined && (
             <button className="details-leave" disabled={leavingGroup} onClick={() => void leaveJoinedGroup()} type="button">

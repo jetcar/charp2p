@@ -93,6 +93,7 @@ type AppInformation = {
   storage: { databaseBytes: number };
 };
 type UnreadMessageCount = { groupId: string; count: number };
+type GroupMessagePreview = { groupId: string; authorId: string; createdAtUnixMs: number; text: string };
 // "memberServed": the owner was unreachable and another current member served
 // the history (ADR-040).
 type GroupConnectionStateName = "online" | "relayed" | "memberServed" | "waiting" | "offline";
@@ -333,6 +334,25 @@ function messageDayLabel(createdAtUnixMs: number) {
   if (day.toDateString() === today.toDateString()) return "Today";
   if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
   return day.toLocaleDateString([], { dateStyle: "medium" });
+}
+
+// Group list rows show the clock time for today's messages, "Yesterday", or
+// a short date.
+function previewTimeLabel(createdAtUnixMs: number) {
+  const day = messageDayLabel(createdAtUnixMs);
+  if (day === "Today") return messageClockTime(createdAtUnixMs);
+  if (day === "Yesterday") return day;
+  return new Date(createdAtUnixMs).toLocaleDateString([], { day: "numeric", month: "short" });
+}
+
+// Tablet widths and Android use the navigation rail and Chats column layout;
+// phones keep the stacked layout and wide desktop windows the sidebar.
+const COMPACT_SHELL_QUERY = "(min-width: 681px) and (max-width: 1199px)";
+
+function compactShellMatches() {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  if (window.matchMedia(COMPACT_SHELL_QUERY).matches) return true;
+  return /Android/i.test(navigator.userAgent) && window.matchMedia("(min-width: 681px)").matches;
 }
 
 function messageAuthorLabel(
@@ -2210,6 +2230,9 @@ function App() {
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  const [messagePreviews, setMessagePreviews] = useState<Record<string, GroupMessagePreview>>({});
+  const [compactShell, setCompactShell] = useState(compactShellMatches);
+  const [groupSearch, setGroupSearch] = useState("");
   const [connectionStates, setConnectionStates] = useState<Record<string, GroupConnectionStateName>>({});
   const [discoveryStates, setDiscoveryStates] = useState<Record<string, GroupDiscoveryName | null>>({});
   const [ownedDiscovery, setOwnedDiscovery] = useState<OwnedGroupDiscoveryStatus | null>(null);
@@ -2326,6 +2349,7 @@ function App() {
     ],
     [joinedGroups, localGroups],
   );
+  const groupIdsKey = availableGroups.map(({ groupId }) => groupId).join(",");
 
   useEffect(() => {
     activeGroupIdRef.current = activeGroupId;
@@ -2772,6 +2796,7 @@ function App() {
   useEffect(() => {
     if (!isTauri() || availableGroups.length === 0) {
       setUnreadCounts({});
+      setMessagePreviews({});
       setConnectionStates({});
       return;
     }
@@ -2789,6 +2814,16 @@ function App() {
         }
       } catch {
         // Unread badges are advisory; the active timeline reports its own errors.
+      }
+      try {
+        const previews = await invoke<GroupMessagePreview[]>("group_message_previews", {
+          groupIds: groupIdsKey.split(","),
+        });
+        if (active) {
+          setMessagePreviews(Object.fromEntries(previews.map((preview) => [preview.groupId, preview])));
+        }
+      } catch {
+        // Previews are advisory; the active timeline reports its own errors.
       }
       try {
         const states = await invoke<GroupConnectionState[]>("group_connection_states");
@@ -2814,7 +2849,15 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [availableGroups.length]);
+  }, [groupIdsKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const queries = [COMPACT_SHELL_QUERY, "(min-width: 681px)"].map((query) => window.matchMedia(query));
+    const update = () => setCompactShell(compactShellMatches());
+    queries.forEach((query) => query.addEventListener("change", update));
+    return () => queries.forEach((query) => query.removeEventListener("change", update));
+  }, []);
 
   useEffect(() => {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
@@ -4005,14 +4048,198 @@ function App() {
     setPeerSearchResult(null);
   }
 
+  function openCreateGroupFromShell() {
+    closeSecondaryViews();
+    closeJoinFlow();
+    setShowMembers(false);
+    setOpenPendingGroupId("");
+    setCreateGroupMode(true);
+  }
+
+  function openJoinFromShell() {
+    closeSecondaryViews();
+    setCreateGroupMode(false);
+    setShowMembers(false);
+    setOpenPendingGroupId("");
+    setJoinMode(true);
+    setError("");
+  }
+
   const groupPageOpen =
     !informationView && !networkView && !settingsView && !backupView && !joinMode && !createGroupMode;
+  // The Chats column stays beside group, create and join pages; Network,
+  // Settings and information pages use the full width next to the rail.
+  const chatsColumnOpen = !informationView && !networkView && !settingsView && !backupView;
+  const groupSearchTerm = groupSearch.trim().toLowerCase();
+  const filteredGroups = availableGroups.filter(({ groupName }) =>
+    groupName.toLowerCase().includes(groupSearchTerm),
+  );
+  const filteredPendingGroups = pendingGroups.filter(({ groupName }) =>
+    groupName.toLowerCase().includes(groupSearchTerm),
+  );
   const detailsGroup =
     appShell && groupPageOpen && showGroupInfo && !pendingGroup && !showMembers ? joinedGroup ?? localGroup : null;
 
   return (
-    <main className={appShell ? `app-shell${detailsGroup ? " with-details" : ""}` : "onboarding-shell"}>
-      {appShell && profile ? (
+    <main
+      className={
+        appShell
+          ? `app-shell${compactShell ? ` compact${chatsColumnOpen ? " with-chats" : ""}` : ""}${detailsGroup ? " with-details" : ""}`
+          : "onboarding-shell"
+      }
+    >
+      {appShell && profile && compactShell ? (
+        <>
+          <nav className="app-rail" aria-label="CharP2P navigation">
+            <div className="rail-brand">
+              <BrandMark decorative />
+              <strong>Char<span>P2P</span></strong>
+            </div>
+            <button
+              aria-current={chatsColumnOpen ? "page" : undefined}
+              className={chatsColumnOpen ? "active" : ""}
+              onClick={closeSecondaryViews}
+              type="button"
+            >
+              <span aria-hidden="true">💬</span> Chats
+            </button>
+            <button
+              aria-current={networkView ? "page" : undefined}
+              className={networkView ? "active" : ""}
+              onClick={() => openShellPage("network")}
+              type="button"
+            >
+              <span aria-hidden="true">⌘</span> Network
+            </button>
+            <button
+              aria-current={settingsView || backupView ? "page" : undefined}
+              className={settingsView || backupView ? "active" : ""}
+              onClick={() => openShellPage("settings")}
+              type="button"
+            >
+              <span aria-hidden="true">⚙</span> Settings
+            </button>
+            <button
+              className="rail-device"
+              onClick={() => openShellPage("settings")}
+              title={`${profile.deviceName} · This device · ${profile.peerId}`}
+              type="button"
+            >
+              <span className="sidebar-device-avatar" aria-hidden="true">
+                {profile.deviceName.trim().charAt(0).toUpperCase() || "?"}
+              </span>
+              <span className="rail-device-name">{profile.deviceName}</span>
+            </button>
+          </nav>
+          {chatsColumnOpen && (
+            <aside className="chats-column" aria-label="Chats">
+              <h1>Chats</h1>
+              <button
+                className={`chats-action primary${createGroupMode ? " active" : ""}`}
+                onClick={openCreateGroupFromShell}
+                type="button"
+              >
+                <span aria-hidden="true">＋</span> New group
+              </button>
+              <button
+                className={`chats-action${joinMode ? " active" : ""}`}
+                onClick={openJoinFromShell}
+                type="button"
+              >
+                <span aria-hidden="true">⛓</span> Join link
+              </button>
+              <input
+                aria-label="Search groups"
+                className="chats-search"
+                onChange={(event) => setGroupSearch(event.target.value)}
+                placeholder="Search groups"
+                type="search"
+                value={groupSearch}
+              />
+              {availableGroups.length === 0 && pendingGroups.length === 0 ? (
+                <p className="chats-empty">No groups yet</p>
+              ) : (
+                filteredGroups.length === 0 &&
+                filteredPendingGroups.length === 0 && <p className="chats-empty">No matching groups</p>
+              )}
+              <ul className="chats-list">
+                {filteredGroups.map((group) => {
+                  const current = groupPageOpen && !pendingGroup && group.groupId === activeGroupId;
+                  const unread = unreadCounts[group.groupId] ?? 0;
+                  const preview = messagePreviews[group.groupId];
+                  const previewText = preview
+                    ? `${preview.authorId === profile.peerId ? "You: " : ""}${preview.text}`
+                    : group.role === "Owner"
+                      ? "No messages yet"
+                      : "No messages since joining";
+                  return (
+                    <li key={group.groupId}>
+                      <button
+                        aria-current={current ? "page" : undefined}
+                        className={current ? "active" : ""}
+                        onClick={() => openGroupFromSidebar(group.groupId)}
+                        title={`${group.role}${connectionStates[group.groupId] ? ` · ${groupConnectionDescription(connectionStates[group.groupId])}` : ""}`}
+                        type="button"
+                      >
+                        <i aria-hidden="true" className={`sidebar-group-icon icon-${group.icon ?? 0}`}>
+                          {GROUP_ICONS[group.icon ?? 0]}
+                        </i>
+                        <span className="chats-row-text">
+                          <span className="chats-row-top">
+                            <strong>{group.groupName}</strong>
+                            {preview && <time>{previewTimeLabel(preview.createdAtUnixMs)}</time>}
+                          </span>
+                          <span className="chats-row-bottom">
+                            <small>{previewText}</small>
+                            {group.groupId !== activeGroupId && unread > 0 && (
+                              <em aria-label={`${unread} unread`} className="unread-count">
+                                {unread > 99 ? "99+" : unread}
+                              </em>
+                            )}
+                          </span>
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+                {filteredPendingGroups.map((group) => {
+                  const current = groupPageOpen && group.groupId === openPendingGroupId;
+                  const state = awaitingApprovalIds.includes(group.groupId)
+                    ? "Awaiting owner approval"
+                    : autoJoinWaitingIds.includes(group.groupId)
+                      ? "Waiting for owner"
+                      : expiryDescription(group.expiresAtUnix);
+                  return (
+                    <li key={`pending-${group.groupId}`}>
+                      <button
+                        aria-current={current ? "page" : undefined}
+                        className={`pending${current ? " active" : ""}`}
+                        onClick={() => openPendingFromSidebar(group.groupId)}
+                        title={`Pending invitation · ${state}`}
+                        type="button"
+                      >
+                        <i aria-hidden="true" className="sidebar-group-icon pending-icon-small">⌁</i>
+                        <span className="chats-row-text">
+                          <span className="chats-row-top">
+                            <strong>{group.groupName}</strong>
+                          </span>
+                          <span className="chats-row-bottom">
+                            <small>Pending · {state}</small>
+                          </span>
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="chats-links">
+                <button onClick={() => openShellPage("privacy")} type="button">Privacy</button>
+                <button onClick={() => openShellPage("identity")} type="button">How identity works</button>
+              </div>
+            </aside>
+          )}
+        </>
+      ) : appShell && profile ? (
         <aside className="app-sidebar" aria-label="CharP2P navigation">
           <div className="sidebar-brand">
             <BrandMark decorative />
@@ -4024,27 +4251,14 @@ function App() {
           </div>
           <button
             className={`sidebar-action primary${createGroupMode ? " active" : ""}`}
-            onClick={() => {
-              closeSecondaryViews();
-              closeJoinFlow();
-              setShowMembers(false);
-              setOpenPendingGroupId("");
-              setCreateGroupMode(true);
-            }}
+            onClick={openCreateGroupFromShell}
             type="button"
           >
             <span aria-hidden="true">＋</span> Create group
           </button>
           <button
             className={`sidebar-action${joinMode ? " active" : ""}`}
-            onClick={() => {
-              closeSecondaryViews();
-              setCreateGroupMode(false);
-              setShowMembers(false);
-              setOpenPendingGroupId("");
-              setJoinMode(true);
-              setError("");
-            }}
+            onClick={openJoinFromShell}
             type="button"
           >
             <span aria-hidden="true">⛓</span> Join with link

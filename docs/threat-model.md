@@ -34,12 +34,17 @@ controls the group; the MVP does not defend members against it.
 ## Trust structure
 
 The MVP has exactly one committer per group: the owner device that holds the
-group root. Invitation version 2 pins that device's peer ID under the root
-signature. Members synchronize only with the pinned owner and accept
-`MemberAdded`/`MemberRemoved` commits only through pulls from it. The owner
-accepts member uploads only for `MessageCreated` and `MessageEdited` events
-signed by the authenticated transport peer (`accept_pushed_events`). No member
-can author a membership change that another device will apply.
+group root. Every invitation version pins that device's peer ID under the root
+signature. Members synchronize with the pinned owner first and accept
+`MemberAdded`, `MemberRemoved` and `KeyEpochAdvanced` commits only when the
+pinned owner device authored them. When the owner is unreachable, a member may
+pull from another current member found through the epoch-derived member
+rendezvous key (ADR-040); such pulls are verified exactly as from the owner and
+uploads still go only to the owner. The owner accepts member uploads only for
+`MessageCreated`, `MessageEdited` and `MessageDeleted` events signed by the
+authenticated transport peer (`accept_pushed_events`). No member can author a
+membership change, key refresh, metadata change or invite-permission change
+that another device will apply.
 
 ## Joins
 
@@ -49,7 +54,9 @@ can author a membership change that another device will apply.
 | Expired invitation | Expiry checked by the joining client and again by the owner. | Clock skew can shift the boundary. |
 | Revoked invitation | Owner deletes the protected bearer before its index under the storage lock and stops the listener (ADR-021). Authorization requires both records and a constant-time bearer match. | DHT provider records stay until TTL; they reveal reachability only. |
 | Rogue peer advertising the rendezvous key | Search results from any provider other than the pinned owner are ignored; the libp2p connection authenticates that peer ID. | A flood of provider records can delay discovery (bounded searches, 32-provider cap). |
-| Link leaked to an unintended person | None beyond expiry and revocation: the MVP profile admits any valid bearer directly (ADR-018). | Unintended join until the owner revokes the link and removes the device. Approval-based joins are deferred. |
+| Link leaked to an unintended person | Groups created with approval required admit only devices the owner approved; an unapproved bearer is recorded as a request and answered `awaiting approval` with no MLS change (ADR-041). Invitation version 4 signs the approval requirement so the preview cannot be downgraded (ADR-044). Single-use invitations are consumed in the admission transaction and fail closed afterwards (ADR-042). | Groups with direct admission admit any valid bearer until the owner revokes the link and removes the device. |
+| Approval request flooding | Requests are recorded only for authorized bearers, bounded to 64 per group, and expire with their invitation; a declined device is answered `unauthorized` until the owner allows it again. | A leaked link can fill the group's request list until it is revoked. |
+| Member-requested invitations | A permitted member asks the owner over `/charp2p/invite/1.0.0`; the owner checks membership and its own permission state, then issues a root-signed invitation as for itself, bounded to 16 active per group (ADR-036, ADR-043). Rejections are only `unauthorized` or `busy`. Withdrawing permission revokes that member's invitations. | A permitted member can share links while permitted; the owner sees the requesting device per invitation. |
 | KeyPackage substitution or credential theft | Owner verifies one bounded KeyPackage with OpenMLS, the pinned ciphersuite and profile, and requires its credential to equal the authenticated peer. | None known. |
 | Duplicate or replayed join request | Admission is idempotent per device and exact KeyPackage hash; a different KeyPackage for an admitted device is rejected (ADR-019). | A device that lost its MLS state cannot rejoin until the owner removes it. |
 | Welcome from a malicious peer | The client accepts a Welcome only from the pinned owner connection, validates every leaf, the ciphersuite, and the profile extension before persisting. | None known. |
@@ -62,10 +69,13 @@ can author a membership change that another device will apply.
 | --- | --- | --- |
 | Removed device reads future messages | Owner stages an MLS remove commit, publishes it as a signed `MemberRemoved` event, and stores event, snapshot, and removed marker in one transaction (ADR-020). Members apply it before materializing later messages. | Members that have not yet synchronized still encrypt to the old epoch until they pull the commit. |
 | Removed device rejoins with a reusable link | Admission checks the removed-device index before cached responses or MLS processing; the cached Welcome is deleted in the removal transaction. | The owner can clear the block (ADR-034); the device then rejoins only through an active invitation with a new KeyPackage and a new MLS leaf. |
-| Removed device keeps synchronizing | The owner serves synchronization only to peers in its current MLS membership. | It can still find the owner through its retained rendezvous key (ADR-025). |
+| Removed device keeps synchronizing | The owner and member-serving nodes serve synchronization only to peers in their current MLS membership. The member rendezvous key derives from the current epoch's MLS exporter, so a removed device cannot derive later keys (ADR-040). | It can still find the owner through its retained invitation rendezvous key (ADR-025). |
+| Members revealed to each other | Member-served history advertises a device only under the epoch-derived member key and serves only pull exchanges, charged to its synchronization data limit (ADR-033, ADR-040). | Current members learn each other's peer IDs and addresses. |
 | Erasure of already received data | Not provided. | Removal and deletion never erase copies already held by any device. |
 | Member leaves while the owner is offline | Leave is device-local and deletes the group's keys and messages on that device (ADR-027). | The owner still lists the device as a member until it removes it. |
 | Compromised member device key | Owner removal advances the epoch. | The attacker keeps prior history and can impersonate the device until removal; identity is a device key, not a person. |
+| Suspected leak of owner path secrets | The owner can commit a `KeyEpochAdvanced` event with no proposals and a forced update path, advancing the epoch without a membership change (ADR-045). Members reject a carried Commit with proposals or without an update path. | Messages from earlier epochs stay readable to whoever held those secrets. |
+| Deletion forged by another member | A `MessageDeleted` event hides its target only when its author is the target message's author; pushes are accepted only when signed by the authenticated peer. | Deletion is a tombstone request and cannot erase copies already received (see below). |
 
 ## Conflicting membership events
 
@@ -77,12 +87,14 @@ can author a membership change that another device will apply.
 | Out-of-order or future-epoch commits | Commits are applied in author sequence; future epochs wait for their predecessor; a commit and its snapshot persist atomically (ADR-017). | A missing predecessor stalls the member until the owner serves it. |
 | Past-epoch commits | Commits older than the local epoch are marked applied without replay (the Welcome already includes them). | Such a commit is not re-validated by MLS; its signature, author binding, and pinned-owner author are still checked. |
 | Member-authored group metadata | `GroupMetadataChanged` is accepted only from the owner device that admitted the member; pushes of it are refused. | None known. |
+| Member-authored invite permission | `InvitePermissionChanged` applies only when authored by the owner device that admitted the member; the highest owner sequence per target is current, and pushes of it are refused. The owner also checks permission in its own state on every request (ADR-036). | None known. |
+| Events from a member-served pull | Every event is verified exactly as from the owner; pulled authors never recorded in the group's MLS roster are skipped, and unrequested events in a response are rejected. Membership commits still apply only when authored by the pinned owner. | A serving member can withhold events; the owner sync fills the gap when it returns. |
 
 ## Lost owner keys
 
 | Threat | Control | Residual risk |
 | --- | --- | --- |
-| Owner device lost or reset | Group root and MLS state live only in that device's protected storage (ADR-011). | The group can no longer admit, remove, rename, or relay: members synchronize only through the pinned owner, so the group stops exchanging new messages. Members keep their local history. |
+| Owner device lost or reset | Group root and MLS state live only in that device's protected storage (ADR-011). | The group can no longer admit, remove, rename, refresh keys, or issue invitations. Members online together can still exchange messages through member-served history (ADR-040), but uploads, delivery acknowledgements and approvals need the owner. Members keep their local history. |
 | Identity backup restored after loss | The backup restores the device identity only, not group roots or MLS state (ADR-028). | A restored device has the owner's peer ID but cannot serve the group. Members cannot synchronize with it. A new group is the only recovery. |
 | Owner identity restored while the original still runs | The restore flow warns to stop using the original device. | Two devices with one peer ID confuse discovery; only the one holding the group root can serve the group. |
 | Stolen SQLite files | Group roots, bearers, rendezvous keys, and snapshot wrapping keys stay in platform-protected storage; SQLite holds encrypted snapshots and local copies (ADR-007, ADR-016). | An attacker with the unlocked platform account can read protected storage. |

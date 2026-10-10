@@ -233,7 +233,7 @@ impl MlsProviderService {
         let _operation = operations
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
-        let store = EventStore::open(path).map_err(|_| "mls_provider_store_unavailable")?;
+        let mut store = EventStore::open(path).map_err(|_| "mls_provider_store_unavailable")?;
         let provider = match store
             .encrypted_mls_provider_snapshot()
             .map_err(|_| "mls_provider_store_unavailable")?
@@ -248,6 +248,7 @@ impl MlsProviderService {
             }
             None => ProfileProvider::default(),
         };
+        record_all_group_rosters(&provider, &mut store);
         drop(_operation);
         Ok(Self {
             operations,
@@ -314,6 +315,8 @@ impl MlsProviderService {
         if result.is_err() {
             *provider = ProfileProvider::from_snapshot(&previous)
                 .map_err(|_| "mls_provider_snapshot_invalid")?;
+        } else {
+            record_group_roster_best_effort(&provider, &mut store, group_id);
         }
         result
     }
@@ -1893,6 +1896,7 @@ impl MlsProviderService {
         store
             .put_applied_mls_event_and_encrypted_provider_snapshot(event, &encrypted)
             .map_err(|_| ApplyGroupCommitError::Unavailable("mls_group_storage_unavailable"))?;
+        record_group_roster_best_effort(provider, store, group_id);
         Ok(true)
     }
 
@@ -2380,6 +2384,8 @@ impl MlsProviderService {
         if result.is_err() {
             *provider = ProfileProvider::from_snapshot(&previous)
                 .map_err(|_| MemberAdmissionError::Unavailable)?;
+        } else {
+            record_group_roster_best_effort(&provider, &mut store, group_id);
         }
         result
     }
@@ -2517,6 +2523,8 @@ impl MlsProviderService {
         if result.is_err() {
             *provider = ProfileProvider::from_snapshot(&previous)
                 .map_err(|_| "mls_provider_snapshot_invalid")?;
+        } else {
+            record_group_roster_best_effort(&provider, &mut store, group_id);
         }
         result
     }
@@ -2814,6 +2822,57 @@ fn blocked_device_ids(store: &EventStore, group_id: PeerId) -> Result<Vec<String
         .into_iter()
         .map(|device_id| device_id.to_string())
         .collect())
+}
+
+/// Records the group's current MLS roster as devices authorized to author
+/// its events. Membership changes are durable before this runs, so a failure
+/// leaves them in place and the backfill retries when the service next opens.
+fn record_group_roster_best_effort(
+    provider: &ProfileProvider,
+    store: &mut EventStore,
+    group_id: PeerId,
+) {
+    let _ = record_group_roster(provider, store, group_id);
+}
+
+fn record_group_roster(
+    provider: &ProfileProvider,
+    store: &mut EventStore,
+    group_id: PeerId,
+) -> Result<(), &'static str> {
+    let Some(group) = MlsGroup::load(
+        provider.storage(),
+        &GroupId::from_slice(&group_id.to_bytes()),
+    )
+    .map_err(|_| "mls_group_storage_unavailable")?
+    else {
+        return Ok(());
+    };
+    let member_ids = group
+        .members()
+        .map(|member| {
+            device_id_from_credential(&member.credential).map_err(|_| "mls_group_members_invalid")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    store
+        .record_group_authors(group_id, &member_ids)
+        .map_err(|_| "group_authors_unavailable")?;
+    Ok(())
+}
+
+/// Backfills recorded authors from the current roster of every owned and
+/// joined group, covering groups created before authors were recorded.
+fn record_all_group_rosters(provider: &ProfileProvider, store: &mut EventStore) {
+    let owned = store.local_groups().unwrap_or_default();
+    let joined = store.joined_groups().unwrap_or_default();
+    let group_ids: Vec<PeerId> = owned
+        .into_iter()
+        .map(|group| group.group_id)
+        .chain(joined.into_iter().map(|group| group.group_id))
+        .collect();
+    for group_id in group_ids {
+        record_group_roster_best_effort(provider, store, group_id);
+    }
 }
 
 fn group_member_devices(group: &MlsGroup) -> Result<Vec<GroupMemberDevice>, &'static str> {
@@ -3203,7 +3262,7 @@ mod tests {
         MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
         WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
     };
-    use charp2p_store::{EventStore, PendingInvitationMetadata};
+    use charp2p_store::{EventStore, LocalGroupMetadata, PendingInvitationMetadata};
 
     #[derive(Clone, Default)]
     struct MemoryWrappingKeyStore {
@@ -4247,6 +4306,10 @@ mod tests {
         owner_service
             .initialize_owner_group(group_id, &owner)
             .unwrap();
+        assert_eq!(
+            recorded_authors(&owner_service, group_id),
+            sorted_peers(&[owner.peer_id()])
+        );
 
         let first_join = first_service
             .prepare_join_request(first_member.peer_id(), &invitation)
@@ -4281,12 +4344,40 @@ mod tests {
             .complete_join(group_id, second_welcome.welcome().unwrap())
             .unwrap();
         pin_joined_owner(&second_service, group_id, owner.peer_id());
+        assert_eq!(
+            recorded_authors(&first_service, group_id),
+            sorted_peers(&[owner.peer_id(), first_member.peer_id()])
+        );
+        assert_eq!(
+            recorded_authors(&owner_service, group_id),
+            sorted_peers(&[
+                owner.peer_id(),
+                first_member.peer_id(),
+                second_member.peer_id()
+            ])
+        );
+        assert_eq!(
+            recorded_authors(&second_service, group_id),
+            sorted_peers(&[
+                owner.peer_id(),
+                first_member.peer_id(),
+                second_member.peer_id()
+            ])
+        );
 
         pull_all(
             &owner_service,
             &first_service,
             first_member.peer_id(),
             group_id,
+        );
+        assert_eq!(
+            recorded_authors(&first_service, group_id),
+            sorted_peers(&[
+                owner.peer_id(),
+                first_member.peer_id(),
+                second_member.peer_id()
+            ])
         );
         first_service
             .create_message_at(group_id, &first_member, "Hello everyone", 43)
@@ -4332,6 +4423,15 @@ mod tests {
             .unwrap()
             .iter()
             .any(|member| member.device_id == first_member.peer_id().to_string()));
+        // A removed device's earlier events stay attributable to the group.
+        assert_eq!(
+            recorded_authors(&second_service, group_id),
+            sorted_peers(&[
+                owner.peer_id(),
+                first_member.peer_id(),
+                second_member.peer_id()
+            ])
+        );
         owner_service
             .create_message_at(group_id, &owner, "After removal", 45)
             .unwrap();
@@ -4616,6 +4716,65 @@ mod tests {
         assert_ne!(
             first_service.member_rendezvous_key(group_id).ok(),
             Some(third_epoch_key)
+        );
+    }
+
+    fn recorded_authors(service: &MlsProviderService, group_id: PeerId) -> Vec<PeerId> {
+        service
+            .store
+            .lock()
+            .unwrap()
+            .group_authors(group_id)
+            .unwrap()
+    }
+
+    fn sorted_peers(peers: &[PeerId]) -> Vec<PeerId> {
+        let mut peers = peers.to_vec();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers
+    }
+
+    #[test]
+    fn startup_backfill_records_the_roster_of_owned_groups() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let owner = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let provider = owner_service.provider.lock().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_local_group(&LocalGroupMetadata {
+                group_id,
+                group_name: "Backfill".to_owned(),
+                icon: 0,
+                history_policy: HistoryPolicy::None,
+                approval_required: false,
+                invitation_lifetime_seconds: 604_800,
+                reusable_invitation: false,
+            })
+            .unwrap();
+        // A group without MLS state is skipped rather than failing startup.
+        store
+            .put_local_group(&LocalGroupMetadata {
+                group_id: GroupIdentity::generate().group_id(),
+                group_name: "Missing".to_owned(),
+                icon: 0,
+                history_policy: HistoryPolicy::None,
+                approval_required: false,
+                invitation_lifetime_seconds: 604_800,
+                reusable_invitation: false,
+            })
+            .unwrap();
+
+        super::record_all_group_rosters(&provider, &mut store);
+
+        assert_eq!(
+            store.group_authors(group_id).unwrap(),
+            vec![owner.peer_id()]
         );
     }
 

@@ -265,7 +265,15 @@ pub struct NetworkNode {
     /// Present on serving nodes only; client nodes answer just the peers they
     /// dialled or share groups with.
     request_limits: Option<PeerRequestLimiter>,
+    /// Transport address of each peer this node dialled directly and is
+    /// still connected to.
+    dialed_addresses: HashMap<PeerId, Multiaddr>,
+    routing_peer_observer: Option<RoutingPeerObserver>,
 }
+
+/// Called with a routing-mode peer and the direct address this node dialled
+/// it at, once Identify confirms it serves the CharP2P DHT protocol (ADR-046).
+pub type RoutingPeerObserver = Box<dyn Fn(PeerId, &Multiaddr) + Send + Sync>;
 
 impl NetworkNode {
     /// Builds a node from its persistent libp2p device identity.
@@ -373,7 +381,15 @@ impl NetworkNode {
             pending_join_responses: HashMap::new(),
             pending_invite_responses: HashMap::new(),
             request_limits,
+            dialed_addresses: HashMap::new(),
+            routing_peer_observer: None,
         }
+    }
+
+    /// Reports routing-mode peers reached over a direct dial to `observer`,
+    /// so the application can remember them as later entry points (ADR-046).
+    pub fn observe_routing_peers(&mut self, observer: RoutingPeerObserver) {
+        self.routing_peer_observer = Some(observer);
     }
 
     /// Returns this node's authenticated peer identifier.
@@ -627,6 +643,10 @@ impl NetworkNode {
                     peer_id, endpoint, ..
                 } => {
                     let remote_address = transport_address(endpoint.get_remote_address());
+                    if endpoint.is_dialer() && !endpoint.is_relayed() {
+                        self.dialed_addresses
+                            .insert(peer_id, remote_address.clone());
+                    }
                     // An address announced over mDNS was reachable on the local
                     // network segment even when it is not in a private range.
                     let path =
@@ -646,10 +666,11 @@ impl NetworkNode {
                     num_established,
                     ..
                 } => {
-                    if num_established == 0
-                        && let Some(limits) = self.request_limits.as_mut()
-                    {
-                        limits.forget(&peer_id);
+                    if num_established == 0 {
+                        self.dialed_addresses.remove(&peer_id);
+                        if let Some(limits) = self.request_limits.as_mut() {
+                            limits.forget(&peer_id);
+                        }
                     }
                     return NetworkEvent::PeerDisconnected { peer_id };
                 }
@@ -664,9 +685,18 @@ impl NetworkNode {
                             .dht
                             .add_address(&peer_id, address);
                     }
+                    let serves_routing = info.protocols.contains(&DHT_PROTOCOL);
+                    if serves_routing
+                        && let (Some(observer), Some(address)) = (
+                            self.routing_peer_observer.as_ref(),
+                            self.dialed_addresses.get(&peer_id),
+                        )
+                    {
+                        observer(peer_id, address);
+                    }
                     return NetworkEvent::PeerIdentified {
                         peer_id,
-                        serves_routing: info.protocols.contains(&DHT_PROTOCOL),
+                        serves_routing,
                         listen_addresses: info.listen_addrs,
                     };
                 }
@@ -1804,6 +1834,64 @@ mod tests {
 
         assert!(client_saw_routing);
         assert!(!routing_saw_client);
+    }
+
+    #[tokio::test]
+    async fn routing_peers_reached_by_a_direct_dial_are_observed() {
+        let mut routing = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let mut client = NetworkNode::new(Keypair::generate_ed25519());
+        let routing_id = routing.peer_id();
+        let client_id = client.peer_id();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client_observed = observed.clone();
+        client.observe_routing_peers(Box::new(move |peer_id, address| {
+            client_observed
+                .lock()
+                .unwrap()
+                .push((peer_id, address.clone()));
+        }));
+        let routing_observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routing_record = routing_observed.clone();
+        routing.observe_routing_peers(Box::new(move |peer_id, address| {
+            routing_record
+                .lock()
+                .unwrap()
+                .push((peer_id, address.clone()));
+        }));
+        routing
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let routing_address = next_listen_address(&mut routing).await;
+
+        client.dial(routing_address.clone()).unwrap();
+        timeout(TEST_TIMEOUT, async {
+            let (mut client_identified, mut routing_identified) = (false, false);
+            while !(client_identified && routing_identified) {
+                tokio::select! {
+                    event = client.next_event() => {
+                        client_identified |= matches!(
+                            event,
+                            NetworkEvent::PeerIdentified { peer_id, .. } if peer_id == routing_id
+                        );
+                    }
+                    event = routing.next_event() => {
+                        routing_identified |= matches!(
+                            event,
+                            NetworkEvent::PeerIdentified { peer_id, .. } if peer_id == client_id
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .expect("both peers should identify each other");
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(routing_id, routing_address)]
+        );
+        // The routing node was dialled, and its peer is not a routing node.
+        assert!(routing_observed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

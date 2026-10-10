@@ -10,12 +10,12 @@ mod network;
 mod pending;
 mod preference_file;
 mod retention;
-// Wired into node start by the next discovery increment (ADR-046).
-#[cfg_attr(not(test), allow(dead_code))]
 mod routing_peers;
 mod settings;
 
 use std::sync::{Arc, Mutex};
+
+use routing_peers::RoutingPeersService;
 
 use background::{BackgroundPreference, BackgroundService, BackgroundStatus};
 use bandwidth::{BandwidthPreference, BandwidthService, BandwidthStatus};
@@ -1353,7 +1353,10 @@ pub fn run() {
                 mls.clone(),
                 Arc::new(MemberInvitationService::new(groups.clone(), mls.clone())),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(std::io::Error::other)?
+            .with_routing_peers(Arc::new(RoutingPeersService::new(
+                data_directory.join("routing-peers.json"),
+            )));
             // An unreadable or invalid community node list is reported on the
             // Network page and leaves only built-in and environment nodes.
             let community = CommunityNodesService::new(data_directory.join("community-nodes.json"));

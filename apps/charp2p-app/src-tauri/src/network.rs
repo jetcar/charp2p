@@ -25,6 +25,7 @@ use tokio::{
 use crate::bandwidth::BandwidthService;
 use crate::groups::{requested_invitation, IssuedInvitation};
 use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
+use crate::routing_peers::RoutingPeersService;
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
 const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
@@ -415,6 +416,8 @@ pub struct NetworkService {
     owner_addresses: Arc<std::sync::Mutex<Vec<Multiaddr>>>,
     /// Whether owner and member nodes also use mDNS on the local network.
     lan_discovery: bool,
+    /// Routing peers recently reached by this device (ADR-046).
+    routing_peers: Option<Arc<RoutingPeersService>>,
 }
 
 impl NetworkService {
@@ -495,6 +498,44 @@ impl NetworkService {
         clear_owner_addresses(&self.owner_addresses);
     }
 
+    /// Remembers routing peers reached by client nodes and uses them as extra
+    /// entry points when such nodes start (ADR-046).
+    pub fn with_routing_peers(mut self, routing_peers: Arc<RoutingPeersService>) -> Self {
+        self.routing_peers = Some(routing_peers);
+        self
+    }
+
+    /// Remembered routing peers that are not configured bootstrap nodes, most
+    /// recently reached first.
+    fn remembered_entry_points(&self) -> Vec<BootstrapPeer> {
+        let Some(routing_peers) = &self.routing_peers else {
+            return Vec::new();
+        };
+        let configured = self.bootstrap_peers();
+        routing_peers
+            .remembered()
+            .iter()
+            .filter_map(|address| parse_bootstrap_peer(address).ok())
+            .filter(|peer| !configured.iter().any(|known| known.peer_id == peer.peer_id))
+            .collect()
+    }
+
+    /// Adds remembered routing peers as DHT entry points after the configured
+    /// bootstrap nodes and records the routing peers this client node reaches.
+    /// Remembered peers are never used for relay reservations (ADR-046).
+    fn use_remembered_routing_peers(&self, node: &mut NetworkNode) {
+        let Some(routing_peers) = &self.routing_peers else {
+            return;
+        };
+        for peer in self.remembered_entry_points() {
+            node.add_bootstrap_peer(peer.peer_id, peer.address);
+        }
+        let routing_peers = routing_peers.clone();
+        node.observe_routing_peers(Box::new(move |peer_id, address| {
+            let _ = routing_peers.record(peer_id, address);
+        }));
+    }
+
     /// Lets the owner advertising node answer member invite requests.
     fn with_invite_requests(mut self, invite_requests: Arc<dyn InviteRequestService>) -> Self {
         self.invite_requests = invite_requests;
@@ -554,6 +595,7 @@ impl NetworkService {
             invite_requests: Arc::new(RejectingInviteRequestService),
             owner_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
             lan_discovery: true,
+            routing_peers: None,
         })
     }
 
@@ -901,6 +943,7 @@ impl NetworkService {
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
                 .map_err(|_| "network_unavailable")?;
         }
+        self.use_remembered_routing_peers(&mut node);
         node.bootstrap().map_err(|_| "network_unavailable")?;
         for key in &keys {
             node.announce_group(*key)
@@ -1190,6 +1233,7 @@ impl NetworkService {
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
                 .map_err(|_| "network_unavailable")?;
         }
+        self.use_remembered_routing_peers(&mut node);
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.announce_group(key)
             .map_err(|_| "network_unavailable")?;
@@ -1332,6 +1376,7 @@ impl NetworkService {
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
+        self.use_remembered_routing_peers(&mut node);
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.find_group_peers(key);
 
@@ -1699,6 +1744,7 @@ impl NetworkService {
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
+        self.use_remembered_routing_peers(&mut node);
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.find_group_peers(key);
 
@@ -1868,6 +1914,7 @@ impl NetworkService {
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
+        self.use_remembered_routing_peers(&mut node);
         node.bootstrap().map_err(|_| "network_unavailable")?;
         node.find_group_peers(key);
 
@@ -2503,6 +2550,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
+    use crate::routing_peers::RoutingPeersService;
 
     use super::{
         address_hint, answer_member_sync_request, discovery_outcome, join_response,
@@ -2970,6 +3018,56 @@ mod tests {
 
         service.replace_community_peers(Vec::new());
         assert_eq!(service.bootstrap_peers().len(), 1);
+    }
+
+    #[test]
+    fn remembered_routing_peers_are_extra_entry_points_outside_the_bootstrap_list() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let routing_peers = Arc::new(RoutingPeersService::new(
+            directory.path().join("routing-peers.json"),
+        ));
+        let built_in_peer = DeviceIdentity::generate().peer_id();
+        let remembered_peer = DeviceIdentity::generate().peer_id();
+        let built_in = format!("/ip4/127.0.0.1/udp/9000/quic-v1/p2p/{built_in_peer}");
+        let address: libp2p::Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap();
+        routing_peers
+            .record(remembered_peer, &address)
+            .expect("peer is stored");
+        routing_peers
+            .record(built_in_peer, &address)
+            .expect("peer is stored");
+        let service = NetworkService::from_sources(&[built_in.as_str()], "")
+            .unwrap()
+            .with_routing_peers(routing_peers);
+
+        let entry_points = service.remembered_entry_points();
+
+        assert_eq!(entry_points.len(), 1);
+        assert_eq!(entry_points[0].peer_id, remembered_peer);
+        assert_eq!(entry_points[0].address, address);
+        assert_eq!(service.bootstrap_peers().len(), 1);
+    }
+
+    #[test]
+    fn remembered_routing_peers_do_not_replace_bootstrap_nodes() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let routing_peers = Arc::new(RoutingPeersService::new(
+            directory.path().join("routing-peers.json"),
+        ));
+        routing_peers
+            .record(
+                DeviceIdentity::generate().peer_id(),
+                &"/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap(),
+            )
+            .expect("peer is stored");
+        let service = NetworkService::from_sources(&[], "")
+            .unwrap()
+            .with_routing_peers(routing_peers);
+
+        let status = tauri::async_runtime::block_on(service.status());
+
+        assert_eq!(status.advertising_status, "bootstrapRequired");
+        assert!(status.bootstrap_nodes.is_empty());
     }
 
     #[test]

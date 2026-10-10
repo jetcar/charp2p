@@ -560,6 +560,24 @@ impl EventStore {
         Ok(outcome)
     }
 
+    /// Atomically persists an owner key refresh event and the advanced MLS
+    /// state (ADR-045).
+    pub fn put_mls_key_refresh(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+    ) -> Result<PutEventOutcome, StoreError> {
+        if event.kind() != charp2p_core::EventKind::KeyEpochAdvanced {
+            return Err(StoreError::CorruptIndex);
+        }
+        validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
+        let transaction = self.connection.transaction()?;
+        let outcome = put_event_in_transaction(&transaction, event)?;
+        put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Atomically persists a protected message event, advanced MLS state, and
     /// its locally encrypted display body.
     pub fn put_message_and_encrypted_mls_provider_snapshot(
@@ -1406,8 +1424,8 @@ impl EventStore {
         Ok(events)
     }
 
-    /// Returns verified MLS membership commits that have not advanced the
-    /// local provider snapshot yet.
+    /// Returns verified MLS commits (membership changes and owner key
+    /// refreshes) that have not advanced the local provider snapshot yet.
     pub fn unapplied_mls_commit_events(
         &self,
         group_id: PeerId,
@@ -1430,10 +1448,7 @@ impl EventStore {
             if event.group_id() != group_id {
                 return Err(StoreError::CorruptIndex);
             }
-            if matches!(
-                event.kind(),
-                charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
-            ) {
+            if is_mls_commit_kind(event.kind()) {
                 events.push(event);
                 if events.len() == limit {
                     break;
@@ -1443,17 +1458,14 @@ impl EventStore {
         Ok(events)
     }
 
-    /// Atomically records an applied MLS membership commit and the resulting
-    /// encrypted provider state.
+    /// Atomically records an applied MLS commit and the resulting encrypted
+    /// provider state.
     pub fn put_applied_mls_event_and_encrypted_provider_snapshot(
         &mut self,
         event: &SignedEvent,
         encrypted_snapshot: &[u8],
     ) -> Result<bool, StoreError> {
-        if !matches!(
-            event.kind(),
-            charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
-        ) {
+        if !is_mls_commit_kind(event.kind()) {
             return Err(StoreError::CorruptIndex);
         }
         validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
@@ -1538,8 +1550,9 @@ impl EventStore {
     /// Returns the stored membership commit count and newest commit for the
     /// synchronization summary.
     ///
-    /// Membership commits are owner-authored, so the newest one is the commit
-    /// with the highest author sequence.
+    /// Owner key refreshes count as commits because later messages depend on
+    /// their epoch (ADR-045). Commits are owner-authored, so the newest one is
+    /// the commit with the highest author sequence.
     pub fn membership_state(&self, group_id: PeerId) -> Result<SyncMembershipState, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT encoded FROM events WHERE group_id = ?1
@@ -1552,10 +1565,7 @@ impl EventStore {
             if event.group_id() != group_id {
                 return Err(StoreError::CorruptIndex);
             }
-            if matches!(
-                event.kind(),
-                charp2p_core::EventKind::MemberAdded | charp2p_core::EventKind::MemberRemoved
-            ) {
+            if is_mls_commit_kind(event.kind()) {
                 state.commits += 1;
                 state.latest_commit = Some(event.id());
             }
@@ -3034,6 +3044,17 @@ impl EventStore {
     }
 }
 
+/// Whether an event kind carries an owner-authored MLS commit that advances
+/// the group epoch.
+fn is_mls_commit_kind(kind: charp2p_core::EventKind) -> bool {
+    matches!(
+        kind,
+        charp2p_core::EventKind::MemberAdded
+            | charp2p_core::EventKind::MemberRemoved
+            | charp2p_core::EventKind::KeyEpochAdvanced
+    )
+}
+
 fn validate_encrypted_mls_provider_snapshot(encrypted: &[u8]) -> Result<(), StoreError> {
     if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES {
         return Err(StoreError::InvalidMlsProviderSnapshotSize(encrypted.len()));
@@ -3553,6 +3574,73 @@ mod tests {
                 commits: 2,
                 latest_commit: Some(removed.id()),
             }
+        );
+
+        let refresh = owner_event(4, EventKind::KeyEpochAdvanced);
+        store.put_event(&refresh).unwrap();
+        assert_eq!(
+            store.membership_state(group.group_id()).unwrap(),
+            SyncMembershipState {
+                commits: 3,
+                latest_commit: Some(refresh.id()),
+            }
+        );
+    }
+
+    #[test]
+    fn key_refresh_is_stored_with_its_snapshot_and_applied_as_a_commit() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let owner_event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"key refresh commit",
+                },
+            )
+            .unwrap()
+        };
+        let refresh = owner_event(1, EventKind::KeyEpochAdvanced);
+        assert!(matches!(
+            store.put_mls_key_refresh(&owner_event(1, EventKind::MemberRemoved), b"snapshot"),
+            Err(StoreError::CorruptIndex)
+        ));
+        assert!(store.get_event(refresh.id()).unwrap().is_none());
+
+        store.put_mls_key_refresh(&refresh, b"refreshed").unwrap();
+        assert_eq!(
+            store.get_event(refresh.id()).unwrap().unwrap().id(),
+            refresh.id()
+        );
+        assert_eq!(
+            store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
+            b"refreshed"
+        );
+        assert_eq!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 10)
+                .unwrap()
+                .iter()
+                .map(SignedEvent::id)
+                .collect::<Vec<_>>(),
+            vec![refresh.id()]
+        );
+        assert!(
+            store
+                .put_applied_mls_event_and_encrypted_provider_snapshot(&refresh, b"applied")
+                .unwrap()
+        );
+        assert!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

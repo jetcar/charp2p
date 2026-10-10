@@ -123,9 +123,9 @@ pub fn record_reported_heads(
 
 /// Validates and atomically stores events uploaded by an authenticated group member.
 ///
-/// Uploads are restricted to messages and message edits signed by the connected
-/// device. Membership
-/// authorization remains the caller's responsibility.
+/// Uploads are restricted to messages, message edits and deletions signed by
+/// the connected device; membership commits and key refreshes arrive only by
+/// pull. Membership authorization remains the caller's responsibility.
 pub fn accept_pushed_events(
     store: &mut EventStore,
     authenticated_peer: PeerId,
@@ -715,6 +715,14 @@ mod tests {
         };
         assert!(matches!(
             accept_pushed_events(&mut store, author.peer_id(), &metadata),
+            Err(SynchronizationError::UnsupportedPushedEvent)
+        ));
+        let refresh = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![event_of(4, EventKind::KeyEpochAdvanced).encode().unwrap()],
+        };
+        assert!(matches!(
+            accept_pushed_events(&mut store, author.peer_id(), &refresh),
             Err(SynchronizationError::UnsupportedPushedEvent)
         ));
     }

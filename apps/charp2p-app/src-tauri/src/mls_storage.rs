@@ -19,9 +19,9 @@ use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
     merge_prepared_member_admission, merge_prepared_member_removal, prepare_profile_key_package,
     prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
-    validate_group_profile, validate_profile_key_package, validate_staged_commit_profile,
-    PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
-    ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+    validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
+    validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
+    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
     EventStore, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
@@ -1771,6 +1771,12 @@ impl MlsProviderService {
             };
             validate_staged_commit_profile(&staged)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            // A key refresh may only replace the owner's path secrets
+            // (ADR-045).
+            if event.kind() == EventKind::KeyEpochAdvanced {
+                validate_key_refresh_commit(&staged)
+                    .map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            }
             group
                 .merge_staged_commit(&*provider, *staged)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;

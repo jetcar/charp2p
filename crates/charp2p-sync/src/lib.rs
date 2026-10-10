@@ -178,6 +178,8 @@ pub struct PullSession {
     group_id: PeerId,
     phase: PullPhase,
     remaining_authors: VecDeque<SyncAuthorHead>,
+    /// Unrecorded authors already moved to the end of the queue once.
+    deferred_authors: HashSet<PeerId>,
     membership: Option<MembershipComparison>,
 }
 
@@ -215,6 +217,7 @@ impl PullSession {
                 group_id,
                 phase: PullPhase::AwaitingSummary,
                 remaining_authors: VecDeque::new(),
+                deferred_authors: HashSet::new(),
                 membership: None,
             },
             SyncRequest::Summary { group_id },
@@ -277,6 +280,24 @@ impl PullSession {
                 self.ensure_group(*group_id)?;
                 if *response_author != author_id {
                     return Err(SynchronizationError::AuthorMismatch);
+                }
+                if !author_may_sync(store, self.group_id, author_id)? {
+                    // A device never seen in the MLS roster may still be
+                    // added by an owner commit pulled earlier in this
+                    // session, so it is retried once after the other
+                    // authors and skipped if it is still unrecorded.
+                    if self.deferred_authors.insert(author_id) {
+                        self.remaining_authors.push_back(SyncAuthorHead {
+                            author_id,
+                            contiguous_sequence: remote_head,
+                        });
+                    }
+                    let next_request = self.next_author_request(store)?;
+                    return Ok(SessionProgress {
+                        next_request,
+                        applied,
+                        complete: matches!(self.phase, PullPhase::Complete),
+                    });
                 }
                 if event_ids.is_empty() {
                     return Err(SynchronizationError::NoProgress);
@@ -389,6 +410,19 @@ impl PullSession {
         }
         Ok(())
     }
+}
+
+/// Whether events by `author_id` may be pulled into the group: once the
+/// group's MLS roster is recorded, only devices ever seen as members. Removed
+/// devices stay recorded because their earlier events remain history; MLS
+/// rejects anything they encrypt after their removal.
+fn author_may_sync(
+    store: &EventStore,
+    group_id: PeerId,
+    author_id: PeerId,
+) -> Result<bool, StoreError> {
+    let authors = store.group_authors(group_id)?;
+    Ok(authors.is_empty() || authors.contains(&author_id))
 }
 
 enum PullPhase {
@@ -859,6 +893,55 @@ mod tests {
             .handle_response(&mut target, &events(&[&requested]))
             .unwrap();
         assert_eq!(progress.applied.inserted, 1);
+    }
+
+    #[test]
+    fn pull_session_skips_authors_never_recorded_in_the_group() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let late = DeviceIdentity::generate();
+        let stranger = DeviceIdentity::generate();
+        let mut source = EventStore::in_memory().unwrap();
+        source
+            .put_events(&[
+                message_event(&owner, &group, 1, b"owner"),
+                message_event(&late, &group, 1, b"added later"),
+                message_event(&stranger, &group, 1, b"never a member"),
+            ])
+            .unwrap();
+        let mut target = EventStore::in_memory().unwrap();
+        target
+            .record_group_authors(group.group_id(), &[owner.peer_id()])
+            .unwrap();
+
+        let (mut session, mut request) = PullSession::start(group.group_id());
+        loop {
+            let response = build_authorized_response(&source, &request).unwrap();
+            let progress = session.handle_response(&mut target, &response).unwrap();
+            // Stands in for an owner commit adding `late`, applied after
+            // the owner's events were pulled.
+            if progress.applied.inserted > 0 {
+                target
+                    .record_group_authors(group.group_id(), &[late.peer_id()])
+                    .unwrap();
+            }
+            let Some(next_request) = progress.next_request else {
+                break;
+            };
+            request = next_request;
+        }
+
+        assert!(session.is_complete());
+        let mut pulled: Vec<_> = target
+            .synchronization_summary(group.group_id())
+            .unwrap()
+            .into_iter()
+            .map(|head| head.author_id)
+            .collect();
+        pulled.sort_by_key(|author| author.to_bytes());
+        let mut expected = vec![owner.peer_id(), late.peer_id()];
+        expected.sort_by_key(|author| author.to_bytes());
+        assert_eq!(pulled, expected);
     }
 
     #[test]

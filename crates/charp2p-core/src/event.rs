@@ -37,17 +37,17 @@ pub enum EventKind {
     GroupCreated,
     /// Changes authenticated display metadata.
     GroupMetadataChanged,
-    /// Records an issued invitation.
+    /// Reserved: records an issued invitation; not authored in the MVP.
     InvitationCreated,
-    /// Revokes an invitation capability.
+    /// Reserved: revokes an invitation capability; not authored in the MVP.
     InvitationRevoked,
     /// Adds a member identity.
     MemberAdded,
     /// Removes a member identity.
     MemberRemoved,
-    /// Adds a device to a member.
+    /// Reserved: adds a device to a member; not authored in the MVP.
     DeviceAdded,
-    /// Revokes a member device.
+    /// Reserved: revokes a member device; not authored in the MVP.
     DeviceRevoked,
     /// Creates a message.
     MessageCreated,

@@ -115,6 +115,11 @@ The invitation secret is placed in the URL fragment for the HTTPS form so a
 normal web request does not send it to the web server. The landing page must
 not load third-party analytics or resources that could capture it.
 
+Invitations for groups that require owner approval use invitation version 4
+(ADR-044): the version 3 layout with zero to four hints under the domain
+separator `charp2p-invitation-v4`, so the join preview can show the
+root-signed approval requirement before the joiner contacts the inviter.
+
 Peer and relay hints are root-signed multiaddresses of the inviter device in
 invitation version 3 (ADR-037): one to four distinct direct or circuit-relay
 addresses of at most 256 bytes, without a trailing `/p2p` component. Clients

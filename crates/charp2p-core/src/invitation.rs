@@ -11,6 +11,7 @@ use crate::GroupIdentity;
 
 const INVITATION_VERSION: u16 = 2;
 const HINTED_INVITATION_VERSION: u16 = 3;
+const APPROVAL_INVITATION_VERSION: u16 = 4;
 /// Most inviter address hints carried by one invitation.
 pub const MAX_ADDRESS_HINTS: usize = 4;
 const MAX_ADDRESS_HINT_BYTES: usize = 256;
@@ -23,6 +24,7 @@ pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
 const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v2\0";
 const HINTED_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v3\0";
+const APPROVAL_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v4\0";
 
 /// Controls which retained messages a newly joined member may request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,6 +97,28 @@ impl Invitation {
         address_hints: &[Multiaddr],
         now_unix: u64,
     ) -> Result<Self, InvitationError> {
+        Self::issue_with_options(
+            owner,
+            inviter_device_id,
+            spec,
+            address_hints,
+            false,
+            now_unix,
+        )
+    }
+
+    /// Issues a signed invitation with optional address hints that also
+    /// authenticates whether the owner must approve each joining device
+    /// (ADR-044). Approval produces a version 4 invitation; otherwise hints
+    /// select version 3 and an empty list version 2.
+    pub fn issue_with_options(
+        owner: &GroupIdentity,
+        inviter_device_id: PeerId,
+        spec: InvitationSpec<'_>,
+        address_hints: &[Multiaddr],
+        approval_required: bool,
+        now_unix: u64,
+    ) -> Result<Self, InvitationError> {
         validate_name("group name", spec.group_name)?;
         validate_name("inviter name", spec.inviter_name)?;
         let inviter_device_id = inviter_device_id.to_bytes();
@@ -118,7 +142,9 @@ impl Invitation {
 
         let owner_public_key = owner.public_key();
         let claims = InvitationClaims {
-            version: if encoded_hints.is_empty() {
+            version: if approval_required {
+                APPROVAL_INVITATION_VERSION
+            } else if encoded_hints.is_empty() {
                 INVITATION_VERSION
             } else {
                 HINTED_INVITATION_VERSION
@@ -148,7 +174,7 @@ impl Invitation {
 
     /// Encodes the invitation as an unpadded URL-safe Base64 payload.
     pub fn encode(&self) -> Result<String, InvitationError> {
-        let bytes = if self.address_hints.is_empty() {
+        let bytes = if self.claims.version == INVITATION_VERSION {
             postcard::to_allocvec(&SignedInvitation {
                 claims: self.claims.clone(),
                 signature: self.signature.clone(),
@@ -183,21 +209,25 @@ impl Invitation {
         let bytes = URL_SAFE_NO_PAD.decode(encoded)?;
         // The version is the first claim field, so it selects the wire layout.
         let (version, _) = postcard::take_from_bytes::<u16>(&bytes)?;
-        let (claims, encoded_hints, signature) = if version == HINTED_INVITATION_VERSION {
-            let wire: SignedHintedInvitation = postcard::from_bytes(&bytes)?;
-            if postcard::to_allocvec(&wire)? != bytes {
-                return Err(InvitationError::NonCanonical);
-            }
-            (wire.claims, wire.address_hints, wire.signature)
-        } else {
-            let wire: SignedInvitation = postcard::from_bytes(&bytes)?;
-            if postcard::to_allocvec(&wire)? != bytes {
-                return Err(InvitationError::NonCanonical);
-            }
-            (wire.claims, Vec::new(), wire.signature)
-        };
+        let (claims, encoded_hints, signature) =
+            if version == HINTED_INVITATION_VERSION || version == APPROVAL_INVITATION_VERSION {
+                let wire: SignedHintedInvitation = postcard::from_bytes(&bytes)?;
+                if postcard::to_allocvec(&wire)? != bytes {
+                    return Err(InvitationError::NonCanonical);
+                }
+                (wire.claims, wire.address_hints, wire.signature)
+            } else {
+                let wire: SignedInvitation = postcard::from_bytes(&bytes)?;
+                if postcard::to_allocvec(&wire)? != bytes {
+                    return Err(InvitationError::NonCanonical);
+                }
+                (wire.claims, Vec::new(), wire.signature)
+            };
         validate_claims(&claims, now_unix)?;
-        let address_hints = if claims.version == HINTED_INVITATION_VERSION {
+        // Version 3 always carries hints; version 4 may carry none.
+        let address_hints = if claims.version == HINTED_INVITATION_VERSION
+            || (claims.version == APPROVAL_INVITATION_VERSION && !encoded_hints.is_empty())
+        {
             validate_address_hints(&encoded_hints)?
         } else {
             Vec::new()
@@ -285,6 +315,12 @@ impl Invitation {
     /// inviter peer ID. Version 2 invitations carry none.
     pub fn address_hints(&self) -> &[Multiaddr] {
         &self.address_hints
+    }
+
+    /// Returns whether the root signature states that the owner must approve
+    /// each joining device before admission (ADR-041, ADR-044).
+    pub fn requires_owner_approval(&self) -> bool {
+        self.claims.version == APPROVAL_INVITATION_VERSION
     }
 }
 
@@ -394,8 +430,8 @@ struct SignedInvitation {
     signature: Vec<u8>,
 }
 
-/// Version 3 wire layout: version 2 claims followed by binary multiaddress
-/// hints, all covered by the root signature.
+/// Version 3 and 4 wire layout: version 2 claims followed by binary
+/// multiaddress hints, all covered by the root signature.
 #[derive(Deserialize, Serialize)]
 struct SignedHintedInvitation {
     claims: InvitationClaims,
@@ -407,13 +443,16 @@ fn signing_payload(
     claims: &InvitationClaims,
     address_hints: &[Vec<u8>],
 ) -> Result<Vec<u8>, postcard::Error> {
-    let (domain, encoded) = if claims.version == HINTED_INVITATION_VERSION {
-        (
+    let (domain, encoded) = match claims.version {
+        HINTED_INVITATION_VERSION => (
             HINTED_SIGNING_DOMAIN,
             postcard::to_allocvec(&(claims, address_hints))?,
-        )
-    } else {
-        (SIGNING_DOMAIN, postcard::to_allocvec(claims)?)
+        ),
+        APPROVAL_INVITATION_VERSION => (
+            APPROVAL_SIGNING_DOMAIN,
+            postcard::to_allocvec(&(claims, address_hints))?,
+        ),
+        _ => (SIGNING_DOMAIN, postcard::to_allocvec(claims)?),
     };
     let mut payload = Vec::with_capacity(domain.len() + encoded.len());
     payload.extend_from_slice(domain);
@@ -422,7 +461,10 @@ fn signing_payload(
 }
 
 fn validate_claims(claims: &InvitationClaims, now_unix: u64) -> Result<(), InvitationError> {
-    if claims.version != INVITATION_VERSION && claims.version != HINTED_INVITATION_VERSION {
+    if !matches!(
+        claims.version,
+        INVITATION_VERSION | HINTED_INVITATION_VERSION | APPROVAL_INVITATION_VERSION
+    ) {
         return Err(InvitationError::UnsupportedVersion(claims.version));
     }
     validate_name("group name", &claims.group_name)?;
@@ -861,6 +903,91 @@ mod tests {
             .unwrap(),
         );
 
+        assert!(matches!(
+            Invitation::decode(&stripped, NOW),
+            Err(InvitationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn approval_invitation_round_trips_as_version_4_with_or_without_hints() {
+        let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        for hints in [Vec::new(), hints()] {
+            let invitation = Invitation::issue_with_options(
+                &owner,
+                inviter_device_id,
+                spec(NOW + 3_600),
+                &hints,
+                true,
+                NOW,
+            )
+            .unwrap();
+            let decoded = Invitation::decode_input(&invitation.custom_uri().unwrap(), NOW).unwrap();
+
+            assert_eq!(hinted_wire(&invitation).claims.version, 4);
+            assert!(decoded.requires_owner_approval());
+            assert_eq!(decoded.address_hints(), hints.as_slice());
+            assert_eq!(decoded.group_id(), owner.group_id());
+        }
+        for hints in [Vec::new(), hints()] {
+            let direct = Invitation::issue_with_options(
+                &owner,
+                inviter_device_id,
+                spec(NOW + 3_600),
+                &hints,
+                false,
+                NOW,
+            )
+            .unwrap();
+            assert!(
+                !Invitation::decode(&direct.encode().unwrap(), NOW)
+                    .unwrap()
+                    .requires_owner_approval()
+            );
+        }
+    }
+
+    #[test]
+    fn approval_requirement_cannot_be_stripped_into_an_earlier_version() {
+        let owner = GroupIdentity::generate();
+        let inviter_device_id = DeviceIdentity::generate().peer_id();
+        let hinted = Invitation::issue_with_options(
+            &owner,
+            inviter_device_id,
+            spec(NOW + 3_600),
+            &hints(),
+            true,
+            NOW,
+        )
+        .unwrap();
+        let mut wire = hinted_wire(&hinted);
+        wire.claims.version = 3;
+        let downgraded = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&wire).unwrap());
+        assert!(matches!(
+            Invitation::decode(&downgraded, NOW),
+            Err(InvitationError::InvalidSignature)
+        ));
+
+        let unhinted = Invitation::issue_with_options(
+            &owner,
+            inviter_device_id,
+            spec(NOW + 3_600),
+            &[],
+            true,
+            NOW,
+        )
+        .unwrap();
+        let wire = hinted_wire(&unhinted);
+        let mut claims = wire.claims;
+        claims.version = 2;
+        let stripped = URL_SAFE_NO_PAD.encode(
+            postcard::to_allocvec(&SignedInvitation {
+                claims,
+                signature: wire.signature,
+            })
+            .unwrap(),
+        );
         assert!(matches!(
             Invitation::decode(&stripped, NOW),
             Err(InvitationError::InvalidSignature)

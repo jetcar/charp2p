@@ -14,6 +14,7 @@ type InvitationPreview = {
   expiresAtUnix: number;
   historyPolicy: "none" | "fromInvitation" | "allRetained";
   reusable: boolean;
+  approvalRequired: boolean;
 };
 const GROUP_ICONS = ["●●●", "◆", "▲", "♥", "★"];
 const INVITATION_LIFETIMES = [
@@ -22,8 +23,8 @@ const INVITATION_LIFETIMES = [
   { label: "14 days", seconds: 1209600 },
   { label: "30 days", seconds: 2592000 },
 ];
-type PendingGroup = InvitationPreview;
-type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable"> & {
+type PendingGroup = Omit<InvitationPreview, "approvalRequired">;
+type JoinedGroup = Omit<InvitationPreview, "expiresAtUnix" | "reusable" | "approvalRequired"> & {
   lastSynchronizedAtUnix: number | null;
   icon: number | null;
 };
@@ -4976,6 +4977,7 @@ function App() {
                 <div><span className="join-fact-icon" aria-hidden="true">✉</span><dt>Messages</dt><dd>You can send messages</dd></div>
                 <div><span className="join-fact-icon" aria-hidden="true">◷</span><dt>History</dt><dd>{historyDescription(invitationPreview.historyPolicy)}</dd></div>
                 <div><span className="join-fact-icon" aria-hidden="true">▦</span><dt>Invitation</dt><dd>{expiryDescription(invitationPreview.expiresAtUnix)}{invitationPreview.reusable ? " · Reusable" : " · Single use"}</dd></div>
+                <div><span className="join-fact-icon" aria-hidden="true">✓</span><dt>Admission</dt><dd>{invitationPreview.approvalRequired ? "The group owner must approve this device before it joins" : "This invitation grants access without owner approval"}</dd></div>
                 <div>
                   <span className="join-fact-icon" aria-hidden="true">⌘</span>
                   <dt>Group fingerprint</dt>

@@ -1148,11 +1148,12 @@ impl GroupService {
         };
         let hinted = (!address_hints.is_empty())
             .then(|| {
-                let invitation = Invitation::issue_with_address_hints(
+                let invitation = Invitation::issue_with_options(
                     &identity,
                     inviter_device_id,
                     spec,
                     address_hints,
+                    group.approval_required,
                     now_unix,
                 )
                 .ok()?;
@@ -1163,8 +1164,15 @@ impl GroupService {
         let (invitation, encoded) = match hinted {
             Some(hinted) => hinted,
             None => {
-                let invitation = Invitation::issue(&identity, inviter_device_id, spec, now_unix)
-                    .map_err(|_| "invitation_creation_failed")?;
+                let invitation = Invitation::issue_with_options(
+                    &identity,
+                    inviter_device_id,
+                    spec,
+                    &[],
+                    group.approval_required,
+                    now_unix,
+                )
+                .map_err(|_| "invitation_creation_failed")?;
                 let encoded = Zeroizing::new(
                     invitation
                         .encode()
@@ -2355,6 +2363,9 @@ mod tests {
                 NOW,
             )
             .unwrap();
+        assert!(Invitation::decode_input(&issued.link, NOW)
+            .unwrap()
+            .requires_owner_approval());
         let request = join_request(&issued.link, NOW);
         let device = DeviceIdentity::generate().peer_id();
         let declined = DeviceIdentity::generate().peer_id();

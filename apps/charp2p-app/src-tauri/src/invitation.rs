@@ -13,6 +13,7 @@ pub struct InvitationPreview {
     pub expires_at_unix: u64,
     pub history_policy: &'static str,
     pub reusable: bool,
+    pub approval_required: bool,
 }
 
 pub fn preview_invitation(input: &str) -> Result<InvitationPreview, &'static str> {
@@ -52,6 +53,7 @@ fn preview_invitation_at(input: &str, now_unix: u64) -> Result<InvitationPreview
         expires_at_unix: invitation.expires_at_unix(),
         history_policy,
         reusable: invitation.is_reusable(),
+        approval_required: invitation.requires_owner_approval(),
     })
 }
 
@@ -97,6 +99,35 @@ mod tests {
         assert_eq!(preview.group_id, owner.group_id().to_string());
         assert_eq!(preview.history_policy, "fromInvitation");
         assert!(!preview.reusable);
+        assert!(!preview.approval_required);
+    }
+
+    #[test]
+    fn preview_shows_the_root_signed_approval_requirement() {
+        let owner = GroupIdentity::generate();
+        let encoded = Invitation::issue_with_options(
+            &owner,
+            DeviceIdentity::generate().peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::FromInvitation,
+                reusable: true,
+            },
+            &[],
+            true,
+            NOW,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        assert!(
+            preview_invitation_at(&encoded, NOW)
+                .unwrap()
+                .approval_required
+        );
     }
 
     #[test]

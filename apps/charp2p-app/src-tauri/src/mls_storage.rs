@@ -1919,20 +1919,27 @@ impl MlsProviderService {
         store: &mut EventStore,
         group_id: PeerId,
     ) -> Result<(), &'static str> {
+        // Events that stay unreadable are paged past, so readable messages
+        // ordered after more than one batch of them still materialize.
+        let mut after = None;
         loop {
             let events = store
-                .unmaterialized_message_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+                .unmaterialized_message_events_after(
+                    group_id,
+                    after,
+                    charp2p_store::MAX_SYNC_BATCH_EVENTS,
+                )
                 .map_err(|_| "message_store_unavailable")?;
-            if events.is_empty() {
+            let Some(last) = events.last() else {
                 return Ok(());
-            }
-            let mut materialized = 0usize;
+            };
+            after = Some((last.author_id(), last.author_sequence()));
             for event in events {
                 let previous = provider
                     .snapshot()
                     .map_err(|_| "mls_provider_snapshot_invalid")?;
                 match self.materialize_message(provider, store, group_id, &event) {
-                    Ok(()) => materialized += 1,
+                    Ok(()) => {}
                     Err(MaterializeMessageError::Unreadable) => {
                         *provider = ProfileProvider::from_snapshot(&previous)
                             .map_err(|_| "mls_provider_snapshot_invalid")?;
@@ -1943,9 +1950,6 @@ impl MlsProviderService {
                         return Err(error);
                     }
                 }
-            }
-            if materialized == 0 {
-                return Ok(());
             }
         }
     }
@@ -5391,6 +5395,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["After rename"]
         );
+    }
+
+    #[test]
+    fn readable_messages_after_a_full_batch_of_unreadable_events_materialize() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member_id, &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member_id, request.key_package(), 42)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        let message = member_service
+            .create_message_at(group_id, &member, "After the noise", 43)
+            .unwrap();
+
+        // A full batch of undecryptable events ordered before the readable one.
+        let noise_author = std::iter::repeat_with(DeviceIdentity::generate)
+            .find(|device| device.peer_id().to_bytes() < member_id.to_bytes())
+            .unwrap();
+        let mut owner_store = owner_service.store.lock().unwrap();
+        for sequence in 1..=charp2p_store::MAX_SYNC_BATCH_EVENTS as u64 {
+            let noise = SignedEvent::create(
+                &noise_author,
+                EventSpec {
+                    group_id,
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 43,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"not an MLS message",
+                },
+            )
+            .unwrap();
+            owner_store.put_event(&noise).unwrap();
+        }
+        owner_store.put_event(&message).unwrap();
+        let mut provider = owner_service.provider.lock().unwrap();
+        owner_service
+            .materialize_pending_messages(&mut provider, &mut owner_store, group_id)
+            .unwrap();
+
+        let materialized = owner_store.encrypted_messages(group_id).unwrap().messages;
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].event_id, *message.id().as_bytes());
     }
 
     #[test]

@@ -1464,9 +1464,28 @@ impl EventStore {
         group_id: PeerId,
         limit: usize,
     ) -> Result<Vec<SignedEvent>, StoreError> {
+        self.unmaterialized_message_events_after(group_id, None, limit)
+    }
+
+    /// Returns the same events as [`Self::unmaterialized_message_events`]
+    /// ordered after the `(author, sequence)` cursor, so a caller can page
+    /// past events it could not decrypt yet instead of reading them again.
+    pub fn unmaterialized_message_events_after(
+        &self,
+        group_id: PeerId,
+        after: Option<(PeerId, u64)>,
+        limit: usize,
+    ) -> Result<Vec<SignedEvent>, StoreError> {
         if !(1..=MAX_SYNC_BATCH_EVENTS).contains(&limit) {
             return Err(StoreError::InvalidBatchLimit(limit));
         }
+        let (after_author, after_sequence) = match after {
+            Some((author, sequence)) => (
+                author.to_bytes(),
+                i64::try_from(sequence).map_err(|_| StoreError::SequenceTooLarge(sequence))?,
+            ),
+            None => (Vec::new(), -1),
+        };
         let mut statement = self.connection.prepare(
             "SELECT e.encoded
              FROM events e
@@ -1479,9 +1498,13 @@ impl EventStore {
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
                AND g.event_id IS NULL AND x.event_id IS NULL AND p.event_id IS NULL
                AND d.event_id IS NULL
+               AND (e.author_id > ?2 OR (e.author_id = ?2 AND e.author_sequence > ?3))
              ORDER BY e.author_id, e.author_sequence",
         )?;
-        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = statement.query_map(
+            params![group_id.to_bytes(), after_author, after_sequence],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
         let mut events = Vec::with_capacity(limit);
         for encoded in rows {
             let event = SignedEvent::decode(&encoded?)?;
@@ -4900,6 +4923,56 @@ mod tests {
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"preceding authenticated snapshot"
         );
+    }
+
+    #[test]
+    fn unmaterialized_message_events_page_after_an_author_sequence_cursor() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first_author = DeviceIdentity::generate();
+        let second_author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let mut events = Vec::new();
+        for (author, sequence) in [
+            (&first_author, 1),
+            (&first_author, 2),
+            (&second_author, 1),
+            (&second_author, 2),
+        ] {
+            let event = message_event(author, &group, sequence, b"MLS ciphertext");
+            store.put_event(&event).unwrap();
+            events.push(event);
+        }
+        events.sort_by_key(|event| (event.author_id().to_bytes(), event.author_sequence()));
+        let ids = |page: &[SignedEvent]| page.iter().map(|event| event.id()).collect::<Vec<_>>();
+
+        let first_page = store
+            .unmaterialized_message_events_after(group.group_id(), None, 3)
+            .unwrap();
+        assert_eq!(ids(&first_page), ids(&events[..3]));
+        let cursor = first_page
+            .last()
+            .map(|event| (event.author_id(), event.author_sequence()));
+        assert_eq!(
+            ids(&store
+                .unmaterialized_message_events_after(group.group_id(), cursor, 3)
+                .unwrap()),
+            vec![events[3].id()]
+        );
+        let last = (events[3].author_id(), events[3].author_sequence());
+        assert!(
+            store
+                .unmaterialized_message_events_after(group.group_id(), Some(last), 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.unmaterialized_message_events_after(
+                group.group_id(),
+                Some((last.0, u64::MAX)),
+                3
+            ),
+            Err(StoreError::SequenceTooLarge(u64::MAX))
+        ));
     }
 
     #[test]

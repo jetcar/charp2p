@@ -10,14 +10,15 @@ use std::{
 
 use charp2p_core::{
     EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
-    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent, SyncMembershipState,
+    MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, PeerId, SignedEvent,
+    SyncMembershipState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -1064,6 +1065,51 @@ impl EventStore {
         Ok(deleted == 1)
     }
 
+    /// Records devices observed as MLS members of a group, for example from
+    /// the roster after a join or an applied membership commit. Entries are
+    /// never dropped by later removals, because a removed device's earlier
+    /// signed events stay part of history. Returns how many were new.
+    pub fn record_group_authors(
+        &mut self,
+        group_id: PeerId,
+        authors: &[PeerId],
+    ) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let mut inserted = 0;
+        for author in authors {
+            inserted += transaction.execute(
+                "INSERT INTO group_authors (group_id, author_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(group_id, author_id) DO NOTHING",
+                params![group_id.to_bytes(), author.to_bytes()],
+            )?;
+        }
+        let total: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM group_authors WHERE group_id = ?1",
+            [group_id.to_bytes()],
+            |row| row.get(0),
+        )?;
+        let total = usize::try_from(total).map_err(|_| StoreError::CorruptIndex)?;
+        if total > MAX_SYNC_AUTHORS {
+            return Err(StoreError::TooManyGroupAuthors(total));
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Lists every device ever recorded as an MLS member of the group,
+    /// ordered by device identifier.
+    pub fn group_authors(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT author_id FROM group_authors
+             WHERE group_id = ?1
+             ORDER BY author_id",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| PeerId::from_bytes(&row?).map_err(|_| StoreError::CorruptIndex))
+            .collect()
+    }
+
     /// Lists devices blocked on this device for one group.
     pub fn blocked_devices(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
         let mut statement = self.connection.prepare(
@@ -1896,7 +1942,7 @@ impl EventStore {
 
     /// Atomically forgets a joined group on this device: its display metadata,
     /// signed events with every dependent local record, peer acknowledgements,
-    /// remembered peer addresses and local blocks, together with the provider state that no longer
+    /// remembered peer addresses, recorded authors and local blocks, together with the provider state that no longer
     /// contains the MLS group.
     pub fn leave_joined_group_and_put_encrypted_mls_provider_snapshot(
         &mut self,
@@ -1915,6 +1961,7 @@ impl EventStore {
             "DELETE FROM events WHERE group_id = ?1",
             "DELETE FROM peer_acknowledged_author_heads WHERE group_id = ?1",
             "DELETE FROM blocked_local_devices WHERE group_id = ?1",
+            "DELETE FROM group_authors WHERE group_id = ?1",
             "DELETE FROM peer_addresses WHERE group_id = ?1",
             "DELETE FROM sequence_conflicts WHERE group_id = ?1",
         ] {
@@ -2634,7 +2681,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=27 => {}
+            6..=28 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3040,6 +3087,19 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 28 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS group_authors (
+                    group_id BLOB NOT NULL,
+                    author_id BLOB NOT NULL,
+                    PRIMARY KEY(group_id, author_id)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3288,6 +3348,9 @@ pub enum StoreError {
     /// A remembered peer address is empty or above the local bound.
     #[error("invalid peer address size {0}")]
     InvalidPeerAddressSize(usize),
+    /// A group would record more authors than synchronization can address.
+    #[error("group would record {0} authors, above the synchronization bound")]
+    TooManyGroupAuthors(usize),
     /// A single-use invitation already admitted a device.
     #[error("single-use invitation already consumed")]
     InvitationConsumed,
@@ -5159,6 +5222,51 @@ mod tests {
                 .event_id,
             *earlier.id().as_bytes()
         );
+    }
+
+    #[test]
+    fn group_authors_are_recorded_once_per_group_and_bounded() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let other_group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate().peer_id();
+        let member = DeviceIdentity::generate().peer_id();
+
+        assert!(store.group_authors(group.group_id()).unwrap().is_empty());
+        assert_eq!(
+            store
+                .record_group_authors(group.group_id(), &[owner, member, owner])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .record_group_authors(group.group_id(), &[member])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .record_group_authors(other_group.group_id(), &[owner])
+                .unwrap(),
+            1
+        );
+        let mut expected = vec![owner, member];
+        expected.sort_by_key(|peer| peer.to_bytes());
+        assert_eq!(store.group_authors(group.group_id()).unwrap(), expected);
+        assert_eq!(
+            store.group_authors(other_group.group_id()).unwrap(),
+            vec![owner]
+        );
+
+        let too_many: Vec<_> = (0..super::MAX_SYNC_AUTHORS)
+            .map(|_| DeviceIdentity::generate().peer_id())
+            .collect();
+        assert!(matches!(
+            store.record_group_authors(group.group_id(), &too_many),
+            Err(StoreError::TooManyGroupAuthors(total)) if total == super::MAX_SYNC_AUTHORS + 2
+        ));
+        assert_eq!(store.group_authors(group.group_id()).unwrap(), expected);
     }
 
     #[test]

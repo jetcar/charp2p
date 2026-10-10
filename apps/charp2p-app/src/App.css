@@ -228,6 +228,7 @@ button { cursor: pointer; }
 .message-bubble .message-author { margin-bottom: 4px; color: #52607d; font-size: 12px; font-weight: 600; line-height: 1.4; }
 .message-author code { color: #68748f; font-weight: 400; }
 .message-day-chip { justify-self: center; margin: 6px 0 0; padding: 3px 12px; border-radius: 999px; color: #52607d; background: #edf2f7; font-size: 12px; font-weight: 600; }
+.earlier-messages-button { justify-self: center; margin: 4px 0; }
 .message-meta { display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 4px; color: #68748f; font-size: 12px; }
 .message-device-warning { color: #b42318; font-weight: 600; }
 .message-menu { position: relative; margin-left: 6px; }

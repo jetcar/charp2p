@@ -324,6 +324,19 @@ function messageTime(createdAtUnixMs: number) {
   });
 }
 
+// Matches the store's message order: creation time, then event ID.
+function compareMessageOrder(left: StoredMessage, right: StoredMessage) {
+  if (left.createdAtUnixMs !== right.createdAtUnixMs) return left.createdAtUnixMs - right.createdAtUnixMs;
+  return left.eventId < right.eventId ? -1 : left.eventId > right.eventId ? 1 : 0;
+}
+
+// Replaces the newest page while keeping loaded earlier messages older than it.
+function mergeLatestMessages(current: StoredMessage[], latest: StoredMessage[], keepEarlier: boolean) {
+  if (!keepEarlier || latest.length === 0) return latest;
+  const earlier = current.filter((message) => compareMessageOrder(message, latest[0]) < 0);
+  return [...earlier, ...latest];
+}
+
 function messageClockTime(createdAtUnixMs: number) {
   return new Date(createdAtUnixMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
@@ -2238,6 +2251,8 @@ function App() {
   const [discoveryStates, setDiscoveryStates] = useState<Record<string, GroupDiscoveryName | null>>({});
   const [ownedDiscovery, setOwnedDiscovery] = useState<OwnedGroupDiscoveryStatus | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
+  const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
+  const earlierMessagesLoadedRef = useRef(false);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
   const [replyingTo, setReplyingTo] = useState<StoredMessage | null>(null);
@@ -2763,6 +2778,7 @@ function App() {
 
   useEffect(() => {
     const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    earlierMessagesLoadedRef.current = false;
     if (!isTauri() || !groupId) {
       setGroupMessages([]);
       setHasEarlierMessages(false);
@@ -2777,8 +2793,9 @@ function App() {
       try {
         const page = await invoke<StoredMessagePage>("group_messages", { groupId });
         if (active) {
-          setGroupMessages(page.messages);
-          setHasEarlierMessages(page.hasEarlier);
+          const keepEarlier = earlierMessagesLoadedRef.current;
+          setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
+          if (!keepEarlier) setHasEarlierMessages(page.hasEarlier);
         }
       } catch (reason) {
         if (active && firstLoad) setError(errorMessage(reason));
@@ -3171,8 +3188,9 @@ function App() {
         setSynchronizationResult(result);
         const page = await invoke<StoredMessagePage>("group_messages", { groupId });
         if (activeGroupIdRef.current === groupId) {
-          setGroupMessages(page.messages);
-          setHasEarlierMessages(page.hasEarlier);
+          const keepEarlier = earlierMessagesLoadedRef.current;
+          setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
+          if (!keepEarlier) setHasEarlierMessages(page.hasEarlier);
         }
       }
     } catch (reason) {
@@ -3800,6 +3818,16 @@ function App() {
         <h3>Messages</h3>
         {renderEvidenceControls(groupId)}
         {renderEvidenceResult()}
+        {hasEarlierMessages && (
+          <button
+            className="secondary-button earlier-messages-button"
+            disabled={loadingEarlierMessages}
+            onClick={() => void loadEarlierMessages(groupId)}
+            type="button"
+          >
+            {loadingEarlierMessages ? "Loading earlier messages…" : "Show earlier messages"}
+          </button>
+        )}
         {groupMessages.map((message, index) => {
           const own = message.authorId === profile?.peerId;
           const day = messageDayLabel(message.createdAtUnixMs);
@@ -3830,11 +3858,34 @@ function App() {
             </Fragment>
           );
         })}
-        {hasEarlierMessages && (
-          <p className="preview-note">Showing the latest 256 messages stored on this device.</p>
-        )}
       </section>
     );
+  }
+
+  async function loadEarlierMessages(groupId: string) {
+    const oldest = groupMessages[0];
+    if (loadingEarlierMessages || !oldest || !isTauri()) return;
+
+    setError("");
+    setLoadingEarlierMessages(true);
+    try {
+      const page = await invoke<StoredMessagePage>("group_messages", {
+        groupId,
+        beforeCreatedAtUnixMs: oldest.createdAtUnixMs,
+        beforeEventId: oldest.eventId,
+      });
+      if (activeGroupIdRef.current !== groupId) return;
+      earlierMessagesLoadedRef.current = true;
+      setGroupMessages((messages) => {
+        const shown = new Set(messages.map(({ eventId }) => eventId));
+        return [...page.messages.filter(({ eventId }) => !shown.has(eventId)), ...messages];
+      });
+      setHasEarlierMessages(page.hasEarlier);
+    } catch (reason) {
+      if (activeGroupIdRef.current === groupId) setError(errorMessage(reason));
+    } finally {
+      setLoadingEarlierMessages(false);
+    }
   }
 
   async function hideMessage(message: StoredMessage) {

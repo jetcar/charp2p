@@ -1793,47 +1793,48 @@ impl MlsProviderService {
         let progress = session
             .handle_response(&mut store, response)
             .map_err(|_| "synchronization_failed")?;
-        self.apply_pending_group_commits(&mut provider, &mut store, session.group_id())?;
-        self.materialize_pending_messages(&mut provider, &mut store, session.group_id())?;
+        // Messages are read before each later commit is applied: the group
+        // keeps no past-epoch secrets, so a message pulled together with the
+        // commit that ends its epoch is readable only before that commit.
+        loop {
+            self.materialize_pending_messages(&mut provider, &mut store, session.group_id())?;
+            if !self.apply_next_group_commit(&mut provider, &mut store, session.group_id())? {
+                break;
+            }
+        }
         Ok(progress)
     }
 
-    fn apply_pending_group_commits(
+    /// Applies the first applicable pending commit and reports whether one
+    /// was recorded.
+    fn apply_next_group_commit(
         &self,
         provider: &mut ProfileProvider,
         store: &mut EventStore,
         group_id: PeerId,
-    ) -> Result<(), &'static str> {
-        loop {
-            let events = store
-                .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
-                .map_err(|_| "mls_group_storage_unavailable")?;
-            if events.is_empty() {
-                return Ok(());
-            }
-            let mut applied = 0usize;
-            for event in events {
-                let previous = provider
-                    .snapshot()
-                    .map_err(|_| "mls_provider_snapshot_invalid")?;
-                match self.apply_group_commit(provider, store, group_id, &event) {
-                    Ok(true) => applied += 1,
-                    Ok(false) => {}
-                    Err(ApplyGroupCommitError::Unreadable) => {
-                        *provider = ProfileProvider::from_snapshot(&previous)
-                            .map_err(|_| "mls_provider_snapshot_invalid")?;
-                    }
-                    Err(ApplyGroupCommitError::Unavailable(error)) => {
-                        *provider = ProfileProvider::from_snapshot(&previous)
-                            .map_err(|_| "mls_provider_snapshot_invalid")?;
-                        return Err(error);
-                    }
+    ) -> Result<bool, &'static str> {
+        let events = store
+            .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+            .map_err(|_| "mls_group_storage_unavailable")?;
+        for event in events {
+            let previous = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            match self.apply_group_commit(provider, store, group_id, &event) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(ApplyGroupCommitError::Unreadable) => {
+                    *provider = ProfileProvider::from_snapshot(&previous)
+                        .map_err(|_| "mls_provider_snapshot_invalid")?;
+                }
+                Err(ApplyGroupCommitError::Unavailable(error)) => {
+                    *provider = ProfileProvider::from_snapshot(&previous)
+                        .map_err(|_| "mls_provider_snapshot_invalid")?;
+                    return Err(error);
                 }
             }
-            if applied == 0 {
-                return Ok(());
-            }
         }
+        Ok(false)
     }
 
     fn apply_group_commit(
@@ -4536,6 +4537,55 @@ mod tests {
                 .unwrap()
                 .text,
             "After refresh"
+        );
+    }
+
+    #[test]
+    fn messages_pulled_with_a_later_commit_are_read_in_their_own_epoch() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let join = member_service
+            .prepare_join_request(member.peer_id(), &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member.peer_id(), join.key_package(), 41)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        pin_joined_owner(&member_service, group_id, owner.peer_id());
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+
+        // The member is offline while the owner writes and then advances the
+        // epoch; one pull delivers the message and the later commit together.
+        owner_service
+            .create_message_at(group_id, &owner, "Before refresh", 42)
+            .unwrap();
+        owner_service
+            .refresh_group_keys_at(group_id, &owner, 43)
+            .unwrap();
+        owner_service
+            .create_message_at(group_id, &owner, "After refresh", 44)
+            .unwrap();
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+        assert_eq!(
+            member_service
+                .messages(group_id, member.peer_id())
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Before refresh", "After refresh"]
         );
     }
 

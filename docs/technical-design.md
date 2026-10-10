@@ -302,7 +302,11 @@ Before decrypting messages, the client applies synchronized `MemberAdded` and
 sender credential to the event author, then atomically stores an applied-event
 marker with the advanced encrypted provider snapshot. Commits already included
 in the joining Welcome are marked without replay, while commits from a future
-epoch wait for their predecessor.
+epoch wait for their predecessor. Groups keep no past-epoch message secrets,
+so after each pulled batch the client decrypts every pending message readable
+in the current epoch before applying the next commit, and repeats until no
+further commit applies; a message pulled together with the commit that ends its
+epoch is therefore still read.
 After pulling, a joined member uploads bounded batches of its locally authored
 message events to the pinned owner over the same authenticated connection. The
 owner accepts only `MessageCreated` events whose signature author matches the

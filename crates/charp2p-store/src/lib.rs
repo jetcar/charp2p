@@ -84,6 +84,14 @@ pub struct EncryptedMessagePage {
     pub has_earlier: bool,
 }
 
+/// Display-order position of a materialized message; a page requested before
+/// it holds only strictly older messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MessageCursor {
+    pub created_at_unix_ms: u64,
+    pub event_id: [u8; 32],
+}
+
 /// Non-secret index for a bearer invitation issued by a locally owned group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuedInvitationMetadata {
@@ -682,8 +690,18 @@ impl EventStore {
 
     /// Lists locally materialized messages in stable display order.
     pub fn encrypted_messages(&self, group_id: PeerId) -> Result<EncryptedMessagePage, StoreError> {
+        self.encrypted_messages_before(group_id, None)
+    }
+
+    /// Lists the newest locally retained messages older than `before` (or the
+    /// newest overall without a cursor) in stable display order.
+    pub fn encrypted_messages_before(
+        &self,
+        group_id: PeerId,
+        before: Option<MessageCursor>,
+    ) -> Result<EncryptedMessagePage, StoreError> {
         let mut messages =
-            self.newest_encrypted_messages(group_id, MAX_RECENT_MESSAGE_EVENTS + 1)?;
+            self.newest_encrypted_messages(group_id, before, MAX_RECENT_MESSAGE_EVENTS + 1)?;
         let has_earlier = messages.len() > MAX_RECENT_MESSAGE_EVENTS;
         messages.truncate(MAX_RECENT_MESSAGE_EVENTS);
         messages.reverse();
@@ -699,15 +717,21 @@ impl EventStore {
         &self,
         group_id: PeerId,
     ) -> Result<Option<EncryptedMessage>, StoreError> {
-        Ok(self.newest_encrypted_messages(group_id, 1)?.pop())
+        Ok(self.newest_encrypted_messages(group_id, None, 1)?.pop())
     }
 
-    /// Lists up to `limit` displayable messages of one group, newest first.
+    /// Lists up to `limit` displayable messages of one group older than
+    /// `before`, newest first.
     fn newest_encrypted_messages(
         &self,
         group_id: PeerId,
+        before: Option<MessageCursor>,
         limit: usize,
     ) -> Result<Vec<EncryptedMessage>, StoreError> {
+        // Stored timestamps fit i64, so a larger cursor is after all of them.
+        let before_created_at =
+            before.map(|cursor| i64::try_from(cursor.created_at_unix_ms).unwrap_or(i64::MAX));
+        let before_event_id = before.map(|cursor| cursor.event_id.to_vec());
         let mut statement = self.connection.prepare(
             "SELECT e.encoded, m.group_id, m.author_id, m.created_at_unix_ms,
                     m.encrypted_body, x.event_id, x.encrypted_body, r.reply_to_event_id
@@ -733,10 +757,21 @@ impl EventStore {
                      AND d.group_id = m.group_id
                      AND d.author_id = m.author_id
                )
+               AND (
+                   ?3 IS NULL
+                   OR m.created_at_unix_ms < ?3
+                   OR (m.created_at_unix_ms = ?3 AND m.event_id < ?4)
+               )
              ORDER BY m.created_at_unix_ms DESC, m.event_id DESC
              LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![group_id.to_bytes(), limit as i64], |row| {
+        let parameters = params![
+            group_id.to_bytes(),
+            limit as i64,
+            before_created_at,
+            before_event_id
+        ];
+        let rows = statement.query_map(parameters, |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -6367,6 +6402,87 @@ mod tests {
             page.messages.last().unwrap().created_at_unix_ms,
             super::MAX_RECENT_MESSAGE_EVENTS as u64 + 1
         );
+
+        let oldest = page.messages.first().unwrap();
+        let earlier = store
+            .encrypted_messages_before(
+                group.group_id(),
+                Some(super::MessageCursor {
+                    created_at_unix_ms: oldest.created_at_unix_ms,
+                    event_id: oldest.event_id,
+                }),
+            )
+            .unwrap();
+        assert!(!earlier.has_earlier);
+        assert_eq!(earlier.messages.len(), 1);
+        assert_eq!(earlier.messages[0].created_at_unix_ms, 1);
+
+        let newest = page.messages.last().unwrap();
+        let before_newest = store
+            .encrypted_messages_before(
+                group.group_id(),
+                Some(super::MessageCursor {
+                    created_at_unix_ms: newest.created_at_unix_ms,
+                    event_id: newest.event_id,
+                }),
+            )
+            .unwrap();
+        assert!(!before_newest.has_earlier);
+        assert_eq!(
+            before_newest.messages.len(),
+            super::MAX_RECENT_MESSAGE_EVENTS
+        );
+        assert_eq!(
+            before_newest.messages.first().unwrap().created_at_unix_ms,
+            1
+        );
+        assert_eq!(
+            before_newest.messages.last().unwrap().created_at_unix_ms,
+            super::MAX_RECENT_MESSAGE_EVENTS as u64
+        );
+    }
+
+    #[test]
+    fn message_cursor_orders_equal_timestamps_by_event_id() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        for sequence in 1..=3 {
+            let event = SignedEvent::create(
+                &author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 7,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"MLS ciphertext",
+                },
+            )
+            .unwrap();
+            store
+                .put_message_and_encrypted_mls_provider_snapshot(
+                    &event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap();
+        }
+        let all = store.encrypted_messages(group.group_id()).unwrap().messages;
+        assert_eq!(all.len(), 3);
+
+        let middle = &all[1];
+        let earlier = store
+            .encrypted_messages_before(
+                group.group_id(),
+                Some(super::MessageCursor {
+                    created_at_unix_ms: middle.created_at_unix_ms,
+                    event_id: middle.event_id,
+                }),
+            )
+            .unwrap();
+        assert_eq!(earlier.messages, vec![all[0].clone()]);
+        assert!(!earlier.has_earlier);
     }
 
     #[test]

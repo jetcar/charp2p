@@ -25,8 +25,8 @@ use charp2p_mls::{
     ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
-    EventStore, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
-    MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
+    EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
+    MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
 use charp2p_sync::{
     accept_pushed_events, build_authorized_response, record_reported_heads, PullSession,
@@ -678,10 +678,22 @@ impl MlsProviderService {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn messages(
         &self,
         group_id: PeerId,
         local_device_id: PeerId,
+    ) -> Result<StoredMessagePage, &'static str> {
+        self.messages_before(group_id, local_device_id, None)
+    }
+
+    /// Lists the newest locally retained messages older than `before`, or the
+    /// newest overall without a cursor.
+    pub(crate) fn messages_before(
+        &self,
+        group_id: PeerId,
+        local_device_id: PeerId,
+        before: Option<MessageCursor>,
     ) -> Result<StoredMessagePage, &'static str> {
         let _operation = self
             .operations
@@ -714,7 +726,7 @@ impl MlsProviderService {
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
         let encrypted_page = store
-            .encrypted_messages(group_id)
+            .encrypted_messages_before(group_id, before)
             .map_err(|_| "message_list_unavailable")?;
         store
             .mark_messages_read(group_id)

@@ -663,20 +663,32 @@ fn delete_group_message(
         .map_err(str::to_owned)
 }
 
+/// Lists the newest retained messages of a group, or with a cursor (the
+/// oldest shown message's timestamp and event ID) the page before it.
 #[tauri::command]
 fn group_messages(
     group_id: String,
+    before_created_at_unix_ms: Option<u64>,
+    before_event_id: Option<String>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
     retention_service: tauri::State<'_, RetentionService>,
 ) -> Result<StoredMessagePage, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let before = match (before_created_at_unix_ms, before_event_id) {
+        (Some(created_at_unix_ms), Some(event_id)) => Some(charp2p_store::MessageCursor {
+            created_at_unix_ms,
+            event_id: parse_event_id(&event_id)?,
+        }),
+        (None, None) => None,
+        _ => return Err("message_cursor_invalid".to_owned()),
+    };
     apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
     mls_service
-        .messages(group_id, identity.peer_id())
+        .messages_before(group_id, identity.peer_id(), before)
         .map_err(str::to_owned)
 }
 

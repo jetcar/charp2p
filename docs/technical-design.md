@@ -479,6 +479,13 @@ target device ID and granted flag as an MLS application message, follows the
 same owner-only authorship, highest-owner-sequence and pull-only rules as
 metadata changes, and is dropped for a removed device.
 
+A `KeyEpochAdvanced` event carries an owner-authored MLS Commit with no
+proposals and a forced update path (ADR-045). It replaces the owner's path
+secrets and advances the epoch without changing membership. Members apply it
+in the same ordered pass as membership commits, only from the pinned owner
+device, reject a carried Commit with proposals or without an update path, and
+receive it only by pull synchronization.
+
 A `MessageEdited` event carries a versioned edit (target `MessageCreated`
 event identifier and replacement text, at most 16 KiB) as an MLS application
 message. Clients display an edit only when its author is the target message's

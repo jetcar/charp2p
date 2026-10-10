@@ -237,6 +237,8 @@ pub enum ProfileError {
     UnsupportedJoinConfiguration,
     /// A group leaf does not carry a valid CharP2P device credential.
     InvalidDeviceCredential,
+    /// A key refresh commit carries proposals or no path update.
+    UnexpectedKeyRefreshContent,
 }
 
 /// Failure while checking and decrypting a profile Welcome.
@@ -514,6 +516,67 @@ pub enum MergeMemberRemovalError {
     InvalidPendingCommit,
     /// OpenMLS could not durably advance the group epoch.
     #[error("pending MLS member removal could not be merged")]
+    MergeFailed,
+}
+
+/// Bounded MLS Commit produced while staging one owner key refresh.
+pub struct PreparedKeyRefresh {
+    commit: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedKeyRefresh {
+    /// Commit that the other members must authenticate and merge.
+    pub fn commit(&self) -> &[u8] {
+        self.commit.as_slice()
+    }
+}
+
+impl fmt::Debug for PreparedKeyRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedKeyRefresh")
+            .field("commit_bytes", &self.commit.len())
+            .finish()
+    }
+}
+
+/// Failure while staging an owner key refresh.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PrepareKeyRefreshError {
+    /// The existing group state is outside the fixed profile.
+    #[error("MLS group does not match the CharP2P profile")]
+    InvalidGroupProfile,
+    /// OpenMLS could not stage the refresh.
+    #[error("MLS key refresh could not be staged")]
+    KeyRefreshFailed,
+    /// The locally generated pending commit is not a pure key refresh.
+    #[error("generated MLS key refresh commit violates the profile")]
+    InvalidPendingCommit,
+    /// A pure key refresh unexpectedly generated a Welcome.
+    #[error("MLS key refresh generated an unexpected Welcome")]
+    UnexpectedWelcome,
+    /// OpenMLS could not encode the generated Commit.
+    #[error("generated MLS key refresh commit could not be encoded")]
+    WireEncodingFailed,
+    /// The generated Commit exceeds the profile wire bound.
+    #[error("generated MLS key refresh commit exceeds the profile wire bound")]
+    WireSizeExceeded,
+    /// A failed preparation could not clear its pending commit.
+    #[error("failed MLS key refresh preparation could not be rolled back")]
+    RollbackFailed,
+}
+
+/// Failure while merging a previously persisted key refresh Commit.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MergeKeyRefreshError {
+    /// There is no locally prepared key refresh Commit.
+    #[error("no MLS key refresh is pending")]
+    MissingPendingCommit,
+    /// The pending Commit is not a profile-valid pure key refresh.
+    #[error("pending MLS key refresh violates the profile")]
+    InvalidPendingCommit,
+    /// OpenMLS could not durably advance the group epoch.
+    #[error("pending MLS key refresh could not be merged")]
     MergeFailed,
 }
 
@@ -845,6 +908,103 @@ pub fn merge_prepared_member_removal<Provider: OpenMlsProvider>(
         .map_err(|_| MergeMemberRemovalError::MergeFailed)
 }
 
+/// Stages a Commit that only replaces the local leaf's path secrets, without
+/// advancing the local epoch.
+///
+/// Queued proposals are left out so the Commit cannot change membership. The
+/// caller must durably publish `commit()` before merging it.
+pub fn prepare_profile_key_refresh<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    signer: &impl Signer,
+) -> Result<PreparedKeyRefresh, PrepareKeyRefreshError> {
+    validate_group_profile(group).map_err(|_| PrepareKeyRefreshError::InvalidGroupProfile)?;
+    let bundle = group
+        .commit_builder()
+        .consume_proposal_store(false)
+        .force_self_update(true)
+        .load_psks(provider.storage())
+        .map_err(|_| PrepareKeyRefreshError::KeyRefreshFailed)?
+        .build(provider.rand(), provider.crypto(), signer, |_| true)
+        .map_err(|_| PrepareKeyRefreshError::KeyRefreshFailed)?
+        .stage_commit(provider)
+        .map_err(|_| PrepareKeyRefreshError::KeyRefreshFailed)?;
+    let pending_is_valid = group.pending_commit().is_some_and(|pending| {
+        validate_staged_commit_profile(pending).is_ok()
+            && validate_key_refresh_commit(pending).is_ok()
+    });
+    if !pending_is_valid {
+        return Err(rollback_prepared_key_refresh(
+            group,
+            provider,
+            PrepareKeyRefreshError::InvalidPendingCommit,
+        ));
+    }
+    let (commit, welcome, _) = bundle.into_contents();
+    if welcome.is_some() {
+        return Err(rollback_prepared_key_refresh(
+            group,
+            provider,
+            PrepareKeyRefreshError::UnexpectedWelcome,
+        ));
+    }
+    let commit = match commit.tls_serialize_detached() {
+        Ok(commit) => Zeroizing::new(commit),
+        Err(_) => {
+            return Err(rollback_prepared_key_refresh(
+                group,
+                provider,
+                PrepareKeyRefreshError::WireEncodingFailed,
+            ));
+        }
+    };
+    if commit.is_empty() || commit.len() > MAX_MLS_WIRE_BYTES {
+        return Err(rollback_prepared_key_refresh(
+            group,
+            provider,
+            PrepareKeyRefreshError::WireSizeExceeded,
+        ));
+    }
+    Ok(PreparedKeyRefresh { commit })
+}
+
+/// Merges one prepared key refresh after its Commit is durably published.
+pub fn merge_prepared_key_refresh<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+) -> Result<(), MergeKeyRefreshError> {
+    let pending = group
+        .pending_commit()
+        .ok_or(MergeKeyRefreshError::MissingPendingCommit)?;
+    validate_staged_commit_profile(pending)
+        .map_err(|_| MergeKeyRefreshError::InvalidPendingCommit)?;
+    validate_key_refresh_commit(pending).map_err(|_| MergeKeyRefreshError::InvalidPendingCommit)?;
+    group
+        .merge_pending_commit(provider)
+        .map_err(|_| MergeKeyRefreshError::MergeFailed)
+}
+
+/// Rejects an authenticated commit carried by a key refresh event unless it
+/// has no proposals and replaces the committer's path. Call this, after
+/// `validate_staged_commit_profile`, before merging such a commit.
+pub fn validate_key_refresh_commit(commit: &StagedCommit) -> Result<(), ProfileError> {
+    if commit.queued_proposals().next().is_some() || commit.update_path_leaf_node().is_none() {
+        return Err(ProfileError::UnexpectedKeyRefreshContent);
+    }
+    Ok(())
+}
+
+fn rollback_prepared_key_refresh<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    error: PrepareKeyRefreshError,
+) -> PrepareKeyRefreshError {
+    match group.clear_pending_commit(provider.storage()) {
+        Ok(()) => error,
+        Err(_) => PrepareKeyRefreshError::RollbackFailed,
+    }
+}
+
 fn rollback_prepared_admission<Provider: OpenMlsProvider>(
     group: &mut MlsGroup,
     provider: &Provider,
@@ -971,13 +1131,15 @@ mod tests {
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeMemberAdmissionError,
-        MlsWireError, PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError,
-        ProfileKeyPackageError, ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
-        abort_prepared_member_admission, decode_profile_message, device_credential,
-        device_id_from_credential, group_create_config, merge_prepared_member_admission,
-        prepare_profile_key_package, prepare_profile_member_admission, profile_capabilities,
-        profile_extensions, stage_profile_welcome, validate_group_profile,
+        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeKeyRefreshError,
+        MergeMemberAdmissionError, MlsWireError, PrepareKeyPackageError,
+        PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError, ProfileProvider,
+        ProfileProviderSnapshotError, StageWelcomeError, abort_prepared_member_admission,
+        decode_profile_message, device_credential, device_id_from_credential, group_create_config,
+        merge_prepared_key_refresh, merge_prepared_member_admission, prepare_profile_key_package,
+        prepare_profile_key_refresh, prepare_profile_member_admission,
+        prepare_profile_member_removal, profile_capabilities, profile_extensions,
+        stage_profile_welcome, validate_group_profile, validate_key_refresh_commit,
         validate_profile_key_package, validate_staged_commit_profile,
     };
 
@@ -1434,6 +1596,126 @@ mod tests {
         assert_eq!(
             merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap_err(),
             MergeMemberAdmissionError::MissingPendingCommit
+        );
+    }
+
+    #[test]
+    fn owner_key_refresh_advances_the_epoch_without_changing_membership() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &member_provider,
+                &member_signer,
+                member_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &member_key_package,
+            member_id,
+        )
+        .unwrap();
+        let mut member_group = stage_profile_welcome(&member_provider, admission.welcome())
+            .unwrap()
+            .into_group(&member_provider)
+            .unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        let epoch = owner_group.epoch();
+
+        let refresh =
+            prepare_profile_key_refresh(&mut owner_group, &owner_provider, &owner_signer).unwrap();
+        assert!(!refresh.commit().is_empty());
+        assert!(refresh.commit().len() <= MAX_MLS_WIRE_BYTES);
+        assert_eq!(owner_group.epoch(), epoch);
+        merge_prepared_key_refresh(&mut owner_group, &owner_provider).unwrap();
+        assert_eq!(owner_group.epoch().as_u64(), epoch.as_u64() + 1);
+        assert_eq!(owner_group.members().count(), 2);
+        assert_eq!(
+            merge_prepared_key_refresh(&mut owner_group, &owner_provider).unwrap_err(),
+            MergeKeyRefreshError::MissingPendingCommit
+        );
+
+        let processed = member_group
+            .process_message(
+                &member_provider,
+                decode_profile_message(refresh.commit())
+                    .unwrap()
+                    .try_into_protocol_message()
+                    .unwrap(),
+            )
+            .unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("expected a staged commit");
+        };
+        validate_staged_commit_profile(&staged).unwrap();
+        validate_key_refresh_commit(&staged).unwrap();
+        member_group
+            .merge_staged_commit(&member_provider, *staged)
+            .unwrap();
+        assert_eq!(member_group.epoch(), owner_group.epoch());
+        assert_eq!(member_group.members().count(), 2);
+
+        let message = owner_group
+            .create_message(&owner_provider, &owner_signer, b"after refresh")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let processed = member_group
+            .process_message(
+                &member_provider,
+                decode_profile_message(&message)
+                    .unwrap()
+                    .try_into_protocol_message()
+                    .unwrap(),
+            )
+            .unwrap();
+        let ProcessedMessageContent::ApplicationMessage(application) = processed.into_content()
+        else {
+            panic!("expected decrypted application data");
+        };
+        assert_eq!(application.into_bytes(), b"after refresh");
+
+        let removal = prepare_profile_member_removal(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            member_id,
+        )
+        .unwrap();
+        let processed = member_group
+            .process_message(
+                &member_provider,
+                decode_profile_message(removal.commit())
+                    .unwrap()
+                    .try_into_protocol_message()
+                    .unwrap(),
+            )
+            .unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("expected a staged commit");
+        };
+        assert_eq!(
+            validate_key_refresh_commit(&staged),
+            Err(ProfileError::UnexpectedKeyRefreshContent)
         );
     }
 

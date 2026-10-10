@@ -111,7 +111,10 @@
 - [x] Signed group-wide delete, part 2/2: "Delete for everyone" action on own messages in the conversation calling the `delete_group_message` command.
 - [x] Synchronization summary carries the current membership state (e.g. MLS epoch / membership commit head) so peers detect stale or newer membership before pulling (technical-design Synchronization).
 - [x] Join preview shows whether owner approval is needed: ADR and invitation version carrying the root-signed approval flag (product pages 4/8).
-- [ ] KeyEpochAdvanced: ADR and owner-committed MLS key refresh (technical-design event types; compromised-device future access).
+- [x] KeyEpochAdvanced 1/4: ADR-045 and charp2p-mls owner key refresh primitive (prepare/merge a proposal-free forced self-update Commit, validate_key_refresh_commit for receivers).
+- [ ] KeyEpochAdvanced 2/4: store treats KeyEpochAdvanced as an MLS commit event (unapplied/applied commit queries, membership state commit count, owner put with snapshot; rejected in member pushes).
+- [ ] KeyEpochAdvanced 3/4: app MlsProviderService::refresh_group_keys (owner signs KeyEpochAdvanced, persists, merges) and member apply path validates the pure refresh; Tauri command refresh_group_keys.
+- [ ] KeyEpochAdvanced 4/4: owner "Refresh group keys" action in the group details pane (confirm, call refresh_group_keys, trigger sync).
 
 ## Needs human
 
@@ -235,3 +238,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-10T02:27:15Z Signed group-wide delete part 2/2: own-message overflow menu gains a red "Delete for everyone" action (confirm, delete_group_message, drop from the timeline, clear reply/edit state, trigger sync); message_not_own text covers deletion. Frontend only; fmt, clippy, workspace tests (215) and npm build pass.
 - 2026-10-10T03:43:40Z Synchronization summary membership state: SyncResponse::Summary carries SyncMembershipState (membership commit count and newest MemberAdded/MemberRemoved event id, validated for consistency); EventStore::membership_state; PullSession records a MembershipComparison (Same/RemoteNewer/RemoteStale/Diverged) from the summary before pulling. Wire format change for Summary. fmt, clippy, workspace tests, src-tauri clippy and tests (after apt-installing webkit2gtk) and npm build pass.
 - 2026-10-10T04:32:50Z Join preview owner approval: ADR-044 invitation version 4 (v3 layout, zero to four hints, domain charp2p-invitation-v4) states root-signed owner approval; Invitation::issue_with_options and requires_owner_approval; owners issue v4 for approval-required groups; preview exposes approvalRequired and the join card shows an Admission fact; technical design updated. fmt, clippy, workspace tests, src-tauri clippy/tests (after apt-installing webkit2gtk) and npm build pass.
+- 2026-10-10T05:28:56Z KeyEpochAdvanced 1/4: ADR-045 (owner-committed proposal-free key refresh, ordered with membership commits, pull-only, counted in sync membership state); charp2p-mls prepare_profile_key_refresh/merge_prepared_key_refresh and validate_key_refresh_commit with a two-device test (epoch advances, membership unchanged, messages decrypt, removal commit rejected as refresh); technical design updated; item split into 4 sub-items. fmt, clippy, workspace tests and npm build pass.

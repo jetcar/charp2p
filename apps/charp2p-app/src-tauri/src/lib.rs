@@ -845,6 +845,32 @@ fn remove_group_member(
         .map_err(str::to_owned)
 }
 
+/// Advances a locally owned group to fresh MLS keys without changing its
+/// membership (ADR-045).
+#[tauri::command]
+fn refresh_group_keys(
+    group_id: String,
+    identity_service: tauri::State<'_, IdentityService>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    if !group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .any(|group| group.group_id == group_id.to_string())
+    {
+        return Err("key_refresh_not_allowed".to_owned());
+    }
+    let identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    mls_service
+        .refresh_group_keys(group_id, &identity)
+        .map_err(str::to_owned)
+}
+
 /// Lists join requests and declined devices for a locally owned group
 /// created with approval required (ADR-041).
 #[tauri::command]
@@ -1420,6 +1446,7 @@ pub fn run() {
             group_message_previews,
             group_members,
             remove_group_member,
+            refresh_group_keys,
             removed_group_members,
             group_approval_requests,
             decide_group_approval_request,

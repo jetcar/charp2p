@@ -17,11 +17,12 @@ use charp2p_core::{
 };
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
-    merge_prepared_member_admission, merge_prepared_member_removal, prepare_profile_key_package,
-    prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
-    validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
-    validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
-    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+    merge_prepared_key_refresh, merge_prepared_member_admission, merge_prepared_member_removal,
+    prepare_profile_key_package, prepare_profile_key_refresh, prepare_profile_member_admission,
+    prepare_profile_member_removal, stage_profile_welcome, validate_group_profile,
+    validate_key_refresh_commit, validate_profile_key_package, validate_staged_commit_profile,
+    PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
+    ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
     EventStore, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
@@ -492,6 +493,105 @@ impl MlsProviderService {
                 .put_mls_member_removal(&event, &encrypted, removed_peer)
                 .map_err(|_| "member_removal_store_unavailable")?;
             group_member_devices(&group)
+        })();
+        if result.is_err() {
+            *provider = ProfileProvider::from_snapshot(&previous)
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+        }
+        result
+    }
+
+    /// Advances an owned group to a fresh epoch with an owner-signed
+    /// KeyEpochAdvanced Commit that leaves membership unchanged (ADR-045).
+    pub(crate) fn refresh_group_keys(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+    ) -> Result<(), &'static str> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or("system_clock_invalid")?;
+        self.refresh_group_keys_at(group_id, owner_identity, created_at_unix_ms)
+    }
+
+    fn refresh_group_keys_at(
+        &self,
+        group_id: PeerId,
+        owner_identity: &DeviceIdentity,
+        created_at_unix_ms: u64,
+    ) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut provider = self
+            .provider
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let previous = provider
+            .snapshot()
+            .map_err(|_| "mls_provider_snapshot_invalid")?;
+        let result = (|| {
+            let mut group = MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&group_id.to_bytes()),
+            )
+            .map_err(|_| "mls_group_storage_unavailable")?
+            .ok_or("mls_joined_group_missing")?;
+            validate_owner_group(&group, group_id, owner_identity.peer_id())
+                .map_err(|_| "key_refresh_not_allowed")?;
+            // Joined members never commit; only the owning device refreshes.
+            if store
+                .joined_groups()
+                .map_err(|_| "key_refresh_store_unavailable")?
+                .iter()
+                .any(|joined| joined.group_id == group_id)
+            {
+                return Err("key_refresh_not_allowed");
+            }
+            let own_signature_key = group
+                .own_leaf_node()
+                .ok_or("mls_group_storage_unavailable")?
+                .signature_key();
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                own_signature_key.as_slice(),
+                CIPHERSUITE.signature_algorithm(),
+            )
+            .ok_or("mls_group_storage_unavailable")?;
+            let (author_sequence, causal_parents) =
+                next_event_position(&store, group_id, owner_identity.peer_id())
+                    .map_err(|_| "key_refresh_failed")?;
+            let refresh = prepare_profile_key_refresh(&mut group, &*provider, &signer)
+                .map_err(|_| "key_refresh_failed")?;
+            let event = SignedEvent::create(
+                owner_identity,
+                EventSpec {
+                    group_id,
+                    author_sequence,
+                    causal_parents: &causal_parents,
+                    created_at_unix_ms,
+                    kind: EventKind::KeyEpochAdvanced,
+                    protected_payload: refresh.commit(),
+                },
+            )
+            .map_err(|_| "key_refresh_failed")?;
+            merge_prepared_key_refresh(&mut group, &*provider).map_err(|_| "key_refresh_failed")?;
+            let snapshot = provider
+                .snapshot()
+                .map_err(|_| "mls_provider_snapshot_invalid")?;
+            let key = self.load_or_create_wrapping_key()?;
+            let encrypted = encrypt_snapshot(&snapshot, &key)?;
+            store
+                .put_mls_key_refresh(&event, &encrypted)
+                .map_err(|_| "key_refresh_store_unavailable")?;
+            Ok(())
         })();
         if result.is_err() {
             *provider = ProfileProvider::from_snapshot(&previous)
@@ -4257,6 +4357,73 @@ mod tests {
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
             }
+        );
+    }
+
+    #[test]
+    fn owner_key_refresh_advances_members_without_changing_membership() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        let member_service = test_service(directory.path().join("member.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let join = member_service
+            .prepare_join_request(member.peer_id(), &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(group_id, &owner, member.peer_id(), join.key_package(), 41)
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        pin_joined_owner(&member_service, group_id, owner.peer_id());
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+
+        // Only the owner may refresh the group keys.
+        assert_eq!(
+            member_service.refresh_group_keys_at(group_id, &member, 42),
+            Err("key_refresh_not_allowed")
+        );
+        owner_service
+            .refresh_group_keys_at(group_id, &owner, 43)
+            .unwrap();
+        let owner_state = owner_service
+            .store
+            .lock()
+            .unwrap()
+            .membership_state(group_id)
+            .unwrap();
+        assert_eq!(owner_state.commits, 2);
+
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+        {
+            let store = member_service.store.lock().unwrap();
+            assert!(store
+                .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.membership_state(group_id).unwrap(), owner_state);
+        }
+        assert_eq!(member_service.group_members(group_id).unwrap().len(), 2);
+        owner_service
+            .create_message_at(group_id, &owner, "After refresh", 44)
+            .unwrap();
+        pull_all(&owner_service, &member_service, member.peer_id(), group_id);
+        assert_eq!(
+            member_service
+                .messages(group_id, member.peer_id())
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .text,
+            "After refresh"
         );
     }
 

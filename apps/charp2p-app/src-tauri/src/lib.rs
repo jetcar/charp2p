@@ -25,8 +25,9 @@ use groups::{
 use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
 use mls_storage::{
-    CreatedMessage, DeviceSequenceConflict, EvidenceExport, GroupMemberDevice, MemberActivity,
-    MlsProviderService, StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
+    CreatedMessage, DeviceSequenceConflict, EvidenceExport, GroupMemberDevice, GroupMessagePreview,
+    MemberActivity, MlsProviderService, StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
+    MAX_PREVIEW_GROUPS,
 };
 use network::{
     AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
@@ -723,6 +724,26 @@ fn unread_message_counts(
     mls_service.unread_message_counts().map_err(str::to_owned)
 }
 
+/// Returns the newest message of each listed group for the group list.
+#[tauri::command]
+fn group_message_previews(
+    group_ids: Vec<String>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    retention_service: tauri::State<'_, RetentionService>,
+) -> Result<Vec<GroupMessagePreview>, String> {
+    if group_ids.len() > MAX_PREVIEW_GROUPS {
+        return Err("group_selection_invalid".to_owned());
+    }
+    let group_ids = group_ids
+        .iter()
+        .map(|group_id| parse_group_id(group_id, "group_not_found"))
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
+    mls_service
+        .message_previews(&group_ids)
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn hide_group_message(
     group_id: String,
@@ -1396,6 +1417,7 @@ pub fn run() {
             export_message_evidence,
             hide_group_message,
             unread_message_counts,
+            group_message_previews,
             group_members,
             remove_group_member,
             removed_group_members,

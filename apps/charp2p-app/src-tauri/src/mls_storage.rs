@@ -58,6 +58,8 @@ const MAX_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
 const MEMBER_RENDEZVOUS_LABEL: &str = "charp2p member rendezvous v1";
 const MEMBER_RENDEZVOUS_SECRET_BYTES: usize = 32;
 pub(crate) const MAX_EVIDENCE_EVENTS: usize = 64;
+/// Maximum number of groups one group list preview request may name.
+pub(crate) const MAX_PREVIEW_GROUPS: usize = 256;
 const EVIDENCE_FORMAT: &str = "charp2p-evidence-v1";
 const EVIDENCE_NOTICE: &str = "Each signed event proves which device signed it and when it claims to have been created. Event payloads are end-to-end encrypted; displayedText is the text shown on the exporting device and is not covered by the signatures.";
 
@@ -172,6 +174,16 @@ pub(crate) struct EvidenceEdit {
 pub(crate) struct UnreadMessageCount {
     pub group_id: String,
     pub count: u64,
+}
+
+/// Newest displayable message of one group, shown in the group list.
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GroupMessagePreview {
+    pub group_id: String,
+    pub author_id: String,
+    pub created_at_unix_ms: u64,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
@@ -757,6 +769,51 @@ impl MlsProviderService {
                 count,
             })
             .collect())
+    }
+
+    /// Returns the newest displayable message of each named group that has
+    /// one, without marking anything read.
+    pub(crate) fn message_previews(
+        &self,
+        group_ids: &[PeerId],
+    ) -> Result<Vec<GroupMessagePreview>, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let latest = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            group_ids
+                .iter()
+                .filter_map(|group_id| {
+                    store
+                        .latest_encrypted_message(*group_id)
+                        .map_err(|_| "message_list_unavailable")
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if latest.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = self
+            .wrapping_keys
+            .get_optional()?
+            .ok_or("mls_wrapping_key_missing")?;
+        latest
+            .iter()
+            .map(|message| {
+                Ok(GroupMessagePreview {
+                    group_id: message.group_id.to_string(),
+                    author_id: message.author_id.to_string(),
+                    created_at_unix_ms: message.created_at_unix_ms,
+                    text: displayed_message_text(message, &key)?,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn acknowledge_messages_shared(
@@ -3036,9 +3093,9 @@ mod tests {
     use super::{
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
         encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash,
-        DeviceSequenceConflict, GroupMemberDevice, MemberActivity, MemberAdmissionError,
-        MlsProviderMutationError, MlsProviderService, UnreadMessageCount, WrappingKeyStore,
-        MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
+        DeviceSequenceConflict, GroupMemberDevice, GroupMessagePreview, MemberActivity,
+        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
+        WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
     };
     use charp2p_store::{EventStore, PendingInvitationMetadata};
 
@@ -3859,6 +3916,16 @@ mod tests {
         assert_eq!(messages.messages[0].author_id, owner.peer_id().to_string());
         assert_eq!(messages.messages[0].delivery_state, "local");
         assert_eq!(messages.messages[1].text, "After restart");
+        let other_group = GroupIdentity::generate().group_id();
+        assert_eq!(
+            restored.message_previews(&[other_group, group_id]).unwrap(),
+            vec![GroupMessagePreview {
+                group_id: group_id.to_string(),
+                author_id: owner.peer_id().to_string(),
+                created_at_unix_ms: 43,
+                text: "After restart".to_owned(),
+            }]
+        );
         restored
             .acknowledge_messages_shared(
                 group_id,

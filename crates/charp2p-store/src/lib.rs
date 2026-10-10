@@ -663,6 +663,32 @@ impl EventStore {
 
     /// Lists locally materialized messages in stable display order.
     pub fn encrypted_messages(&self, group_id: PeerId) -> Result<EncryptedMessagePage, StoreError> {
+        let mut messages =
+            self.newest_encrypted_messages(group_id, MAX_RECENT_MESSAGE_EVENTS + 1)?;
+        let has_earlier = messages.len() > MAX_RECENT_MESSAGE_EVENTS;
+        messages.truncate(MAX_RECENT_MESSAGE_EVENTS);
+        messages.reverse();
+        Ok(EncryptedMessagePage {
+            messages,
+            has_earlier,
+        })
+    }
+
+    /// Returns the newest displayable message of one group, used for the
+    /// group list preview, or `None` when no message is shown there.
+    pub fn latest_encrypted_message(
+        &self,
+        group_id: PeerId,
+    ) -> Result<Option<EncryptedMessage>, StoreError> {
+        Ok(self.newest_encrypted_messages(group_id, 1)?.pop())
+    }
+
+    /// Lists up to `limit` displayable messages of one group, newest first.
+    fn newest_encrypted_messages(
+        &self,
+        group_id: PeerId,
+        limit: usize,
+    ) -> Result<Vec<EncryptedMessage>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT e.encoded, m.group_id, m.author_id, m.created_at_unix_ms,
                     m.encrypted_body, x.event_id, x.encrypted_body, r.reply_to_event_id
@@ -691,22 +717,19 @@ impl EventStore {
              ORDER BY m.created_at_unix_ms DESC, m.event_id DESC
              LIMIT ?2",
         )?;
-        let rows = statement.query_map(
-            params![group_id.to_bytes(), (MAX_RECENT_MESSAGE_EVENTS + 1) as i64],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<Vec<u8>>>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
-                ))
-            },
-        )?;
-        let mut messages = Vec::with_capacity(MAX_RECENT_MESSAGE_EVENTS + 1);
+        let rows = statement.query_map(params![group_id.to_bytes(), limit as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })?;
+        let mut messages = Vec::with_capacity(limit);
         for row in rows {
             let (
                 encoded,
@@ -754,13 +777,7 @@ impl EventStore {
                     .transpose()?,
             });
         }
-        let has_earlier = messages.len() > MAX_RECENT_MESSAGE_EVENTS;
-        messages.truncate(MAX_RECENT_MESSAGE_EVENTS);
-        messages.reverse();
-        Ok(EncryptedMessagePage {
-            messages,
-            has_earlier,
-        })
+        Ok(messages)
     }
 
     /// Records the highest contiguous sequence for one author explicitly
@@ -4916,6 +4933,66 @@ mod tests {
                 .messages
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn latest_encrypted_message_skips_blocked_devices() {
+        let mut store = EventStore::in_memory().unwrap();
+        let earlier_author = DeviceIdentity::generate();
+        let later_author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let empty_group = GroupIdentity::generate();
+        let message_at = |author: &DeviceIdentity, created_at_unix_ms| {
+            SignedEvent::create(
+                author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: 1,
+                    causal_parents: &[],
+                    created_at_unix_ms,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"MLS ciphertext",
+                },
+            )
+            .unwrap()
+        };
+        let earlier = message_at(&earlier_author, 1_800_000_000_000);
+        let later = message_at(&later_author, 1_800_000_001_000);
+        for event in [&later, &earlier] {
+            store
+                .put_received_message_and_encrypted_mls_provider_snapshot(
+                    event,
+                    b"advanced encrypted provider",
+                    b"encrypted local message",
+                )
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .latest_encrypted_message(empty_group.group_id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .latest_encrypted_message(group.group_id())
+                .unwrap()
+                .unwrap()
+                .event_id,
+            *later.id().as_bytes()
+        );
+        store
+            .block_device_locally(group.group_id(), later_author.peer_id())
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_encrypted_message(group.group_id())
+                .unwrap()
+                .unwrap()
+                .event_id,
+            *earlier.id().as_bytes()
         );
     }
 

@@ -251,7 +251,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_delete_failed: "The local message copy could not be deleted.",
   message_delivery_state_unavailable: "The message was shared, but its delivery state could not be saved.",
   message_not_found: "That message is no longer stored on this device.",
-  message_not_own: "Only messages sent from this device can be edited.",
+  message_not_own: "Only messages sent from this device can be edited or deleted for everyone.",
   message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",
   message_store_unavailable: "The encrypted message could not be saved.",
@@ -3554,6 +3554,16 @@ function App() {
           <button disabled={Boolean(deletingMessage)} onClick={() => void hideMessage(message)} type="button">
             {deletingMessage === message.eventId ? "Deleting…" : "Delete here"}
           </button>
+          {own && (
+            <button
+              className="message-menu-danger"
+              disabled={Boolean(deletingMessage)}
+              onClick={() => void deleteMessageForEveryone(message)}
+              type="button"
+            >
+              Delete for everyone
+            </button>
+          )}
         </div>
       </details>
     );
@@ -3815,6 +3825,31 @@ function App() {
       setGroupMessages((messages) => messages.filter(({ eventId }) => eventId !== message.eventId));
       if (createdMessage?.eventId === message.eventId) setCreatedMessage(null);
       if (replyingTo?.eventId === message.eventId) setReplyingTo(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setDeletingMessage("");
+    }
+  }
+
+  async function deleteMessageForEveryone(message: StoredMessage) {
+    if (deletingMessage || !isTauri()) return;
+    if (!window.confirm("Delete this message for everyone? Members receive a signed deletion when they sync. Copies already exported or kept by modified apps cannot be recalled.")) return;
+
+    setError("");
+    setDeletingMessage(message.eventId);
+    try {
+      await invoke("delete_group_message", {
+        groupId: message.groupId,
+        eventId: message.eventId,
+      });
+      setGroupMessages((messages) => messages.filter(({ eventId }) => eventId !== message.eventId));
+      if (createdMessage?.eventId === message.eventId) setCreatedMessage(null);
+      if (replyingTo?.eventId === message.eventId) setReplyingTo(null);
+      if (editingMessage?.eventId === message.eventId) setEditingMessage(null);
+      if (joinedGroup?.groupId === message.groupId) {
+        void performJoinedGroupSynchronization(message.groupId, false);
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {

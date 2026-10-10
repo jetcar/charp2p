@@ -116,6 +116,17 @@
 - [x] KeyEpochAdvanced 3/4: app MlsProviderService::refresh_group_keys (owner signs KeyEpochAdvanced, persists via put_mls_key_refresh, merges) with a two-device apply test; Tauri command refresh_group_keys.
 - [x] KeyEpochAdvanced 4/4: owner "Refresh group keys" action in the group details pane (confirm, call refresh_group_keys, trigger sync).
 
+- [x] Sync: pull responses must contain only the requested events (author and event ids from the request); reject unrequested events in PullSession (technical-design Synchronization, ADR-040).
+- [ ] Sync authors 1/2: store/MLS query of authorized authors for a group (pinned owner plus devices added through MLS membership).
+- [ ] Sync authors 2/2: reject pulled events from authors never authorized in the group in advance_pull_session, honouring removed-device markers by sequence (technical-design Synchronization).
+- [ ] Conversation history 1/2: store query and group_messages parameter taking a "before" cursor for older locally retained messages.
+- [ ] Conversation history 2/2: "Show earlier messages" button in the conversation using the cursor.
+- [ ] Docs: reconcile docs/threat-model.md with implemented approval joins (ADR-041), MessageDeleted pushes and member-served history/invite permission/key refresh (ADR-040/036/045).
+- [ ] Docs: mark InvitationCreated, InvitationRevoked, DeviceAdded and DeviceRevoked as reserved event kinds in the technical design (ADR-020/021).
+- [ ] Discovery: bounded device-local list of recently successful routing peers dialled at node start as extra entry points (technical-design Discovery).
+- [ ] Connectivity 1/2: TCP+noise+yamux transport beside QUIC in charp2p-network, QUIC preferred (technical-design Connectivity, ADR-0005).
+- [ ] Connectivity 2/2: nodes listen on TCP and include TCP address hints in invitations (check ADR-037 hint format).
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -242,3 +253,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-10T06:32:46Z KeyEpochAdvanced 2/4: store is_mls_commit_kind includes KeyEpochAdvanced in unapplied/applied MLS commit queries and membership_state; put_mls_key_refresh persists the event and snapshot atomically; push rejection covered by a sync test; app apply path runs validate_key_refresh_commit for KeyEpochAdvanced. fmt, clippy, workspace tests, src-tauri clippy/tests (after apt-installing webkit2gtk) and npm build pass.
 - 2026-10-10T07:32:51Z KeyEpochAdvanced 3/4: MlsProviderService::refresh_group_keys signs a KeyEpochAdvanced event over a prepared proposal-free key refresh, merges it and persists via put_mls_key_refresh with provider rollback on failure; joined members are refused (key_refresh_not_allowed) since validate_owner_group only checks the own leaf; Tauri command refresh_group_keys for owned groups; two-device test (member refused, owner refreshes, member pulls and applies, membership unchanged and sync membership state equal, post-refresh message readable). fmt, clippy, workspace tests, src-tauri clippy/tests (after apt-installing webkit2gtk) and npm build pass.
 - 2026-10-10T08:28:23Z KeyEpochAdvanced 4/4: owner-only "Refresh group keys" button in the group details pane with a confirm dialog, calling refresh_group_keys; shows a status note that members pick up new keys when they next synchronize (pull-only per ADR-045, so no owner-side sync trigger exists); errors use the members error line. Frontend-only change. fmt, clippy, workspace tests and npm build pass.
+- 2026-10-10T09:35:01Z Sync pull response scope: gap analysis added a 10-item backlog; PullSession keeps the requested event IDs in AwaitingEvents and rejects pulled events from another author (AuthorMismatch) or outside the request (new UnrequestedEvent) before persisting anything; unit test covers both and the accepted case. fmt, clippy, workspace tests, src-tauri clippy/tests (after apt-installing webkit/gtk dev libs) and npm build pass.

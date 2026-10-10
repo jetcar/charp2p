@@ -2,11 +2,12 @@
 
 //! Bounded synchronization orchestration between protocol messages and SQLite.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use charp2p_core::{
-    EventError, EventKind, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId, SignedEvent,
-    SyncAuthorHead, SyncError, SyncMembershipState, SyncPeerHead, SyncRequest, SyncResponse,
+    EventError, EventId, EventKind, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES, PeerId,
+    SignedEvent, SyncAuthorHead, SyncError, SyncMembershipState, SyncPeerHead, SyncRequest,
+    SyncResponse,
 };
 use charp2p_store::{EventStore, PutEventsOutcome, StoreError};
 use thiserror::Error;
@@ -284,6 +285,7 @@ impl PullSession {
                     author_id,
                     remote_head,
                     local_head,
+                    requested: event_ids.iter().copied().collect(),
                 };
                 Some(SyncRequest::Events {
                     group_id: self.group_id,
@@ -295,11 +297,26 @@ impl PullSession {
                     author_id,
                     remote_head,
                     local_head,
+                    requested,
                 },
-                SyncResponse::Events { group_id, .. },
+                SyncResponse::Events {
+                    group_id,
+                    encoded_events,
+                },
             ) => {
                 self.ensure_group(*group_id)?;
-                applied = apply_response(store, response)?;
+                let mut events = Vec::with_capacity(encoded_events.len());
+                for encoded in encoded_events {
+                    let event = SignedEvent::decode(encoded)?;
+                    if event.author_id() != author_id {
+                        return Err(SynchronizationError::AuthorMismatch);
+                    }
+                    if !requested.contains(&event.id()) {
+                        return Err(SynchronizationError::UnrequestedEvent);
+                    }
+                    events.push(event);
+                }
+                applied = store.put_events(&events)?.into();
                 let new_head = local_author_head(store, self.group_id, author_id)?;
                 if new_head <= local_head {
                     return Err(SynchronizationError::NoProgress);
@@ -385,6 +402,8 @@ enum PullPhase {
         author_id: PeerId,
         remote_head: u64,
         local_head: u64,
+        /// Event IDs asked for; a response may contain only these.
+        requested: HashSet<EventId>,
     },
     Complete,
 }
@@ -457,6 +476,9 @@ pub enum SynchronizationError {
     /// Only group messages and message edits can be uploaded by a member.
     #[error("uploaded event kind is not supported")]
     UnsupportedPushedEvent,
+    /// A pulled event was not among the event IDs requested from the peer.
+    #[error("synchronization response contains an unrequested event")]
+    UnrequestedEvent,
 }
 
 fn event_ids_request(group_id: PeerId, author_id: PeerId, after_sequence: u64) -> SyncRequest {
@@ -778,6 +800,65 @@ mod tests {
             target.synchronization_summary(group.group_id()).unwrap(),
             source.synchronization_summary(group.group_id()).unwrap()
         );
+    }
+
+    #[test]
+    fn pull_session_rejects_unrequested_events() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let intruder = DeviceIdentity::generate();
+        let requested = message_event(&author, &group, 1, b"requested");
+        let other = message_event(&author, &group, 2, b"not requested");
+        let foreign = message_event(&intruder, &group, 1, b"foreign author");
+        let mut target = EventStore::in_memory().unwrap();
+
+        let awaiting_events = |target: &mut EventStore| {
+            let (mut session, _) = PullSession::start(group.group_id());
+            let summary = SyncResponse::Summary {
+                group_id: group.group_id(),
+                heads: vec![SyncAuthorHead {
+                    author_id: author.peer_id(),
+                    contiguous_sequence: 2,
+                }],
+                membership: SyncMembershipState::default(),
+            };
+            session.handle_response(target, &summary).unwrap();
+            let ids = SyncResponse::EventIds {
+                group_id: group.group_id(),
+                author_id: author.peer_id(),
+                event_ids: vec![requested.id()],
+                complete: false,
+            };
+            session.handle_response(target, &ids).unwrap();
+            session
+        };
+        let events = |batch: &[&SignedEvent]| SyncResponse::Events {
+            group_id: group.group_id(),
+            encoded_events: batch.iter().map(|event| event.encode().unwrap()).collect(),
+        };
+
+        let mut session = awaiting_events(&mut target);
+        assert!(matches!(
+            session.handle_response(&mut target, &events(&[&requested, &other])),
+            Err(SynchronizationError::UnrequestedEvent)
+        ));
+        let mut session_foreign = awaiting_events(&mut target);
+        assert!(matches!(
+            session_foreign.handle_response(&mut target, &events(&[&foreign])),
+            Err(SynchronizationError::AuthorMismatch)
+        ));
+        assert!(
+            target
+                .synchronization_summary(group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut session = awaiting_events(&mut target);
+        let progress = session
+            .handle_response(&mut target, &events(&[&requested]))
+            .unwrap();
+        assert_eq!(progress.applied.inserted, 1);
     }
 
     #[test]

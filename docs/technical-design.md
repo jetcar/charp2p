@@ -248,7 +248,11 @@ Preferred connectivity order:
 
 Nodes build both a QUIC transport and a TCP transport authenticated with Noise
 and multiplexed with Yamux (ADR-047). When dialing remembered addresses, direct
-QUIC addresses are tried first and TCP addresses race behind them.
+QUIC addresses are tried first and TCP addresses race behind them. Client
+nodes listen on QUIC and TCP on every interface, and community nodes accept
+both on their configured addresses. Invitation address hints (ADR-037) list
+relay circuit addresses first, then direct QUIC addresses, then direct TCP
+addresses, within the four-hint limit.
 
 Client nodes run Direct Connection Upgrade through Relay (DCUtR): after a
 relayed connection is established, both peers exchange their observed

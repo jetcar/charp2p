@@ -932,12 +932,7 @@ impl NetworkService {
         // The owner device also answers mDNS so members on the same local
         // network can reach it without a relay.
         let mut node = self.group_client_node(network_identity);
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
@@ -1141,12 +1136,7 @@ impl NetworkService {
 
         let mut node =
             NetworkNode::new_contributing(network_identity.into_network_keypair(), relay);
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
@@ -1222,12 +1212,7 @@ impl NetworkService {
         active.take();
 
         let mut node = self.group_client_node(network_identity);
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
@@ -1335,12 +1320,7 @@ impl NetworkService {
         let key = DiscoveryKey::from_invitation(invitation);
         let expected_inviter = invitation.inviter_device_id();
         let mut node = NetworkNode::new(identity.into_network_keypair());
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         // Invitation address hints (ADR-037) are dialed before the DHT
         // search; the transport authenticates the pinned inviter.
         if !hints.is_empty() && node.dial_peer_at(expected_inviter, hints).is_ok() {
@@ -1735,12 +1715,7 @@ impl NetworkService {
             return Err("network_bootstrap_required");
         }
         let mut node = self.group_client_node(identity);
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         for bootstrap in &self.bootstrap_peers() {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
         }
@@ -1870,12 +1845,7 @@ impl NetworkService {
         }
         let lan_deadline = Instant::now() + LAN_DISCOVERY_WINDOW;
         let mut node = self.group_client_node(identity);
-        node.listen_on(
-            "/ip4/0.0.0.0/udp/0/quic-v1"
-                .parse()
-                .map_err(|_| "network_configuration_invalid")?,
-        )
-        .map_err(|_| "network_unavailable")?;
+        listen_on_all_interfaces(&mut node)?;
         // Remembered addresses of the last successful synchronizations are
         // tried before a DHT lookup; the transport still authenticates the
         // provider as `expected_peer`.
@@ -2496,17 +2466,36 @@ fn pinned_address_hints(invitation: &Invitation) -> Vec<Multiaddr> {
         .collect()
 }
 
+/// Starts listening on QUIC and on TCP (ADR-047) on every interface, each
+/// on a port chosen by the operating system.
+fn listen_on_all_interfaces(node: &mut NetworkNode) -> Result<(), &'static str> {
+    for address in ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"] {
+        node.listen_on(
+            address
+                .parse()
+                .map_err(|_| "network_configuration_invalid")?,
+        )
+        .map_err(|_| "network_unavailable")?;
+    }
+    Ok(())
+}
+
 /// Picks at most the invitation hint limit, relay circuit addresses first
-/// because they also reach an owner behind NAT.
+/// because they also reach an owner behind NAT, then direct QUIC addresses
+/// and finally direct TCP addresses for networks that block UDP.
 fn select_address_hints(addresses: &[Multiaddr]) -> Vec<Multiaddr> {
     let (relayed, direct): (Vec<_>, Vec<_>) = addresses.iter().cloned().partition(|address| {
         address
             .iter()
             .any(|protocol| protocol == Protocol::P2pCircuit)
     });
+    let (quic, other): (Vec<_>, Vec<_>) = direct
+        .into_iter()
+        .partition(|address| address.iter().any(|protocol| protocol == Protocol::QuicV1));
     relayed
         .into_iter()
-        .chain(direct)
+        .chain(quic)
+        .chain(other)
         .take(MAX_ADDRESS_HINTS)
         .collect()
 }
@@ -2829,8 +2818,12 @@ mod tests {
         );
         record_owner_address(&addresses, "/ip6/::/udp/4001/quic-v1".parse().unwrap());
 
+        let tcp: libp2p::Multiaddr = "/ip4/192.168.1.20/tcp/4001".parse().unwrap();
+        record_owner_address(&addresses, tcp.clone());
+        record_owner_address(&addresses, "/ip4/127.0.0.1/tcp/4001".parse().unwrap());
+
         let hints = select_address_hints(&addresses.lock().unwrap());
-        assert_eq!(hints, vec![relayed, direct]);
+        assert_eq!(hints, vec![relayed, direct, tcp]);
 
         let many: Vec<libp2p::Multiaddr> = (1..=6)
             .map(|port| {

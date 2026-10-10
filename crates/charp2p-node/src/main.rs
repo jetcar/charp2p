@@ -32,6 +32,15 @@ struct Config {
     )]
     listen: Multiaddr,
 
+    /// TCP address on which the routing node also accepts peer connections,
+    /// for clients on networks that block UDP.
+    #[arg(
+        long,
+        env = "CHARP2P_NODE_LISTEN_TCP",
+        default_value = "/ip4/0.0.0.0/tcp/4001"
+    )]
+    listen_tcp: Multiaddr,
+
     /// File containing this node's persistent libp2p identity.
     #[arg(
         long,
@@ -84,6 +93,7 @@ async fn main() -> Result<(), NodeError> {
     }
     let peer_id = node.peer_id();
     node.listen_on(config.listen)?;
+    node.listen_on(config.listen_tcp)?;
 
     println!("CharP2P routing node");
     println!("Peer ID: {peer_id}");

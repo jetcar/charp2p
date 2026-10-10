@@ -27,7 +27,7 @@ use libp2p::{
         NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle,
         dial_opts::DialOpts,
     },
-    yamux,
+    tcp, yamux,
 };
 use thiserror::Error;
 
@@ -352,6 +352,12 @@ impl NetworkNode {
         });
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .expect("TCP transport construction is infallible")
             .with_quic()
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .expect("relay transport construction is infallible")
@@ -397,7 +403,7 @@ impl NetworkNode {
         *self.swarm.local_peer_id()
     }
 
-    /// Starts listening on a QUIC multiaddress.
+    /// Starts listening on a QUIC or TCP multiaddress.
     pub fn listen_on(&mut self, address: Multiaddr) -> Result<(), NetworkError> {
         self.swarm.listen_on(address)?;
         Ok(())
@@ -428,13 +434,15 @@ impl NetworkNode {
         Ok(())
     }
 
-    /// Dials a peer at previously remembered addresses. The connection only
-    /// completes when the remote authenticates as `peer_id`.
+    /// Dials a peer at previously remembered addresses, QUIC addresses first
+    /// (ADR-047). The connection only completes when the remote authenticates
+    /// as `peer_id`.
     pub fn dial_peer_at(
         &mut self,
         peer_id: PeerId,
-        addresses: Vec<Multiaddr>,
+        mut addresses: Vec<Multiaddr>,
     ) -> Result<(), NetworkError> {
+        prefer_quic(&mut addresses);
         self.swarm
             .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())?;
         Ok(())
@@ -1362,6 +1370,21 @@ fn record_key(key: DiscoveryKey) -> kad::RecordKey {
     kad::RecordKey::new(key.as_bytes())
 }
 
+/// Orders direct QUIC addresses before every other address, keeping the
+/// relative order within each kind, so QUIC is attempted first (ADR-047).
+fn prefer_quic(addresses: &mut [Multiaddr]) {
+    addresses.sort_by_key(|address| !is_quic_address(address));
+}
+
+fn is_quic_address(address: &Multiaddr) -> bool {
+    address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::QuicV1))
+        && !address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1406,6 +1429,46 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_establish_an_authenticated_quic_connection() {
         let _ = connected_nodes().await;
+    }
+
+    #[test]
+    fn dial_addresses_put_direct_quic_first() {
+        let mut addresses: Vec<Multiaddr> = [
+            "/ip4/192.0.2.1/tcp/4001",
+            "/ip4/192.0.2.9/udp/4001/quic-v1/p2p-circuit",
+            "/ip4/192.0.2.1/udp/4001/quic-v1",
+            "/ip4/192.0.2.2/tcp/4001",
+            "/ip6/2001:db8::1/udp/4001/quic-v1",
+        ]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        super::prefer_quic(&mut addresses);
+        let ordered: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            ordered,
+            [
+                "/ip4/192.0.2.1/udp/4001/quic-v1",
+                "/ip6/2001:db8::1/udp/4001/quic-v1",
+                "/ip4/192.0.2.1/tcp/4001",
+                "/ip4/192.0.2.9/udp/4001/quic-v1/p2p-circuit",
+                "/ip4/192.0.2.2/tcp/4001",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_nodes_establish_an_authenticated_tcp_connection() {
+        let (mut listener, mut dialer, listener_id, _) =
+            connected_nodes_on("/ip4/127.0.0.1/tcp/0").await;
+        let group_id = GroupIdentity::generate().group_id();
+        dialer
+            .send_sync_request(listener_id, SyncRequest::Summary { group_id })
+            .unwrap();
+        let (_, _, request) = timeout(TEST_TIMEOUT, next_sync_request(&mut listener, &mut dialer))
+            .await
+            .expect("listener should receive the sync request over TCP");
+        assert_eq!(request, SyncRequest::Summary { group_id });
     }
 
     #[tokio::test]
@@ -1925,14 +1988,18 @@ mod tests {
     }
 
     async fn connected_nodes() -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {
+        connected_nodes_on("/ip4/127.0.0.1/udp/0/quic-v1").await
+    }
+
+    async fn connected_nodes_on(
+        listen_on: &str,
+    ) -> (NetworkNode, NetworkNode, libp2p::PeerId, libp2p::PeerId) {
         let mut listener = NetworkNode::new(Keypair::generate_ed25519());
         let mut dialer = NetworkNode::new(Keypair::generate_ed25519());
         let listener_id = listener.peer_id();
         let dialer_id = dialer.peer_id();
 
-        listener
-            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
-            .unwrap();
+        listener.listen_on(listen_on.parse().unwrap()).unwrap();
         let listen_address = next_listen_address(&mut listener).await;
         let dial_address: Multiaddr = format!("{listen_address}/p2p/{listener_id}")
             .parse()
@@ -1947,7 +2014,7 @@ mod tests {
                 )
             })
             .await
-            .expect("loopback QUIC connection should complete");
+            .expect("loopback connection should complete");
 
         assert_eq!(listener_peer, dialer_id);
         assert_eq!(listener_path, ConnectionPath::Lan);

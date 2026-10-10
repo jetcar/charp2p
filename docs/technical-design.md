@@ -246,6 +246,10 @@ Preferred connectivity order:
 4. NAT traversal coordinated through an authenticated relay connection.
 5. Circuit relay for the session when direct establishment fails.
 
+Nodes build both a QUIC transport and a TCP transport authenticated with Noise
+and multiplexed with Yamux (ADR-047). When dialing remembered addresses, direct
+QUIC addresses are tried first and TCP addresses race behind them.
+
 Client nodes run Direct Connection Upgrade through Relay (DCUtR): after a
 relayed connection is established, both peers exchange their observed
 external address candidates over the relay and attempt a synchronized direct

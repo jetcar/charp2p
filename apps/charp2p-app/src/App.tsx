@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import QRCode from "qrcode";
 import { ChangeEvent, FormEvent, Fragment, useEffect, useMemo, useRef, useState } from "react";
@@ -154,6 +155,9 @@ const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const SINGLE_USE_INVITATION_CHECK_INTERVAL_MS = 15_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
+// Owner new-event notices (ADR-049) arriving during a synchronization wait for it to finish.
+const JOINED_GROUP_NOTICE_RETRY_MS = 1_000;
+const GROUP_EVENTS_AVAILABLE_EVENT = "group-events-available";
 const BACKGROUND_GROUP_SYNC_INTERVAL_MS = 300_000;
 const BACKGROUND_GROUP_SYNC_STEP_MS = 5_000;
 const BACKGROUND_GROUP_SYNC_START_DELAY_MS = 15_000;
@@ -2706,10 +2710,35 @@ function App() {
       }
     }
 
+    let noticeTimer: number | undefined;
+    let stopListening: (() => void) | undefined;
+
+    async function synchronizeOnNotice() {
+      noticeTimer = undefined;
+      if (!active) return;
+      if (synchronizationInFlight.current) {
+        noticeTimer = window.setTimeout(synchronizeOnNotice, JOINED_GROUP_NOTICE_RETRY_MS);
+        return;
+      }
+      await performJoinedGroupSynchronization(groupId, false);
+    }
+
     timer = window.setTimeout(synchronizePeriodically, JOINED_GROUP_SYNC_START_DELAY_MS);
+    // The pinned owner tells this member's serving node about newly stored
+    // events, so pull at once instead of waiting for the next periodic pass.
+    void listen<string>(GROUP_EVENTS_AVAILABLE_EVENT, ({ payload }) => {
+      if (payload === groupId && noticeTimer === undefined) void synchronizeOnNotice();
+    })
+      .then((unlisten) => {
+        if (active) stopListening = unlisten;
+        else unlisten();
+      })
+      .catch(() => undefined);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
+      if (noticeTimer !== undefined) window.clearTimeout(noticeTimer);
+      stopListening?.();
     };
   }, [joinedGroup]);
 

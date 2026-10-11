@@ -151,6 +151,12 @@ pub fn accept_pushed_events(
         ) {
             return Err(SynchronizationError::UnsupportedPushedEvent);
         }
+        if store
+            .removed_author_cutoff(event.group_id(), authenticated_peer)?
+            .is_some_and(|cutoff| event.author_sequence() > cutoff)
+        {
+            return Err(SynchronizationError::RemovedAuthor);
+        }
         events.push(event);
     }
 
@@ -255,13 +261,21 @@ impl PullSession {
                     .into_iter()
                     .map(|head| (head.author_id, head.contiguous_sequence))
                     .collect();
-                let mut missing: Vec<_> = heads
-                    .iter()
-                    .filter(|head| {
-                        head.contiguous_sequence > local.get(&head.author_id).copied().unwrap_or(0)
-                    })
-                    .cloned()
-                    .collect();
+                let mut missing = Vec::new();
+                for head in heads {
+                    let remote_head = accepted_head(
+                        store,
+                        self.group_id,
+                        head.author_id,
+                        head.contiguous_sequence,
+                    )?;
+                    if remote_head > local.get(&head.author_id).copied().unwrap_or(0) {
+                        missing.push(SyncAuthorHead {
+                            author_id: head.author_id,
+                            contiguous_sequence: remote_head,
+                        });
+                    }
+                }
                 missing.sort_by_key(|head| head.author_id.to_bytes());
                 self.remaining_authors = missing.into();
                 self.next_author_request(store)?
@@ -328,6 +342,10 @@ impl PullSession {
                 },
             ) => {
                 self.ensure_group(*group_id)?;
+                // A removal pulled earlier in this session may have cut the
+                // author off since the summary was compared.
+                let cutoff = store.removed_author_cutoff(self.group_id, author_id)?;
+                let remote_head = cutoff.map_or(remote_head, |cutoff| remote_head.min(cutoff));
                 let mut events = Vec::with_capacity(encoded_events.len());
                 for encoded in encoded_events {
                     let event = SignedEvent::decode(encoded)?;
@@ -337,9 +355,20 @@ impl PullSession {
                     if !requested.contains(&event.id()) {
                         return Err(SynchronizationError::UnrequestedEvent);
                     }
+                    if cutoff.is_some_and(|cutoff| event.author_sequence() > cutoff) {
+                        continue;
+                    }
                     events.push(event);
                 }
                 applied = store.put_events(&events)?.into();
+                if local_head >= remote_head {
+                    let next_request = self.next_author_request(store)?;
+                    return Ok(SessionProgress {
+                        next_request,
+                        applied,
+                        complete: matches!(self.phase, PullPhase::Complete),
+                    });
+                }
                 let new_head = local_author_head(store, self.group_id, author_id)?;
                 if new_head <= local_head {
                     return Err(SynchronizationError::NoProgress);
@@ -388,12 +417,18 @@ impl PullSession {
     ) -> Result<Option<SyncRequest>, SynchronizationError> {
         while let Some(remote) = self.remaining_authors.pop_front() {
             let local_head = local_author_head(store, self.group_id, remote.author_id)?;
-            if local_head >= remote.contiguous_sequence {
+            let remote_head = accepted_head(
+                store,
+                self.group_id,
+                remote.author_id,
+                remote.contiguous_sequence,
+            )?;
+            if local_head >= remote_head {
                 continue;
             }
             self.phase = PullPhase::AwaitingEventIds {
                 author_id: remote.author_id,
-                remote_head: remote.contiguous_sequence,
+                remote_head,
                 local_head,
             };
             return Ok(Some(event_ids_request(
@@ -425,6 +460,19 @@ fn author_may_sync(
 ) -> Result<bool, StoreError> {
     let authors = store.group_authors(group_id)?;
     Ok(authors.is_empty() || authors.contains(&author_id))
+}
+
+/// Caps a peer's advertised author head at the last sequence a removed
+/// device may still contribute.
+fn accepted_head(
+    store: &EventStore,
+    group_id: PeerId,
+    author_id: PeerId,
+    remote_head: u64,
+) -> Result<u64, StoreError> {
+    Ok(store
+        .removed_author_cutoff(group_id, author_id)?
+        .map_or(remote_head, |cutoff| remote_head.min(cutoff)))
 }
 
 enum PullPhase {
@@ -512,6 +560,9 @@ pub enum SynchronizationError {
     /// Only group messages and message edits can be uploaded by a member.
     #[error("uploaded event kind is not supported")]
     UnsupportedPushedEvent,
+    /// An uploaded event was authored by a removed device after its removal.
+    #[error("uploaded event was authored after its device's removal")]
+    RemovedAuthor,
     /// A pulled event was not among the event IDs requested from the peer.
     #[error("synchronization response contains an unrequested event")]
     UnrequestedEvent,
@@ -801,6 +852,124 @@ mod tests {
             accept_pushed_events(&mut store, authenticated.peer_id(), &request),
             Err(SynchronizationError::PushedAuthorMismatch)
         ));
+    }
+
+    #[test]
+    fn push_and_pull_refuse_a_removed_devices_later_events() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let removed = DeviceIdentity::generate();
+        let removal = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS remove commit",
+            },
+        )
+        .unwrap();
+        let removed_events: Vec<_> = (1..=4)
+            .map(|sequence| message_event(&removed, &group, sequence, b"removed"))
+            .collect();
+        let mut source = EventStore::in_memory().unwrap();
+        source.put_events(&removed_events).unwrap();
+        let mut target = EventStore::in_memory().unwrap();
+        target.put_events(&removed_events[..1]).unwrap();
+        target
+            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id())
+            .unwrap();
+
+        let push = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![removed_events[1].encode().unwrap()],
+        };
+        assert!(matches!(
+            accept_pushed_events(&mut target, removed.peer_id(), &push),
+            Err(SynchronizationError::RemovedAuthor)
+        ));
+
+        let (mut session, mut request) = PullSession::start(group.group_id());
+        loop {
+            let response = build_authorized_response(&source, &request).unwrap();
+            let progress = session.handle_response(&mut target, &response).unwrap();
+            let Some(next_request) = progress.next_request else {
+                break;
+            };
+            request = next_request;
+        }
+        assert!(session.is_complete());
+        assert_eq!(
+            target
+                .synchronization_summary(group.group_id())
+                .unwrap()
+                .into_iter()
+                .find(|head| head.author_id == removed.peer_id())
+                .unwrap()
+                .contiguous_sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn pull_session_drops_events_past_a_removal_applied_mid_session() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let removed = DeviceIdentity::generate();
+        let removal = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS remove commit",
+            },
+        )
+        .unwrap();
+        let first = message_event(&removed, &group, 1, b"before");
+        let second = message_event(&removed, &group, 2, b"after");
+        let mut target = EventStore::in_memory().unwrap();
+        target.put_events(std::slice::from_ref(&first)).unwrap();
+
+        let (mut session, _) = PullSession::start(group.group_id());
+        let summary = SyncResponse::Summary {
+            group_id: group.group_id(),
+            heads: vec![SyncAuthorHead {
+                author_id: removed.peer_id(),
+                contiguous_sequence: 2,
+            }],
+            membership: SyncMembershipState::default(),
+        };
+        session.handle_response(&mut target, &summary).unwrap();
+        let ids = SyncResponse::EventIds {
+            group_id: group.group_id(),
+            author_id: removed.peer_id(),
+            event_ids: vec![second.id()],
+            complete: true,
+        };
+        session.handle_response(&mut target, &ids).unwrap();
+        // Stands in for the owner's removal commit applied by the caller
+        // between two responses.
+        target
+            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id())
+            .unwrap();
+        let progress = session
+            .handle_response(
+                &mut target,
+                &SyncResponse::Events {
+                    group_id: group.group_id(),
+                    encoded_events: vec![second.encode().unwrap()],
+                },
+            )
+            .unwrap();
+
+        assert!(progress.complete);
+        assert_eq!(progress.applied.inserted, 0);
+        assert!(target.get_event(second.id()).unwrap().is_none());
     }
 
     #[test]

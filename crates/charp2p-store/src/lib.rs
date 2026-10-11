@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -489,6 +489,16 @@ impl EventStore {
             .is_some())
     }
 
+    /// Returns the highest author sequence still accepted from a removed
+    /// device, or `None` when the device is not removed from the group.
+    pub fn removed_author_cutoff(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<Option<u64>, StoreError> {
+        removed_author_cutoff_in(&self.connection, group_id, author_id)
+    }
+
     /// Lists the devices an owner has removed from the group and not yet
     /// allowed to join again, ordered by device identifier.
     pub fn removed_mls_members(&self, group_id: PeerId) -> Result<Vec<PeerId>, StoreError> {
@@ -538,12 +548,18 @@ impl EventStore {
             "DELETE FROM mls_join_admissions WHERE group_id = ?1 AND member_id = ?2",
             params![event.group_id().to_bytes(), removed_member_id.to_bytes()],
         )?;
+        // Events the device authored before its removal stay history; any
+        // later sequence is refused while the removal holds.
         transaction.execute(
             "INSERT INTO removed_mls_members (
-                group_id, member_id, removal_event_id
-             ) VALUES (?1, ?2, ?3)
+                group_id, member_id, removal_event_id, cutoff_sequence
+             ) VALUES (?1, ?2, ?3, COALESCE((
+                SELECT MAX(author_sequence) FROM events
+                WHERE group_id = ?1 AND author_id = ?2
+             ), 0))
              ON CONFLICT(group_id, member_id) DO UPDATE SET
-                removal_event_id = excluded.removal_event_id",
+                removal_event_id = excluded.removal_event_id,
+                cutoff_sequence = excluded.cutoff_sequence",
             params![
                 event.group_id().to_bytes(),
                 removed_member_id.to_bytes(),
@@ -2757,7 +2773,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=29 => {}
+            6..=30 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3190,6 +3206,45 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 30 {
+            let transaction = connection.transaction()?;
+            let (has_table, has_cutoff): (bool, bool) = transaction.query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM pragma_table_info('removed_mls_members')),
+                    EXISTS(
+                        SELECT 1 FROM pragma_table_info('removed_mls_members')
+                        WHERE name = 'cutoff_sequence'
+                    )",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if has_table && !has_cutoff {
+                transaction.execute_batch(
+                    "ALTER TABLE removed_mls_members
+                        ADD COLUMN cutoff_sequence INTEGER NOT NULL DEFAULT 0
+                            CHECK(cutoff_sequence >= 0);",
+                )?;
+                // Events a removed device stored before this migration stay
+                // history; its later sequences are refused.
+                let removed: Vec<(Vec<u8>, Vec<u8>)> = transaction
+                    .prepare("SELECT group_id, member_id FROM removed_mls_members")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                for (group_id, member_id) in removed {
+                    transaction.execute(
+                        "UPDATE removed_mls_members SET cutoff_sequence = COALESCE((
+                            SELECT MAX(author_sequence) FROM events
+                            WHERE group_id = ?1 AND author_id = ?2
+                         ), 0)
+                         WHERE group_id = ?1 AND member_id = ?2",
+                        params![group_id, member_id],
+                    )?;
+                }
+            }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3366,6 +3421,14 @@ fn put_event_in_transaction(
         });
     }
 
+    if removed_author_cutoff_in(transaction, event.group_id(), event.author_id())?
+        .is_some_and(|cutoff| event.author_sequence() > cutoff)
+    {
+        return Err(StoreError::RemovedAuthor {
+            sequence: event.author_sequence(),
+        });
+    }
+
     transaction.execute(
         "INSERT INTO events (
                 event_id, group_id, author_id, author_sequence, encoded
@@ -3379,6 +3442,23 @@ fn put_event_in_transaction(
         ],
     )?;
     Ok(PutEventOutcome::Inserted)
+}
+
+fn removed_author_cutoff_in(
+    connection: &Connection,
+    group_id: PeerId,
+    author_id: PeerId,
+) -> Result<Option<u64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT cutoff_sequence FROM removed_mls_members
+             WHERE group_id = ?1 AND member_id = ?2",
+            params![group_id.to_bytes(), author_id.to_bytes()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|cutoff| u64::try_from(cutoff).map_err(|_| StoreError::CorruptIndex))
+        .transpose()
 }
 
 /// Failures produced by local event persistence.
@@ -3403,6 +3483,12 @@ pub enum StoreError {
     #[error("author sequence {sequence} is already assigned to another event")]
     SequenceConflict {
         /// Conflicting author sequence.
+        sequence: u64,
+    },
+    /// A removed device authored this sequence after its removal.
+    #[error("author sequence {sequence} was authored after the device's removal")]
+    RemovedAuthor {
+        /// Refused author sequence.
         sequence: u64,
     },
     /// A synchronization page size is zero or exceeds the protocol bound.
@@ -4921,6 +5007,70 @@ mod tests {
     }
 
     #[test]
+    fn removed_device_events_after_its_removal_are_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let removal = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS remove commit",
+            },
+        )
+        .unwrap();
+        let before = message_event(&member, &group, 1, b"before");
+        let late = message_event(&member, &group, 2, b"late");
+        store.put_event(&before).unwrap();
+        assert_eq!(
+            store
+                .removed_author_cutoff(group.group_id(), member.peer_id())
+                .unwrap(),
+            None
+        );
+
+        store
+            .put_mls_member_removal(&removal, b"snapshot", member.peer_id())
+            .unwrap();
+        assert_eq!(
+            store
+                .removed_author_cutoff(group.group_id(), member.peer_id())
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store.put_event(&before).unwrap(),
+            PutEventOutcome::AlreadyPresent
+        );
+        assert!(matches!(
+            store.put_events(std::slice::from_ref(&late)),
+            Err(StoreError::RemovedAuthor { sequence: 2 })
+        ));
+        assert!(store.get_event(late.id()).unwrap().is_none());
+        assert!(
+            store
+                .put_event(&message_event(
+                    &member,
+                    &GroupIdentity::generate(),
+                    2,
+                    b"other group"
+                ))
+                .is_ok()
+        );
+
+        // Allowing the device to join again lifts the cut-off.
+        store
+            .allow_removed_mls_member_readmission(group.group_id(), member.peer_id())
+            .unwrap();
+        assert_eq!(store.put_event(&late).unwrap(), PutEventOutcome::Inserted);
+    }
+
+    #[test]
     fn snapshot_write_failure_rolls_back_the_event() {
         let mut store = EventStore::in_memory().unwrap();
         store
@@ -6263,6 +6413,58 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, super::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_thirty_database_adds_removed_author_cutoffs() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let removal = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS remove commit",
+            },
+        )
+        .unwrap();
+        {
+            let mut store = EventStore::open(path).unwrap();
+            store
+                .put_events(&[
+                    message_event(&member, &group, 1, b"first"),
+                    message_event(&member, &group, 2, b"second"),
+                ])
+                .unwrap();
+            store
+                .put_mls_member_removal(&removal, b"snapshot", member.peer_id())
+                .unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "ALTER TABLE removed_mls_members DROP COLUMN cutoff_sequence;
+                     PRAGMA user_version = 30;",
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        assert_eq!(
+            store
+                .removed_author_cutoff(group.group_id(), member.peer_id())
+                .unwrap(),
+            Some(2)
+        );
+        assert!(matches!(
+            store.put_event(&message_event(&member, &group, 3, b"late")),
+            Err(StoreError::RemovedAuthor { sequence: 3 })
+        ));
     }
 
     #[test]

@@ -1722,6 +1722,7 @@ impl MlsProviderService {
                         | SynchronizationError::UnsupportedPushedEvent => {
                             SyncRejectReason::InvalidRequest
                         }
+                        SynchronizationError::RemovedAuthor => SyncRejectReason::Unauthorized,
                         _ => SyncRejectReason::Busy,
                     },
                 },
@@ -5709,9 +5710,36 @@ mod tests {
             .remove_member_at(group_id, &owner, member_id, 44)
             .unwrap();
 
-        assert_eq!(deliver_late_message(&owner_service, group_id, &message), 0);
+        // The owner refuses sequences past the removed device's cut-off.
         let mut store = owner_service.store.lock().unwrap();
-        assert!(!store.record_unreadable_message_event(&message).unwrap());
+        assert!(matches!(
+            store.put_event(&message),
+            Err(charp2p_store::StoreError::RemovedAuthor { .. })
+        ));
+        assert!(store.get_event(message.id()).unwrap().is_none());
+        drop(store);
+
+        // A member store without the cut-off still never reads it.
+        let other = tempdir().unwrap();
+        let (other_service, other_owner, other_group, other_member, other_message) =
+            late_member_message(other.path());
+        other_service
+            .remove_member_at(other_group, &other_owner, other_member, 44)
+            .unwrap();
+        other_service
+            .store
+            .lock()
+            .unwrap()
+            .allow_removed_mls_member_readmission(other_group, other_member)
+            .unwrap();
+        assert_eq!(
+            deliver_late_message(&other_service, other_group, &other_message),
+            0
+        );
+        let mut store = other_service.store.lock().unwrap();
+        assert!(!store
+            .record_unreadable_message_event(&other_message)
+            .unwrap());
     }
 
     #[test]

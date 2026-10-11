@@ -569,7 +569,12 @@ Requirements:
 - Events may arrive out of order and wait for missing parents.
 - An author sequence cannot be reused with different content.
 - Events from unauthorized or revoked devices are rejected according to the
-  membership state in which they were authored.
+  membership state in which they were authored. When the owner removes a
+  device it records that device's highest stored author sequence as its
+  cut-off; later sequences are refused on upload, skipped during pulls, and
+  never stored, until the owner allows the device to join again. Members
+  already hold only what the owner accepted, and the device's past-epoch
+  messages are unreadable to them.
 - Resource limits apply before signature verification where possible.
 - A peer never trusts another peer's statement that an event is valid.
 

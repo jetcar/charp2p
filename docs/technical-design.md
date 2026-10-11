@@ -644,9 +644,10 @@ from measured worst-case Welcomes before the MVP accepts public invitations.
 Clients reject a non-profile ciphersuite from the public Welcome header before
 processing it. They validate the authenticated group-context profile marker on
 staged Welcomes before group persistence, on every staged commit before merge,
-and on restored group state before use. A rejected decrypted Welcome consumes
-its matching one-time MLS KeyPackage, so the joining client publishes a fresh
-one afterward.
+and on restored group state before use. OpenMLS consumes the one-time
+KeyPackage while decrypting a Welcome, so the joining client processes it on
+the in-memory provider and, on any rejection, restores the provider and keeps
+the durable pending KeyPackage for the owner's idempotent retry (ADR-052).
 
 The shared MLS provider exports a deterministic, versioned snapshot containing
 its group state and one-time private material. The decoder bounds the snapshot,

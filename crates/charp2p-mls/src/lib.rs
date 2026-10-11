@@ -1138,7 +1138,8 @@ fn rollback_prepared_removal<Provider: OpenMlsProvider>(
 /// one-time key package. The encrypted profile marker is checked after
 /// decryption and before group persistence. OpenMLS consumes the key package
 /// during decryption even when that second check rejects the Welcome, so the
-/// application must publish a fresh key package after such a rejection.
+/// application must restore its provider state after such a rejection to keep
+/// the key package for a retry.
 pub fn stage_profile_welcome<Provider: openmls::storage::OpenMlsProvider>(
     provider: &Provider,
     encoded: &[u8],

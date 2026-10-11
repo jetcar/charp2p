@@ -3721,10 +3721,35 @@ mod tests {
         )
         .unwrap();
         merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        let mut other_group = MlsGroup::new_with_group_id(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            GroupId::from_slice(&GroupIdentity::generate().group_id().to_bytes()),
+            CredentialWithKey {
+                credential: device_credential(owner_id).into(),
+                signature_key: owner_signer.public().into(),
+            },
+        )
+        .unwrap();
+        let other_admission = prepare_profile_member_admission(
+            &mut other_group,
+            &owner_provider,
+            &owner_signer,
+            request.key_package(),
+            joiner_id,
+        )
+        .unwrap();
 
         assert_eq!(
             service.complete_join(group_id, &[1]),
             Err("mls_welcome_invalid")
+        );
+        // A Welcome rejected after decryption leaves the one-time KeyPackage
+        // usable for the owner's cached retry (ADR-052).
+        assert_eq!(
+            service.complete_join(group_id, other_admission.welcome()),
+            Err("mls_welcome_group_mismatch")
         );
         assert!(EventStore::open(&path)
             .unwrap()

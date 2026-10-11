@@ -382,7 +382,8 @@ function messageAuthorLabel(
   if (joinedGroup && message.authorId === joinedGroup.inviterDeviceId) {
     return joinedGroup.inviterName;
   }
-  return `Peer ${shortPeerId(message.authorId)}`;
+  // The short fingerprint follows the label, as on the Members page.
+  return "Member";
 }
 
 function messageDeviceState(

@@ -170,6 +170,9 @@ button { cursor: pointer; }
 .information-sections section { padding: 19px; border: 1px solid #dce4ec; border-radius: 15px; background: white; }
 .information-sections h3 { margin: 0 0 8px; color: #172044; font-size: 17px; }
 .information-sections p { margin: 0; color: #64718c; font-size: 14px; line-height: 1.55; }
+/* Card controls on the Network and Settings pages use compact sizes, not the onboarding ones. */
+.information-sections input:not([type="checkbox"]) { height: 46px; margin: 6px 0 12px; padding: 0 14px; border-width: 1px; border-radius: 10px; font-size: 15px; }
+.information-sections .primary-button, .information-sections .secondary-button, .information-sections .danger-button { min-height: 46px; margin-top: 14px; border-radius: 10px; font-size: 16px; }
 .network-nodes { grid-column: 1 / -1; }
 .network-nodes ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .network-nodes li { display: grid; gap: 3px; min-width: 0; }
@@ -201,9 +204,10 @@ button { cursor: pointer; }
 .member-block:disabled { cursor: wait; opacity: .65; }
 .status-chip.blocked-chip { color: #9e2838; background: #fff5f6; }
 .status-chip.conflict-chip { color: #8a4b00; background: #fff6e8; }
-.message-composer { position: sticky; bottom: 0; z-index: 1; display: grid; gap: 8px; margin: 16px 0 0; padding: 12px 0 14px; border-top: 1px solid #dce4ec; background: white; }
+/* The shadow covers the main pane's bottom padding so messages do not show below the sticky composer. */
+.message-composer { position: sticky; bottom: 0; z-index: 1; display: grid; gap: 8px; margin: 16px 0 0; padding: 12px 0 14px; border-top: 1px solid #dce4ec; background: white; box-shadow: 0 40px 0 #fbfcfd; }
 .message-composer-row { display: flex; align-items: center; gap: 10px; }
-.message-composer-row input { flex: 1; min-width: 0; height: 46px; padding: 0 18px; border: 1px solid #cad5e2; border-radius: 23px; outline: none; color: #172044; background: #f5f8fb; }
+.message-composer-row input { flex: 1; min-width: 0; height: 46px; padding: 0 18px; border: 1px solid #cad5e2; border-radius: 23px; outline: none; color: #172044; background: #f5f8fb; font-size: 15px; }
 .message-composer-row input:focus { border-color: #10a89f; box-shadow: 0 0 0 3px rgba(16, 168, 159, .1); background: white; }
 .message-send-button { display: grid; flex: none; width: 46px; height: 46px; place-items: center; padding: 0; border: 0; border-radius: 50%; color: white; background: #10a89f; cursor: pointer; }
 .message-send-button:hover:not(:disabled) { background: #0b8f87; }
@@ -466,11 +470,11 @@ button { cursor: pointer; }
 
 /* Conversation header: group identity, connection, sync pill and details toggle. */
 .conversation-header { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 0 0 16px; border-bottom: 1px solid #e6ebf0; text-align: left; }
-.conversation-icon { display: grid; flex: none; place-items: center; width: 44px; height: 44px; border-radius: 50%; color: white; font-size: 22px; }
+.conversation-icon { display: grid; flex: none; place-items: center; width: 52px; height: 52px; border-radius: 50%; color: white; font-size: 16px; letter-spacing: -3px; }
 .conversation-icon:not([class*="icon-"]) { color: #087d75; background: #e2f8f4; }
-.conversation-title { flex: 1; min-width: 0; }
-.conversation-title h2 { margin: 0; overflow: hidden; color: #172044; font-size: 20px; text-overflow: ellipsis; white-space: nowrap; }
-.conversation-title p { margin: 2px 0 0; color: #6a7691; font-size: 14px; }
+.conversation-title { flex: 1; min-width: 0; text-align: left; }
+.conversation-title h2 { margin: 0; overflow: hidden; color: #172044; font-size: 24px; line-height: 1.25; letter-spacing: normal; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-title p { margin: 2px 0 0; overflow: hidden; color: #6a7691; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .sync-pill { flex: none; padding: 6px 12px; border-radius: 999px; color: #087d75; background: #e2f8f4; font-size: 13px; font-weight: 700; }
 .sync-pill.unreachable { color: #8a4b00; background: #fff6e8; }
 .conversation-info-button { flex: none; padding: 6px 12px; border: 1px solid #dce4ec; border-radius: 10px; color: #172044; background: white; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
@@ -485,7 +489,7 @@ button { cursor: pointer; }
 .group-details-pane > header h2 { margin: 0; font-size: 22px; }
 .details-close { width: 36px; height: 36px; display: grid; place-items: center; border: 0; border-radius: 50%; color: #55627e; background: transparent; font-size: 28px; line-height: 1; }
 .details-close:hover { background: #f1f5f9; }
-.details-icon { width: 104px; height: 104px; display: grid; place-items: center; border-radius: 50%; color: white; font-size: 46px; }
+.details-icon { flex: none; width: 104px; height: 104px; display: grid; place-items: center; border-radius: 50%; color: white; font-size: 30px; letter-spacing: -6px; }
 .details-icon:not([class*="icon-"]) { color: #087d75; background: #e2f8f4; }
 .details-name { margin: 8px 0 0; overflow-wrap: anywhere; font-size: 22px; }
 .details-subtitle { margin: 0; color: #6a7691; font-size: 15px; }
@@ -525,9 +529,9 @@ button { cursor: pointer; }
 .members-page-header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 18px; margin: 0 0 16px !important; padding-bottom: 20px; border-bottom: 1px solid #e3e8ee; }
 .members-page-icon { width: 60px; height: 60px; display: grid; flex: none; place-items: center; border-radius: 50%; background: #e9eef4; font-size: 26px; }
 .members-page-title { flex: 1 1 220px; min-width: 0; }
-.members-page-title h2 { margin: 0 0 4px; font-size: 30px; letter-spacing: -.8px; }
+.members-page-title h2 { margin: 0 0 4px; overflow: hidden; font-size: 26px; letter-spacing: -.6px; text-overflow: ellipsis; white-space: nowrap; }
 .members-page-title p { margin: 0; overflow-wrap: anywhere; color: #6d7695; font-size: 17px; }
-.setup-form input.members-search { width: 240px; max-width: 100%; height: 46px; margin: 0; padding: 0 16px; border: 1px solid #dce4ec; border-radius: 10px; font-size: 16px; }
+.setup-form input.members-search { flex: 0 1 180px; min-width: 120px; width: 180px; max-width: 100%; height: 46px; margin: 0; padding: 0 16px; border: 1px solid #dce4ec; border-radius: 10px; font-size: 16px; }
 .members-invite { min-height: 46px; padding: 0 18px; border: 0; border-radius: 10px; color: white; background: #0f9b92; font-size: 16px; font-weight: 650; }
 .members-invite:hover { background: #0b857d; }
 .member-card { min-width: 0; display: grid; grid-template-columns: 52px minmax(0, 1fr) auto 36px 36px; align-items: center; gap: 14px; padding: 16px 18px; border: 1px solid #dce4ec; border-radius: 16px; background: white; }

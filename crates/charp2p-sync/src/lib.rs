@@ -879,7 +879,7 @@ mod tests {
         let mut target = EventStore::in_memory().unwrap();
         target.put_events(&removed_events[..1]).unwrap();
         target
-            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id())
+            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id(), 1)
             .unwrap();
 
         let push = SyncRequest::PushEvents {
@@ -955,7 +955,7 @@ mod tests {
         // Stands in for the owner's removal commit applied by the caller
         // between two responses.
         target
-            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id())
+            .put_mls_member_removal(&removal, b"snapshot", removed.peer_id(), 1)
             .unwrap();
         let progress = session
             .handle_response(

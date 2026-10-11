@@ -27,6 +27,8 @@ const PROFILE_EXTENSION_TYPE: ExtensionType = ExtensionType::Unknown(PROFILE_EXT
 const DEVICE_CREDENTIAL_DOMAIN: &[u8] = b"charp2p-device-credential\0";
 const DEVICE_CREDENTIAL_VERSION: u16 = 1;
 const MAX_DEVICE_PEER_ID_BYTES: usize = 128;
+const REMOVAL_CUTOFF_DOMAIN: &[u8] = b"charp2p-removal-cutoff\0";
+const REMOVAL_CUTOFF_VERSION: u16 = 1;
 const PROVIDER_SNAPSHOT_VERSION: u16 = 1;
 const MAX_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_SNAPSHOT_RECORDS: usize = 4_096;
@@ -693,6 +695,48 @@ pub fn device_id_from_credential(
         .map_err(|_| DeviceCredentialError::InvalidIdentity)
 }
 
+/// Highest author sequence the owner still accepted from a removed device,
+/// signed into the removal Commit's authenticated data (ADR-051).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemovalCutoff {
+    /// Device removed by the Commit.
+    pub removed_peer: PeerId,
+    /// Highest author sequence of the removed device that stays history;
+    /// zero when the owner stored no event from it.
+    pub cutoff_sequence: u64,
+}
+
+impl RemovalCutoff {
+    /// Encodes the cut-off as MLS authenticated data.
+    pub fn encode(&self) -> Vec<u8> {
+        let peer_id = self.removed_peer.to_bytes();
+        let mut encoded = Vec::with_capacity(REMOVAL_CUTOFF_DOMAIN.len() + 2 + 8 + peer_id.len());
+        encoded.extend_from_slice(REMOVAL_CUTOFF_DOMAIN);
+        encoded.extend_from_slice(&REMOVAL_CUTOFF_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&self.cutoff_sequence.to_be_bytes());
+        encoded.extend_from_slice(&peer_id);
+        encoded
+    }
+
+    /// Decodes cut-off authenticated data; `None` when the data is empty,
+    /// from another version, or malformed.
+    pub fn decode(authenticated_data: &[u8]) -> Option<Self> {
+        let rest = authenticated_data.strip_prefix(REMOVAL_CUTOFF_DOMAIN)?;
+        if rest.len() < 2 + 8 + 1 || rest.len() > 2 + 8 + MAX_DEVICE_PEER_ID_BYTES {
+            return None;
+        }
+        let (version, rest) = rest.split_at(2);
+        if u16::from_be_bytes([version[0], version[1]]) != REMOVAL_CUTOFF_VERSION {
+            return None;
+        }
+        let (sequence, peer_id) = rest.split_at(8);
+        Some(Self {
+            removed_peer: PeerId::from_bytes(peer_id).ok()?,
+            cutoff_sequence: u64::from_be_bytes(sequence.try_into().ok()?),
+        })
+    }
+}
+
 /// Generates and stores one-time profile KeyPackage private material.
 ///
 /// `credential_with_key` must contain the public key of `signer` and a
@@ -878,11 +922,14 @@ pub fn abort_prepared_member_admission<Provider: OpenMlsProvider>(
 ///
 /// The caller must durably publish `commit()` before merging it. The local leaf
 /// is rejected because owner removal uses a separate ownership-transfer policy.
+/// `cutoff_sequence` is the removed device's highest accepted author sequence,
+/// carried as the Commit's authenticated data (ADR-051).
 pub fn prepare_profile_member_removal<Provider: OpenMlsProvider>(
     group: &mut MlsGroup,
     provider: &Provider,
     signer: &impl Signer,
     removed_peer: PeerId,
+    cutoff_sequence: u64,
 ) -> Result<PreparedMemberRemoval, PrepareMemberRemovalError> {
     validate_group_profile(group).map_err(|_| PrepareMemberRemovalError::InvalidGroupProfile)?;
     let mut target: Option<LeafNodeIndex> = None;
@@ -897,9 +944,19 @@ pub fn prepare_profile_member_removal<Provider: OpenMlsProvider>(
     if target == group.own_leaf_index() {
         return Err(PrepareMemberRemovalError::OwnLeaf);
     }
+    group.set_aad(
+        RemovalCutoff {
+            removed_peer,
+            cutoff_sequence,
+        }
+        .encode(),
+    );
     let (commit, welcome, _) = group
         .remove_members(provider, signer, &[target])
-        .map_err(|_| PrepareMemberRemovalError::MemberRemovalFailed)?;
+        .map_err(|_| {
+            group.set_aad(Vec::new());
+            PrepareMemberRemovalError::MemberRemovalFailed
+        })?;
     let pending_is_valid = group
         .pending_commit()
         .is_some_and(|pending| validate_staged_commit_profile(pending).is_ok());
@@ -1181,11 +1238,11 @@ mod tests {
         CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
         MergeKeyRefreshError, MergeMemberAdmissionError, MigrateGroupConfigError, MlsWireError,
         PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError,
-        ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
-        abort_prepared_member_admission, decode_profile_message, device_credential,
-        device_id_from_credential, group_create_config, merge_prepared_key_refresh,
-        merge_prepared_member_admission, migrate_group_join_config, prepare_profile_key_package,
-        prepare_profile_key_refresh, prepare_profile_member_admission,
+        ProfileProvider, ProfileProviderSnapshotError, REMOVAL_CUTOFF_DOMAIN, RemovalCutoff,
+        StageWelcomeError, abort_prepared_member_admission, decode_profile_message,
+        device_credential, device_id_from_credential, group_create_config,
+        merge_prepared_key_refresh, merge_prepared_member_admission, migrate_group_join_config,
+        prepare_profile_key_package, prepare_profile_key_refresh, prepare_profile_member_admission,
         prepare_profile_member_removal, profile_capabilities, profile_extensions,
         stage_profile_welcome, validate_group_profile, validate_key_refresh_commit,
         validate_profile_key_package, validate_staged_commit_profile,
@@ -1895,8 +1952,10 @@ mod tests {
             &owner_provider,
             &owner_signer,
             member_id,
+            7,
         )
         .unwrap();
+        assert!(owner_group.aad().is_empty());
         let processed = member_group
             .process_message(
                 &member_provider,
@@ -1906,6 +1965,13 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+        assert_eq!(
+            RemovalCutoff::decode(processed.aad()),
+            Some(RemovalCutoff {
+                removed_peer: member_id,
+                cutoff_sequence: 7,
+            })
+        );
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             panic!("expected a staged commit");
         };
@@ -1913,6 +1979,21 @@ mod tests {
             validate_key_refresh_commit(&staged),
             Err(ProfileError::UnexpectedKeyRefreshContent)
         );
+    }
+
+    #[test]
+    fn removal_cutoff_round_trips_and_rejects_malformed_data() {
+        let cutoff = RemovalCutoff {
+            removed_peer: DeviceIdentity::generate().peer_id(),
+            cutoff_sequence: u64::MAX,
+        };
+        let encoded = cutoff.encode();
+        assert_eq!(RemovalCutoff::decode(&encoded), Some(cutoff));
+        assert_eq!(RemovalCutoff::decode(&[]), None);
+        assert_eq!(RemovalCutoff::decode(&encoded[..encoded.len() - 1]), None);
+        let mut other_version = encoded.clone();
+        other_version[REMOVAL_CUTOFF_DOMAIN.len() + 1] ^= 1;
+        assert_eq!(RemovalCutoff::decode(&other_version), None);
     }
 
     #[test]

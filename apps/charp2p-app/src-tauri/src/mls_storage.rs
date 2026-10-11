@@ -22,7 +22,8 @@ use charp2p_mls::{
     prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
     validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
     validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
-    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
+    ProfileKeyPackageError, ProfileProvider, RemovalCutoff, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+    MAX_PAST_EPOCHS,
 };
 use charp2p_store::{
     EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
@@ -471,9 +472,19 @@ impl MlsProviderService {
             let (author_sequence, causal_parents) =
                 next_event_position(&store, group_id, owner_identity.peer_id())
                     .map_err(|_| "member_removal_failed")?;
-            let removal =
-                prepare_profile_member_removal(&mut group, &*provider, &signer, removed_peer)
-                    .map_err(map_removal_preparation_error)?;
+            // Members refuse the removed device's later events from the
+            // cut-off signed into the Commit (ADR-051).
+            let cutoff_sequence = store
+                .highest_author_sequence(group_id, removed_peer)
+                .map_err(|_| "member_removal_store_unavailable")?;
+            let removal = prepare_profile_member_removal(
+                &mut group,
+                &*provider,
+                &signer,
+                removed_peer,
+                cutoff_sequence,
+            )
+            .map_err(map_removal_preparation_error)?;
             let event = SignedEvent::create(
                 owner_identity,
                 EventSpec {
@@ -494,7 +505,7 @@ impl MlsProviderService {
             let key = self.load_or_create_wrapping_key()?;
             let encrypted = encrypt_snapshot(&snapshot, &key)?;
             store
-                .put_mls_member_removal(&event, &encrypted, removed_peer)
+                .put_mls_member_removal(&event, &encrypted, removed_peer, cutoff_sequence)
                 .map_err(|_| "member_removal_store_unavailable")?;
             group_member_devices(&group)
         })();
@@ -1896,7 +1907,9 @@ impl MlsProviderService {
         if protocol.epoch() > group.epoch() {
             return Ok(false);
         }
+        let mut removed_author = None;
         if protocol.epoch() == group.epoch() {
+            let members_before = member_device_ids(&group)?;
             let processed = group
                 .process_message(&*provider, protocol)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;
@@ -1905,6 +1918,7 @@ impl MlsProviderService {
             if sender != event.author_id() {
                 return Err(ApplyGroupCommitError::Unreadable);
             }
+            let cutoff = RemovalCutoff::decode(processed.aad());
             let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
             else {
                 return Err(ApplyGroupCommitError::Unreadable);
@@ -1921,7 +1935,20 @@ impl MlsProviderService {
                 .merge_staged_commit(&*provider, *staged)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;
             validate_group_profile(&group).map_err(|_| ApplyGroupCommitError::Unreadable)?;
+            // A removal's signed cut-off counts only for the one device the
+            // Commit removed; removals without one record no cut-off.
+            if event.kind() == EventKind::MemberRemoved {
+                let members_after = member_device_ids(&group)?;
+                let removed: Vec<_> = members_before
+                    .into_iter()
+                    .filter(|member| !members_after.contains(member))
+                    .collect();
+                removed_author = cutoff
+                    .filter(|cutoff| removed == [cutoff.removed_peer])
+                    .map(|cutoff| (cutoff.removed_peer, cutoff.cutoff_sequence));
+            }
         }
+        let current_members = member_device_ids(&group)?;
         let snapshot = provider
             .snapshot()
             .map_err(|_| ApplyGroupCommitError::Unavailable("mls_provider_snapshot_invalid"))?;
@@ -1931,7 +1958,7 @@ impl MlsProviderService {
         let encrypted =
             encrypt_snapshot(&snapshot, &key).map_err(ApplyGroupCommitError::Unavailable)?;
         store
-            .put_applied_mls_event_and_encrypted_provider_snapshot(event, &encrypted)
+            .put_applied_mls_membership_commit(event, &encrypted, removed_author, &current_members)
             .map_err(|_| ApplyGroupCommitError::Unavailable("mls_group_storage_unavailable"))?;
         record_group_roster_best_effort(provider, store, group_id);
         Ok(true)
@@ -2967,6 +2994,16 @@ fn all_group_ids(store: &EventStore) -> Vec<PeerId> {
         .into_iter()
         .map(|group| group.group_id)
         .chain(joined.into_iter().map(|group| group.group_id))
+        .collect()
+}
+
+fn member_device_ids(group: &MlsGroup) -> Result<Vec<PeerId>, ApplyGroupCommitError> {
+    group
+        .members()
+        .map(|member| {
+            device_id_from_credential(&member.credential)
+                .map_err(|_| ApplyGroupCommitError::Unreadable)
+        })
         .collect()
 }
 
@@ -4524,6 +4561,18 @@ mod tests {
             .unwrap()
             .iter()
             .any(|member| member.device_id == first_member.peer_id().to_string()));
+        // The remaining member records the owner's signed cut-off, so its
+        // serving node refuses the removed device's later events too.
+        let removed_cutoff = |service: &MlsProviderService| {
+            service
+                .store
+                .lock()
+                .unwrap()
+                .removed_author_cutoff(group_id, first_member.peer_id())
+                .unwrap()
+        };
+        assert_eq!(removed_cutoff(&owner_service), Some(1));
+        assert_eq!(removed_cutoff(&second_service), Some(1));
         // A removed device's earlier events stay attributable to the group.
         assert_eq!(
             recorded_authors(&second_service, group_id),

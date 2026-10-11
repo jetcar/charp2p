@@ -529,13 +529,33 @@ impl EventStore {
         )? > 0)
     }
 
+    /// Returns the highest stored author sequence of a device in a group, or
+    /// zero when none is stored.
+    pub fn highest_author_sequence(
+        &self,
+        group_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<u64, StoreError> {
+        let sequence: Option<i64> = self.connection.query_row(
+            "SELECT MAX(author_sequence) FROM events
+             WHERE group_id = ?1 AND author_id = ?2",
+            params![group_id.to_bytes(), author_id.to_bytes()],
+            |row| row.get(0),
+        )?;
+        sequence.map_or(Ok(0), |sequence| {
+            u64::try_from(sequence).map_err(|_| StoreError::CorruptIndex)
+        })
+    }
+
     /// Atomically persists a member-removal event, the advanced MLS state,
-    /// and the durable re-admission block for that device.
+    /// and the durable re-admission block for that device. `cutoff_sequence`
+    /// is the cut-off signed into the removal Commit (ADR-051).
     pub fn put_mls_member_removal(
         &mut self,
         event: &SignedEvent,
         encrypted_snapshot: &[u8],
         removed_member_id: PeerId,
+        cutoff_sequence: u64,
     ) -> Result<PutEventOutcome, StoreError> {
         if event.kind() != charp2p_core::EventKind::MemberRemoved {
             return Err(StoreError::CorruptIndex);
@@ -550,21 +570,11 @@ impl EventStore {
         )?;
         // Events the device authored before its removal stay history; any
         // later sequence is refused while the removal holds.
-        transaction.execute(
-            "INSERT INTO removed_mls_members (
-                group_id, member_id, removal_event_id, cutoff_sequence
-             ) VALUES (?1, ?2, ?3, COALESCE((
-                SELECT MAX(author_sequence) FROM events
-                WHERE group_id = ?1 AND author_id = ?2
-             ), 0))
-             ON CONFLICT(group_id, member_id) DO UPDATE SET
-                removal_event_id = excluded.removal_event_id,
-                cutoff_sequence = excluded.cutoff_sequence",
-            params![
-                event.group_id().to_bytes(),
-                removed_member_id.to_bytes(),
-                event.id().as_bytes().as_slice(),
-            ],
+        put_removed_author_cutoff_in_transaction(
+            &transaction,
+            event,
+            removed_member_id,
+            cutoff_sequence,
         )?;
         transaction.execute(
             "UPDATE applied_invite_permissions SET granted = 0
@@ -1603,7 +1613,23 @@ impl EventStore {
         event: &SignedEvent,
         encrypted_snapshot: &[u8],
     ) -> Result<bool, StoreError> {
-        if !is_mls_commit_kind(event.kind()) {
+        self.put_applied_mls_membership_commit(event, encrypted_snapshot, None, &[])
+    }
+
+    /// Atomically records an applied owner MLS commit on a member device with
+    /// its membership effects (ADR-051): a removal's signed author cut-off is
+    /// recorded, and cut-offs of devices that are current members again are
+    /// cleared.
+    pub fn put_applied_mls_membership_commit(
+        &mut self,
+        event: &SignedEvent,
+        encrypted_snapshot: &[u8],
+        removed_author: Option<(PeerId, u64)>,
+        current_members: &[PeerId],
+    ) -> Result<bool, StoreError> {
+        if !is_mls_commit_kind(event.kind())
+            || (removed_author.is_some() && event.kind() != charp2p_core::EventKind::MemberRemoved)
+        {
             return Err(StoreError::CorruptIndex);
         }
         validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
@@ -1631,6 +1657,20 @@ impl EventStore {
                 event.group_id().to_bytes()
             ],
         )? != 0;
+        for member_id in current_members {
+            transaction.execute(
+                "DELETE FROM removed_mls_members WHERE group_id = ?1 AND member_id = ?2",
+                params![event.group_id().to_bytes(), member_id.to_bytes()],
+            )?;
+        }
+        if let Some((removed_member_id, cutoff_sequence)) = removed_author {
+            put_removed_author_cutoff_in_transaction(
+                &transaction,
+                event,
+                removed_member_id,
+                cutoff_sequence,
+            )?;
+        }
         transaction.commit()?;
         Ok(inserted)
     }
@@ -3444,6 +3484,30 @@ fn put_event_in_transaction(
     Ok(PutEventOutcome::Inserted)
 }
 
+fn put_removed_author_cutoff_in_transaction(
+    transaction: &Transaction<'_>,
+    removal: &SignedEvent,
+    removed_member_id: PeerId,
+    cutoff_sequence: u64,
+) -> Result<(), StoreError> {
+    let cutoff = i64::try_from(cutoff_sequence).map_err(|_| StoreError::CorruptIndex)?;
+    transaction.execute(
+        "INSERT INTO removed_mls_members (
+            group_id, member_id, removal_event_id, cutoff_sequence
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(group_id, member_id) DO UPDATE SET
+            removal_event_id = excluded.removal_event_id,
+            cutoff_sequence = excluded.cutoff_sequence",
+        params![
+            removal.group_id().to_bytes(),
+            removed_member_id.to_bytes(),
+            removal.id().as_bytes().as_slice(),
+            cutoff,
+        ],
+    )?;
+    Ok(())
+}
+
 fn removed_author_cutoff_in(
     connection: &Connection,
     group_id: PeerId,
@@ -4939,7 +5003,14 @@ mod tests {
                 .unwrap()
         );
         store
-            .put_mls_member_removal(&removed, b"removed provider snapshot", member_id)
+            .put_mls_member_removal(
+                &removed,
+                b"removed provider snapshot",
+                member_id,
+                store
+                    .highest_author_sequence(group.group_id(), member_id)
+                    .unwrap(),
+            )
             .unwrap();
         assert!(
             store
@@ -5035,7 +5106,14 @@ mod tests {
         );
 
         store
-            .put_mls_member_removal(&removal, b"snapshot", member.peer_id())
+            .put_mls_member_removal(
+                &removal,
+                b"snapshot",
+                member.peer_id(),
+                store
+                    .highest_author_sequence(group.group_id(), member.peer_id())
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(
             store
@@ -5068,6 +5146,85 @@ mod tests {
             .allow_removed_mls_member_readmission(group.group_id(), member.peer_id())
             .unwrap();
         assert_eq!(store.put_event(&late).unwrap(), PutEventOutcome::Inserted);
+    }
+
+    #[test]
+    fn applied_member_removal_records_the_signed_cutoff_until_readded() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let commit = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"MLS commit",
+                },
+            )
+            .unwrap()
+        };
+        let removal = commit(1, EventKind::MemberRemoved);
+        let readded = commit(2, EventKind::MemberAdded);
+        store.put_event(&removal).unwrap();
+        store.put_event(&readded).unwrap();
+        assert!(matches!(
+            store.put_applied_mls_membership_commit(
+                &readded,
+                b"snapshot",
+                Some((member.peer_id(), 3)),
+                &[]
+            ),
+            Err(StoreError::CorruptIndex)
+        ));
+
+        // The cut-off is the owner's signed one, not this device's highest
+        // stored sequence.
+        assert!(
+            store
+                .put_applied_mls_membership_commit(
+                    &removal,
+                    b"snapshot one",
+                    Some((member.peer_id(), 3)),
+                    &[owner.peer_id()]
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .removed_author_cutoff(group.group_id(), member.peer_id())
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            store
+                .put_event(&message_event(&member, &group, 3, b"before"))
+                .unwrap(),
+            PutEventOutcome::Inserted
+        );
+        assert!(matches!(
+            store.put_event(&message_event(&member, &group, 4, b"late")),
+            Err(StoreError::RemovedAuthor { sequence: 4 })
+        ));
+
+        store
+            .put_applied_mls_membership_commit(
+                &readded,
+                b"snapshot two",
+                None,
+                &[owner.peer_id(), member.peer_id()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .removed_author_cutoff(group.group_id(), member.peer_id())
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6334,7 +6491,7 @@ mod tests {
 
         let removal = owner_event(5, EventKind::MemberRemoved);
         store
-            .put_mls_member_removal(&removal, b"snapshot five", member)
+            .put_mls_member_removal(&removal, b"snapshot five", member, 0)
             .unwrap();
         assert!(
             !store
@@ -6364,6 +6521,7 @@ mod tests {
                 &owner_event(7, EventKind::MemberRemoved),
                 b"snapshot",
                 other,
+                0,
             )
             .unwrap();
         store
@@ -6443,7 +6601,7 @@ mod tests {
                 ])
                 .unwrap();
             store
-                .put_mls_member_removal(&removal, b"snapshot", member.peer_id())
+                .put_mls_member_removal(&removal, b"snapshot", member.peer_id(), 2)
                 .unwrap();
             store
                 .connection

@@ -153,6 +153,10 @@ trait SynchronizationService: Send + Sync {
         author_id: PeerId,
         peers: &[SyncPeerHead],
     ) -> Result<(), &'static str>;
+
+    /// Devices of the group's current MLS epoch that may receive the
+    /// owner's new-event notices (ADR-049); empty when the group is unknown.
+    fn notice_recipients(&self, group_id: PeerId) -> Vec<PeerId>;
 }
 
 impl PendingJoinService for MlsProviderService {
@@ -218,6 +222,17 @@ impl SynchronizationService for MlsProviderService {
         peers: &[SyncPeerHead],
     ) -> Result<(), &'static str> {
         MlsProviderService::record_observed_heads(self, group_id, author_id, peers)
+    }
+
+    fn notice_recipients(&self, group_id: PeerId) -> Vec<PeerId> {
+        self.group_members(group_id)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.device_id.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -412,6 +427,9 @@ pub struct NetworkService {
     member_serving: Mutex<Option<ActiveMemberServing>>,
     /// Groups whose pinned owner announced new events (ADR-049).
     event_notices: broadcast::Sender<PeerId>,
+    /// Owned groups with newly stored events, which the owner advertising
+    /// node announces to connected current members (ADR-049).
+    stored_events: broadcast::Sender<PeerId>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
     group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedGroupSynchronization>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
@@ -595,6 +613,7 @@ impl NetworkService {
             contribution: Mutex::new(None),
             member_serving: Mutex::new(None),
             event_notices: broadcast::channel(EVENT_NOTICE_CAPACITY).0,
+            stored_events: broadcast::channel(EVENT_NOTICE_CAPACITY).0,
             last_connection: std::sync::Mutex::new(None),
             group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
@@ -1029,6 +1048,7 @@ impl NetworkService {
         let synchronization = Arc::clone(&self.synchronization);
         let invite_requests = Arc::clone(&self.invite_requests);
         let owner_addresses = Arc::clone(&self.owner_addresses);
+        let mut stored_events = self.stored_events.subscribe();
         let task_keys = keys.clone();
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
@@ -1044,6 +1064,14 @@ impl NetworkService {
                 }
                 tokio::select! {
                     _ = expiry_check.tick() => {}
+                    stored = stored_events.recv() => match stored {
+                        Ok(group_id) => {
+                            send_event_notices(&mut node, synchronization.as_ref(), group_id, None);
+                        }
+                        // Missed notices only delay members to their next retry.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
                     _ = refresh.tick() => {
                         if task_keys.iter().any(|key| node.announce_group(*key).is_err()) {
                             break;
@@ -1065,7 +1093,24 @@ impl NetworkService {
                             } => {
                                 let response = synchronization
                                     .answer_sync_request(peer_id, &request);
+                                let accepted = match response {
+                                    SyncResponse::EventsAccepted { group_id, inserted }
+                                        if inserted > 0 =>
+                                    {
+                                        Some(group_id)
+                                    }
+                                    _ => None,
+                                };
                                 let _ = node.send_sync_response(request_id, response);
+                                // The uploader already holds the events it pushed.
+                                if let Some(group_id) = accepted {
+                                    send_event_notices(
+                                        &mut node,
+                                        synchronization.as_ref(),
+                                        group_id,
+                                        Some(peer_id),
+                                    );
+                                }
                             }
                             NetworkEvent::JoinRequestReceived {
                                 peer_id,
@@ -1079,7 +1124,18 @@ impl NetworkService {
                                     &request,
                                     peer_id,
                                 );
+                                let admitted = response.welcome().is_some();
                                 let _ = node.send_join_response(request_id, response);
+                                // Existing members pull the admission commit;
+                                // the new member starts from its Welcome.
+                                if admitted {
+                                    send_event_notices(
+                                        &mut node,
+                                        synchronization.as_ref(),
+                                        request.group_id(),
+                                        Some(peer_id),
+                                    );
+                                }
                             }
                             NetworkEvent::InviteRequestReceived {
                                 peer_id,
@@ -1193,6 +1249,14 @@ impl NetworkService {
     /// Stops the contribution node, if one is running.
     pub async fn stop_contribution(&self) {
         self.contribution.lock().await.take();
+    }
+
+    /// Tells the connected current members of an owned group that this
+    /// owner device stored new events, so they pull now (ADR-049). Members
+    /// that are not connected still pull at their next retry.
+    pub fn notify_group_events(&self, group_id: PeerId) {
+        // No running advertising node only means nobody is connected.
+        let _ = self.stored_events.send(group_id);
     }
 
     /// Subscribes to the groups whose pinned owner sent an acknowledged
@@ -2257,6 +2321,23 @@ fn answer_member_sync_request(
     response
 }
 
+/// Sends `EventsAvailable` for an owned group to its connected current
+/// members other than `skip` (ADR-049). The owner never dials members for
+/// a notice, and their acknowledgements need no handling.
+fn send_event_notices(
+    node: &mut NetworkNode,
+    synchronization: &dyn SynchronizationService,
+    group_id: PeerId,
+    skip: Option<PeerId>,
+) {
+    let local = node.peer_id();
+    for member in synchronization.notice_recipients(group_id) {
+        if member != local && Some(member) != skip && node.is_connected(member) {
+            let _ = node.send_sync_request(member, SyncRequest::EventsAvailable { group_id });
+        }
+    }
+}
+
 /// Handles an event on a member serving node: synchronization requests
 /// get the metered member answer and acknowledged owner notices are
 /// published to `notices`, while join and invitation requests are rejected
@@ -2435,6 +2516,10 @@ impl SynchronizationService for UnavailableSynchronizationService {
         _peers: &[SyncPeerHead],
     ) -> Result<(), &'static str> {
         Err("synchronization_unavailable")
+    }
+
+    fn notice_recipients(&self, _group_id: PeerId) -> Vec<PeerId> {
+        Vec::new()
     }
 }
 
@@ -2732,6 +2817,14 @@ mod tests {
             _peers: &[SyncPeerHead],
         ) -> Result<(), &'static str> {
             Ok(())
+        }
+
+        fn notice_recipients(&self, group_id: PeerId) -> Vec<PeerId> {
+            if group_id == self.group_id {
+                vec![self.expected_peer]
+            } else {
+                Vec::new()
+            }
         }
     }
 
@@ -4631,6 +4724,44 @@ mod tests {
                     group_id: invitation.group_id(),
                     heads: Vec::new(),
                     membership: SyncMembershipState::default(),
+                }
+            );
+
+            // Newly stored events reach the connected member as a notice;
+            // other groups have no recipients.
+            service.notify_group_events(DeviceIdentity::generate().peer_id());
+            service.notify_group_events(invitation.group_id());
+            let notice = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = requester.next_event() => {
+                            if let NetworkEvent::SyncRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } = event
+                            {
+                                if peer_id == owner_id {
+                                    let _ = requester.send_sync_response(
+                                        request_id,
+                                        SyncResponse::Acknowledged {
+                                            group_id: invitation.group_id(),
+                                        },
+                                    );
+                                    break request;
+                                }
+                            }
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("connected member should receive the owner's notice");
+            assert_eq!(
+                notice,
+                SyncRequest::EventsAvailable {
+                    group_id: invitation.group_id(),
                 }
             );
 

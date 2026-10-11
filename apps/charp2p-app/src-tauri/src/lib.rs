@@ -209,6 +209,7 @@ fn rename_group(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let Some(icon) = group_service
@@ -230,7 +231,9 @@ fn rename_group(
         .map_err(str::to_owned)?;
     mls_service
         .change_group_metadata(group_id, &identity, &metadata)
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    network_service.notify_group_events(group_id);
+    Ok(())
 }
 
 /// Changes an owned group's icon and shares it with members first, so a
@@ -242,6 +245,7 @@ fn change_group_icon(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<LocalGroup, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let Some(group) = group_service
@@ -261,6 +265,7 @@ fn change_group_icon(
     mls_service
         .share_current_metadata(group_id, &identity, &group.group_name, icon)
         .map_err(str::to_owned)?;
+    network_service.notify_group_events(group_id);
     group_service
         .set_icon(group_id, icon)
         .map_err(str::to_owned)
@@ -286,6 +291,7 @@ fn set_member_invite_permission(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<Vec<String>, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let member_id = parse_group_id(&member_device_id, "member_not_found")?;
@@ -309,7 +315,10 @@ fn set_member_invite_permission(
     }
     mls_service
         .change_invite_permission(group_id, &identity, member_id, granted)
-        .map(|devices| devices.iter().map(ToString::to_string).collect())
+        .map(|devices| {
+            network_service.notify_group_events(group_id);
+            devices.iter().map(ToString::to_string).collect()
+        })
         .map_err(str::to_owned)
 }
 
@@ -619,6 +628,8 @@ fn send_group_message(
     reply_to_event_id: Option<String>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<CreatedMessage, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let reply_to = reply_to_event_id
@@ -630,6 +641,7 @@ fn send_group_message(
         .map_err(str::to_owned)?;
     mls_service
         .create_message(group_id, &identity, &message, reply_to.as_ref())
+        .inspect(|_| notify_owned_group_events(&group_service, &network_service, group_id))
         .map_err(str::to_owned)
 }
 
@@ -640,6 +652,8 @@ fn edit_group_message(
     message: String,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let event_id = parse_event_id(&event_id)?;
@@ -648,7 +662,9 @@ fn edit_group_message(
         .map_err(str::to_owned)?;
     mls_service
         .edit_message(group_id, &identity, &event_id, &message)
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    notify_owned_group_events(&group_service, &network_service, group_id);
+    Ok(())
 }
 
 /// Sends a signed group-wide tombstone for one of this device's messages.
@@ -658,6 +674,8 @@ fn delete_group_message(
     event_id: String,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    group_service: tauri::State<'_, Arc<GroupService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let event_id = parse_event_id(&event_id)?;
@@ -666,7 +684,9 @@ fn delete_group_message(
         .map_err(str::to_owned)?;
     mls_service
         .delete_message(group_id, &identity, &event_id)
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    notify_owned_group_events(&group_service, &network_service, group_id);
+    Ok(())
 }
 
 /// Lists the newest retained messages of a group, or with a cursor (the
@@ -841,6 +861,7 @@ fn remove_group_member(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<Vec<GroupMemberDevice>, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let member_id = parse_group_id(&member_device_id, "member_not_found")?;
@@ -860,6 +881,7 @@ fn remove_group_member(
         .map_err(str::to_owned)?;
     mls_service
         .remove_member(group_id, &identity, member_id)
+        .inspect(|_| network_service.notify_group_events(group_id))
         .map_err(str::to_owned)
 }
 
@@ -871,6 +893,7 @@ fn refresh_group_keys(
     identity_service: tauri::State<'_, IdentityService>,
     group_service: tauri::State<'_, Arc<GroupService>>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    network_service: tauri::State<'_, NetworkService>,
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     if !group_service
@@ -886,7 +909,9 @@ fn refresh_group_keys(
         .map_err(str::to_owned)?;
     mls_service
         .refresh_group_keys(group_id, &identity)
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    network_service.notify_group_events(group_id);
+    Ok(())
 }
 
 /// Lists join requests and declined devices for a locally owned group
@@ -1293,6 +1318,24 @@ async fn advertise_owned_groups(
         .advertise_owner_group(identity, owner_identity, inviter_name, keys)
         .await
         .map_err(str::to_owned)
+}
+
+/// Tells connected members to pull an event this device just stored, when
+/// it owns the group (ADR-049); members push their own events to the owner,
+/// which notifies the others on acceptance.
+fn notify_owned_group_events(
+    group_service: &GroupService,
+    network_service: &NetworkService,
+    group_id: charp2p_core::PeerId,
+) {
+    let owned = group_service.list().is_ok_and(|groups| {
+        groups
+            .iter()
+            .any(|group| group.group_id == group_id.to_string())
+    });
+    if owned {
+        network_service.notify_group_events(group_id);
+    }
 }
 
 fn parse_group_id(input: &str, error: &'static str) -> Result<charp2p_core::PeerId, String> {

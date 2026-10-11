@@ -428,6 +428,11 @@ impl NetworkNode {
         Ok(())
     }
 
+    /// Whether at least one connection to `peer_id` is established.
+    pub fn is_connected(&self, peer_id: PeerId) -> bool {
+        self.swarm.is_connected(&peer_id)
+    }
+
     /// Dials a discovered peer using addresses already learned by behaviours.
     pub fn dial_peer(&mut self, peer_id: PeerId) -> Result<(), NetworkError> {
         self.swarm.dial(peer_id)?;

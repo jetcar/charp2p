@@ -1484,7 +1484,8 @@ impl EventStore {
     /// Returns at most `limit` verified message, edit, deletion,
     /// group-metadata, and invite-permission events that
     /// have not been decrypted locally yet. Events are ordered by author and
-    /// sequence so each sender ratchet advances consistently.
+    /// sequence so each sender ratchet advances consistently. An author's
+    /// events after a gap in its stored sequence wait until the gap is filled.
     pub fn unmaterialized_message_events(
         &self,
         group_id: PeerId,
@@ -1526,6 +1527,11 @@ impl EventStore {
                AND g.event_id IS NULL AND x.event_id IS NULL AND p.event_id IS NULL
                AND d.event_id IS NULL AND u.event_id IS NULL
                AND (e.author_id > ?2 OR (e.author_id = ?2 AND e.author_sequence > ?3))
+               AND e.author_sequence = (
+                   SELECT COUNT(*) FROM events s
+                   WHERE s.group_id = e.group_id AND s.author_id = e.author_id
+                     AND s.author_sequence <= e.author_sequence
+               )
              ORDER BY e.author_id, e.author_sequence",
         )?;
         let rows = statement.query_map(
@@ -5312,6 +5318,31 @@ mod tests {
             ),
             Err(StoreError::SequenceTooLarge(u64::MAX))
         ));
+    }
+
+    #[test]
+    fn unmaterialized_message_events_wait_for_author_sequence_gaps() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let first = message_event(&author, &group, 1, b"First ciphertext");
+        let second = message_event(&author, &group, 2, b"Second ciphertext");
+        let third = message_event(&author, &group, 3, b"Third ciphertext");
+        store.put_event(&first).unwrap();
+        store.put_event(&third).unwrap();
+        let ids = |store: &EventStore| {
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .iter()
+                .map(|event| event.id())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&store), vec![first.id()]);
+
+        store.put_event(&second).unwrap();
+        assert_eq!(ids(&store), vec![first.id(), second.id(), third.id()]);
     }
 
     #[test]

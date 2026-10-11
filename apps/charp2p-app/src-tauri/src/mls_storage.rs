@@ -1944,6 +1944,13 @@ impl MlsProviderService {
                         *provider = ProfileProvider::from_snapshot(&previous)
                             .map_err(|_| "mls_provider_snapshot_invalid")?;
                     }
+                    Err(MaterializeMessageError::PermanentlyUnreadable) => {
+                        *provider = ProfileProvider::from_snapshot(&previous)
+                            .map_err(|_| "mls_provider_snapshot_invalid")?;
+                        store
+                            .record_unreadable_message_event(&event)
+                            .map_err(|_| "message_store_unavailable")?;
+                    }
                     Err(MaterializeMessageError::Unavailable(error)) => {
                         *provider = ProfileProvider::from_snapshot(&previous)
                             .map_err(|_| "mls_provider_snapshot_invalid")?;
@@ -1979,10 +1986,16 @@ impl MlsProviderService {
         ))?;
         validate_group_profile(&group).map_err(|_| MaterializeMessageError::Unreadable)?;
         let message = decode_profile_message(event.protected_payload())
-            .map_err(|_| MaterializeMessageError::Unreadable)?;
+            .map_err(|_| MaterializeMessageError::PermanentlyUnreadable)?;
         let protocol: ProtocolMessage = message
             .try_into_protocol_message()
-            .map_err(|_| MaterializeMessageError::Unreadable)?;
+            .map_err(|_| MaterializeMessageError::PermanentlyUnreadable)?;
+        // Without past-epoch secrets, ciphertext from an epoch this device
+        // already left (or never joined) cannot be read again; later epochs
+        // stay pending until their commit is applied.
+        if protocol.group_id() != group.group_id() || protocol.epoch() < group.epoch() {
+            return Err(MaterializeMessageError::PermanentlyUnreadable);
+        }
         let processed = group
             .process_message(&*provider, protocol)
             .map_err(|_| MaterializeMessageError::Unreadable)?;
@@ -2982,6 +2995,9 @@ enum MlsProviderMutationError<E> {
 
 enum MaterializeMessageError {
     Unreadable,
+    /// The event can never be decrypted on this device and is recorded so
+    /// later pulls do not try it again.
+    PermanentlyUnreadable,
     Unavailable(&'static str),
 }
 
@@ -5084,7 +5100,7 @@ mod tests {
             vec!["After join"]
         );
         assert!(member_service.unread_message_counts().unwrap().is_empty());
-        let store = EventStore::open(member_path).unwrap();
+        let mut store = EventStore::open(member_path).unwrap();
         let event_ids = store
             .event_ids_after(group_id, owner.peer_id(), 0, 4)
             .unwrap();
@@ -5093,6 +5109,15 @@ mod tests {
             store.get_event(event_ids[2]).unwrap().unwrap().kind(),
             EventKind::MemberAdded
         );
+        // The pre-join message is recorded as permanently unreadable and is
+        // not decrypted again on later pulls.
+        assert!(store
+            .unmaterialized_message_events(group_id, 10)
+            .unwrap()
+            .is_empty());
+        let before_join = store.get_event(event_ids[1]).unwrap().unwrap();
+        assert_eq!(before_join.kind(), EventKind::MessageCreated);
+        assert!(!store.record_unreadable_message_event(&before_join).unwrap());
     }
 
     #[test]

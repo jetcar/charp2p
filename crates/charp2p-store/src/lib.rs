@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -1495,9 +1495,10 @@ impl EventStore {
              LEFT JOIN applied_message_edits x ON x.event_id = e.event_id
              LEFT JOIN applied_invite_permissions p ON p.event_id = e.event_id
              LEFT JOIN applied_message_deletions d ON d.event_id = e.event_id
+             LEFT JOIN unreadable_message_events u ON u.event_id = e.event_id
              WHERE e.group_id = ?1 AND m.event_id IS NULL AND h.event_id IS NULL
                AND g.event_id IS NULL AND x.event_id IS NULL AND p.event_id IS NULL
-               AND d.event_id IS NULL
+               AND d.event_id IS NULL AND u.event_id IS NULL
                AND (e.author_id > ?2 OR (e.author_id = ?2 AND e.author_sequence > ?3))
              ORDER BY e.author_id, e.author_sequence",
         )?;
@@ -1526,6 +1527,23 @@ impl EventStore {
             }
         }
         Ok(events)
+    }
+
+    /// Records a stored message-like event this device can never decrypt
+    /// (pre-join or past-epoch ciphertext, or a malformed MLS message) so it
+    /// is no longer returned by [`Self::unmaterialized_message_events`].
+    /// Returns whether the event was stored and newly recorded.
+    pub fn record_unreadable_message_event(
+        &mut self,
+        event: &SignedEvent,
+    ) -> Result<bool, StoreError> {
+        let inserted = self.connection.execute(
+            "INSERT INTO unreadable_message_events (event_id, group_id)
+             SELECT event_id, group_id FROM events WHERE event_id = ?1
+             ON CONFLICT(event_id) DO NOTHING",
+            [event.id().as_bytes().as_slice()],
+        )?;
+        Ok(inserted == 1)
     }
 
     /// Returns verified MLS commits (membership changes and owner key
@@ -2739,7 +2757,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=28 => {}
+            6..=29 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3152,6 +3170,20 @@ impl EventStore {
                     group_id BLOB NOT NULL,
                     author_id BLOB NOT NULL,
                     PRIMARY KEY(group_id, author_id)
+                 ) STRICT;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 29 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS unreadable_message_events (
+                    event_id BLOB PRIMARY KEY NOT NULL
+                        CHECK(length(event_id) = 32)
+                        REFERENCES events(event_id) ON DELETE CASCADE,
+                    group_id BLOB NOT NULL
                  ) STRICT;",
             )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -4973,6 +5005,31 @@ mod tests {
             ),
             Err(StoreError::SequenceTooLarge(u64::MAX))
         ));
+    }
+
+    #[test]
+    fn unreadable_message_events_are_recorded_once_and_skipped() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let unreadable = message_event(&author, &group, 1, b"Pre-join ciphertext");
+        let pending = message_event(&author, &group, 2, b"Future-epoch ciphertext");
+        let unstored = message_event(&author, &group, 3, b"Unstored ciphertext");
+        store.put_event(&unreadable).unwrap();
+        store.put_event(&pending).unwrap();
+
+        assert!(store.record_unreadable_message_event(&unreadable).unwrap());
+        assert!(!store.record_unreadable_message_event(&unreadable).unwrap());
+        assert!(!store.record_unreadable_message_event(&unstored).unwrap());
+        assert_eq!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .iter()
+                .map(|event| event.id())
+                .collect::<Vec<_>>(),
+            vec![pending.id()]
+        );
     }
 
     #[test]

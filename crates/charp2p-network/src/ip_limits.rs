@@ -51,7 +51,7 @@ impl Behaviour {
 
 /// Returns the direct remote IP address, or `None` for relayed or
 /// non-IP addresses.
-fn direct_ip(address: &Multiaddr) -> Option<IpAddr> {
+pub(crate) fn direct_ip(address: &Multiaddr) -> Option<IpAddr> {
     if address
         .iter()
         .any(|protocol| matches!(protocol, Protocol::P2pCircuit))

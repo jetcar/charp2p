@@ -2,6 +2,7 @@
 
 //! Portable libp2p transport and peer-discovery foundation for CharP2P.
 
+mod byte_limits;
 mod invite_codec;
 mod ip_limits;
 mod join_codec;
@@ -18,11 +19,13 @@ use charp2p_core::{
 };
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, allow_block_list, connection_limits, dcutr, identify,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, Transport, allow_block_list, connection_limits,
+    core::{muxing::StreamMuxerBox, transport::Boxed, upgrade},
+    dcutr, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
-    noise, ping, relay, request_response,
+    noise, ping, quic, relay, request_response,
     swarm::{
         NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle,
         dial_opts::DialOpts,
@@ -31,7 +34,12 @@ use libp2p::{
 };
 use thiserror::Error;
 
-use crate::{invite_codec::InviteCodec, join_codec::JoinCodec, request_limits::PeerRequestLimiter};
+use crate::{
+    byte_limits::{ByteRate, InboundByteLimiter},
+    invite_codec::InviteCodec,
+    join_codec::JoinCodec,
+    request_limits::PeerRequestLimiter,
+};
 
 const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 /// Kademlia protocol name that keeps the CharP2P DHT separate from the IPFS
@@ -60,6 +68,18 @@ const MAX_ESTABLISHED_INCOMING_CONNECTIONS_PER_IP: u32 = 16;
 /// synchronization requests from one peer, then refill at the per-second rate.
 const MAX_INBOUND_REQUEST_BURST_PER_PEER: u32 = 64;
 const MAX_INBOUND_REQUESTS_PER_PEER_PER_SECOND: u32 = 8;
+/// Serving nodes read at most this many bytes from one peer across its direct
+/// connections; the burst fits one maximum-size synchronization request.
+const INBOUND_BYTES_PER_PEER: ByteRate = ByteRate {
+    burst: 4 * MEBIBYTE,
+    per_second: MEBIBYTE,
+};
+/// Serving nodes read at most this many bytes from one remote IP address
+/// across its direct connections.
+const INBOUND_BYTES_PER_IP: ByteRate = ByteRate {
+    burst: 16 * MEBIBYTE,
+    per_second: 4 * MEBIBYTE,
+};
 /// Provider records expire quickly; online advertisers republish well
 /// within the lifetime and the app refreshes its own publication every five
 /// minutes.
@@ -191,6 +211,35 @@ fn serving_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS))
         .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS))
         .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+}
+
+/// Builds the TCP (Noise and Yamux) and QUIC transports. Serving nodes wrap
+/// each direct connection so reads stay within the per-peer and per-IP byte
+/// rates; client nodes read without a byte bound.
+fn direct_transport(
+    identity: &Keypair,
+    byte_limits: Option<InboundByteLimiter>,
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>, Box<dyn std::error::Error + Send + Sync>> {
+    let tcp = tcp::tokio::Transport::new(tcp::Config::default())
+        .upgrade(upgrade::Version::V1Lazy)
+        .authenticate(noise::Config::new(identity)?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let quic = quic::tokio::Transport::new(quic::Config::new(identity))
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    Ok(tcp
+        .or_transport(quic)
+        .map(move |either, endpoint| {
+            let (peer, muxer) = either.into_inner();
+            match &byte_limits {
+                Some(limits) => (
+                    peer,
+                    StreamMuxerBox::new(limits.wrap(peer, &endpoint, muxer)),
+                ),
+                None => (peer, muxer),
+            }
+        })
+        .boxed())
 }
 
 /// Relay capacity chosen by a routing node operator or an opted-in desktop
@@ -350,15 +399,12 @@ impl NetworkNode {
                 MAX_INBOUND_REQUESTS_PER_PEER_PER_SECOND,
             )
         });
+        let byte_limits = (dht_mode == kad::Mode::Server)
+            .then(|| InboundByteLimiter::new(INBOUND_BYTES_PER_PEER, INBOUND_BYTES_PER_IP));
         let swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
-            .expect("TCP transport construction is infallible")
-            .with_quic()
+            .with_other_transport(|identity| direct_transport(identity, byte_limits))
+            .expect("direct transport construction is infallible")
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .expect("relay transport construction is infallible")
             .with_behaviour(|identity, relay_client| {

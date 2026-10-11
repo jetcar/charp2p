@@ -803,8 +803,11 @@ most 128 pending and 1,024 established inbound connections, 16 established
 direct inbound connections per remote IP address, and 4 established
 connections per peer. They also bound each peer's inbound join, invitation,
 and synchronization requests to a shared burst of 64 refilled at 8 per second,
-answering excess requests `busy`. Client nodes dial only the peers they need
-and keep no inbound bound.
+answering excess requests `busy`. They read each peer's direct connections
+at up to 1 MiB per second after a 4 MiB burst, and each remote IP address's
+direct connections at up to 4 MiB per second after a 16 MiB burst, delaying
+reads beyond that (ADR-050). Client nodes dial only the peers they need and
+keep no inbound bound.
 Load-tested quotas, metrics, and deployment
 packaging remain production gates.
 

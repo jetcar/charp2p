@@ -22,7 +22,7 @@ use charp2p_mls::{
     prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
     validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
     validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
-    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
 };
 use charp2p_store::{
     EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
@@ -1991,19 +1991,42 @@ impl MlsProviderService {
         let protocol: ProtocolMessage = message
             .try_into_protocol_message()
             .map_err(|_| MaterializeMessageError::PermanentlyUnreadable)?;
-        // Without past-epoch secrets, ciphertext from an epoch this device
-        // already left (or never joined) cannot be read again; later epochs
-        // stay pending until their commit is applied.
-        if protocol.group_id() != group.group_id() || protocol.epoch() < group.epoch() {
+        // Only the last MAX_PAST_EPOCHS epochs keep message secrets
+        // (ADR-048); older ciphertext, or ciphertext from before this device
+        // joined, cannot be read again. Later epochs stay pending until their
+        // commit is applied.
+        if protocol.group_id() != group.group_id()
+            || protocol
+                .epoch()
+                .as_u64()
+                .saturating_add(MAX_PAST_EPOCHS as u64)
+                < group.epoch().as_u64()
+        {
             return Err(MaterializeMessageError::PermanentlyUnreadable);
         }
+        // A past epoch never becomes more readable, so its failures are final.
+        let past_epoch = protocol.epoch() < group.epoch();
+        let unreadable = if past_epoch {
+            MaterializeMessageError::PermanentlyUnreadable
+        } else {
+            MaterializeMessageError::Unreadable
+        };
         let processed = group
             .process_message(&*provider, protocol)
-            .map_err(|_| MaterializeMessageError::Unreadable)?;
-        let sender = device_id_from_credential(processed.credential())
-            .map_err(|_| MaterializeMessageError::Unreadable)?;
+            .map_err(|_| unreadable)?;
+        let sender = device_id_from_credential(processed.credential()).map_err(|_| unreadable)?;
         if sender != event.author_id() {
-            return Err(MaterializeMessageError::Unreadable);
+            return Err(unreadable);
+        }
+        // Retained secrets read late messages only from current members, so a
+        // removed device cannot author into an epoch it once belonged to.
+        if past_epoch
+            && !group.members().any(|member| {
+                device_id_from_credential(&member.credential)
+                    .is_ok_and(|device_id| device_id == sender)
+            })
+        {
+            return Err(MaterializeMessageError::PermanentlyUnreadable);
         }
         let ProcessedMessageContent::ApplicationMessage(application) = processed.into_content()
         else {
@@ -3012,6 +3035,7 @@ enum MlsProviderMutationError<E> {
     Unavailable(&'static str),
 }
 
+#[derive(Clone, Copy)]
 enum MaterializeMessageError {
     Unreadable,
     /// The event can never be decrypted on this device and is recorded so
@@ -3297,7 +3321,7 @@ mod tests {
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
         merge_prepared_member_admission, prepare_profile_key_package,
         prepare_profile_member_admission, stage_profile_welcome, validate_group_profile,
-        ProfileProvider, CIPHERSUITE,
+        ProfileProvider, CIPHERSUITE, MAX_PAST_EPOCHS,
     };
     use charp2p_sync::PullSession;
     use openmls::prelude::{
@@ -5544,6 +5568,109 @@ mod tests {
         let materialized = owner_store.encrypted_messages(group_id).unwrap().messages;
         assert_eq!(materialized.len(), 1);
         assert_eq!(materialized[0].event_id, *message.id().as_bytes());
+    }
+
+    /// Admits one member and returns the services plus a message the member
+    /// authored in the admission epoch but has not yet delivered.
+    fn late_member_message(
+        directory: &std::path::Path,
+    ) -> (
+        MlsProviderService,
+        DeviceIdentity,
+        PeerId,
+        PeerId,
+        SignedEvent,
+    ) {
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let invitation = invitation(&group_identity);
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let owner_service = test_service(directory.join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let member_service = test_service(directory.join("member.sqlite3"));
+        let request = member_service
+            .prepare_join_request(member.peer_id(), &invitation)
+            .unwrap();
+        let welcome = owner_service
+            .admit_member_at(
+                group_id,
+                &owner,
+                member.peer_id(),
+                request.key_package(),
+                42,
+            )
+            .unwrap();
+        member_service
+            .complete_join(group_id, welcome.welcome().unwrap())
+            .unwrap();
+        let message = member_service
+            .create_message_at(group_id, &member, "Written offline", 43)
+            .unwrap();
+        (owner_service, owner, group_id, member.peer_id(), message)
+    }
+
+    fn deliver_late_message(
+        owner_service: &MlsProviderService,
+        group_id: PeerId,
+        message: &SignedEvent,
+    ) -> usize {
+        let mut store = owner_service.store.lock().unwrap();
+        store.put_event(message).unwrap();
+        let mut provider = owner_service.provider.lock().unwrap();
+        owner_service
+            .materialize_pending_messages(&mut provider, &mut store, group_id)
+            .unwrap();
+        let materialized = store.encrypted_messages(group_id).unwrap().messages;
+        assert!(store
+            .unmaterialized_message_events(group_id, 10)
+            .unwrap()
+            .is_empty());
+        materialized.len()
+    }
+
+    #[test]
+    fn late_messages_from_current_members_are_read_within_the_past_epoch_window() {
+        let directory = tempdir().unwrap();
+        let (owner_service, owner, group_id, _, message) = late_member_message(directory.path());
+        for at in 0..MAX_PAST_EPOCHS as u64 {
+            owner_service
+                .refresh_group_keys_at(group_id, &owner, 44 + at)
+                .unwrap();
+        }
+
+        assert_eq!(deliver_late_message(&owner_service, group_id, &message), 1);
+    }
+
+    #[test]
+    fn late_messages_older_than_the_past_epoch_window_are_recorded_unreadable() {
+        let directory = tempdir().unwrap();
+        let (owner_service, owner, group_id, _, message) = late_member_message(directory.path());
+        for at in 0..=MAX_PAST_EPOCHS as u64 {
+            owner_service
+                .refresh_group_keys_at(group_id, &owner, 44 + at)
+                .unwrap();
+        }
+
+        assert_eq!(deliver_late_message(&owner_service, group_id, &message), 0);
+        let mut store = owner_service.store.lock().unwrap();
+        assert!(!store.record_unreadable_message_event(&message).unwrap());
+    }
+
+    #[test]
+    fn late_messages_from_removed_members_are_recorded_unreadable() {
+        let directory = tempdir().unwrap();
+        let (owner_service, owner, group_id, member_id, message) =
+            late_member_message(directory.path());
+        owner_service
+            .remove_member_at(group_id, &owner, member_id, 44)
+            .unwrap();
+
+        assert_eq!(deliver_late_message(&owner_service, group_id, &message), 0);
+        let mut store = owner_service.store.lock().unwrap();
+        assert!(!store.record_unreadable_message_event(&message).unwrap());
     }
 
     #[test]

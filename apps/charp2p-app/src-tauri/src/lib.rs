@@ -1010,9 +1010,11 @@ async fn network_status(
 }
 
 /// Reports the Groups page connection state of each joined group from its
-/// latest synchronization attempt in this session.
+/// latest synchronization attempt in this session, and of each owned group
+/// from the members connected to its owner advertising node now.
 #[tauri::command]
-fn group_connection_states(
+async fn group_connection_states(
+    group_service: tauri::State<'_, Arc<GroupService>>,
     pending_service: tauri::State<'_, PendingInvitationService>,
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<Vec<GroupConnectionState>, String> {
@@ -1022,7 +1024,19 @@ fn group_connection_states(
         .iter()
         .filter_map(|group| group.group_id.parse().ok())
         .collect::<Vec<_>>();
-    Ok(network_service.group_connection_states(&group_ids))
+    let owned_ids = group_service
+        .list()
+        .map_err(str::to_owned)?
+        .iter()
+        .filter_map(|group| group.group_id.parse().ok())
+        .collect::<Vec<_>>();
+    let mut states = network_service.group_connection_states(&group_ids);
+    states.extend(
+        network_service
+            .owned_group_connection_states(&owned_ids)
+            .await,
+    );
+    Ok(states)
 }
 
 /// Reports whether the background provider advertises an owned group's

@@ -874,6 +874,7 @@ dependencies = [
  "futures",
  "libp2p",
  "thiserror 2.0.21",
+ "tokio",
  "zeroize",
 ]
 

@@ -3709,10 +3709,10 @@ function App() {
     const ownerDeviceId = joined?.inviterDeviceId ?? profile?.peerId ?? "";
     const ownerName = joined?.inviterName ?? profile?.deviceName ?? "Owner";
     const memberCount = groupMembers.length;
-    const connectionState = joined ? connectionStates[joined.groupId] : undefined;
+    const connectionState = connectionStates[group.groupId];
     const connection = joined
       ? connectionState ? groupConnectionDescription(connectionState) : "Connection not checked"
-      : "You own this group";
+      : `You own this group${connectionState ? ` · ${groupConnectionDescription(connectionState)}` : ""}`;
     const sync = joined
       ? joinedSyncPill(connectionState, joined.lastSynchronizedAtUnix)
       : ownerSyncPill(advertisement?.status ?? null, advertisementRetrying);

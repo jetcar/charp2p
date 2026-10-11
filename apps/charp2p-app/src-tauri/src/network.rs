@@ -56,6 +56,8 @@ const EVENT_NOTICE_CAPACITY: usize = 16;
 /// Most listen addresses of the owner advertising node kept as invitation
 /// hint candidates.
 const MAX_OWNER_LISTEN_ADDRESSES: usize = 16;
+/// Connected peers the owner advertising node tracks for owned group states.
+const MAX_OWNER_PEERS: usize = 1024;
 /// Largest binary multiaddress an invitation accepts as a hint (ADR-037).
 const MAX_ADDRESS_HINT_BYTES: usize = 256;
 
@@ -440,6 +442,9 @@ pub struct NetworkService {
     /// Current listen addresses of the owner advertising node, without the
     /// device peer ID, offered as invitation address hints (ADR-037).
     owner_addresses: Arc<std::sync::Mutex<Vec<Multiaddr>>>,
+    /// Peers currently connected to the owner advertising node and their
+    /// best connection path, from which owned groups report their state.
+    owner_peers: Arc<std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>>,
     /// Whether owner and member nodes also use mDNS on the local network.
     lan_discovery: bool,
     /// Routing peers recently reached by this device (ADR-046).
@@ -522,6 +527,7 @@ impl NetworkService {
             existing.task.abort();
         }
         clear_owner_addresses(&self.owner_addresses);
+        clear_owner_peers(&self.owner_peers);
     }
 
     /// Remembers routing peers reached by client nodes and uses them as extra
@@ -622,6 +628,7 @@ impl NetworkService {
             synchronization,
             invite_requests: Arc::new(RejectingInviteRequestService),
             owner_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
+            owner_peers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             lan_discovery: true,
             routing_peers: None,
         })
@@ -865,6 +872,42 @@ impl NetworkService {
             .collect()
     }
 
+    /// Reports the connection state of each owned group from the owner
+    /// advertising node: whether it runs and which current members are
+    /// connected to it now.
+    pub async fn owned_group_connection_states(
+        &self,
+        group_ids: &[PeerId],
+    ) -> Vec<GroupConnectionState> {
+        let serving = self
+            .advertisement
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| !active.task.is_finished());
+        let connected = self
+            .owner_peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let observed_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        group_ids
+            .iter()
+            .map(|group_id| {
+                // The advertising node never connects to its own device.
+                let members = self.synchronization.notice_recipients(*group_id);
+                GroupConnectionState {
+                    group_id: group_id.to_string(),
+                    state: owned_group_state(serving, &members, &connected),
+                    discovery: None,
+                    observed_at_unix,
+                }
+            })
+            .collect()
+    }
+
     /// Reports whether the background provider currently advertises every
     /// retained rendezvous key of one owned group.
     pub async fn owned_group_discovery_status(
@@ -956,6 +999,7 @@ impl NetworkService {
             existing.task.abort();
         }
         clear_owner_addresses(&self.owner_addresses);
+        clear_owner_peers(&self.owner_peers);
 
         // The owner device also answers mDNS so members on the same local
         // network can reach it without a relay.
@@ -979,6 +1023,12 @@ impl NetworkService {
                 match node.next_event().await {
                     NetworkEvent::Listening { address } => {
                         record_owner_address(&self.owner_addresses, address);
+                    }
+                    NetworkEvent::PeerConnected { peer_id, path, .. } => {
+                        record_owner_peer(&self.owner_peers, peer_id, path);
+                    }
+                    NetworkEvent::PeerDisconnected { peer_id } if !node.is_connected(peer_id) => {
+                        forget_owner_peer(&self.owner_peers, peer_id);
                     }
                     NetworkEvent::GroupAnnounced { key: announced }
                         if pending.contains(&announced) =>
@@ -1040,6 +1090,7 @@ impl NetworkService {
         });
         if let Err(error) = announced {
             clear_owner_addresses(&self.owner_addresses);
+            clear_owner_peers(&self.owner_peers);
             return Err(error);
         }
 
@@ -1048,6 +1099,7 @@ impl NetworkService {
         let synchronization = Arc::clone(&self.synchronization);
         let invite_requests = Arc::clone(&self.invite_requests);
         let owner_addresses = Arc::clone(&self.owner_addresses);
+        let owner_peers = Arc::clone(&self.owner_peers);
         let mut stored_events = self.stored_events.subscribe();
         let task_keys = keys.clone();
         let task = tokio::spawn(async move {
@@ -1085,6 +1137,14 @@ impl NetworkService {
                             } if task_keys.contains(&failed) => break,
                             NetworkEvent::Listening { address } => {
                                 record_owner_address(&owner_addresses, address);
+                            }
+                            NetworkEvent::PeerConnected { peer_id, path, .. } => {
+                                record_owner_peer(&owner_peers, peer_id, path);
+                            }
+                            NetworkEvent::PeerDisconnected { peer_id }
+                                if !node.is_connected(peer_id) =>
+                            {
+                                forget_owner_peer(&owner_peers, peer_id);
                             }
                             NetworkEvent::SyncRequestReceived {
                                 peer_id,
@@ -1161,6 +1221,7 @@ impl NetworkService {
                 }
             }
             clear_owner_addresses(&owner_addresses);
+            clear_owner_peers(&owner_peers);
         });
         *active = Some(ActiveAdvertisement {
             keys,
@@ -2570,6 +2631,65 @@ fn clear_owner_addresses(addresses: &std::sync::Mutex<Vec<Multiaddr>>) {
     }
 }
 
+/// Records a connection to the owner advertising node, keeping a direct or
+/// LAN path over a relayed one while the peer has both.
+fn record_owner_peer(
+    peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>,
+    peer_id: PeerId,
+    path: ConnectionPath,
+) {
+    let mut peers = peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if peers.contains_key(&peer_id) || peers.len() < MAX_OWNER_PEERS {
+        let best = match peers.get(&peer_id) {
+            Some(ConnectionPath::Relayed) | None => path,
+            Some(existing) if path == ConnectionPath::Relayed => *existing,
+            Some(_) => path,
+        };
+        peers.insert(peer_id, best);
+    }
+}
+
+/// Forgets a peer whose last connection to the owner advertising node closed.
+fn forget_owner_peer(peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>, peer_id: PeerId) {
+    peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&peer_id);
+}
+
+fn clear_owner_peers(peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>) {
+    peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Connection state of an owned group: offline while this owner device does
+/// not serve it, online or relayed while a current member is connected
+/// (direct or LAN paths win), and otherwise waiting for members.
+fn owned_group_state(
+    serving: bool,
+    members: &[PeerId],
+    connected: &BTreeMap<PeerId, ConnectionPath>,
+) -> &'static str {
+    if !serving {
+        return "offline";
+    }
+    let paths = members
+        .iter()
+        .filter_map(|member| connected.get(member))
+        .collect::<Vec<_>>();
+    if paths.iter().any(|path| **path != ConnectionPath::Relayed) {
+        "online"
+    } else if paths.is_empty() {
+        "waiting"
+    } else {
+        "relayed"
+    }
+}
+
 /// Strips the trailing device peer ID, which joiners append from the pinned
 /// inviter instead, and rejects loopback, unspecified, and oversized
 /// addresses that cannot serve as an invitation hint.
@@ -2652,6 +2772,7 @@ pub(crate) fn parse_bootstrap_peer(input: &str) -> Result<BootstrapPeer, &'stati
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -2676,8 +2797,9 @@ mod tests {
     use crate::routing_peers::RoutingPeersService;
 
     use super::{
-        address_hint, answer_member_sync_request, discovery_outcome, join_response,
-        parse_bootstrap_peer, pinned_address_hints, record_owner_address, select_address_hints,
+        address_hint, answer_member_sync_request, clear_owner_peers, discovery_outcome,
+        forget_owner_peer, join_response, owned_group_state, parse_bootstrap_peer,
+        pinned_address_hints, record_owner_address, record_owner_peer, select_address_hints,
         upgraded_path, AdvertisementResult, BootstrapNodeStatus, JoinRequestAuthorization,
         JoinRequestAuthorizer, MemberAdmissionService, NetworkService, NetworkStatus,
         PeerSearchResult, PendingJoinService, PullSession, SessionProgress, SynchronizationService,
@@ -2934,6 +3056,36 @@ mod tests {
             self.lan_discovery = false;
             self
         }
+    }
+
+    #[test]
+    fn owned_group_state_follows_serving_and_connected_members() {
+        let member = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let stranger = DeviceIdentity::generate().peer_id();
+        let peers = std::sync::Mutex::new(BTreeMap::new());
+        let members = [member, other];
+        let state =
+            |serving| owned_group_state(serving, &members, &peers.lock().expect("peers lock"));
+
+        assert_eq!(state(true), "waiting");
+        // A connected peer that is not a current member does not count.
+        record_owner_peer(&peers, stranger, ConnectionPath::Direct);
+        assert_eq!(state(true), "waiting");
+        record_owner_peer(&peers, member, ConnectionPath::Relayed);
+        assert_eq!(state(true), "relayed");
+        assert_eq!(state(false), "offline");
+        // A hole-punched direct connection wins over the relayed one and a
+        // later relayed connection does not downgrade it.
+        record_owner_peer(&peers, member, ConnectionPath::Direct);
+        record_owner_peer(&peers, member, ConnectionPath::Relayed);
+        assert_eq!(state(true), "online");
+        forget_owner_peer(&peers, member);
+        assert_eq!(state(true), "waiting");
+        record_owner_peer(&peers, other, ConnectionPath::Lan);
+        assert_eq!(state(true), "online");
+        clear_owner_peers(&peers);
+        assert_eq!(state(true), "waiting");
     }
 
     #[test]

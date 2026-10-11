@@ -169,22 +169,24 @@ An online group member advertises a provider record for an opaque key:
 
 ```text
 discovery_key = BLAKE3(
-  "charp2p-rendezvous-v1" || group_id || discovery_secret
+  "charp2p-rendezvous-v1\0" || group_id_peer_id_bytes || discovery_secret
 )
 ```
 
-The DHT maps that key to signed peer provider records. A record contains only:
+The domain string ends in one NUL byte, and `group_id_peer_id_bytes` is the
+group root's binary libp2p peer ID encoding. The 32-byte result is used
+unchanged as the Kademlia record key.
 
-```text
-protocol version
-provider peer ID
-dialable or relayed multiaddresses
-expiry
-signature
-```
+The DHT maps that key to standard libp2p Kademlia provider records; CharP2P
+defines no record format of its own. A provider record holds only the
+provider peer ID and its dialable or relayed multiaddresses, with expiry
+managed by the serving node that stores it. Provider records are not signed by
+the provider: their addresses are only dial hints. Authenticity comes from the
+authenticated libp2p connection, whose remote peer ID must equal the inviter
+device peer ID pinned under the group-root signature (see below).
 
-It contains no group name, membership, messages, or group encryption keys.
-The 32-byte result is the opaque Kademlia provider-record key preimage. Records
+A record contains no group name, membership, messages, or group encryption
+keys. Records
 expire quickly and online peers periodically re-advertise: nodes keep received
 provider records for 30 minutes and republish their own every 10 minutes.
 Serving nodes filter DHT inserts: they store only provider records whose key
@@ -468,6 +470,16 @@ Wall-clock time is display metadata and cannot determine authorization or
 conflict resolution. Authorization derives from the signed membership state
 referenced by the event.
 
+Ordering and completeness use each author's gap-free `author_sequence`, not
+the causal parents. `causal_parent_ids` holds up to 16 unique event IDs
+(ADR-003) and is signed with the body, but the MVP does not require parents to
+be present before storing an event, does not hold events back for missing
+parents, and derives no order from them. Clients name the author's own
+previous event as the single parent (none for an author's first event). Events
+from one author are applied in sequence order, and a gap in an author's
+sequence stops that author's later events from being treated as
+synchronized.
+
 MVP event types are:
 
 ```text
@@ -566,7 +578,8 @@ Summaries contain at most 1,024 authors. Signed-event responses contain at most
 Requirements:
 
 - Receiving the same event repeatedly is harmless.
-- Events may arrive out of order and wait for missing parents.
+- Events may arrive out of order; an author's events after a sequence gap
+  wait until the gap is filled.
 - An author sequence cannot be reused with different content.
 - Events from unauthorized or revoked devices are rejected according to the
   membership state in which they were authored. When the owner removes a

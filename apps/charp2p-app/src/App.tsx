@@ -119,7 +119,11 @@ type SynchronizeGroupResult = {
   uploadedEvents: number;
   synchronizedAtUnix: number;
   connectionType: "direct" | "lan" | "relayed";
+  // How this device's membership commits compared with the peer's before
+  // the pull; null when the peer sent no summary.
+  membership: MembershipComparisonName | null;
 };
+type MembershipComparisonName = "same" | "remoteNewer" | "remoteStale" | "diverged";
 
 type CreatedMessage = {
   eventId: string;
@@ -492,6 +496,13 @@ function connectionTypeDescription(connectionType: "direct" | "lan" | "relayed")
   if (connectionType === "relayed") return "Relay";
   if (connectionType === "lan") return "Local network";
   return "Direct";
+}
+
+function membershipComparisonDescription(membership: MembershipComparisonName | null) {
+  if (membership === "remoteNewer") return " · membership updated";
+  if (membership === "remoteStale") return " · peer has older membership";
+  if (membership === "diverged") return " · ⚠ membership differs from peer";
+  return "";
 }
 
 function groupConnectionDescription(state: GroupConnectionStateName) {
@@ -3798,8 +3809,8 @@ function App() {
                     ? "○ Synchronizing…"
                     : synchronizationResult
                       ? synchronizationResult.status === "memberSynchronized"
-                        ? `✓ ${synchronizationResult.synchronizedEvents} received from a member · owner offline · ${connectionTypeDescription(synchronizationResult.connectionType)}`
-                        : `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}`
+                        ? `✓ ${synchronizationResult.synchronizedEvents} received from a member · owner offline · ${connectionTypeDescription(synchronizationResult.connectionType)}${membershipComparisonDescription(synchronizationResult.membership)}`
+                        : `✓ ${synchronizationResult.synchronizedEvents} received · ${synchronizationResult.uploadedEvents} shared · ${connectionTypeDescription(synchronizationResult.connectionType)}${membershipComparisonDescription(synchronizationResult.membership)}`
                       : "○ Sync not checked"}
                 </span>
               </div>

@@ -13,7 +13,7 @@ use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileP
 use charp2p_network::{
     ConnectionPath, NetworkEvent, NetworkNode, OutboundSyncRequestId, RelayLimits,
 };
-use charp2p_sync::{PullSession, SessionProgress};
+use charp2p_sync::{MembershipComparison, PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
 use tokio::{
@@ -356,6 +356,9 @@ pub struct SynchronizeGroupResult {
     pub uploaded_events: usize,
     pub synchronized_at_unix: u64,
     pub connection_type: &'static str,
+    /// How this device's membership commits compared with the peer's before
+    /// the pull, or `None` when the peer sent no summary.
+    pub membership: Option<&'static str>,
     /// Address that reached the group provider, remembered for the next
     /// synchronization; never sent to the frontend.
     #[serde(skip)]
@@ -1682,7 +1685,7 @@ impl NetworkService {
                 &mut ConnectionPath::Direct,
             )
             .await
-            .unwrap_or(0);
+            .map_or(0, |(inserted, _)| inserted);
         Ok(JoinGroupResult {
             status: "joined",
             group_id: invitation.group_id().to_string(),
@@ -1802,7 +1805,7 @@ impl NetworkService {
         // the remembered address stays the relayed one, which keeps working
         // after the NAT mapping of the direct connection expires.
         let initial_path = connection_path;
-        let synchronized_events = self
+        let (synchronized_events, membership) = self
             .pull_from_connected_peer(
                 &mut node,
                 expected_peer,
@@ -1844,6 +1847,7 @@ impl NetworkService {
                 .map_err(|_| "system_clock_invalid")?
                 .as_secs(),
             connection_type: connection_type_name(connection_path),
+            membership: membership.map(membership_comparison_name),
             peer_address,
         })
     }
@@ -1964,7 +1968,7 @@ impl NetworkService {
                 .pull_from_connected_peer(&mut node, provider, group_id, Some(bandwidth), &mut path)
                 .await
             {
-                Ok(synchronized_events) => {
+                Ok((synchronized_events, membership)) => {
                     return Ok(SynchronizeGroupResult {
                         status: "memberSynchronized",
                         group_id: group_id.to_string(),
@@ -1975,6 +1979,7 @@ impl NetworkService {
                             .map_err(|_| "system_clock_invalid")?
                             .as_secs(),
                         connection_type: connection_type_name(path),
+                        membership: membership.map(membership_comparison_name),
                         peer_address,
                     });
                 }
@@ -2168,7 +2173,7 @@ impl NetworkService {
         group_id: PeerId,
         bandwidth: Option<&BandwidthService>,
         path: &mut ConnectionPath,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<(usize, Option<MembershipComparison>), &'static str> {
         let (mut session, mut request) = PullSession::start(group_id);
         let mut inserted = 0_usize;
         for _ in 0..MAX_SYNC_EXCHANGES {
@@ -2194,7 +2199,7 @@ impl NetworkService {
                 .advance_pull_session(&mut session, &response)?;
             inserted = inserted.saturating_add(progress.applied.inserted);
             if progress.complete {
-                return Ok(inserted);
+                return Ok((inserted, session.membership_comparison()));
             }
             request = progress.next_request.ok_or("synchronization_failed")?;
         }
@@ -2593,6 +2598,16 @@ fn remaining_until_expiry(expires_at_unix: u64) -> Result<Duration, &'static str
         .map_err(|_| "invitation_expired")
 }
 
+/// Names a membership comparison for the frontend.
+fn membership_comparison_name(comparison: MembershipComparison) -> &'static str {
+    match comparison {
+        MembershipComparison::Same => "same",
+        MembershipComparison::RemoteNewer => "remoteNewer",
+        MembershipComparison::RemoteStale => "remoteStale",
+        MembershipComparison::Diverged => "diverged",
+    }
+}
+
 fn connection_type_name(path: ConnectionPath) -> &'static str {
     match path {
         ConnectionPath::Direct => "direct",
@@ -2798,13 +2813,14 @@ mod tests {
 
     use super::{
         address_hint, answer_member_sync_request, clear_owner_peers, discovery_outcome,
-        forget_owner_peer, join_response, owned_group_state, parse_bootstrap_peer,
-        pinned_address_hints, record_owner_address, record_owner_peer, select_address_hints,
-        upgraded_path, AdvertisementResult, BootstrapNodeStatus, JoinRequestAuthorization,
-        JoinRequestAuthorizer, MemberAdmissionService, NetworkService, NetworkStatus,
-        PeerSearchResult, PendingJoinService, PullSession, SessionProgress, SynchronizationService,
-        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
-        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
+        forget_owner_peer, join_response, membership_comparison_name, owned_group_state,
+        parse_bootstrap_peer, pinned_address_hints, record_owner_address, record_owner_peer,
+        select_address_hints, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
+        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService,
+        MembershipComparison, NetworkService, NetworkStatus, PeerSearchResult, PendingJoinService,
+        PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
+        MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -3639,6 +3655,26 @@ mod tests {
         assert_eq!(
             discovery_outcome(&Err::<(), _>("synchronization_bandwidth_limited")),
             None
+        );
+    }
+
+    #[test]
+    fn membership_comparisons_have_frontend_names() {
+        assert_eq!(
+            membership_comparison_name(MembershipComparison::Same),
+            "same"
+        );
+        assert_eq!(
+            membership_comparison_name(MembershipComparison::RemoteNewer),
+            "remoteNewer"
+        );
+        assert_eq!(
+            membership_comparison_name(MembershipComparison::RemoteStale),
+            "remoteStale"
+        );
+        assert_eq!(
+            membership_comparison_name(MembershipComparison::Diverged),
+            "diverged"
         );
     }
 

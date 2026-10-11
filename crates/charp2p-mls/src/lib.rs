@@ -43,6 +43,12 @@ pub const PROFILE_VERSION: u16 = 1;
 pub const CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
 
+/// Number of past epochs whose message secrets a group keeps (ADR-048).
+///
+/// A message that arrives after the commit ending its epoch was applied stays
+/// readable while its epoch is within this window.
+pub const MAX_PAST_EPOCHS: usize = 4;
+
 /// Profile provider whose secret-bearing storage can be snapshotted for
 /// application-managed encrypted persistence.
 #[derive(Default)]
@@ -589,6 +595,7 @@ pub fn group_create_config() -> MlsGroupCreateConfig {
         .ciphersuite(CIPHERSUITE)
         .capabilities(profile_capabilities())
         .use_ratchet_tree_extension(true)
+        .max_past_epochs(MAX_PAST_EPOCHS)
         .with_group_context_extensions(profile_extensions())
         .build()
 }
@@ -597,7 +604,47 @@ pub fn group_create_config() -> MlsGroupCreateConfig {
 fn group_join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .use_ratchet_tree_extension(true)
+        .max_past_epochs(MAX_PAST_EPOCHS)
         .build()
+}
+
+/// Returns the join behavior stored by groups created before ADR-048, which
+/// kept no past-epoch message secrets.
+fn legacy_group_join_config() -> MlsGroupJoinConfig {
+    MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .build()
+}
+
+/// Failure while upgrading a restored group's stored join configuration.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MigrateGroupConfigError {
+    /// The stored configuration is neither the current nor the legacy profile.
+    #[error("stored MLS group configuration is outside the profile")]
+    Unsupported,
+    /// OpenMLS could not durably store the upgraded configuration.
+    #[error("upgraded MLS group configuration could not be stored")]
+    StorageFailed,
+}
+
+/// Upgrades a group restored with the legacy profile join configuration to the
+/// current one, returning whether the stored configuration changed.
+///
+/// Past-epoch message secrets start accumulating from the next applied commit.
+pub fn migrate_group_join_config<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+) -> Result<bool, MigrateGroupConfigError> {
+    if group.configuration() == &group_join_config() {
+        return Ok(false);
+    }
+    if group.configuration() != &legacy_group_join_config() {
+        return Err(MigrateGroupConfigError::Unsupported);
+    }
+    group
+        .set_configuration(provider.storage(), &group_join_config())
+        .map_err(|_| MigrateGroupConfigError::StorageFailed)?;
+    Ok(true)
 }
 
 /// Returns the capabilities that every profile key package must advertise.
@@ -1131,12 +1178,13 @@ mod tests {
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MergeKeyRefreshError,
-        MergeMemberAdmissionError, MlsWireError, PrepareKeyPackageError,
-        PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError, ProfileProvider,
-        ProfileProviderSnapshotError, StageWelcomeError, abort_prepared_member_admission,
-        decode_profile_message, device_credential, device_id_from_credential, group_create_config,
-        merge_prepared_key_refresh, merge_prepared_member_admission, prepare_profile_key_package,
+        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
+        MergeKeyRefreshError, MergeMemberAdmissionError, MigrateGroupConfigError, MlsWireError,
+        PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError,
+        ProfileProvider, ProfileProviderSnapshotError, StageWelcomeError,
+        abort_prepared_member_admission, decode_profile_message, device_credential,
+        device_id_from_credential, group_create_config, merge_prepared_key_refresh,
+        merge_prepared_member_admission, migrate_group_join_config, prepare_profile_key_package,
         prepare_profile_key_refresh, prepare_profile_member_admission,
         prepare_profile_member_removal, profile_capabilities, profile_extensions,
         stage_profile_welcome, validate_group_profile, validate_key_refresh_commit,
@@ -1600,6 +1648,154 @@ mod tests {
     }
 
     #[test]
+    fn messages_from_past_epochs_within_the_window_stay_readable() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &owner_provider);
+        let (member_credential, member_signer) = credential(member_id, &member_provider);
+        let member_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &member_provider,
+                &member_signer,
+                member_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &member_key_package,
+            member_id,
+        )
+        .unwrap();
+        let mut member_group = stage_profile_welcome(&member_provider, admission.welcome())
+            .unwrap()
+            .into_group(&member_provider)
+            .unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        validate_group_profile(&member_group).unwrap();
+
+        // One message per epoch, each followed by a refresh the member applies
+        // before reading any of them.
+        let mut messages = Vec::new();
+        for index in 0..=MAX_PAST_EPOCHS {
+            messages.push(
+                owner_group
+                    .create_message(&owner_provider, &owner_signer, &[index as u8])
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+            );
+            let refresh =
+                prepare_profile_key_refresh(&mut owner_group, &owner_provider, &owner_signer)
+                    .unwrap();
+            merge_prepared_key_refresh(&mut owner_group, &owner_provider).unwrap();
+            let processed = member_group
+                .process_message(
+                    &member_provider,
+                    decode_profile_message(refresh.commit())
+                        .unwrap()
+                        .try_into_protocol_message()
+                        .unwrap(),
+                )
+                .unwrap();
+            let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
+            else {
+                panic!("expected a staged commit");
+            };
+            member_group
+                .merge_staged_commit(&member_provider, *staged)
+                .unwrap();
+        }
+
+        let read = |group: &mut MlsGroup, message: &[u8]| {
+            group
+                .process_message(
+                    &member_provider,
+                    decode_profile_message(message)
+                        .unwrap()
+                        .try_into_protocol_message()
+                        .unwrap(),
+                )
+                .map(|processed| match processed.into_content() {
+                    ProcessedMessageContent::ApplicationMessage(application) => {
+                        application.into_bytes()
+                    }
+                    _ => panic!("expected application data"),
+                })
+        };
+        assert!(read(&mut member_group, &messages[0]).is_err());
+        for (index, message) in messages.iter().enumerate().skip(1) {
+            assert_eq!(read(&mut member_group, message).unwrap(), [index as u8]);
+        }
+    }
+
+    #[test]
+    fn legacy_group_join_config_migrates_to_the_past_epoch_window() {
+        let provider = OpenMlsRustCrypto::default();
+        let (group_credential, signer) =
+            credential(DeviceIdentity::generate().peer_id(), &provider);
+        let mut group = MlsGroup::new(
+            &provider,
+            &signer,
+            &MlsGroupCreateConfig::builder()
+                .ciphersuite(CIPHERSUITE)
+                .capabilities(profile_capabilities())
+                .use_ratchet_tree_extension(true)
+                .with_group_context_extensions(profile_extensions())
+                .build(),
+            group_credential,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_group_profile(&group),
+            Err(ProfileError::UnsupportedJoinConfiguration)
+        );
+
+        assert_eq!(migrate_group_join_config(&mut group, &provider), Ok(true));
+        validate_group_profile(&group).unwrap();
+        assert_eq!(migrate_group_join_config(&mut group, &provider), Ok(false));
+        let restored = MlsGroup::load(provider.storage(), group.group_id())
+            .unwrap()
+            .unwrap();
+        validate_group_profile(&restored).unwrap();
+
+        let (other_credential, other_signer) =
+            credential(DeviceIdentity::generate().peer_id(), &provider);
+        let mut other = MlsGroup::new(
+            &provider,
+            &other_signer,
+            &MlsGroupCreateConfig::builder()
+                .ciphersuite(CIPHERSUITE)
+                .capabilities(profile_capabilities())
+                .use_ratchet_tree_extension(true)
+                .padding_size(64)
+                .with_group_context_extensions(profile_extensions())
+                .build(),
+            other_credential,
+        )
+        .unwrap();
+        assert_eq!(
+            migrate_group_join_config(&mut other, &provider),
+            Err(MigrateGroupConfigError::Unsupported)
+        );
+    }
+
+    #[test]
     fn owner_key_refresh_advances_the_epoch_without_changing_membership() {
         let owner_provider = OpenMlsRustCrypto::default();
         let member_provider = OpenMlsRustCrypto::default();
@@ -1802,6 +1998,7 @@ mod tests {
             &MlsGroupCreateConfig::builder()
                 .ciphersuite(CIPHERSUITE)
                 .use_ratchet_tree_extension(true)
+                .max_past_epochs(MAX_PAST_EPOCHS)
                 .build(),
             owner_credential,
         )

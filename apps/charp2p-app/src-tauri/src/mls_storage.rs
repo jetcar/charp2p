@@ -18,11 +18,11 @@ use charp2p_core::{
 use charp2p_mls::{
     decode_profile_message, device_credential, device_id_from_credential, group_create_config,
     merge_prepared_key_refresh, merge_prepared_member_admission, merge_prepared_member_removal,
-    prepare_profile_key_package, prepare_profile_key_refresh, prepare_profile_member_admission,
-    prepare_profile_member_removal, stage_profile_welcome, validate_group_profile,
-    validate_key_refresh_commit, validate_profile_key_package, validate_staged_commit_profile,
-    PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
-    ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
+    migrate_group_join_config, prepare_profile_key_package, prepare_profile_key_refresh,
+    prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
+    validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
+    validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
+    ProfileKeyPackageError, ProfileProvider, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
 };
 use charp2p_store::{
     EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
@@ -248,6 +248,7 @@ impl MlsProviderService {
             }
             None => ProfileProvider::default(),
         };
+        migrate_all_group_join_configs(&provider, &store);
         record_all_group_rosters(&provider, &mut store);
         drop(_operation);
         Ok(Self {
@@ -2893,16 +2894,34 @@ fn record_group_roster(
 /// Backfills recorded authors from the current roster of every owned and
 /// joined group, covering groups created before authors were recorded.
 fn record_all_group_rosters(provider: &ProfileProvider, store: &mut EventStore) {
+    for group_id in all_group_ids(store) {
+        record_group_roster_best_effort(provider, store, group_id);
+    }
+}
+
+/// Upgrades every owned and joined group restored with the legacy profile
+/// join configuration to the past-epoch secret window (ADR-048). The upgrade
+/// lives in the in-memory provider and is persisted with the next snapshot,
+/// so it simply repeats at the next start until then.
+fn migrate_all_group_join_configs(provider: &ProfileProvider, store: &EventStore) {
+    for group_id in all_group_ids(store) {
+        if let Ok(Some(mut group)) = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&group_id.to_bytes()),
+        ) {
+            let _ = migrate_group_join_config(&mut group, provider);
+        }
+    }
+}
+
+fn all_group_ids(store: &EventStore) -> Vec<PeerId> {
     let owned = store.local_groups().unwrap_or_default();
     let joined = store.joined_groups().unwrap_or_default();
-    let group_ids: Vec<PeerId> = owned
+    owned
         .into_iter()
         .map(|group| group.group_id)
         .chain(joined.into_iter().map(|group| group.group_id))
-        .collect();
-    for group_id in group_ids {
-        record_group_roster_best_effort(provider, store, group_id);
-    }
+        .collect()
 }
 
 fn group_member_devices(group: &MlsGroup) -> Result<Vec<GroupMemberDevice>, &'static str> {
@@ -3277,12 +3296,13 @@ mod tests {
     use charp2p_mls::{
         decode_profile_message, device_credential, device_id_from_credential, group_create_config,
         merge_prepared_member_admission, prepare_profile_key_package,
-        prepare_profile_member_admission, stage_profile_welcome, ProfileProvider, CIPHERSUITE,
+        prepare_profile_member_admission, stage_profile_welcome, validate_group_profile,
+        ProfileProvider, CIPHERSUITE,
     };
     use charp2p_sync::PullSession;
     use openmls::prelude::{
-        CredentialWithKey, GroupId, MlsGroup, OpenMlsProvider, ProcessedMessageContent,
-        ProtocolMessage,
+        CredentialWithKey, GroupId, MlsGroup, MlsGroupJoinConfig, OpenMlsProvider,
+        ProcessedMessageContent, ProtocolMessage,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use tempfile::tempdir;
@@ -4858,6 +4878,52 @@ mod tests {
             store.group_authors(group_id).unwrap(),
             vec![owner.peer_id()]
         );
+    }
+
+    #[test]
+    fn startup_migrates_legacy_group_join_configs() {
+        let directory = tempdir().unwrap();
+        let group_identity = GroupIdentity::generate();
+        let group_id = group_identity.group_id();
+        let owner = DeviceIdentity::generate();
+        let owner_service = test_service(directory.path().join("owner.sqlite3"));
+        owner_service
+            .initialize_owner_group(group_id, &owner)
+            .unwrap();
+        let provider = owner_service.provider.lock().unwrap();
+        let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
+        let mut group = MlsGroup::load(provider.storage(), &mls_group_id)
+            .unwrap()
+            .unwrap();
+        // Groups created before ADR-048 stored no past-epoch window.
+        group
+            .set_configuration(
+                provider.storage(),
+                &MlsGroupJoinConfig::builder()
+                    .use_ratchet_tree_extension(true)
+                    .build(),
+            )
+            .unwrap();
+        assert!(validate_group_profile(&group).is_err());
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_local_group(&LocalGroupMetadata {
+                group_id,
+                group_name: "Legacy".to_owned(),
+                icon: 0,
+                history_policy: HistoryPolicy::None,
+                approval_required: false,
+                invitation_lifetime_seconds: 604_800,
+                reusable_invitation: false,
+            })
+            .unwrap();
+
+        super::migrate_all_group_join_configs(&provider, &store);
+
+        let group = MlsGroup::load(provider.storage(), &mls_group_id)
+            .unwrap()
+            .unwrap();
+        validate_group_profile(&group).unwrap();
     }
 
     fn test_service(path: impl AsRef<Path>) -> MlsProviderService {

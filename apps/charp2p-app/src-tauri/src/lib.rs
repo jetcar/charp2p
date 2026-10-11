@@ -39,10 +39,13 @@ use network::{
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use retention::{RetentionPreference, RetentionService};
 use settings::{AppInformation, SettingsService};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const MAX_GROUP_ID_TEXT_BYTES: usize = 256;
 const EVENT_ID_HEX_BYTES: usize = 64;
+/// Tauri event carrying the id of a joined group whose pinned owner
+/// announced new events (ADR-049).
+const GROUP_EVENTS_AVAILABLE_EVENT: &str = "group-events-available";
 
 #[tauri::command]
 fn identity_status(
@@ -1227,10 +1230,18 @@ async fn serve_joined_group(
         return Ok("inactive");
     };
     let group_id = parse_group_id(&group_id, "joined_group_not_found")?;
-    if pending_service.joined_sync_target(group_id).is_err() {
+    let Ok((_, owner_device_id)) = pending_service.joined_sync_target(group_id) else {
         network_service.stop_member_serving().await;
         return Ok("inactive");
-    }
+    };
+    // The serving node keeps a connection to the pinned owner for its
+    // new-event notices (ADR-049); unparsable addresses are skipped.
+    let owner_addresses = pending_service
+        .known_peer_addresses(group_id, owner_device_id)
+        .map_err(str::to_owned)?
+        .into_iter()
+        .filter_map(|address| Multiaddr::try_from(address).ok())
+        .collect::<Vec<_>>();
     // A removed or unreadable group stops advertising its earlier epoch key.
     let key = match mls_service.member_rendezvous_key(group_id) {
         Ok(key) => key,
@@ -1243,7 +1254,14 @@ async fn serve_joined_group(
         .load_network_identity()
         .map_err(str::to_owned)?;
     network_service
-        .serve_member_group(identity, group_id, key, Arc::clone(&bandwidth_service))
+        .serve_member_group(
+            identity,
+            group_id,
+            key,
+            owner_device_id,
+            owner_addresses,
+            Arc::clone(&bandwidth_service),
+        )
         .await
         .map_err(str::to_owned)
 }
@@ -1396,6 +1414,22 @@ pub fn run() {
             )));
             app.manage(RetentionService::new(data_directory.join("retention.json")));
             app.manage(SettingsService::new(database_path));
+
+            // Forward the pinned owner's acknowledged new-event notices to the
+            // interface, which pulls the group at once (ADR-049).
+            let handle = app.handle().clone();
+            let mut notices = handle.state::<NetworkService>().subscribe_event_notices();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match notices.recv().await {
+                        Ok(group_id) => {
+                            let _ = handle.emit(GROUP_EVENTS_AVAILABLE_EVENT, group_id.to_string());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             // Resume an opted-in contribution from the stored preference; a
             // missing identity or invalid preference leaves contribution off.

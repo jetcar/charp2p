@@ -17,7 +17,7 @@ use charp2p_sync::{PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
 use tokio::{
-    sync::Mutex,
+    sync::{broadcast, Mutex},
     task::JoinHandle,
     time::{interval, interval_at, sleep_until, timeout, Instant, MissedTickBehavior},
 };
@@ -47,6 +47,12 @@ const MAX_MEMBER_PROVIDERS: usize = 4;
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONTRIBUTION_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often a member serving node redials the pinned owner after its
+/// connection closed, so the owner can send new-event notices (ADR-049).
+const OWNER_REDIAL_INTERVAL: Duration = Duration::from_secs(20);
+/// Acknowledged new-event notices buffered for slow subscribers; a lagging
+/// subscriber only misses an immediate pull, never data.
+const EVENT_NOTICE_CAPACITY: usize = 16;
 /// Most listen addresses of the owner advertising node kept as invitation
 /// hint candidates.
 const MAX_OWNER_LISTEN_ADDRESSES: usize = 16;
@@ -404,6 +410,8 @@ pub struct NetworkService {
     advertisement: Mutex<Option<ActiveAdvertisement>>,
     contribution: Mutex<Option<ActiveContribution>>,
     member_serving: Mutex<Option<ActiveMemberServing>>,
+    /// Groups whose pinned owner announced new events (ADR-049).
+    event_notices: broadcast::Sender<PeerId>,
     last_connection: std::sync::Mutex<Option<ObservedConnection>>,
     group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedGroupSynchronization>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
@@ -586,6 +594,7 @@ impl NetworkService {
             advertisement: Mutex::new(None),
             contribution: Mutex::new(None),
             member_serving: Mutex::new(None),
+            event_notices: broadcast::channel(EVENT_NOTICE_CAPACITY).0,
             last_connection: std::sync::Mutex::new(None),
             group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
@@ -1186,16 +1195,27 @@ impl NetworkService {
         self.contribution.lock().await.take();
     }
 
+    /// Subscribes to the groups whose pinned owner sent an acknowledged
+    /// new-event notice to the member serving node (ADR-049).
+    pub fn subscribe_event_notices(&self) -> broadcast::Receiver<PeerId> {
+        self.event_notices.subscribe()
+    }
+
     /// Advertises the member rendezvous key of a joined group's current MLS
     /// epoch and serves pull-only synchronization to current members
     /// (ADR-040). The node restarts only when the group or key changes, so
     /// calling this again after a synchronization re-advertises once the
-    /// epoch advanced. Served bytes are charged to `bandwidth`.
+    /// epoch advanced. Served bytes are charged to `bandwidth`. The node
+    /// also keeps a connection to the pinned `owner`, dialled at its
+    /// remembered `owner_addresses` and redialled after it closes, over
+    /// which the owner sends new-event notices (ADR-049).
     pub async fn serve_member_group(
         &self,
         network_identity: DeviceIdentity,
         group_id: PeerId,
         key: DiscoveryKey,
+        owner: PeerId,
+        owner_addresses: Vec<Multiaddr>,
         bandwidth: Arc<BandwidthService>,
     ) -> Result<&'static str, &'static str> {
         let mut active = self.member_serving.lock().await;
@@ -1224,6 +1244,7 @@ impl NetworkService {
             .map_err(|_| "network_unavailable")?;
 
         let synchronization = Arc::clone(&self.synchronization);
+        let notices = self.event_notices.clone();
         timeout(PROVIDER_SEARCH_TIMEOUT, async {
             loop {
                 match node.next_event().await {
@@ -1239,6 +1260,7 @@ impl NetworkService {
                         event,
                         synchronization.as_ref(),
                         &bandwidth,
+                        &notices,
                     ),
                 }
             }
@@ -1252,6 +1274,11 @@ impl NetworkService {
                 ADVERTISEMENT_REFRESH_INTERVAL,
             );
             refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // The first tick dials the owner at once; later ticks redial only
+            // while no connection to it is open.
+            let mut redial = interval(OWNER_REDIAL_INTERVAL);
+            redial.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut owner_connected = false;
             loop {
                 tokio::select! {
                     _ = refresh.tick() => {
@@ -1259,16 +1286,32 @@ impl NetworkService {
                             break;
                         }
                     }
+                    _ = redial.tick(), if !owner_connected => {
+                        // An unreachable owner is retried at the next tick;
+                        // scheduled pulls still deliver its events.
+                        let _ = if owner_addresses.is_empty() {
+                            node.dial_peer(owner)
+                        } else {
+                            node.dial_peer_at(owner, owner_addresses.clone())
+                        };
+                    }
                     event = node.next_event() => match event {
                         NetworkEvent::DiscoveryFailed {
                             key: failed,
                             operation: charp2p_network::DiscoveryOperation::Announcement,
                         } if failed == key => break,
+                        NetworkEvent::PeerConnected { peer_id, .. } if peer_id == owner => {
+                            owner_connected = true;
+                        }
+                        NetworkEvent::PeerDisconnected { peer_id } if peer_id == owner => {
+                            owner_connected = false;
+                        }
                         event => answer_member_node_event(
                             &mut node,
                             event,
                             synchronization.as_ref(),
                             &bandwidth,
+                            &notices,
                         ),
                     },
                 }
@@ -2215,13 +2258,15 @@ fn answer_member_sync_request(
 }
 
 /// Handles an event on a member serving node: synchronization requests
-/// get the metered member answer, while join and invitation requests are
-/// rejected because only the owner admits devices.
+/// get the metered member answer and acknowledged owner notices are
+/// published to `notices`, while join and invitation requests are rejected
+/// because only the owner admits devices.
 fn answer_member_node_event(
     node: &mut NetworkNode,
     event: NetworkEvent,
     synchronization: &dyn SynchronizationService,
     bandwidth: &BandwidthService,
+    notices: &broadcast::Sender<PeerId>,
 ) {
     match event {
         NetworkEvent::SyncRequestReceived {
@@ -2231,6 +2276,10 @@ fn answer_member_node_event(
         } => {
             let response =
                 answer_member_sync_request(synchronization, bandwidth, peer_id, &request);
+            if let SyncResponse::Acknowledged { group_id } = response {
+                // No subscriber only means no immediate pull is wanted.
+                let _ = notices.send(group_id);
+            }
             let _ = node.send_sync_response(request_id, response);
         }
         NetworkEvent::JoinRequestReceived { request_id, .. } => {
@@ -2622,6 +2671,11 @@ mod tests {
                     SyncResponse::ObservedHeads {
                         group_id: self.group_id,
                         peers: Vec::new(),
+                    }
+                }
+                SyncRequest::EventsAvailable { group_id } if *group_id == self.group_id => {
+                    SyncResponse::Acknowledged {
+                        group_id: self.group_id,
                     }
                 }
                 _ => SyncResponse::Rejected {
@@ -4692,8 +4746,14 @@ mod tests {
             let serving = service(puller_id);
             let pulling = service(member_id);
             {
-                let serve =
-                    serving.serve_member_group(member, group_id, key, Arc::clone(&bandwidth));
+                let serve = serving.serve_member_group(
+                    member,
+                    group_id,
+                    key,
+                    DeviceIdentity::generate().peer_id(),
+                    Vec::new(),
+                    Arc::clone(&bandwidth),
+                );
                 tokio::pin!(serve);
                 let status = timeout(Duration::from_secs(10), async {
                     loop {
@@ -4764,6 +4824,7 @@ mod tests {
         let key = DiscoveryKey::derive(group_id, &[7; 32]);
         let (member, member_again) = identity_pair();
         let member_id = member.peer_id();
+        let owner_id = DeviceIdentity::generate().peer_id();
         tauri::async_runtime::block_on(async {
             let requester_identity = DeviceIdentity::generate();
             let requester_id = requester_identity.peer_id();
@@ -4794,8 +4855,14 @@ mod tests {
             .unwrap()
             .without_lan_discovery();
             {
-                let serve =
-                    service.serve_member_group(member, group_id, key, Arc::clone(&bandwidth));
+                let serve = service.serve_member_group(
+                    member,
+                    group_id,
+                    key,
+                    owner_id,
+                    Vec::new(),
+                    Arc::clone(&bandwidth),
+                );
                 tokio::pin!(serve);
                 let status = timeout(Duration::from_secs(10), async {
                     loop {
@@ -4821,7 +4888,14 @@ mod tests {
             // The same epoch key keeps the running node.
             assert_eq!(
                 service
-                    .serve_member_group(member_again, group_id, key, Arc::clone(&bandwidth))
+                    .serve_member_group(
+                        member_again,
+                        group_id,
+                        key,
+                        owner_id,
+                        Vec::new(),
+                        Arc::clone(&bandwidth),
+                    )
                     .await,
                 Ok("advertising")
             );
@@ -4930,6 +5004,111 @@ mod tests {
             })
             .await
             .expect("stopping should end the member serving node");
+        });
+    }
+
+    #[test]
+    fn member_serving_node_connects_to_the_owner_and_reports_its_notices() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[8; 32]);
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        tauri::async_runtime::block_on(async {
+            let owner_identity = DeviceIdentity::generate();
+            let owner_id = owner_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let mut owner = NetworkNode::new(owner_identity.into_network_keypair());
+            owner
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let owner_address = loop {
+                if let NetworkEvent::Listening { address } = owner.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &format!("{address}/p2p/{routing_id}"),
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id,
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let mut notices = service.subscribe_event_notices();
+            {
+                let serve = service.serve_member_group(
+                    member,
+                    group_id,
+                    key,
+                    owner_id,
+                    vec![owner_address],
+                    Arc::clone(&bandwidth),
+                );
+                tokio::pin!(serve);
+                let status = timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut serve => break result,
+                            _ = routing.next_event() => {}
+                            _ = owner.next_event() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("member advertisement should complete")
+                .unwrap();
+                assert_eq!(status, "advertising");
+            }
+
+            // The member dials the owner, which notices over that connection.
+            let response = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = owner.next_event() => match event {
+                            NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id => {
+                                owner
+                                    .send_sync_request(
+                                        member_id,
+                                        SyncRequest::EventsAvailable { group_id },
+                                    )
+                                    .unwrap();
+                            }
+                            NetworkEvent::SyncResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } if peer_id == member_id => break response,
+                            _ => {}
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("member should acknowledge the owner's notice");
+            assert_eq!(response, SyncResponse::Acknowledged { group_id });
+            assert_eq!(notices.try_recv(), Ok(group_id));
         });
     }
 

@@ -290,6 +290,10 @@ the group screen: it loads the protected derived discovery key, rediscovers the
 invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
 pull. While the joined-group screen is loaded, the client performs an initial
 automatic pull and retries once per minute. Manual retry remains available.
+When the owner stores new events it may send an `EventsAvailable` notice over
+an existing connection to a member; the member acknowledges only its joined
+group's pinned owner and then runs the same bounded pull immediately
+(ADR-049). The notice carries no event data.
 Each successful pull/push session records its completion time in joined-group
 metadata so the interface can restore the last synchronization time.
 After each verified batch commits, the client authenticates and decrypts any

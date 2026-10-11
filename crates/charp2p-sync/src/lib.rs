@@ -75,7 +75,9 @@ pub fn build_authorized_response(
                 encoded_events,
             }
         }
-        SyncRequest::PushEvents { .. } | SyncRequest::ReportHeads { .. } => {
+        SyncRequest::PushEvents { .. }
+        | SyncRequest::ReportHeads { .. }
+        | SyncRequest::EventsAvailable { .. } => {
             return Err(SynchronizationError::UnexpectedRequest);
         }
     };

@@ -82,13 +82,17 @@ pub enum SyncRequest {
         group_id: PeerId,
         heads: Vec<SyncAuthorHead>,
     },
+    /// Tells a connected member that the owner stored new group events, so
+    /// it pulls now instead of waiting for its next scheduled retry. Carries
+    /// no event data; the member answers with `Acknowledged` (ADR-049).
+    EventsAvailable { group_id: PeerId },
 }
 
 impl SyncRequest {
     /// Checks collection bounds and duplicate identifiers before processing.
     pub fn validate(&self) -> Result<(), SyncError> {
         match self {
-            Self::Summary { .. } => Ok(()),
+            Self::Summary { .. } | Self::EventsAvailable { .. } => Ok(()),
             Self::EventIds { limit, .. } if (1..=MAX_SYNC_BATCH_ITEMS as u16).contains(limit) => {
                 Ok(())
             }
@@ -139,6 +143,8 @@ pub enum SyncResponse {
         group_id: PeerId,
         peers: Vec<SyncPeerHead>,
     },
+    /// Confirms an `EventsAvailable` notice; the pull follows separately.
+    Acknowledged { group_id: PeerId },
 }
 
 impl SyncResponse {
@@ -172,7 +178,7 @@ impl SyncResponse {
             Self::EventsAccepted { inserted, .. } => {
                 Err(SyncError::InvalidAcceptedCount(*inserted))
             }
-            Self::Rejected { .. } => Ok(()),
+            Self::Rejected { .. } | Self::Acknowledged { .. } => Ok(()),
             Self::ObservedHeads { peers, .. } => validate_peer_heads(peers),
         }
     }
@@ -490,6 +496,16 @@ mod tests {
             .validate(),
             Err(SyncError::TooManyEventIds)
         ));
+    }
+
+    #[test]
+    fn event_notices_carry_only_the_group() {
+        let group_id = GroupIdentity::generate().group_id();
+        let request = SyncRequest::EventsAvailable { group_id };
+        let response = SyncResponse::Acknowledged { group_id };
+
+        assert!(request.validate().is_ok());
+        assert!(response.validate().is_ok());
     }
 
     fn signed_event(

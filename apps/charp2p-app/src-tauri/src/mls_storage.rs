@@ -1642,6 +1642,28 @@ impl MlsProviderService {
                 reason: SyncRejectReason::Busy,
             };
         };
+        // Only a joined group's pinned owner announces newly stored events
+        // (ADR-049); the notice changes no state here.
+        if let SyncRequest::EventsAvailable { group_id } = request {
+            return match store.joined_groups() {
+                Ok(joined)
+                    if joined.iter().any(|joined| {
+                        joined.group_id == *group_id
+                            && joined.inviter_device_id == authenticated_peer
+                    }) =>
+                {
+                    SyncResponse::Acknowledged {
+                        group_id: *group_id,
+                    }
+                }
+                Ok(_) => SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                },
+                Err(_) => SyncResponse::Rejected {
+                    reason: SyncRejectReason::Busy,
+                },
+            };
+        }
         // A member device serves only the pull exchanges; uploads and head
         // reports stay with the owner (ADR-040).
         if matches!(
@@ -3065,7 +3087,8 @@ fn sync_request_group_id(request: &SyncRequest) -> PeerId {
         | SyncRequest::EventIds { group_id, .. }
         | SyncRequest::Events { group_id, .. }
         | SyncRequest::PushEvents { group_id, .. }
-        | SyncRequest::ReportHeads { group_id, .. } => *group_id,
+        | SyncRequest::ReportHeads { group_id, .. }
+        | SyncRequest::EventsAvailable { group_id } => *group_id,
     }
 }
 
@@ -4741,6 +4764,24 @@ mod tests {
                 inserted: 1,
             }
         );
+
+        // Only the pinned owner's new-event notice is acknowledged.
+        let notice = SyncRequest::EventsAvailable { group_id };
+        assert_eq!(
+            first_service.answer_sync_request(owner.peer_id(), &notice),
+            SyncResponse::Acknowledged { group_id }
+        );
+        for (service, peer) in [
+            (&first_service, second_member.peer_id()),
+            (&owner_service, first_member.peer_id()),
+        ] {
+            assert_eq!(
+                service.answer_sync_request(peer, &notice),
+                SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                }
+            );
+        }
     }
 
     #[test]

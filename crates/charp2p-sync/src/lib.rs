@@ -355,7 +355,9 @@ impl PullSession {
                     if !requested.contains(&event.id()) {
                         return Err(SynchronizationError::UnrequestedEvent);
                     }
-                    if cutoff.is_some_and(|cutoff| event.author_sequence() > cutoff) {
+                    // Events past the peer's gap-free head (or the removal
+                    // cut-off) wait until the gap before them is pulled.
+                    if event.author_sequence() > remote_head {
                         continue;
                     }
                     events.push(event);
@@ -1064,6 +1066,43 @@ mod tests {
             .handle_response(&mut target, &events(&[&requested]))
             .unwrap();
         assert_eq!(progress.applied.inserted, 1);
+    }
+
+    #[test]
+    fn pull_session_drops_events_past_the_peers_gap_free_head() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let first = message_event(&author, &group, 1, b"first");
+        let third = message_event(&author, &group, 3, b"past the gap");
+        let mut source = EventStore::in_memory().unwrap();
+        let mut target = EventStore::in_memory().unwrap();
+        source.put_event(&first).unwrap();
+        source.put_event(&third).unwrap();
+
+        let (mut session, request) = PullSession::start(group.group_id());
+        let summary = build_authorized_response(&source, &request).unwrap();
+        let ids_request = session
+            .handle_response(&mut target, &summary)
+            .unwrap()
+            .next_request
+            .unwrap();
+        let ids = build_authorized_response(&source, &ids_request).unwrap();
+        let SyncResponse::EventIds { event_ids, .. } = &ids else {
+            panic!("identifier request must return event IDs");
+        };
+        assert_eq!(event_ids, &vec![first.id(), third.id()]);
+        let events_request = session
+            .handle_response(&mut target, &ids)
+            .unwrap()
+            .next_request
+            .unwrap();
+        let events = build_authorized_response(&source, &events_request).unwrap();
+        let progress = session.handle_response(&mut target, &events).unwrap();
+
+        assert!(progress.complete);
+        assert_eq!(progress.applied.inserted, 1);
+        assert!(target.get_event(first.id()).unwrap().is_some());
+        assert!(target.get_event(third.id()).unwrap().is_none());
     }
 
     #[test]

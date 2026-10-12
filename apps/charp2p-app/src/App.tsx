@@ -960,7 +960,7 @@ function MembersView({
         )}
         <button aria-label="Close members and devices" className="details-close" onClick={onClose} type="button">×</button>
       </header>
-      <p className="preview-note">Each membership belongs to one cryptographic device identity. Device names other than this device's and the owner's are not known, so members are shown by fingerprint.</p>
+      <p className="preview-note">Each membership belongs to one cryptographic device identity. Device names other than this device's and the owner's are not known, so members are shown by fingerprint. “Verified” confirms a device's keys, not who a person is: a peer identity is not a verified legal identity.</p>
       <div className="member-list" role="list">
         {visible.length === 0 && members.length > 0 && <p className="preview-note">No member device matches “{search.trim()}”.</p>}
         {visible.map((member) => {

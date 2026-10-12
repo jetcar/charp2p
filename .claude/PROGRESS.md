@@ -163,7 +163,7 @@
 - [x] UI: map remaining user-reachable backend error codes (`key_refresh_failed`, `key_refresh_store_unavailable`, `launch_at_login_unavailable`, `member_readmission_failed`, `invite_permission_owner`, `relay_requires_routing`, `relay_limits_invalid`) to messages.
 - [x] Docs: owner push acceptance covers `MessageCreated`, `MessageEdited` and `MessageDeleted` (technical-design upload paragraph, threat-model).
 - [x] Docs: complete technical-design "Serialization and size limits" (invite exchange codec, deletion and invite-permission plaintexts) and fix the node-policy "unsigned records" bullet (provider records are unsigned stock Kademlia records).
-- [ ] Docs: update stale apps/charp2p-app/README.md (identity backup exists, approval/single-use supported, several local groups, removed footer pages).
+- [x] Docs: update stale apps/charp2p-app/README.md (identity backup exists, approval/single-use supported, several local groups, removed footer pages).
 - [ ] Protocol vectors: pin invitation v3/v4, the MLS-protected plaintexts (reply body, edit, deletion, metadata, invite permission) and the join/invite wire codecs in crates/charp2p-core/tests/protocol_vectors.rs.
 
 ## Needs human
@@ -335,3 +335,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-12T07:27Z UI error code mapping: added messages for key refresh (incl. key_refresh_not_allowed), launch at login, member readmission, invite_permission_owner and relay contribution codes; npm build, fmt, clippy, tests pass.
 - 2026-10-12T08:26:10Z Docs: owner push acceptance covers MessageCreated/Edited/Deleted: technical-design upload paragraph and threat-model membership-event row corrected; fmt, clippy, tests, app build pass.
 - 2026-10-12T09:27:15Z Docs serialization limits: technical-design now documents the `/charp2p/invite/1.0.0` big-endian request/response framing, lists message-deletion and invite-permission plaintexts under Postcard with their 64/128-byte limits and the invite wire limits (136 bytes / 8 KiB + 5); node-policy bullet now says provider records are unsigned stock Kademlia records bounded by size instead of signatures. fmt, clippy, workspace tests, app build pass.
+- 2026-10-12T10:27:30Z Docs: app README: replaced stale claims (onboarding-only shell, footer pages, recovery export later, first local group only, single-use/approval rejected) with current behavior: Privacy/identity pages in onboarding and group navigation, encrypted identity backup export/restore, several owned groups, single-use invitations and owner approval; retained history still rejected. fmt, clippy, workspace tests, npm build pass.

@@ -14,17 +14,19 @@ Build an arm64 debug APK with `pnpm tauri android build --debug --apk` after
 installing Tauri's Android prerequisites. Windows build hosts must allow
 symbolic-link creation, normally through Developer Mode.
 
-The current shell implements device onboarding and a local invitation preview.
-Its group switcher restores every joined membership, keeps owner and member
-groups accessible in one session, and opens another invitation without hiding
-existing groups.
-The footer privacy and identity pages explain local message storage, observable
-network metadata, relay limits, device-key continuity, and the current recovery
-limitation from inside the Windows and Android interface.
+The shell implements device onboarding, owned and joined groups, messaging,
+members and devices, network status, and settings. Its group list restores
+every owned and joined membership, keeps them accessible in one session, and
+opens another invitation without hiding existing groups.
+The Privacy and How identity works pages, linked from the onboarding screen and
+the group navigation, explain local message storage, observable network
+metadata, relay limits, device-key continuity, and identity backup from inside
+the Windows and Android interface.
 Identity creation and restart detection use Rust commands and platform-protected
 storage. Raw invitation payloads, canonical HTTPS links, and `charp2p://` links
-are parsed and authenticated in Rust before any network access. Encrypted
-recovery export remains a later increment.
+are parsed and authenticated in Rust before any network access. Settings can
+export a passphrase-encrypted identity backup as a file or text, and onboarding
+can restore the device name and identity key from it.
 Accepted invitations survive restarts: safe group metadata is indexed in SQLite
 while the signed bearer credential remains in platform-protected storage. Invitation
 version 2 also pins the root-authorized inviter device; discovery ignores
@@ -51,7 +53,7 @@ bootstrap nodes. The relay transport uses Noise and Yamux over the authenticated
 relay connection, so discovered peers can establish the existing join and sync
 protocols when the owner's direct QUIC address is not reachable.
 
-The ready screen can create and restore a first local group, then issue and
+The ready screen can create and restore local groups, then issue and
 copy signed custom-URI invitations. Group-root keys and issued bearer
 credentials use the platform keyring; SQLite stores their non-secret indexes
 and invitation defaults. Group creation also initializes the owner's durable
@@ -62,10 +64,12 @@ the bearer and index are removed immediately. Its protected rendezvous key is
 retained so already admitted members can still discover the owner, while new
 join attempts are rejected. The owner view renders the signed invitation as a
 QR code for Windows and Android handoff without sending it to a QR service.
-The current secure profile exposes only expiring reusable invitations, direct
-invite-based admission, and messages sent after joining. The backend rejects
-single-use, manual-approval, and retained-history creation options so the UI
-cannot promise unenforced access controls.
+Invitations always expire and can be reusable or single-use; a consumed
+single-use invitation is retired but still lets its admitted device finish
+joining. Groups can require owner approval, in which case join requests wait in
+the Members & devices view until the owner approves or declines them. Members
+see messages sent after they joined: the backend rejects the retained-history
+creation option so the UI cannot promise unenforced access controls.
 Inbound join requests are checked against this protected issuance state before
 MLS processing. The advertiser then verifies the bounded MLS KeyPackage,
 requires the pinned profile, and binds its signed device credential to the
@@ -84,10 +88,9 @@ device from the Members & devices view. The signed `MemberRemoved` event,
 advanced MLS state, and durable re-admission block commit atomically; cached
 join responses are deleted so active reusable invitations cannot restore the
 removed device. Removing a device prevents future access but cannot erase
-messages it already stored. The backend still enforces one locally created
-group while owner-root key management remains device-scoped; the interface can
-also display multiple joined groups. Expired pending joins also
-remove their retained one-time MLS key material before the invitation is
+messages it already stored. A device can own several local groups, each with
+its own group-root key, alongside multiple joined groups. Expired pending joins
+also remove their retained one-time MLS key material before the invitation is
 discarded.
 
 The owner and joined-group screens can create bounded text messages as MLS

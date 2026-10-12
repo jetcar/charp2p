@@ -178,6 +178,29 @@ mod tests {
     }
 
     #[test]
+    fn saving_replaces_a_damaged_preference() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        std::fs::write(directory.path().join("background.json"), b"{").expect("file is written");
+        let preference = BackgroundPreference {
+            keep_running_when_closed: true,
+            launch_at_login: false,
+        };
+
+        service(&directory)
+            .set(preference)
+            .expect("preference is stored");
+
+        assert_eq!(
+            service(&directory)
+                .status()
+                .expect("status is available")
+                .preference,
+            preference
+        );
+        assert!(service(&directory).keeps_running_when_closed());
+    }
+
+    #[test]
     fn unavailable_builds_refuse_background_running() {
         let directory = tempfile::tempdir().expect("temporary directory is available");
         let path = directory.path().join("background.json");

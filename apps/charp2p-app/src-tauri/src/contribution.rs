@@ -224,6 +224,28 @@ mod tests {
     }
 
     #[test]
+    fn saving_replaces_a_damaged_preference() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        std::fs::write(directory.path().join("contribution.json"), b"{").expect("file is written");
+        let preference = ContributionPreference {
+            routing: true,
+            relay: None,
+        };
+
+        service(&directory)
+            .set(preference)
+            .expect("preference is stored");
+
+        assert_eq!(
+            service(&directory)
+                .status()
+                .expect("status is available")
+                .preference,
+            preference
+        );
+    }
+
+    #[test]
     fn unavailable_builds_refuse_contribution() {
         let directory = tempfile::tempdir().expect("temporary directory is available");
         let service = ContributionService::with_availability(

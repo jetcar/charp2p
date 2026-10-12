@@ -284,6 +284,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   bandwidth_preference_unavailable: "The bandwidth limit could not be read or saved on this device.",
   retention_preference_invalid: "The saved retention is damaged or out of range. Save a period between 1 and 3650 days; no messages are removed until then.",
   retention_preference_unavailable: "The message retention could not be read or saved on this device.",
+  background_preference_invalid: "The saved background settings are damaged. CharP2P exits when its window closes until you choose a setting.",
+  background_preference_unavailable: "The background settings could not be read or saved on this device.",
+  contribution_preference_invalid: "The saved contribution settings are damaged. This device does not contribute until you save new settings.",
+  contribution_preference_unavailable: "The contribution settings could not be read or saved on this device.",
   message_retention_failed: "Older messages could not be removed from this device.",
   synchronization_failed: "Group synchronization failed. Try again.",
   synchronization_limit_exceeded: "Group synchronization exceeded its safe exchange limit.",
@@ -1241,9 +1245,13 @@ function ContributionSection({ networkStatus }: { networkStatus: NetworkStatus |
   const [circuitMib, setCircuitMib] = useState(DEFAULT_RELAY_CIRCUIT_MIB);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // A damaged preference file is reported; the controls start from the off
+  // default so saving any choice replaces the file.
+  const [damaged, setDamaged] = useState(false);
 
   function showPreference(next: ContributionStatus) {
     setStatus(next);
+    setDamaged(false);
     setRouting(next.preference.routing);
     setRelay(next.preference.relay !== null);
     if (next.preference.relay) {
@@ -1260,7 +1268,17 @@ function ContributionSection({ networkStatus }: { networkStatus: NetworkStatus |
         if (active) showPreference(next);
       })
       .catch((caught) => {
-        if (active) setError(errorMessage(caught));
+        if (!active) return;
+        setError(errorMessage(caught));
+        if (caught === "contribution_preference_invalid") {
+          setStatus({
+            available: true,
+            preference: { routing: false, relay: null },
+            worstCaseRelayedBytes: 0,
+            circuitDurationSeconds: 300,
+          });
+          setDamaged(true);
+        }
       });
     return () => {
       active = false;
@@ -1275,7 +1293,8 @@ function ContributionSection({ networkStatus }: { networkStatus: NetworkStatus |
   const circuitMinutes = Math.round((status?.circuitDurationSeconds ?? 300) / 60);
   const changed =
     status !== null &&
-    (routing !== status.preference.routing ||
+    (damaged ||
+      routing !== status.preference.routing ||
       relayEnabled !== (status.preference.relay !== null) ||
       (relayEnabled &&
         (circuits !== status.preference.relay?.maxCircuits || circuitMib !== status.preference.relay?.maxCircuitMib)));
@@ -1637,7 +1656,13 @@ function BackgroundSection() {
         if (active) setStatus(next);
       })
       .catch((caught) => {
-        if (active) setError(errorMessage(caught));
+        if (!active) return;
+        setError(errorMessage(caught));
+        // A damaged file closes the app normally; the controls start from
+        // that default so choosing a setting replaces the file.
+        if (caught === "background_preference_invalid") {
+          setStatus({ available: true, preference: { keepRunningWhenClosed: false, launchAtLogin: false } });
+        }
       });
     return () => {
       active = false;

@@ -5164,9 +5164,9 @@ function App() {
                   onClick={() => void checkPreviewReachability()}
                   type="button"
                 >
-                  {checkingPreviewReachability ? "Checking connection…" : "Check whether the inviter is reachable"}
+                  {checkingPreviewReachability ? "Checking connection…" : "Check whether the group owner is reachable"}
                 </button>
-                <p className="preview-note">Checking looks up the invitation's discovery key on the network. Joining still waits until a group member is reachable.</p>
+                <p className="preview-note">Checking looks up the invitation's discovery key on the network. Only the group owner device admits new devices, so joining waits until it is reachable.</p>
               </div>
 
               <div className="join-actions">

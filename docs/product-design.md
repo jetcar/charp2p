@@ -8,8 +8,8 @@ open discovery network and synchronize the group history held by group
 members.
 
 The first release targets small private groups. It does not promise continuous
-delivery: if no group member is online, a joining device or an out-of-date
-device waits until a member returns.
+delivery: a joining device waits until the group owner device is online, and
+an out-of-date device waits until a group member returns.
 
 ## User roles
 
@@ -46,17 +46,20 @@ availability. A node operator does not become a group administrator.
 1. The user opens an HTTPS app link or a `charp2p:` URI.
 2. The app validates the invitation locally before contacting peers.
 3. The join preview shows the group name, inviter identity, invitation expiry,
-   requested permissions, and whether a group peer is currently reachable.
+   requested permissions, and whether the group owner device is currently
+   reachable.
 4. The user explicitly accepts.
-5. The app searches for providers of the invitation's secret discovery key.
+5. The app searches for providers of the invitation's secret discovery key,
+   which only the group owner device advertises.
 6. It tries direct connections and then relay addresses.
-7. A connected member validates the signed invitation and returns the current
-   membership state and allowed history.
+7. The owner device validates the signed invitation, admits the device, and
+   returns the current membership state and allowed history. Other members
+   cannot admit devices.
 8. The new device verifies every received event before displaying the group.
 
-An invitation does not guarantee immediate joining. With no reachable group
-member, the app retains the pending invitation and retries when opened or when
-the operating system permits background work.
+An invitation does not guarantee immediate joining. Until the group owner
+device is reachable, the app retains the pending invitation and retries when
+opened or when the operating system permits background work.
 
 ### Send and synchronize a message
 

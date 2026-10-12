@@ -742,6 +742,7 @@ impl GroupService {
             store
                 .remove_issued_invitation(invitation.invitation_id)
                 .map_err(|_| "group_store_unavailable")?;
+            self.retire_owner_discovery_key(store, invitation.group_id, invitation.invitation_id)?;
         }
         Ok(())
     }
@@ -1231,6 +1232,7 @@ impl GroupService {
             .map(|group| group.group_id)
             .collect();
         let mut invitations = Vec::with_capacity(indexed.len());
+        let mut active = Vec::with_capacity(indexed.len());
         for indexed in indexed {
             if !local_group_ids.contains(&indexed.group_id) {
                 self.invitation_secrets.remove(indexed.invitation_id)?;
@@ -1283,11 +1285,24 @@ impl GroupService {
                     .map_err(|_| "group_store_unavailable")?;
                 continue;
             }
+            active.push(indexed.invitation_id);
             invitations.push(issued_invitation(
                 &invitation,
                 encoded,
                 indexed.requested_by,
             ));
+        }
+        // Sweep keys whose bearer was already removed, including keys that
+        // become retireable once their admitted members were all removed.
+        for group_id in local_group_ids {
+            for metadata in store
+                .owner_discovery_keys(group_id)
+                .map_err(|_| "group_store_unavailable")?
+            {
+                if !active.contains(&metadata.invitation_id) {
+                    self.retire_owner_discovery_key(&mut store, group_id, metadata.invitation_id)?;
+                }
+            }
         }
         Ok(invitations)
     }
@@ -1323,6 +1338,26 @@ impl GroupService {
             });
         }
         Ok(())
+    }
+
+    /// Retires the rendezvous key of an invitation that is no longer active
+    /// when no current admission records it (ADR-054). The index is removed
+    /// before the protected key, so an admission racing this either commits
+    /// first and keeps the key or is refused.
+    fn retire_owner_discovery_key(
+        &self,
+        store: &mut EventStore,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<bool, &'static str> {
+        if !store
+            .retire_owner_discovery_key(group_id, invitation_id)
+            .map_err(|_| "group_store_unavailable")?
+        {
+            return Ok(false);
+        }
+        self.owner_discovery_keys.remove(invitation_id)?;
+        Ok(true)
     }
 
     fn remove_owner_discovery_keys(
@@ -2770,14 +2805,105 @@ mod tests {
             .get_optional(invitation_id)
             .unwrap()
             .is_none());
-        assert_eq!(
-            service.owner_discovery_keys(group_id).unwrap(),
-            vec![expected_discovery_key]
-        );
+        // It admitted no device, so its rendezvous key is retired (ADR-054).
+        assert!(service.owner_discovery_keys(group_id).unwrap().is_empty());
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(invitation_id)
+            .unwrap()
+            .is_none());
         assert_eq!(
             service.revoke_invitation(group_id, invitation_id),
             Err("issued_invitation_not_found")
         );
+    }
+
+    #[test]
+    fn expired_invitation_key_is_retired_once_no_admitted_member_remains() {
+        use charp2p_core::{EventKind, EventSpec, SignedEvent};
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let mut invitation_ids = Vec::new();
+        for _ in 0..2 {
+            let issued = service
+                .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", NOW)
+                .unwrap();
+            invitation_ids.push(request_invitation_id(&join_request(&issued.link, NOW), NOW));
+        }
+        let (used, unused) = (invitation_ids[0], invitation_ids[1]);
+        let event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id,
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: NOW * 1000,
+                    kind,
+                    protected_payload: b"MLS commit",
+                },
+            )
+            .unwrap()
+        };
+        let member = DeviceIdentity::generate().peer_id();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_join_admission(
+                &event(1, EventKind::MemberAdded),
+                b"snapshot",
+                member,
+                &[1; 32],
+                b"response",
+                Some(AdmittingInvitation {
+                    invitation_id: used,
+                    single_use: false,
+                }),
+            )
+            .unwrap();
+
+        // Active invitations keep their keys.
+        assert_eq!(service.issued_invitations_at(NOW).unwrap().len(), 2);
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 2);
+
+        // Once expired, only the key that admitted a current member stays.
+        let expired = NOW + 400 * 86_400;
+        assert!(service.issued_invitations_at(expired).unwrap().is_empty());
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 1);
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(unused)
+            .unwrap()
+            .is_none());
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(used)
+            .unwrap()
+            .is_some());
+
+        // Removing that member lets the next sweep retire its key.
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_member_removal(
+                &event(2, EventKind::MemberRemoved),
+                b"removal snapshot",
+                member,
+                0,
+            )
+            .unwrap();
+        assert!(service.issued_invitations_at(expired).unwrap().is_empty());
+        assert!(service.owner_discovery_keys(group_id).unwrap().is_empty());
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(used)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

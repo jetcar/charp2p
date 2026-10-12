@@ -293,8 +293,11 @@ hard exchange limit. Initial synchronization failure does not roll back an
 already durable MLS membership. A joined member can retry synchronization from
 the group screen: it loads the protected derived discovery key, rediscovers the
 invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
-pull. While the joined-group screen is loaded, the client performs an initial
-automatic pull and retries once per minute. Manual retry remains available.
+pull. When the member serving node (ADR-040) already holds an authenticated
+connection to the pinned owner, the pull and push run over that connection
+instead, and the serving node resumes once they end. While the joined-group
+screen is loaded, the client performs an initial automatic pull and retries
+once per minute. Manual retry remains available.
 When the owner stores new events it may send an `EventsAvailable` notice over
 an existing connection to a member; the member acknowledges only its joined
 group's pinned owner and then runs the same bounded pull immediately

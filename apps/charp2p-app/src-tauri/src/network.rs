@@ -17,7 +17,7 @@ use charp2p_sync::{MembershipComparison, PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
 use tokio::{
-    sync::{broadcast, Mutex},
+    sync::{broadcast, mpsc, oneshot, Mutex},
     task::JoinHandle,
     time::{interval, interval_at, sleep_until, timeout, Instant, MissedTickBehavior},
 };
@@ -400,7 +400,38 @@ impl Drop for ActiveAdvertisement {
 struct ActiveMemberServing {
     group_id: PeerId,
     key: DiscoveryKey,
+    owner: PeerId,
+    /// Asks the serving task to lend its node while it holds an
+    /// authenticated connection to `owner`.
+    lend: mpsc::Sender<oneshot::Sender<LentOwnerConnection>>,
     task: JoinHandle<()>,
+}
+
+/// Member serving node lent for one synchronization over its existing
+/// connection to the pinned owner (technical-design Connectivity order 1).
+/// Dropping it, even when the synchronization is cancelled, hands the node
+/// back to the serving task.
+struct LentOwnerConnection {
+    node: Option<NetworkNode>,
+    path: ConnectionPath,
+    address: Multiaddr,
+    returns: Option<oneshot::Sender<NetworkNode>>,
+}
+
+impl LentOwnerConnection {
+    fn node(&mut self) -> &mut NetworkNode {
+        self.node
+            .as_mut()
+            .expect("a lent node is held until it is dropped")
+    }
+}
+
+impl Drop for LentOwnerConnection {
+    fn drop(&mut self) {
+        if let (Some(node), Some(returns)) = (self.node.take(), self.returns.take()) {
+            let _ = returns.send(node);
+        }
+    }
 }
 
 impl Drop for ActiveMemberServing {
@@ -1373,6 +1404,7 @@ impl NetworkService {
 
         let synchronization = Arc::clone(&self.synchronization);
         let notices = self.event_notices.clone();
+        let (lend, mut lend_requests) = mpsc::channel::<oneshot::Sender<LentOwnerConnection>>(4);
         timeout(PROVIDER_SEARCH_TIMEOUT, async {
             loop {
                 match node.next_event().await {
@@ -1406,7 +1438,8 @@ impl NetworkService {
             // while no connection to it is open.
             let mut redial = interval(OWNER_REDIAL_INTERVAL);
             redial.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut owner_connected = false;
+            // Path and address of the open connection to the owner.
+            let mut owner_connection: Option<(ConnectionPath, Multiaddr)> = None;
             loop {
                 tokio::select! {
                     _ = refresh.tick() => {
@@ -1414,7 +1447,34 @@ impl NetworkService {
                             break;
                         }
                     }
-                    _ = redial.tick(), if !owner_connected => {
+                    Some(reply) = lend_requests.recv() => {
+                        // Without an open owner connection the dropped reply
+                        // sends the synchronization to a fresh dial.
+                        let Some((path, address)) = owner_connection
+                            .clone()
+                            .filter(|_| node.is_connected(owner))
+                        else {
+                            continue;
+                        };
+                        let (returns, returned) = oneshot::channel();
+                        // A refused reply drops the lent node, which returns it.
+                        let _ = reply.send(LentOwnerConnection {
+                            node: Some(node),
+                            path,
+                            address,
+                            returns: Some(returns),
+                        });
+                        // Requests from other members wait or fail while the
+                        // node is lent; they retry at their next pull.
+                        let Ok(returned) = returned.await else {
+                            break;
+                        };
+                        node = returned;
+                        if !node.is_connected(owner) {
+                            owner_connection = None;
+                        }
+                    }
+                    _ = redial.tick(), if owner_connection.is_none() => {
                         // An unreachable owner is retried at the next tick;
                         // scheduled pulls still deliver its events.
                         let _ = if owner_addresses.is_empty() {
@@ -1428,11 +1488,20 @@ impl NetworkService {
                             key: failed,
                             operation: charp2p_network::DiscoveryOperation::Announcement,
                         } if failed == key => break,
-                        NetworkEvent::PeerConnected { peer_id, .. } if peer_id == owner => {
-                            owner_connected = true;
+                        NetworkEvent::PeerConnected {
+                            peer_id,
+                            path,
+                            remote_address,
+                        } if peer_id == owner => {
+                            owner_connection = Some((path, remote_address));
                         }
                         NetworkEvent::PeerDisconnected { peer_id } if peer_id == owner => {
-                            owner_connected = false;
+                            owner_connection = None;
+                        }
+                        NetworkEvent::DirectConnectionUpgraded { peer_id } if peer_id == owner => {
+                            if let Some((path, _)) = owner_connection.as_mut() {
+                                *path = ConnectionPath::Direct;
+                            }
                         }
                         event => answer_member_node_event(
                             &mut node,
@@ -1448,9 +1517,34 @@ impl NetworkService {
         *active = Some(ActiveMemberServing {
             group_id,
             key,
+            owner,
+            lend,
             task,
         });
         Ok("advertising")
+    }
+
+    /// Borrows the member serving node of `group_id` while it holds an
+    /// authenticated connection to the pinned `owner`, so synchronization
+    /// reuses that connection before dialing (technical-design Connectivity
+    /// order 1).
+    async fn lend_owner_connection(
+        &self,
+        group_id: PeerId,
+        owner: PeerId,
+    ) -> Option<LentOwnerConnection> {
+        let lend = {
+            let active = self.member_serving.lock().await;
+            let serving = active.as_ref().filter(|serving| {
+                serving.group_id == group_id
+                    && serving.owner == owner
+                    && !serving.task.is_finished()
+            })?;
+            serving.lend.clone()
+        };
+        let (reply, lent) = oneshot::channel();
+        lend.send(reply).await.ok()?;
+        lent.await.ok()
     }
 
     /// Stops the member serving node, if one is running.
@@ -1787,27 +1881,42 @@ impl NetworkService {
         // Skip discovery while the synchronization data limit is spent
         // (ADR-033).
         bandwidth.ensure_sync_budget()?;
-        let connected = self
-            .connect_to_group_provider(identity, key, expected_peer, known_addresses)
-            .await;
-        // A remembered address says nothing about the discovery record.
-        *discovery = match &connected {
-            Ok(connection) if !connection.looked_up => None,
-            _ => discovery_outcome(&connected),
+        let mut lent = self.lend_owner_connection(group_id, expected_peer).await;
+        let mut dialed = None;
+        let (node, mut connection_path, peer_address) = match lent.as_mut() {
+            // The member serving node's open owner connection is reused; no
+            // discovery record is looked up.
+            Some(lent) => {
+                let path = lent.path;
+                let address = lent.address.clone();
+                let _ = self.observe_connection(Ok(path), |path| Some(connection_type_name(*path)));
+                (lent.node(), path, address)
+            }
+            None => {
+                let connected = self
+                    .connect_to_group_provider(identity, key, expected_peer, known_addresses)
+                    .await;
+                // A remembered address says nothing about the discovery record.
+                *discovery = match &connected {
+                    Ok(connection) if !connection.looked_up => None,
+                    _ => discovery_outcome(&connected),
+                };
+                let ProviderConnection {
+                    node,
+                    path,
+                    address,
+                    ..
+                } = connected?;
+                (dialed.insert(node), path, address)
+            }
         };
-        let ProviderConnection {
-            mut node,
-            path: mut connection_path,
-            address: peer_address,
-            ..
-        } = connected?;
         // A relayed connection may be hole-punched while the exchange runs;
         // the remembered address stays the relayed one, which keeps working
         // after the NAT mapping of the direct connection expires.
         let initial_path = connection_path;
         let (synchronized_events, membership) = self
             .pull_from_connected_peer(
-                &mut node,
+                node,
                 expected_peer,
                 group_id,
                 Some(bandwidth),
@@ -1816,7 +1925,7 @@ impl NetworkService {
             .await?;
         let uploaded_events = self
             .push_to_connected_peer(
-                &mut node,
+                node,
                 expected_peer,
                 group_id,
                 local_peer,
@@ -1825,7 +1934,7 @@ impl NetworkService {
             )
             .await?;
         self.exchange_observed_heads(
-            &mut node,
+            node,
             expected_peer,
             group_id,
             local_peer,
@@ -5419,6 +5528,188 @@ mod tests {
                                 ..
                             } if peer_id == member_id => break response,
                             _ => {}
+                        },
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("member should acknowledge the owner's notice");
+            assert_eq!(response, SyncResponse::Acknowledged { group_id });
+            assert_eq!(notices.try_recv(), Ok(group_id));
+        });
+    }
+
+    #[test]
+    fn synchronization_reuses_the_member_serving_connection_to_the_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[9; 32]);
+        let (member, member_again) = identity_pair();
+        let member_id = member.peer_id();
+        tauri::async_runtime::block_on(async {
+            let owner_identity = DeviceIdentity::generate();
+            let owner_id = owner_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let mut owner = NetworkNode::new(owner_identity.into_network_keypair());
+            owner
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let owner_address = loop {
+                if let NetworkEvent::Listening { address } = owner.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &format!("{address}/p2p/{routing_id}"),
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id,
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let mut member_connections = 0;
+            {
+                let serve = service.serve_member_group(
+                    member,
+                    group_id,
+                    key,
+                    owner_id,
+                    vec![owner_address.clone()],
+                    Arc::clone(&bandwidth),
+                );
+                tokio::pin!(serve);
+                let status = timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut serve => break result,
+                            _ = routing.next_event() => {}
+                            event = owner.next_event() => {
+                                if matches!(
+                                    event,
+                                    NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id
+                                ) {
+                                    member_connections += 1;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("member advertisement should complete")
+                .unwrap();
+                assert_eq!(status, "advertising");
+            }
+            // Wait until the serving node holds its connection to the owner.
+            timeout(Duration::from_secs(10), async {
+                while member_connections == 0 {
+                    tokio::select! {
+                        _ = routing.next_event() => {}
+                        event = owner.next_event() => {
+                            if matches!(
+                                event,
+                                NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id
+                            ) {
+                                member_connections += 1;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("member serving node should connect to the owner");
+
+            // No remembered address and no discovery record: only the open
+            // serving connection can reach the owner.
+            let synchronize =
+                service.synchronize(member_again, key, group_id, owner_id, &[], &bandwidth);
+            tokio::pin!(synchronize);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut synchronize => break result,
+                        _ = routing.next_event() => {}
+                        event = owner.next_event() => match event {
+                            NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id => {
+                                member_connections += 1;
+                            }
+                            NetworkEvent::SyncRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } if peer_id == member_id => {
+                                let response = match request {
+                                    SyncRequest::Summary { .. } => SyncResponse::Summary {
+                                        group_id,
+                                        heads: Vec::new(),
+                                        membership: SyncMembershipState::default(),
+                                    },
+                                    SyncRequest::ReportHeads { .. } => SyncResponse::ObservedHeads {
+                                        group_id,
+                                        peers: Vec::new(),
+                                    },
+                                    _ => SyncResponse::Rejected {
+                                        reason: SyncRejectReason::InvalidRequest,
+                                    },
+                                };
+                                owner.send_sync_response(request_id, response).unwrap();
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            })
+            .await
+            .expect("synchronization should complete")
+            .unwrap();
+            assert_eq!(result.status, "synchronized");
+            assert_eq!(result.synchronized_events, 3);
+            assert_eq!(result.peer_address, owner_address);
+            assert_eq!(member_connections, 1);
+            assert_eq!(
+                service.group_connection_states(&[group_id])[0].discovery,
+                None
+            );
+
+            // The serving node got its node back and still answers notices.
+            let mut notices = service.subscribe_event_notices();
+            owner
+                .send_sync_request(member_id, SyncRequest::EventsAvailable { group_id })
+                .unwrap();
+            let response = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = owner.next_event() => {
+                            if let NetworkEvent::SyncResponseReceived {
+                                peer_id,
+                                response,
+                                ..
+                            } = event
+                            {
+                                if peer_id == member_id {
+                                    break response;
+                                }
+                            }
                         },
                         _ = routing.next_event() => {}
                     }

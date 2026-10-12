@@ -466,7 +466,9 @@ pub struct NetworkService {
     /// Owned groups with newly stored events, which the owner advertising
     /// node announces to connected current members (ADR-049).
     stored_events: broadcast::Sender<PeerId>,
-    last_connection: std::sync::Mutex<Option<ObservedConnection>>,
+    /// Latest observed connection path, shared with the owner advertising
+    /// node so current members connecting to it count too.
+    last_connection: Arc<std::sync::Mutex<Option<ObservedConnection>>>,
     group_connections: std::sync::Mutex<BTreeMap<PeerId, ObservedGroupSynchronization>>,
     join_authorizer: Arc<dyn JoinRequestAuthorizer>,
     member_admission: Arc<dyn MemberAdmissionService>,
@@ -654,7 +656,7 @@ impl NetworkService {
             member_serving: Mutex::new(None),
             event_notices: broadcast::channel(EVENT_NOTICE_CAPACITY).0,
             stored_events: broadcast::channel(EVENT_NOTICE_CAPACITY).0,
-            last_connection: std::sync::Mutex::new(None),
+            last_connection: Arc::new(std::sync::Mutex::new(None)),
             group_connections: std::sync::Mutex::new(BTreeMap::new()),
             join_authorizer,
             member_admission,
@@ -794,16 +796,7 @@ impl NetworkService {
             Err(_) => None,
         };
         if let Some(connection_type) = connection_type {
-            let observed_at_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs());
-            *self
-                .last_connection
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ObservedConnection {
-                connection_type,
-                observed_at_unix,
-            });
+            remember_connection(&self.last_connection, connection_type);
         }
         result
     }
@@ -1134,6 +1127,7 @@ impl NetworkService {
         let invite_requests = Arc::clone(&self.invite_requests);
         let owner_addresses = Arc::clone(&self.owner_addresses);
         let owner_peers = Arc::clone(&self.owner_peers);
+        let last_connection = Arc::clone(&self.last_connection);
         let mut stored_events = self.stored_events.subscribe();
         let task_keys = keys.clone();
         let task = tokio::spawn(async move {
@@ -1187,6 +1181,13 @@ impl NetworkService {
                             } => {
                                 let response = synchronization
                                     .answer_sync_request(peer_id, &request);
+                                if !matches!(response, SyncResponse::Rejected { .. }) {
+                                    record_member_connection(
+                                        &last_connection,
+                                        &owner_peers,
+                                        peer_id,
+                                    );
+                                }
                                 let accepted = match response {
                                     SyncResponse::EventsAccepted { group_id, inserted }
                                         if inserted > 0 =>
@@ -2783,6 +2784,40 @@ fn forget_owner_peer(peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>,
         .remove(&peer_id);
 }
 
+/// Stores the latest observed connection path shown on the Network page.
+fn remember_connection(
+    last_connection: &std::sync::Mutex<Option<ObservedConnection>>,
+    connection_type: &'static str,
+) {
+    let observed_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    *last_connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ObservedConnection {
+        connection_type,
+        observed_at_unix,
+    });
+}
+
+/// Records the path of a current member whose synchronization request the
+/// owner advertising node answered, so owner-only devices report the
+/// connection type of their members.
+fn record_member_connection(
+    last_connection: &std::sync::Mutex<Option<ObservedConnection>>,
+    owner_peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>,
+    peer_id: PeerId,
+) {
+    let path = owner_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&peer_id)
+        .copied();
+    if let Some(path) = path {
+        remember_connection(last_connection, connection_type_name(path));
+    }
+}
+
 fn clear_owner_peers(peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>) {
     peers
         .lock()
@@ -2923,13 +2958,13 @@ mod tests {
     use super::{
         address_hint, answer_member_sync_request, clear_owner_peers, discovery_outcome,
         forget_owner_peer, join_response, membership_comparison_name, owned_group_state,
-        parse_bootstrap_peer, pinned_address_hints, record_owner_address, record_owner_peer,
-        select_address_hints, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
-        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService,
-        MembershipComparison, NetworkService, NetworkStatus, PeerSearchResult, PendingJoinService,
-        PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
-        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
-        MAX_GROUP_CONNECTION_STATES,
+        parse_bootstrap_peer, pinned_address_hints, record_member_connection, record_owner_address,
+        record_owner_peer, select_address_hints, upgraded_path, AdvertisementResult,
+        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
+        MemberAdmissionService, MembershipComparison, NetworkService, NetworkStatus,
+        PeerSearchResult, PendingJoinService, PullSession, SessionProgress, SynchronizationService,
+        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
+        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -3181,6 +3216,26 @@ mod tests {
             self.lan_discovery = false;
             self
         }
+    }
+
+    #[test]
+    fn member_connections_to_the_owner_node_set_the_last_connection() {
+        let member = DeviceIdentity::generate().peer_id();
+        let unknown = DeviceIdentity::generate().peer_id();
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let status = || tauri::async_runtime::block_on(service.status());
+
+        // A peer without a recorded connection path leaves it unchanged.
+        record_member_connection(&service.last_connection, &service.owner_peers, unknown);
+        assert_eq!(status().connection_type, None);
+        record_owner_peer(&service.owner_peers, member, ConnectionPath::Relayed);
+        record_member_connection(&service.last_connection, &service.owner_peers, member);
+        assert_eq!(status().connection_type, Some("relayed"));
+        record_owner_peer(&service.owner_peers, member, ConnectionPath::Lan);
+        record_member_connection(&service.last_connection, &service.owner_peers, member);
+        let status = status();
+        assert_eq!(status.connection_type, Some("lan"));
+        assert!(status.connection_observed_at_unix > 0);
     }
 
     #[test]

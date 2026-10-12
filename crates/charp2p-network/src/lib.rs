@@ -27,8 +27,9 @@ use libp2p::{
     multiaddr::Protocol,
     noise, ping, quic, relay, request_response,
     swarm::{
-        NetworkBehaviour, StreamProtocol, SwarmEvent, behaviour::toggle::Toggle,
-        dial_opts::DialOpts,
+        NetworkBehaviour, StreamProtocol, SwarmEvent,
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
     },
     tcp, yamux,
 };
@@ -59,6 +60,9 @@ const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(60 * 60);
 const RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(5 * 60);
 const RELAY_CIRCUIT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RELAY_CIRCUITS: u32 = 32;
+/// Relay circuits of a remembered address set are dialled only after every
+/// direct address failed or after this grace period without a connection.
+const DIRECT_DIAL_GRACE: Duration = Duration::from_secs(1);
 const MEBIBYTE: u64 = 1024 * 1024;
 const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
@@ -317,7 +321,14 @@ pub struct NetworkNode {
     /// Transport address of each peer this node dialled directly and is
     /// still connected to.
     dialed_addresses: HashMap<PeerId, Multiaddr>,
+    /// Relay circuit addresses held back while direct addresses are dialled.
+    relay_fallbacks: HashMap<PeerId, RelayFallback>,
     routing_peer_observer: Option<RoutingPeerObserver>,
+}
+
+struct RelayFallback {
+    addresses: Vec<Multiaddr>,
+    due: tokio::time::Instant,
 }
 
 /// Called with a routing-mode peer and the direct address this node dialled
@@ -434,6 +445,7 @@ impl NetworkNode {
             pending_invite_responses: HashMap::new(),
             request_limits,
             dialed_addresses: HashMap::new(),
+            relay_fallbacks: HashMap::new(),
             routing_peer_observer: None,
         }
     }
@@ -486,17 +498,77 @@ impl NetworkNode {
     }
 
     /// Dials a peer at previously remembered addresses, QUIC addresses first
-    /// (ADR-047). The connection only completes when the remote authenticates
-    /// as `peer_id`.
+    /// (ADR-047) with TCP racing behind them. Relay circuits are dialled only
+    /// when every direct address fails or none connects within
+    /// [`DIRECT_DIAL_GRACE`]. The connection only completes when the remote
+    /// authenticates as `peer_id`.
     pub fn dial_peer_at(
         &mut self,
         peer_id: PeerId,
-        mut addresses: Vec<Multiaddr>,
+        addresses: Vec<Multiaddr>,
     ) -> Result<(), NetworkError> {
-        prefer_quic(&mut addresses);
+        let (mut direct, relayed): (Vec<_>, Vec<_>) = addresses
+            .into_iter()
+            .partition(|address| !is_relayed(address));
+        self.relay_fallbacks.remove(&peer_id);
+        if direct.is_empty() {
+            self.swarm
+                .dial(DialOpts::peer_id(peer_id).addresses(relayed).build())?;
+            return Ok(());
+        }
+        prefer_quic(&mut direct);
         self.swarm
-            .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())?;
+            .dial(DialOpts::peer_id(peer_id).addresses(direct).build())?;
+        if !relayed.is_empty() {
+            self.relay_fallbacks.insert(
+                peer_id,
+                RelayFallback {
+                    addresses: relayed,
+                    due: tokio::time::Instant::now() + DIRECT_DIAL_GRACE,
+                },
+            );
+        }
         Ok(())
+    }
+
+    /// Dials the held-back relay circuits of `peer_id`, alongside a direct
+    /// dial that may still be pending.
+    fn dial_relay_fallback(&mut self, peer_id: PeerId) {
+        if let Some(fallback) = self.relay_fallbacks.remove(&peer_id) {
+            // A failure is reported like any other unreachable peer: the
+            // caller's connect timeout expires.
+            let _ = self.swarm.dial(
+                DialOpts::peer_id(peer_id)
+                    .condition(PeerCondition::Disconnected)
+                    .addresses(fallback.addresses)
+                    .build(),
+            );
+        }
+    }
+
+    /// Waits for the next swarm event, dialling relay fallbacks whose direct
+    /// grace period ends meanwhile.
+    async fn next_swarm_event(&mut self) -> SwarmEvent<BehaviourEvent> {
+        loop {
+            let Some(due) = self.relay_fallbacks.values().map(|f| f.due).min() else {
+                return self.swarm.select_next_some().await;
+            };
+            tokio::select! {
+                event = self.swarm.select_next_some() => return event,
+                () = tokio::time::sleep_until(due) => {
+                    let now = tokio::time::Instant::now();
+                    let expired: Vec<PeerId> = self
+                        .relay_fallbacks
+                        .iter()
+                        .filter(|(_, fallback)| fallback.due <= now)
+                        .map(|(peer_id, _)| *peer_id)
+                        .collect();
+                    for peer_id in expired {
+                        self.dial_relay_fallback(peer_id);
+                    }
+                }
+            }
+        }
     }
 
     /// Registers a known bootstrap peer address with the routing table.
@@ -691,7 +763,7 @@ impl NetworkNode {
     /// Waits for the next application-relevant network event.
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
-            match self.swarm.select_next_some().await {
+            match self.next_swarm_event().await {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     if self.relay_server {
                         self.swarm.add_external_address(address.clone());
@@ -701,6 +773,7 @@ impl NetworkNode {
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {
+                    self.relay_fallbacks.remove(&peer_id);
                     let remote_address = transport_address(endpoint.get_remote_address());
                     if endpoint.is_dialer() && !endpoint.is_relayed() {
                         self.dialed_addresses
@@ -1059,6 +1132,10 @@ impl NetworkNode {
                     self.pending_sync_responses
                         .remove(&InboundSyncRequestId(request_id));
                 }
+                SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(peer_id),
+                    ..
+                } => self.dial_relay_fallback(peer_id),
                 _ => {}
             }
         }
@@ -1431,9 +1508,13 @@ fn is_quic_address(address: &Multiaddr) -> bool {
     address
         .iter()
         .any(|protocol| matches!(protocol, Protocol::QuicV1))
-        && !address
-            .iter()
-            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+        && !is_relayed(address)
+}
+
+fn is_relayed(address: &Multiaddr) -> bool {
+    address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
 }
 
 #[cfg(test)]
@@ -1810,6 +1891,135 @@ mod tests {
         })
         .await
         .expect("peers should connect through the routing node relay");
+    }
+
+    /// Returns a routing relay and a destination holding a reservation on it,
+    /// with the destination's relayed listen address.
+    async fn relayed_destination() -> (NetworkNode, NetworkNode, Multiaddr) {
+        let mut relay = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let relay_id = relay.peer_id();
+        relay
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let relay_address = next_listen_address(&mut relay).await;
+
+        let mut destination = NetworkNode::new(Keypair::generate_ed25519());
+        destination.reserve_relay(relay_id, relay_address).unwrap();
+        let relayed_address = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = destination.next_event() => {
+                        if let NetworkEvent::Listening { address } = event
+                            && address.iter().any(|protocol| protocol == Protocol::P2pCircuit)
+                        {
+                            break address;
+                        }
+                    }
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("relay should grant a listen reservation");
+        (relay, destination, relayed_address)
+    }
+
+    #[tokio::test]
+    async fn remembered_relay_circuits_are_dialled_after_direct_addresses_fail() {
+        let (mut relay, mut destination, relayed_address) = relayed_destination().await;
+        let destination_id = destination.peer_id();
+        let mut source = NetworkNode::new(Keypair::generate_ed25519());
+        source
+            .dial_peer_at(
+                destination_id,
+                vec![relayed_address, "/ip4/127.0.0.1/tcp/1".parse().unwrap()],
+            )
+            .unwrap();
+
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = source.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, path, .. } = event
+                            && peer_id == destination_id
+                        {
+                            assert_eq!(path, ConnectionPath::Relayed);
+                            break;
+                        }
+                    }
+                    _ = destination.next_event() => {}
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("source should fall back to the relay circuit");
+    }
+
+    #[tokio::test]
+    async fn remembered_direct_addresses_are_dialled_before_relay_circuits() {
+        let (mut relay, mut destination, relayed_address) = relayed_destination().await;
+        let destination_id = destination.peer_id();
+        destination
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let direct_address = timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = destination.next_event() => {
+                        if let NetworkEvent::Listening { address } = event
+                            && !address.iter().any(|protocol| protocol == Protocol::P2pCircuit)
+                        {
+                            break address;
+                        }
+                    }
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("destination should listen directly");
+
+        let mut source = NetworkNode::new(Keypair::generate_ed25519());
+        let source_id = source.peer_id();
+        source
+            .dial_peer_at(destination_id, vec![relayed_address, direct_address])
+            .unwrap();
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    event = source.next_event() => {
+                        if let NetworkEvent::PeerConnected { peer_id, path, .. } = event
+                            && peer_id == destination_id
+                        {
+                            assert_ne!(path, ConnectionPath::Relayed);
+                            break;
+                        }
+                    }
+                    _ = destination.next_event() => {}
+                    _ = relay.next_event() => {}
+                }
+            }
+        })
+        .await
+        .expect("source should connect directly");
+
+        // Past the direct grace period the relay still never saw the source.
+        let relay_contacted = timeout(super::DIRECT_DIAL_GRACE * 2, async {
+            loop {
+                tokio::select! {
+                    event = relay.next_event() => {
+                        if matches!(event, NetworkEvent::PeerConnected { peer_id, .. } if peer_id == source_id) {
+                            break;
+                        }
+                    }
+                    _ = source.next_event() => {}
+                    _ = destination.next_event() => {}
+                }
+            }
+        })
+        .await;
+        assert!(relay_contacted.is_err());
     }
 
     #[tokio::test]

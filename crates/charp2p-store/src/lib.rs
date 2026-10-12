@@ -746,12 +746,36 @@ impl EventStore {
         Ok(self.newest_encrypted_messages(group_id, None, 1)?.pop())
     }
 
+    /// Returns one displayable message of a group by event ID, or `None` when
+    /// it is not materialized there or is hidden by a block or deletion.
+    pub fn encrypted_message(
+        &self,
+        group_id: PeerId,
+        event_id: [u8; 32],
+    ) -> Result<Option<EncryptedMessage>, StoreError> {
+        Ok(self
+            .query_encrypted_messages(group_id, None, Some(event_id), 1)?
+            .pop())
+    }
+
     /// Lists up to `limit` displayable messages of one group older than
     /// `before`, newest first.
     fn newest_encrypted_messages(
         &self,
         group_id: PeerId,
         before: Option<MessageCursor>,
+        limit: usize,
+    ) -> Result<Vec<EncryptedMessage>, StoreError> {
+        self.query_encrypted_messages(group_id, before, None, limit)
+    }
+
+    /// Lists up to `limit` displayable messages of one group older than
+    /// `before`, optionally only the one with `event_id`, newest first.
+    fn query_encrypted_messages(
+        &self,
+        group_id: PeerId,
+        before: Option<MessageCursor>,
+        event_id: Option<[u8; 32]>,
         limit: usize,
     ) -> Result<Vec<EncryptedMessage>, StoreError> {
         // Stored timestamps fit i64, so a larger cursor is after all of them.
@@ -788,6 +812,7 @@ impl EventStore {
                    OR m.created_at_unix_ms < ?3
                    OR (m.created_at_unix_ms = ?3 AND m.event_id < ?4)
                )
+               AND (?5 IS NULL OR m.event_id = ?5)
              ORDER BY m.created_at_unix_ms DESC, m.event_id DESC
              LIMIT ?2",
         )?;
@@ -795,7 +820,8 @@ impl EventStore {
             group_id.to_bytes(),
             limit as i64,
             before_created_at,
-            before_event_id
+            before_event_id,
+            event_id.map(|event_id| event_id.to_vec())
         ];
         let rows = statement.query_map(parameters, |row| {
             Ok((
@@ -6937,6 +6963,27 @@ mod tests {
         assert!(!earlier.has_earlier);
         assert_eq!(earlier.messages.len(), 1);
         assert_eq!(earlier.messages[0].created_at_unix_ms, 1);
+        let earliest_id = earlier.messages[0].event_id;
+        assert_eq!(
+            store
+                .encrypted_message(group.group_id(), earliest_id)
+                .unwrap()
+                .unwrap()
+                .created_at_unix_ms,
+            1
+        );
+        assert!(
+            store
+                .encrypted_message(GroupIdentity::generate().group_id(), earliest_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .encrypted_message(group.group_id(), [7; 32])
+                .unwrap()
+                .is_none()
+        );
 
         let newest = page.messages.last().unwrap();
         let before_newest = store
@@ -6960,6 +7007,18 @@ mod tests {
         assert_eq!(
             before_newest.messages.last().unwrap().created_at_unix_ms,
             super::MAX_RECENT_MESSAGE_EVENTS as u64
+        );
+
+        assert!(
+            store
+                .hide_message_locally(group.group_id(), &earliest_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .encrypted_message(group.group_id(), earliest_id)
+                .unwrap()
+                .is_none()
         );
     }
 

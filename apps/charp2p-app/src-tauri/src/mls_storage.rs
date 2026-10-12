@@ -792,8 +792,9 @@ impl MlsProviderService {
 
     /// Builds an evidence export of user-selected readable messages: their
     /// signed event envelopes (and the latest applied edit's envelope) with
-    /// the text shown on this device (ADR-029). Selection is limited to the
-    /// messages the timeline currently shows.
+    /// the text shown on this device (ADR-029). Selected messages are looked
+    /// up by event ID, so any retained message the timeline can show,
+    /// including earlier loaded pages, is exportable.
     pub(crate) fn evidence(
         &self,
         group_id: PeerId,
@@ -812,20 +813,19 @@ impl MlsProviderService {
             .store
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
-        let page = store
-            .encrypted_messages(group_id)
-            .map_err(|_| "message_list_unavailable")?;
-        let selected = page
-            .messages
-            .into_iter()
-            .filter(|message| event_ids.contains(&message.event_id))
-            .collect::<Vec<_>>();
         let mut requested = event_ids.to_vec();
         requested.sort_unstable();
         requested.dedup();
-        if selected.len() != requested.len() {
-            return Err("message_not_found");
-        }
+        let mut selected = requested
+            .iter()
+            .map(|event_id| {
+                store
+                    .encrypted_message(group_id, *event_id)
+                    .map_err(|_| "message_list_unavailable")?
+                    .ok_or("message_not_found")
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        selected.sort_by_key(|message| (message.created_at_unix_ms, message.event_id));
         let key = self
             .wrapping_keys
             .get_optional()?
@@ -6163,6 +6163,55 @@ mod tests {
                 vec!["Member kept".to_owned(), "Owner kept".to_owned()]
             );
         }
+    }
+
+    #[test]
+    fn evidence_exports_messages_older_than_the_newest_page() {
+        let directory = tempdir().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let service = test_service(directory.path().join("owner.sqlite3"));
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        let oldest = service
+            .create_message_at(group_id, &owner, "Oldest", 1)
+            .unwrap();
+        // Newer messages from another device are stored directly; only the
+        // selected oldest message needs a readable local body.
+        let other = DeviceIdentity::generate();
+        {
+            let mut store = service.store.lock().unwrap();
+            let snapshot = store.encrypted_mls_provider_snapshot().unwrap().unwrap();
+            let body = store
+                .encrypted_message(group_id, *oldest.id().as_bytes())
+                .unwrap()
+                .unwrap()
+                .encrypted_body;
+            for sequence in 1..=charp2p_store::MAX_RECENT_MESSAGE_EVENTS as u64 {
+                let event = SignedEvent::create(
+                    &other,
+                    EventSpec {
+                        group_id,
+                        author_sequence: sequence,
+                        causal_parents: &[],
+                        created_at_unix_ms: sequence + 1,
+                        kind: EventKind::MessageCreated,
+                        protected_payload: b"MLS ciphertext",
+                    },
+                )
+                .unwrap();
+                store
+                    .put_message_and_encrypted_mls_provider_snapshot(&event, &snapshot, &body)
+                    .unwrap();
+            }
+            assert!(store.encrypted_messages(group_id).unwrap().has_earlier);
+        }
+
+        let export = service
+            .evidence(group_id, owner.peer_id(), &[*oldest.id().as_bytes()], 99)
+            .unwrap();
+        assert_eq!(export.events.len(), 1);
+        assert_eq!(export.events[0].event_id, hex_bytes(oldest.id().as_bytes()));
+        assert_eq!(export.events[0].displayed_text, "Oldest");
     }
 
     #[test]

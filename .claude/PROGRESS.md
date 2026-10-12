@@ -165,7 +165,7 @@
 - [x] Docs: complete technical-design "Serialization and size limits" (invite exchange codec, deletion and invite-permission plaintexts) and fix the node-policy "unsigned records" bullet (provider records are unsigned stock Kademlia records).
 - [x] Docs: update stale apps/charp2p-app/README.md (identity backup exists, approval/single-use supported, several local groups, removed footer pages).
 - [x] Protocol vectors: pin the MLS-protected plaintexts (plain and reply body, edit, deletion, metadata v1/v2, invite permission) in crates/charp2p-core/tests/protocol_vectors.rs.
-- [ ] Protocol vectors: pin invitation v3/v4 (single-use, approval, history policy variants).
+- [x] Protocol vectors: pin invitation v3/v4 (single-use, approval, history policy variants).
 - [ ] Protocol vectors: pin the join and invite request/response wire codecs.
 
 ## Needs human
@@ -339,3 +339,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-12T09:27:15Z Docs serialization limits: technical-design now documents the `/charp2p/invite/1.0.0` big-endian request/response framing, lists message-deletion and invite-permission plaintexts under Postcard with their 64/128-byte limits and the invite wire limits (136 bytes / 8 KiB + 5); node-policy bullet now says provider records are unsigned stock Kademlia records bounded by size instead of signatures. fmt, clippy, workspace tests, app build pass.
 - 2026-10-12T10:27:30Z Docs: app README: replaced stale claims (onboarding-only shell, footer pages, recovery export later, first local group only, single-use/approval rejected) with current behavior: Privacy/identity pages in onboarding and group navigation, encrypted identity backup export/restore, several owned groups, single-use invitations and owner approval; retained history still rejected. fmt, clippy, workspace tests, npm build pass.
 - 2026-10-12T11:28:35Z Protocol vectors (MLS plaintexts): pinned plain/reply message body, edit, deletion, group metadata v1/v2 and invite permission encodings plus unknown-version rejection; split remaining invitation v3/v4 and join/invite codec vectors into sub-items. fmt, clippy, workspace tests, npm build pass.
+- 2026-10-12T12:30:30Z Protocol vectors (invitations v3/v4): pinned a single-use hinted v3 invitation (FromInvitation, one QUIC hint) and a reusable approval v4 invitation (AllRetained, no hints) with IDs and discovery keys, plus a test that relabelling the version byte fails verification. fmt, clippy, workspace tests, npm build pass.

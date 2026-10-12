@@ -38,6 +38,21 @@ const INVITATION_DISCOVERY_KEY: &str =
 const INVITATION_EXPIRES_AT_UNIX: u64 = 4_102_444_800;
 const VERIFIED_AT_UNIX: u64 = 1_700_000_000;
 
+/// Version 3 single-use invitation with history from the invitation and the
+/// address hint `/ip4/192.0.2.1/udp/4001/quic-v1`, otherwise as above.
+const HINTED_INVITATION: &str = "AyQIARIgoJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPAmACQIARIg0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcgoJnJnHrPqmwmr9p2cQO9CVA3V16Nw_2QQPJbzzXsngMtewuGWGrRXxMv014baLsMVmVjdG9yIGdyb3VwDFZlY3RvciBvd25lcoCumaQPAQABCwTAAAIBkQIPoc0DQBMe9BHqMVwy0MYHQDNrqbU2AEQLcZeP174KY35ry5WqLW-oJCeZI4gNA8Biati15YeC6gAPpqR_T7RerRj8Wgg";
+const HINTED_INVITATION_ID: &str = "032d7b0b86586ad15f132fd35e1b68bb";
+const HINTED_INVITATION_DISCOVERY_KEY: &str =
+    "8e19e8eb0c73bd3694ebcdb48ddee878edb8fca202cad06625608242f56a8128";
+const HINTED_INVITATION_ADDRESS: &str = "/ip4/192.0.2.1/udp/4001/quic-v1";
+
+/// Version 4 reusable invitation requiring owner approval, granting all
+/// retained history, without address hints, otherwise as above.
+const APPROVAL_INVITATION: &str = "BCQIARIgoJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPAmACQIARIg0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzehFgGQMilBxXuUkCd4vxk8TbZ-hg9gkf8tOMr0QQmhX1Kt0Abx9tnUDxAeEQh3PNgMVmVjdG9yIGdyb3VwDFZlY3RvciBvd25lcoCumaQPAgEAQDScjPDAkwYcHYvSFVPJna4JMC4zG_7BiZ5TM4M6gZmErTqTV9NgyvtmxFOSeXv8Prt-Pifu-yOv6rdF7v1aEQE";
+const APPROVAL_INVITATION_ID: &str = "52add006f1f6d9d40f101e1108773cd8";
+const APPROVAL_INVITATION_DISCOVERY_KEY: &str =
+    "b40dcc0422787e96fd4c3cadab6dda95f00bd1591b0df6046b2ebead9c733bf4";
+
 /// MLS-protected plaintexts. Targets are the event identifier `[0x55; 32]`.
 const MESSAGE_TARGET: [u8; 32] = [0x55; 32];
 /// Plain message text "Vector text" without a reply reference.
@@ -184,6 +199,73 @@ fn fixed_invitation_rejects_a_tampered_signature() {
     chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
     let tampered: String = chars.into_iter().collect();
     assert!(Invitation::decode(&tampered, VERIFIED_AT_UNIX).is_err());
+}
+
+#[test]
+fn fixed_hinted_invitation_decodes_and_verifies() {
+    let invitation =
+        Invitation::decode(HINTED_INVITATION, VERIFIED_AT_UNIX).expect("vector verifies");
+    assert_eq!(invitation.group_id().to_string(), GROUP_ID);
+    assert_eq!(invitation.inviter_device_id().to_string(), DEVICE_PEER_ID);
+    assert_eq!(invitation.history_policy(), HistoryPolicy::FromInvitation);
+    assert!(!invitation.is_reusable());
+    assert!(!invitation.requires_owner_approval());
+    let hints: Vec<String> = invitation
+        .address_hints()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(hints, [HINTED_INVITATION_ADDRESS]);
+    assert_eq!(
+        hex(invitation.invitation_id().as_bytes()),
+        HINTED_INVITATION_ID
+    );
+    assert_eq!(
+        hex(DiscoveryKey::from_invitation(&invitation).as_bytes()),
+        HINTED_INVITATION_DISCOVERY_KEY
+    );
+    assert_eq!(invitation.encode().expect("re-encode"), HINTED_INVITATION);
+}
+
+#[test]
+fn fixed_approval_invitation_decodes_and_verifies() {
+    let invitation =
+        Invitation::decode(APPROVAL_INVITATION, VERIFIED_AT_UNIX).expect("vector verifies");
+    assert_eq!(invitation.group_id().to_string(), GROUP_ID);
+    assert_eq!(invitation.inviter_device_id().to_string(), DEVICE_PEER_ID);
+    assert_eq!(invitation.history_policy(), HistoryPolicy::AllRetained);
+    assert!(invitation.is_reusable());
+    assert!(invitation.requires_owner_approval());
+    assert!(invitation.address_hints().is_empty());
+    assert_eq!(
+        hex(invitation.invitation_id().as_bytes()),
+        APPROVAL_INVITATION_ID
+    );
+    assert_eq!(
+        hex(DiscoveryKey::from_invitation(&invitation).as_bytes()),
+        APPROVAL_INVITATION_DISCOVERY_KEY
+    );
+    assert_eq!(invitation.encode().expect("re-encode"), APPROVAL_INVITATION);
+}
+
+#[test]
+fn invitation_versions_are_bound_to_their_signing_domain() {
+    // Every vector continues with the byte 0x24 after its version, so the
+    // first two Base64 characters encode version 2, 3 or 4 respectively.
+    // Relabelling a signed invitation as another version must fail.
+    const VERSION_PREFIXES: [&str; 3] = ["Ai", "Ay", "BC"];
+    for vector in [INVITATION, HINTED_INVITATION, APPROVAL_INVITATION] {
+        for prefix in VERSION_PREFIXES {
+            if vector.starts_with(prefix) {
+                continue;
+            }
+            let relabelled = format!("{prefix}{}", &vector[2..]);
+            assert!(
+                Invitation::decode(&relabelled, VERIFIED_AT_UNIX).is_err(),
+                "{prefix} relabelling of a vector verified"
+            );
+        }
+    }
 }
 
 #[test]

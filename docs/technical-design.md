@@ -218,13 +218,22 @@ connection instead of trusting whichever peer knows the rendezvous secret.
 After loading and revalidating an issued invitation, the owner retains its
 derived rendezvous key in platform-protected storage under a non-secret SQLite
 index. Revoking or expiring the bearer removes join authority but keeps that
-key so members admitted through it can still find the owner. One background
+key so members admitted through it can still find the owner. Following
+ADR-054, each owner admission records the invitation that admitted it, and
+after the bearer has expired, been revoked or been retired as consumed its key
+is retired (index first, then the protected key) once no current admission
+records that invitation; removing the last member it admitted makes it
+retireable too. Revocation and consumed-bearer retirement retire the key
+immediately, and listing issued invitations, which runs before every
+background advertisement recheck, sweeps the rest. Keys indexed before
+provenance was recorded are kept. One background
 provider advertises the retained keys of every owned group while the app runs,
 whichever group is open in the interface. It refreshes publication every five
 minutes, and the interface rechecks it every 30 seconds and restarts a failed
 advertiser after 5 seconds. Retained keys are bounded to 64 per group and 256
-across all owned groups on the device; issuing an invitation that would exceed
-either bound is refused. Closing the app removes the live provider, while
+across all owned groups on the device, counting keys of active invitations and
+keys that admitted a current member rather than every invitation ever issued;
+issuing an invitation that would exceed either bound is refused. Closing the app removes the live provider, while
 short-lived DHT records may remain until their network TTL elapses.
 
 LAN discovery may use mDNS as an additional path, never as the only discovery
@@ -395,7 +404,9 @@ temporary authorization, MLS, or storage failures return `busy`. These public
 categories do not reveal which local record was missing or unavailable.
 Admission is idempotent for one authenticated device and exact KeyPackage. The
 owner commits the membership event, advanced provider snapshot, request hash,
-and an encrypted accepted response in one transaction. An exact retry returns
+admitting invitation ID, and an encrypted accepted response in one
+transaction, which requires the invitation's rendezvous-key index to be
+present so an admission cannot commit after its key was retired (ADR-054). An exact retry returns
 that response even after restart. A different KeyPackage for an already present
 device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
@@ -821,7 +832,9 @@ Each client stores:
 - One opaque derived discovery key per joined group in platform-protected
   storage. It supports later peer lookup but carries no join authorization.
 - Owner-side rendezvous keys retained in platform-protected storage after
-  invitation revocation or expiry, with non-secret indexes in SQLite.
+  invitation revocation or expiry, with non-secret indexes in SQLite, until no
+  current admission records their invitation (ADR-054).
+- The admitting invitation ID of each owner admission.
 - Locally materialized message bodies encrypted and authenticated against their
   signed event IDs.
 - User preferences and local blocks.
@@ -885,6 +898,8 @@ and security-contact information before public access.
 
 - Forged messages and group events.
 - Invitation tampering and expired invitations.
+- Owner reachability leaking through expired or revoked invitations that
+  admitted no current member, whose rendezvous keys are retired (ADR-054).
 - Replay and duplicate events.
 - Unauthorized membership changes.
 - DHT record flooding and oversized inputs.

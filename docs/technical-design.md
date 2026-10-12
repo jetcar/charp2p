@@ -218,10 +218,13 @@ connection instead of trusting whichever peer knows the rendezvous secret.
 After loading and revalidating an issued invitation, the owner retains its
 derived rendezvous key in platform-protected storage under a non-secret SQLite
 index. Revoking or expiring the bearer removes join authority but keeps that
-key so members admitted through it can still find the owner. The owner provides
-all retained keys while the group is open, refreshes publication every five
-minutes, and restarts failed advertisers from its status poll. The set is
-bounded to 64 keys per group. Closing the app removes the live provider, while
+key so members admitted through it can still find the owner. One background
+provider advertises the retained keys of every owned group while the app runs,
+whichever group is open in the interface. It refreshes publication every five
+minutes, and the interface rechecks it every 30 seconds and restarts a failed
+advertiser after 5 seconds. Retained keys are bounded to 64 per group and 256
+across all owned groups on the device; issuing an invitation that would exceed
+either bound is refused. Closing the app removes the live provider, while
 short-lived DHT records may remain until their network TTL elapses.
 
 LAN discovery may use mDNS as an additional path, never as the only discovery
@@ -603,6 +606,13 @@ Requirements:
   member again.
 - Resource limits apply before signature verification where possible.
 - A peer never trusts another peer's statement that an event is valid.
+
+The open joined group synchronizes with its owner every minute and when an
+owner new-event notice arrives (ADR-049). Joined groups that are not open
+synchronize one at a time, 5 seconds apart, starting 15 seconds after launch and
+repeating every five minutes after each full pass, so unread counts, last
+synchronization times and connection states stay current while the app or its
+background window runs.
 
 SQLite is the expected local event index, with protected payloads and key
 material separated so keys can use platform secure storage.

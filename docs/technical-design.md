@@ -77,7 +77,9 @@ group_id = multihash("charp2p-group-v1" || group_root_public_key)
 The initial owner controls the corresponding administration key. Membership
 and device authorization are expressed as signed group events. The protocol
 must support rotating administration keys even if the MVP UI exposes one
-owner.
+owner: the group ID stays bound to the original root key, and a reserved
+`AdministrationKeyRotated` event kind is kept for a future signed hand-over to
+a successor key (ADR-053). MVP clients do not author it.
 
 Peer identity proves continuity of a device key, not a person's civil identity.
 
@@ -501,16 +503,18 @@ MessageEdited
 MessageDeleted
 KeyEpochAdvanced
 InvitePermissionChanged
+AdministrationKeyRotated
 ```
 
-`InvitationCreated`, `InvitationRevoked`, `DeviceAdded` and `DeviceRevoked`
-are reserved codes in the MVP. Invitations are device-local protected bearers
-revoked only at their pinned owner device (ADR-013, ADR-021), and each device
-joins and is removed as its own MLS member through `MemberAdded` and
-`MemberRemoved` (ADR-020), so no MVP client authors these kinds. Clients keep
-the codes so a future protocol can assign them, never accept them through
-member pushes, and store a pulled event of a reserved kind without applying
-it to group state or showing it.
+`InvitationCreated`, `InvitationRevoked`, `DeviceAdded`, `DeviceRevoked` and
+`AdministrationKeyRotated` are reserved codes in the MVP. Invitations are
+device-local protected bearers revoked only at their pinned owner device
+(ADR-013, ADR-021), and each device joins and is removed as its own MLS member
+through `MemberAdded` and `MemberRemoved` (ADR-020), and administration-key
+rotation is deferred (ADR-053), so no MVP client authors these kinds. Clients
+keep the codes so a future protocol can assign them, never accept them through
+member pushes, and store a pulled event of a reserved kind without applying it
+to group state or showing it.
 
 A `GroupMetadataChanged` event carries versioned display metadata as an MLS
 application message: version 1 holds the group name, version 2 adds a built-in

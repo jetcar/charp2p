@@ -98,7 +98,7 @@ that another device will apply.
 | Identity backup restored after loss | The backup restores the device identity only, not group roots or MLS state (ADR-028). | A restored device has the owner's peer ID but cannot serve the group. Members cannot synchronize with it. A new group is the only recovery. |
 | Owner identity restored while the original still runs | The restore flow warns to stop using the original device. | Two devices with one peer ID confuse discovery; only the one holding the group root can serve the group. |
 | Stolen SQLite files | Group roots, bearers, rendezvous keys, and snapshot wrapping keys stay in platform-protected storage; SQLite holds encrypted snapshots and local copies (ADR-007, ADR-016). | An attacker with the unlocked platform account can read protected storage. |
-| Owner administration-key rotation | Not implemented. The protocol keeps a root public key per group ID so rotation can be added. | No transfer of ownership in the MVP; multiple owners are an MVP exclusion. |
+| Owner administration-key rotation | Not implemented. The group ID stays bound to the original root public key and the reserved `AdministrationKeyRotated` event kind is kept so rotation can be added (ADR-053); clients store a pulled event of that kind without applying it and refuse it through member pushes. | No transfer of ownership in the MVP; multiple owners are an MVP exclusion. |
 
 ## Out of scope for the MVP
 

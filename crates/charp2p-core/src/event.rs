@@ -59,6 +59,9 @@ pub enum EventKind {
     KeyEpochAdvanced,
     /// Grants or withdraws a member device's invite permission.
     InvitePermissionChanged,
+    /// Reserved: hands group administration to a successor key; not
+    /// authored in the MVP (ADR-053).
+    AdministrationKeyRotated,
 }
 
 impl EventKind {
@@ -77,6 +80,7 @@ impl EventKind {
             Self::MessageDeleted => 11,
             Self::KeyEpochAdvanced => 12,
             Self::InvitePermissionChanged => 13,
+            Self::AdministrationKeyRotated => 14,
         }
     }
 
@@ -95,6 +99,7 @@ impl EventKind {
             11 => Ok(Self::MessageDeleted),
             12 => Ok(Self::KeyEpochAdvanced),
             13 => Ok(Self::InvitePermissionChanged),
+            14 => Ok(Self::AdministrationKeyRotated),
             _ => Err(EventError::UnsupportedKind(code)),
         }
     }
@@ -415,7 +420,7 @@ mod tests {
 
     #[test]
     fn event_kind_codes_round_trip() {
-        for code in 1..=13 {
+        for code in 1..=14 {
             let kind = EventKind::from_code(code).expect("known kind");
             assert_eq!(kind.code(), code);
         }
@@ -423,9 +428,13 @@ mod tests {
             EventKind::from_code(13).expect("known kind"),
             EventKind::InvitePermissionChanged
         );
+        assert_eq!(
+            EventKind::from_code(14).expect("known kind"),
+            EventKind::AdministrationKeyRotated
+        );
         assert!(matches!(
-            EventKind::from_code(14),
-            Err(EventError::UnsupportedKind(14))
+            EventKind::from_code(15),
+            Err(EventError::UnsupportedKind(15))
         ));
         assert!(matches!(
             EventKind::from_code(0),

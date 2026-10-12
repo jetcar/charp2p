@@ -855,6 +855,18 @@ mod tests {
             accept_pushed_events(&mut store, author.peer_id(), &refresh),
             Err(SynchronizationError::UnsupportedPushedEvent)
         ));
+        let rotation = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![
+                event_of(4, EventKind::AdministrationKeyRotated)
+                    .encode()
+                    .unwrap(),
+            ],
+        };
+        assert!(matches!(
+            accept_pushed_events(&mut store, author.peer_id(), &rotation),
+            Err(SynchronizationError::UnsupportedPushedEvent)
+        ));
     }
 
     #[test]

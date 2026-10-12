@@ -267,8 +267,9 @@ and multiplexed with Yamux (ADR-047). When dialing remembered addresses, direct
 QUIC addresses are tried first and TCP addresses race behind them. Relay
 circuit addresses among them are dialed only after every direct address has
 failed or none has connected within one second. Client
-nodes listen on QUIC and TCP on every interface, and community nodes accept
-both on their configured addresses. Invitation address hints (ADR-037) list
+nodes listen on QUIC and TCP on every IPv4 interface and, where the device
+has IPv6, on every IPv6 interface; community nodes accept both on each of
+their configured addresses. Invitation address hints (ADR-037) list
 relay circuit addresses first, then direct QUIC addresses, then direct TCP
 addresses, within the four-hint limit.
 

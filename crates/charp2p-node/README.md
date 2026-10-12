@@ -19,7 +19,9 @@ Run it with a persistent identity file:
 ```sh
 cargo run --release -p charp2p-node -- \
   --listen /ip4/0.0.0.0/udp/4001/quic-v1 \
+  --listen /ip6/::/udp/4001/quic-v1 \
   --listen-tcp /ip4/0.0.0.0/tcp/4001 \
+  --listen-tcp /ip6/::/tcp/4001 \
   --identity /var/lib/charp2p/node-identity.key
 ```
 
@@ -30,6 +32,10 @@ CHARP2P_NODE_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1
 CHARP2P_NODE_LISTEN_TCP=/ip4/0.0.0.0/tcp/4001
 CHARP2P_NODE_IDENTITY=data/node-identity.key
 ```
+
+`--listen` and `--listen-tcp` may be repeated, and their environment variables
+take several comma-separated addresses, for example to also accept IPv6
+connections. Every address must be available or startup stops.
 
 To refuse abusive peers, list their peer IDs one per line in a text file and
 pass it with `--blocked-peers <file>` or `CHARP2P_NODE_BLOCKED_PEERS`. Blank

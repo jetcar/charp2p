@@ -25,21 +25,25 @@ const MAX_BLOCKED_PEERS: usize = 4_096;
 )]
 struct Config {
     /// QUIC address on which the routing node accepts peer connections.
+    /// Repeat the flag, or separate environment values with commas, to also
+    /// listen on IPv6 or on further addresses.
     #[arg(
         long,
         env = "CHARP2P_NODE_LISTEN",
-        default_value = "/ip4/0.0.0.0/udp/4001/quic-v1"
+        default_value = "/ip4/0.0.0.0/udp/4001/quic-v1",
+        value_delimiter = ','
     )]
-    listen: Multiaddr,
+    listen: Vec<Multiaddr>,
 
     /// TCP address on which the routing node also accepts peer connections,
-    /// for clients on networks that block UDP.
+    /// for clients on networks that block UDP. Repeatable like `--listen`.
     #[arg(
         long,
         env = "CHARP2P_NODE_LISTEN_TCP",
-        default_value = "/ip4/0.0.0.0/tcp/4001"
+        default_value = "/ip4/0.0.0.0/tcp/4001",
+        value_delimiter = ','
     )]
-    listen_tcp: Multiaddr,
+    listen_tcp: Vec<Multiaddr>,
 
     /// File containing this node's persistent libp2p identity.
     #[arg(
@@ -92,8 +96,9 @@ async fn main() -> Result<(), NodeError> {
         node.block_peer(*blocked_peer);
     }
     let peer_id = node.peer_id();
-    node.listen_on(config.listen)?;
-    node.listen_on(config.listen_tcp)?;
+    for address in config.listen.iter().chain(&config.listen_tcp) {
+        node.listen_on(address.clone())?;
+    }
 
     println!("CharP2P routing node");
     println!("Peer ID: {peer_id}");
@@ -425,5 +430,38 @@ mod tests {
                 Err(NodeError::RelayLimitsInvalid)
             ));
         }
+    }
+
+    #[test]
+    fn listen_addresses_default_to_ipv4_and_accept_several_addresses() {
+        let default = Config::try_parse_from(["charp2p-node"]).unwrap();
+        assert_eq!(
+            default.listen,
+            ["/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap()]
+        );
+        assert_eq!(
+            default.listen_tcp,
+            ["/ip4/0.0.0.0/tcp/4001".parse().unwrap()]
+        );
+
+        let dual_stack = Config::try_parse_from([
+            "charp2p-node",
+            "--listen",
+            "/ip4/0.0.0.0/udp/4001/quic-v1",
+            "--listen",
+            "/ip6/::/udp/4001/quic-v1",
+            "--listen-tcp",
+            "/ip4/0.0.0.0/tcp/4001,/ip6/::/tcp/4001",
+        ])
+        .unwrap();
+        assert_eq!(dual_stack.listen.len(), 2);
+        assert_eq!(
+            dual_stack.listen_tcp,
+            [
+                "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+                "/ip6/::/tcp/4001".parse().unwrap()
+            ]
+        );
+        assert!(Config::try_parse_from(["charp2p-node", "--listen", "not-an-address"]).is_err());
     }
 }

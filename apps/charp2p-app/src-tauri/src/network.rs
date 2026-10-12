@@ -2850,15 +2850,16 @@ fn owned_group_state(
 }
 
 /// Strips the trailing device peer ID, which joiners append from the pinned
-/// inviter instead, and rejects loopback, unspecified, and oversized
-/// addresses that cannot serve as an invitation hint.
+/// inviter instead, and rejects loopback, unspecified, IPv6 link-local
+/// (unusable without the owner's interface scope), and oversized addresses
+/// that cannot serve as an invitation hint.
 fn address_hint(mut address: Multiaddr) -> Option<Multiaddr> {
     if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
         address.pop();
     }
     let local_only = address.iter().any(|protocol| match protocol {
         Protocol::Ip4(ip) => ip.is_loopback() || ip.is_unspecified(),
-        Protocol::Ip6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Protocol::Ip6(ip) => ip.is_loopback() || ip.is_unspecified() || ip.is_unicast_link_local(),
         _ => false,
     });
     let valid = !local_only
@@ -2879,8 +2880,9 @@ fn pinned_address_hints(invitation: &Invitation) -> Vec<Multiaddr> {
         .collect()
 }
 
-/// Starts listening on QUIC and on TCP (ADR-047) on every interface, each
-/// on a port chosen by the operating system.
+/// Starts listening on QUIC and on TCP (ADR-047) on every IPv4 and IPv6
+/// interface, each on a port chosen by the operating system. IPv4 is
+/// required; IPv6 is skipped on devices or networks without it.
 fn listen_on_all_interfaces(node: &mut NetworkNode) -> Result<(), &'static str> {
     for address in ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"] {
         node.listen_on(
@@ -2889,6 +2891,12 @@ fn listen_on_all_interfaces(node: &mut NetworkNode) -> Result<(), &'static str> 
                 .map_err(|_| "network_configuration_invalid")?,
         )
         .map_err(|_| "network_unavailable")?;
+    }
+    for address in ["/ip6/::/udp/0/quic-v1", "/ip6/::/tcp/0"] {
+        let address = address
+            .parse()
+            .map_err(|_| "network_configuration_invalid")?;
+        let _ = node.listen_on(address);
     }
     Ok(())
 }
@@ -3296,6 +3304,7 @@ mod tests {
             "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap(),
         );
         record_owner_address(&addresses, "/ip6/::/udp/4001/quic-v1".parse().unwrap());
+        record_owner_address(&addresses, "/ip6/fe80::1/udp/4001/quic-v1".parse().unwrap());
 
         let tcp: libp2p::Multiaddr = "/ip4/192.168.1.20/tcp/4001".parse().unwrap();
         record_owner_address(&addresses, tcp.clone());
@@ -4188,12 +4197,15 @@ mod tests {
             .expect("advertisement should complete")
             .unwrap();
             // The owner listens on every interface; its recorded non-loopback
-            // address supplies the port for a loopback hint.
+            // IPv4 address supplies the port for a loopback hint.
             let port = timeout(Duration::from_secs(10), async {
                 loop {
                     let port = owner_service.owner_address_hints().iter().find_map(|hint| {
+                        let ipv4 = hint.iter().any(|protocol| {
+                            matches!(protocol, libp2p::multiaddr::Protocol::Ip4(_))
+                        });
                         hint.iter().find_map(|protocol| match protocol {
-                            libp2p::multiaddr::Protocol::Udp(port) => Some(port),
+                            libp2p::multiaddr::Protocol::Udp(port) if ipv4 => Some(port),
                             _ => None,
                         })
                     });

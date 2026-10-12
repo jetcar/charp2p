@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -140,6 +140,14 @@ pub enum ApprovalRequestOutcome {
 pub struct OwnerDiscoveryKeyMetadata {
     pub invitation_id: InvitationId,
     pub group_id: PeerId,
+}
+
+/// The invitation whose join request an owner admission answers (ADR-054).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmittingInvitation {
+    pub invitation_id: InvitationId,
+    /// Whether the admission consumes the invitation (ADR-042).
+    pub single_use: bool,
 }
 
 /// Largest event-identifier page returned for one synchronization request.
@@ -370,9 +378,11 @@ impl EventStore {
     }
 
     /// Atomically persists an admitted member event, the advanced MLS state,
-    /// and the encrypted response used to retry that exact join request.
-    /// A single-use invitation is consumed in the same transaction; if it was
-    /// already consumed nothing is stored.
+    /// and the encrypted response used to retry that exact join request,
+    /// recording the admitting invitation (ADR-054). That invitation's owner
+    /// rendezvous-key index must still exist, so an admission cannot commit
+    /// after its key was retired. A single-use invitation is consumed in the
+    /// same transaction; if it was already consumed nothing is stored.
     pub fn put_mls_join_admission(
         &mut self,
         event: &SignedEvent,
@@ -380,7 +390,7 @@ impl EventStore {
         member_id: PeerId,
         request_hash: &[u8; 32],
         encrypted_response: &[u8],
-        single_use_invitation: Option<InvitationId>,
+        invitation: Option<AdmittingInvitation>,
     ) -> Result<PutEventOutcome, StoreError> {
         if event.kind() != charp2p_core::EventKind::MemberAdded {
             return Err(StoreError::CorruptIndex);
@@ -388,21 +398,42 @@ impl EventStore {
         validate_encrypted_mls_provider_snapshot(encrypted_snapshot)?;
         validate_encrypted_join_response(encrypted_response)?;
         let transaction = self.connection.transaction()?;
+        if let Some(invitation) = invitation {
+            let indexed = transaction
+                .query_row(
+                    "SELECT 1 FROM owner_discovery_keys
+                     WHERE invitation_id = ?1 AND group_id = ?2",
+                    params![
+                        invitation.invitation_id.as_bytes().as_slice(),
+                        event.group_id().to_bytes(),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if indexed.is_none() {
+                return Err(StoreError::InvitationRetired);
+            }
+        }
         let outcome = put_event_in_transaction(&transaction, event)?;
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
         transaction.execute(
             "INSERT INTO mls_join_admissions (
-                group_id, member_id, request_hash, encrypted_response, event_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                group_id, member_id, request_hash, encrypted_response, event_id,
+                invitation_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 event.group_id().to_bytes(),
                 member_id.to_bytes(),
                 request_hash.as_slice(),
                 encrypted_response,
                 event.id().as_bytes().as_slice(),
+                invitation.map(|invitation| invitation.invitation_id.as_bytes().to_vec()),
             ],
         )?;
-        if let Some(invitation_id) = single_use_invitation {
+        if let Some(invitation_id) = invitation
+            .filter(|invitation| invitation.single_use)
+            .map(|invitation| invitation.invitation_id)
+        {
             let inserted = transaction.execute(
                 "INSERT INTO consumed_single_use_invitations (
                     invitation_id, group_id, member_id, event_id
@@ -2512,6 +2543,28 @@ impl EventStore {
         Ok(keys)
     }
 
+    /// Removes the index of an owner rendezvous key whose bearer invitation is
+    /// no longer active, when the key was indexed with provenance and no
+    /// current admission records that invitation (ADR-054). The check and the
+    /// removal are one statement, so a concurrent admission either commits
+    /// first and keeps the key or is refused. Returns whether it was removed;
+    /// the caller then removes the protected key.
+    pub fn retire_owner_discovery_key(
+        &mut self,
+        group_id: PeerId,
+        invitation_id: InvitationId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM owner_discovery_keys
+             WHERE invitation_id = ?1 AND group_id = ?2 AND retirable = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM mls_join_admissions
+                   WHERE invitation_id = ?1 AND group_id = ?2
+               )",
+            params![invitation_id.as_bytes().as_slice(), group_id.to_bytes()],
+        )? != 0)
+    }
+
     /// Removes a dangling owner rendezvous-key index.
     pub fn remove_owner_discovery_key(
         &mut self,
@@ -2899,7 +2952,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=31 => {}
+            6..=32 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3440,6 +3493,42 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 32 {
+            // Admissions and keys indexed before provenance was recorded keep
+            // their keys (ADR-054).
+            let transaction = connection.transaction()?;
+            let lacks_column = |table: &str, column: &str| -> rusqlite::Result<bool> {
+                transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                     ) AND NOT EXISTS(
+                        SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+                     )",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+            };
+            if lacks_column("mls_join_admissions", "invitation_id")? {
+                transaction.execute_batch(
+                    "ALTER TABLE mls_join_admissions ADD COLUMN invitation_id BLOB
+                        CHECK(invitation_id IS NULL OR length(invitation_id) = 16);
+
+                     CREATE INDEX IF NOT EXISTS mls_join_admissions_by_invitation
+                        ON mls_join_admissions(invitation_id, group_id);",
+                )?;
+            }
+            if lacks_column("owner_discovery_keys", "retirable")? {
+                transaction.execute_batch(
+                    "ALTER TABLE owner_discovery_keys ADD COLUMN retirable INTEGER NOT NULL
+                        DEFAULT 1 CHECK(retirable IN (0, 1));
+
+                     UPDATE owner_discovery_keys SET retirable = 0;",
+                )?;
+            }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3765,6 +3854,9 @@ pub enum StoreError {
     /// A single-use invitation already admitted a device.
     #[error("single-use invitation already consumed")]
     InvitationConsumed,
+    /// The admitting invitation's owner rendezvous key was retired.
+    #[error("admitting invitation's rendezvous key was retired")]
+    InvitationRetired,
     /// Stored index columns disagree with the verified signed envelope.
     #[error("event-store index does not match its signed event")]
     CorruptIndex,
@@ -3791,13 +3883,13 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        ApprovalRequestOutcome, ApprovalState, AuthorHead, EventStore, IssuedInvitationMetadata,
-        JoinedGroupMetadata, LocalGroupMetadata, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
-        MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
-        MAX_PEER_ADDRESS_BYTES, MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP,
-        MAX_SEQUENCE_CONFLICTS_PER_AUTHOR, MAX_SYNC_BATCH_EVENTS, OwnerApprovalRequest,
-        OwnerDiscoveryKeyMetadata, PendingInvitationMetadata, PutEventOutcome,
-        SequenceConflictSummary, StoreError,
+        AdmittingInvitation, ApprovalRequestOutcome, ApprovalState, AuthorHead, EventStore,
+        IssuedInvitationMetadata, JoinedGroupMetadata, LocalGroupMetadata,
+        MAX_ENCRYPTED_JOIN_RESPONSE_BYTES, MAX_ENCRYPTED_MESSAGE_BODY_BYTES,
+        MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES, MAX_PEER_ADDRESS_BYTES,
+        MAX_PENDING_APPROVAL_REQUESTS_PER_GROUP, MAX_SEQUENCE_CONFLICTS_PER_AUTHOR,
+        MAX_SYNC_BATCH_EVENTS, OwnerApprovalRequest, OwnerDiscoveryKeyMetadata,
+        PendingInvitationMetadata, PutEventOutcome, SequenceConflictSummary, StoreError,
     };
 
     fn message_event(
@@ -4780,6 +4872,144 @@ mod tests {
     }
 
     #[test]
+    fn owner_discovery_key_is_retired_only_without_a_current_admission() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let group_id = group.group_id();
+        let used = InvitationId::from_bytes([4; 16]);
+        let unused = InvitationId::from_bytes([5; 16]);
+        for invitation_id in [used, unused] {
+            store
+                .put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+                    invitation_id,
+                    group_id,
+                })
+                .unwrap();
+        }
+        let added = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id,
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"MLS commit",
+                },
+            )
+            .unwrap()
+        };
+        let member = DeviceIdentity::generate().peer_id();
+        store
+            .put_mls_join_admission(
+                &added(1, EventKind::MemberAdded),
+                b"snapshot",
+                member,
+                &[1; 32],
+                b"response",
+                Some(AdmittingInvitation {
+                    invitation_id: used,
+                    single_use: false,
+                }),
+            )
+            .unwrap();
+
+        // Another group's key of the same ID is not retired.
+        assert!(
+            !store
+                .retire_owner_discovery_key(GroupIdentity::generate().group_id(), unused)
+                .unwrap()
+        );
+        assert!(!store.retire_owner_discovery_key(group_id, used).unwrap());
+        assert!(store.retire_owner_discovery_key(group_id, unused).unwrap());
+        assert_eq!(
+            store.owner_discovery_keys(group_id).unwrap(),
+            vec![OwnerDiscoveryKeyMetadata {
+                invitation_id: used,
+                group_id,
+            }]
+        );
+
+        // A retired key no longer admits, even a reusable invitation.
+        let refused = added(2, EventKind::MemberAdded);
+        assert!(matches!(
+            store.put_mls_join_admission(
+                &refused,
+                b"other snapshot",
+                DeviceIdentity::generate().peer_id(),
+                &[2; 32],
+                b"other response",
+                Some(AdmittingInvitation {
+                    invitation_id: unused,
+                    single_use: false,
+                }),
+            ),
+            Err(StoreError::InvitationRetired)
+        ));
+        assert!(store.get_event(refused.id()).unwrap().is_none());
+
+        // Removing the only member it admitted makes the key retireable.
+        store
+            .put_mls_member_removal(
+                &added(3, EventKind::MemberRemoved),
+                b"removal snapshot",
+                member,
+                0,
+            )
+            .unwrap();
+        assert!(store.retire_owner_discovery_key(group_id, used).unwrap());
+        assert!(store.owner_discovery_keys(group_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_thirty_two_database_keeps_existing_owner_discovery_keys() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let group_id = GroupIdentity::generate().group_id();
+        let legacy = InvitationId::from_bytes([6; 16]);
+        {
+            let store = EventStore::open(path).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP INDEX mls_join_admissions_by_invitation;
+                     ALTER TABLE mls_join_admissions DROP COLUMN invitation_id;
+                     ALTER TABLE owner_discovery_keys DROP COLUMN retirable;
+                     PRAGMA user_version = 32;",
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO owner_discovery_keys (invitation_id, group_id)
+                     VALUES (?1, ?2)",
+                    params![legacy.as_bytes().as_slice(), group_id.to_bytes()],
+                )
+                .unwrap();
+        }
+
+        let mut store = EventStore::open(path).unwrap();
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::SCHEMA_VERSION);
+        // An admission before provenance cannot be ruled out.
+        assert!(!store.retire_owner_discovery_key(group_id, legacy).unwrap());
+        let indexed = InvitationId::from_bytes([7; 16]);
+        store
+            .put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+                invitation_id: indexed,
+                group_id,
+            })
+            .unwrap();
+        assert!(store.retire_owner_discovery_key(group_id, indexed).unwrap());
+        assert_eq!(store.owner_discovery_keys(group_id).unwrap().len(), 1);
+    }
+
+    #[test]
     fn owner_discovery_key_indexes_survive_invitation_removal() {
         let file = NamedTempFile::new().unwrap();
         let group_id = GroupIdentity::generate().group_id();
@@ -5063,6 +5293,16 @@ mod tests {
         };
         let first = DeviceIdentity::generate().peer_id();
         let second = DeviceIdentity::generate().peer_id();
+        store
+            .put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+                invitation_id,
+                group_id: group.group_id(),
+            })
+            .unwrap();
+        let invitation = Some(AdmittingInvitation {
+            invitation_id,
+            single_use: true,
+        });
         assert_eq!(
             store
                 .single_use_invitation_consumer(group.group_id(), invitation_id)
@@ -5077,7 +5317,7 @@ mod tests {
                 first,
                 &[1; 32],
                 b"first response",
-                Some(invitation_id),
+                invitation,
             )
             .unwrap();
         assert_eq!(
@@ -5101,7 +5341,7 @@ mod tests {
                 second,
                 &[2; 32],
                 b"second response",
-                Some(invitation_id),
+                invitation,
             ),
             Err(StoreError::InvitationConsumed)
         ));

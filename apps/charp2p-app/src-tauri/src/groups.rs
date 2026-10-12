@@ -11,8 +11,8 @@ use charp2p_core::{
     JoinResponse, PeerId,
 };
 use charp2p_store::{
-    ApprovalRequestOutcome, ApprovalState, EventStore, IssuedInvitationMetadata,
-    LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
+    AdmittingInvitation, ApprovalRequestOutcome, ApprovalState, EventStore,
+    IssuedInvitationMetadata, LocalGroupMetadata, OwnerDiscoveryKeyMetadata,
 };
 use keyring_core::Error as KeyringError;
 use libp2p::Multiaddr;
@@ -1449,7 +1449,10 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
             owner_identity,
             authenticated_peer,
             request.key_package(),
-            single_use_invitation,
+            Some(AdmittingInvitation {
+                invitation_id: invitation.invitation_id(),
+                single_use: single_use_invitation.is_some(),
+            }),
             &group.group_name,
             group.icon,
         );
@@ -1699,7 +1702,7 @@ mod tests {
         Invitation, InvitationId, InvitationSpec, InviteRejectReason, InviteRequest,
         InviteResponse, JoinRequest, PeerId,
     };
-    use charp2p_store::{EventStore, LocalGroupMetadata};
+    use charp2p_store::{AdmittingInvitation, EventStore, LocalGroupMetadata};
 
     use super::{
         encode_identifier, issued_invitation, parse_invitation_id, requested_invitation,
@@ -2308,7 +2311,10 @@ mod tests {
                 DeviceIdentity::generate().peer_id(),
                 &[1; 32],
                 b"response",
-                Some(invitation_id),
+                Some(AdmittingInvitation {
+                    invitation_id,
+                    single_use: true,
+                }),
             )
             .unwrap();
         assert!(service

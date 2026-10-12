@@ -11,8 +11,8 @@ use chacha20poly1305::{
 };
 use charp2p_core::{
     DeviceIdentity, DiscoveryKey, EventId, EventKind, EventSpec, GroupMetadata, Invitation,
-    InvitationId, InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageDeletion,
-    MessageEdit, PeerId, SignedEvent, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
+    InvitePermission, JoinRequest, JoinResponse, MessageBody, MessageDeletion, MessageEdit, PeerId,
+    SignedEvent, SyncPeerHead, SyncRejectReason, SyncRequest, SyncResponse,
     MAX_JOIN_RESPONSE_WIRE_BYTES, MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_RESPONSE_BYTES,
 };
 use charp2p_mls::{
@@ -26,7 +26,7 @@ use charp2p_mls::{
     MAX_PAST_EPOCHS,
 };
 use charp2p_store::{
-    EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
+    AdmittingInvitation, EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
     MAX_ENCRYPTED_MESSAGE_BODY_BYTES, MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES,
 };
 use charp2p_sync::{
@@ -2210,7 +2210,7 @@ impl MlsProviderService {
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
-        single_use_invitation: Option<InvitationId>,
+        invitation: Option<AdmittingInvitation>,
         local_group_name: &str,
         icon: u8,
     ) -> Result<JoinResponse, MemberAdmissionError> {
@@ -2224,7 +2224,7 @@ impl MlsProviderService {
             owner_identity,
             authenticated_peer,
             encoded_key_package,
-            single_use_invitation,
+            invitation,
             local_group_name,
             icon,
             created_at_unix_ms,
@@ -2238,7 +2238,7 @@ impl MlsProviderService {
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
-        single_use_invitation: Option<InvitationId>,
+        invitation: Option<AdmittingInvitation>,
         local_group_name: &str,
         icon: u8,
         created_at_unix_ms: u64,
@@ -2248,7 +2248,7 @@ impl MlsProviderService {
             owner_identity,
             authenticated_peer,
             encoded_key_package,
-            single_use_invitation,
+            invitation,
             created_at_unix_ms,
         )?;
         if admitted {
@@ -2340,7 +2340,7 @@ impl MlsProviderService {
         owner_identity: &DeviceIdentity,
         authenticated_peer: PeerId,
         encoded_key_package: &[u8],
-        single_use_invitation: Option<InvitationId>,
+        invitation: Option<AdmittingInvitation>,
         created_at_unix_ms: u64,
     ) -> Result<(JoinResponse, bool), MemberAdmissionError> {
         let _operation = self
@@ -2389,7 +2389,10 @@ impl MlsProviderService {
             }
             return Ok((response, false));
         }
-        if let Some(invitation_id) = single_use_invitation {
+        if let Some(invitation_id) = invitation
+            .filter(|invitation| invitation.single_use)
+            .map(|invitation| invitation.invitation_id)
+        {
             if store
                 .single_use_invitation_consumer(group_id, invitation_id)
                 .map_err(|_| MemberAdmissionError::Unavailable)?
@@ -2477,10 +2480,12 @@ impl MlsProviderService {
                     authenticated_peer,
                     &request_hash,
                     &encrypted_response,
-                    single_use_invitation,
+                    invitation,
                 )
                 .map_err(|error| match error {
-                    StoreError::InvitationConsumed => MemberAdmissionError::Unauthorized,
+                    StoreError::InvitationConsumed | StoreError::InvitationRetired => {
+                        MemberAdmissionError::Unauthorized
+                    }
                     _ => MemberAdmissionError::Unavailable,
                 })?;
             Ok((response, true))
@@ -3385,6 +3390,7 @@ mod tests {
         prepare_profile_member_admission, stage_profile_welcome, validate_group_profile,
         ProfileProvider, CIPHERSUITE, MAX_PAST_EPOCHS,
     };
+    use charp2p_store::{AdmittingInvitation, OwnerDiscoveryKeyMetadata};
     use charp2p_sync::PullSession;
     use openmls::prelude::{
         CredentialWithKey, GroupId, MlsGroup, MlsGroupJoinConfig, OpenMlsProvider,
@@ -3995,6 +4001,17 @@ mod tests {
         let (_, second_package) = member_key_package(second_id);
         let service = test_service(&path);
         service.initialize_owner_group(group_id, &owner).unwrap();
+        EventStore::open(&path)
+            .unwrap()
+            .put_owner_discovery_key(&OwnerDiscoveryKeyMetadata {
+                invitation_id,
+                group_id,
+            })
+            .unwrap();
+        let single_use = Some(AdmittingInvitation {
+            invitation_id,
+            single_use: true,
+        });
 
         let (welcome, admitted) = service
             .admit_member_once_at(
@@ -4002,7 +4019,7 @@ mod tests {
                 &owner,
                 first_id,
                 first_package.encoded(),
-                Some(invitation_id),
+                single_use,
                 42,
             )
             .unwrap();
@@ -4013,7 +4030,7 @@ mod tests {
                 &owner,
                 first_id,
                 first_package.encoded(),
-                Some(invitation_id),
+                single_use,
                 43,
             )
             .unwrap();
@@ -4025,7 +4042,7 @@ mod tests {
                 &owner,
                 second_id,
                 second_package.encoded(),
-                Some(invitation_id),
+                single_use,
                 44,
             ),
             Err(MemberAdmissionError::Unauthorized)
@@ -4038,6 +4055,11 @@ mod tests {
                 .unwrap(),
             Some(first_id)
         );
+        // The admission records its invitation, so its key is kept (ADR-054).
+        let mut store = store;
+        assert!(!store
+            .retire_owner_discovery_key(group_id, invitation_id)
+            .unwrap());
         assert!(store
             .mls_join_admission(group_id, second_id)
             .unwrap()
@@ -4062,6 +4084,25 @@ mod tests {
                 45,
             )
             .unwrap();
+        assert_eq!(service.group_members(group_id).unwrap().len(), 3);
+
+        // An invitation whose rendezvous key was retired admits nobody.
+        let third_id = DeviceIdentity::generate().peer_id();
+        let (_, third_package) = member_key_package(third_id);
+        assert!(matches!(
+            service.admit_member_once_at(
+                group_id,
+                &owner,
+                third_id,
+                third_package.encoded(),
+                Some(AdmittingInvitation {
+                    invitation_id: invitation(&group_identity).invitation_id(),
+                    single_use: false,
+                }),
+                46,
+            ),
+            Err(MemberAdmissionError::Unauthorized)
+        ));
         assert_eq!(service.group_members(group_id).unwrap().len(), 3);
     }
 

@@ -7,7 +7,8 @@
 
 use charp2p_core::{
     DeviceIdentity, DeviceIdentitySecret, DiscoveryKey, EventId, EventKind, GroupIdentity,
-    GroupIdentitySecret, HistoryPolicy, Invitation, InvitationError, SignedEvent,
+    GroupIdentitySecret, GroupMetadata, HistoryPolicy, Invitation, InvitationError,
+    InvitePermission, MessageBody, MessageDeletion, MessageEdit, SignedEvent,
 };
 
 /// Protobuf-encoded Ed25519 keypair from the seed `[0x11; 32]`.
@@ -36,6 +37,25 @@ const INVITATION_DISCOVERY_KEY: &str =
     "20147a358d72cbf42e7681aef7d752e658b2458ea59ee88c02749a529ccf250a";
 const INVITATION_EXPIRES_AT_UNIX: u64 = 4_102_444_800;
 const VERIFIED_AT_UNIX: u64 = 1_700_000_000;
+
+/// MLS-protected plaintexts. Targets are the event identifier `[0x55; 32]`.
+const MESSAGE_TARGET: [u8; 32] = [0x55; 32];
+/// Plain message text "Vector text" without a reply reference.
+const MESSAGE_BODY_PLAIN: &str = "566563746f722074657874";
+/// Structured reply body "Vector reply" behind the 0xff marker.
+const MESSAGE_BODY_REPLY: &str = "ff0155555555555555555555555555555555555555555555555555555555555555550c566563746f72207265706c79";
+/// Version 1 edit with replacement text "Vector edit".
+const MESSAGE_EDIT: &str =
+    "0155555555555555555555555555555555555555555555555555555555555555550b566563746f722065646974";
+/// Version 1 deletion of the target event.
+const MESSAGE_DELETION: &str = "015555555555555555555555555555555555555555555555555555555555555555";
+/// Version 1 metadata naming "Vector group" without an icon.
+const GROUP_METADATA_V1: &str = "010c566563746f722067726f7570";
+/// Version 2 metadata naming "Vector group" with built-in icon 3.
+const GROUP_METADATA_V2: &str = "020c566563746f722067726f757003";
+/// Version 1 grant of the invite permission to the vector device.
+const INVITE_PERMISSION: &str =
+    "0126002408011220d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -164,4 +184,76 @@ fn fixed_invitation_rejects_a_tampered_signature() {
     chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
     let tampered: String = chars.into_iter().collect();
     assert!(Invitation::decode(&tampered, VERIFIED_AT_UNIX).is_err());
+}
+
+#[test]
+fn message_plaintext_encodings_are_fixed() {
+    let plain = MessageBody::new("Vector text", None).expect("plain body");
+    assert_eq!(hex(&plain.encode().expect("encode")), MESSAGE_BODY_PLAIN);
+    assert_eq!(
+        MessageBody::decode(&unhex(MESSAGE_BODY_PLAIN)).expect("decode"),
+        plain
+    );
+
+    let reply = MessageBody::new("Vector reply", Some(MESSAGE_TARGET)).expect("reply body");
+    assert_eq!(hex(&reply.encode().expect("encode")), MESSAGE_BODY_REPLY);
+    let decoded = MessageBody::decode(&unhex(MESSAGE_BODY_REPLY)).expect("decode");
+    assert_eq!(decoded.reply_to(), Some(&MESSAGE_TARGET));
+    assert_eq!(decoded.text(), "Vector reply");
+
+    let edit = MessageEdit::new(MESSAGE_TARGET, "Vector edit").expect("edit");
+    assert_eq!(hex(&edit.encode().expect("encode")), MESSAGE_EDIT);
+    assert_eq!(
+        MessageEdit::decode(&unhex(MESSAGE_EDIT)).expect("decode"),
+        edit
+    );
+
+    let deletion = MessageDeletion::new(MESSAGE_TARGET);
+    assert_eq!(hex(&deletion.encode().expect("encode")), MESSAGE_DELETION);
+    assert_eq!(
+        MessageDeletion::decode(&unhex(MESSAGE_DELETION)).expect("decode"),
+        deletion
+    );
+}
+
+#[test]
+fn group_plaintext_encodings_are_fixed() {
+    let v1 = GroupMetadata::new("Vector group").expect("metadata");
+    assert_eq!(hex(&v1.encode().expect("encode")), GROUP_METADATA_V1);
+    assert_eq!(
+        GroupMetadata::decode(&unhex(GROUP_METADATA_V1)).expect("decode"),
+        v1
+    );
+
+    let v2 = v1.with_icon(3).expect("icon");
+    assert_eq!(hex(&v2.encode().expect("encode")), GROUP_METADATA_V2);
+    assert_eq!(
+        GroupMetadata::decode(&unhex(GROUP_METADATA_V2))
+            .expect("decode")
+            .icon(),
+        Some(3)
+    );
+
+    let permission = InvitePermission::new(device().peer_id(), true);
+    assert_eq!(
+        hex(&permission.encode().expect("encode")),
+        INVITE_PERMISSION
+    );
+    let decoded = InvitePermission::decode(&unhex(INVITE_PERMISSION)).expect("decode");
+    assert_eq!(decoded.device_id().to_string(), DEVICE_PEER_ID);
+    assert!(decoded.granted());
+}
+
+#[test]
+fn versioned_plaintexts_reject_an_unknown_version() {
+    let bump = |vector: &str, version_index: usize| {
+        let mut bytes = unhex(vector);
+        bytes[version_index] = 0x7f;
+        bytes
+    };
+    assert!(MessageBody::decode(&bump(MESSAGE_BODY_REPLY, 1)).is_err());
+    assert!(MessageEdit::decode(&bump(MESSAGE_EDIT, 0)).is_err());
+    assert!(MessageDeletion::decode(&bump(MESSAGE_DELETION, 0)).is_err());
+    assert!(GroupMetadata::decode(&bump(GROUP_METADATA_V1, 0)).is_err());
+    assert!(InvitePermission::decode(&bump(INVITE_PERMISSION, 0)).is_err());
 }

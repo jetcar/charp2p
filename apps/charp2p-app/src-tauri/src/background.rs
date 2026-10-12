@@ -32,6 +32,19 @@ pub struct BackgroundStatus {
     pub preference: BackgroundPreference,
 }
 
+impl BackgroundStatus {
+    /// Reports starting at sign-in as on only while the operating system
+    /// login entry still exists, so an entry removed outside the app reads as
+    /// off. `None` means the entry could not be checked and keeps the stored
+    /// preference.
+    pub fn with_login_entry(mut self, login_entry_exists: Option<bool>) -> Self {
+        if login_entry_exists == Some(false) {
+            self.preference.launch_at_login = false;
+        }
+        self
+    }
+}
+
 /// Stores the background preference in a small file next to the database.
 pub struct BackgroundService {
     path: PathBuf,
@@ -240,6 +253,29 @@ mod tests {
                 launch_at_login: false,
             }
         );
+    }
+
+    #[test]
+    fn launch_at_login_reads_as_off_once_the_login_entry_is_removed() {
+        let status = |launch_at_login| BackgroundStatus {
+            available: true,
+            preference: BackgroundPreference {
+                keep_running_when_closed: true,
+                launch_at_login,
+            },
+        };
+
+        for (stored, entry, reported) in [
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (true, None, true),
+            (false, Some(true), false),
+            (false, None, false),
+        ] {
+            let reconciled = status(stored).with_login_entry(entry);
+            assert_eq!(reconciled.preference.launch_at_login, reported);
+            assert!(reconciled.preference.keep_running_when_closed);
+        }
     }
 
     #[test]

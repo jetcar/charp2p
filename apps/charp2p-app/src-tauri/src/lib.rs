@@ -1075,12 +1075,18 @@ fn app_information(service: tauri::State<'_, SettingsService>) -> Result<AppInfo
     service.information().map_err(str::to_owned)
 }
 
-/// Reports the device-local background preference (ADR-032).
+/// Reports the device-local background preference (ADR-032). Starting at
+/// sign-in reads as on only while the operating system login entry exists.
 #[tauri::command]
 fn background_status(
+    app: tauri::AppHandle,
     service: tauri::State<'_, BackgroundService>,
 ) -> Result<BackgroundStatus, String> {
-    service.status().map_err(str::to_owned)
+    let status = service.status().map_err(str::to_owned)?;
+    if !status.available {
+        return Ok(status);
+    }
+    Ok(status.with_login_entry(launch_at_login_entry_exists(&app)))
 }
 
 /// Registers or removes the operating system login entry, then stores the
@@ -1095,7 +1101,8 @@ fn set_background_preference(
     if service.is_available() {
         set_launch_at_login(&app, preference.launch_at_login).map_err(str::to_owned)?;
     }
-    service.set(preference).map_err(str::to_owned)
+    let status = service.set(preference).map_err(str::to_owned)?;
+    Ok(status.with_login_entry(launch_at_login_entry_exists(&app)))
 }
 
 /// The login entry passes [`background::LOGIN_LAUNCH_ARGUMENT`] so the app can
@@ -1113,6 +1120,20 @@ fn set_launch_at_login(app: &tauri::AppHandle, enabled: bool) -> Result<(), &'st
         Ok(())
     };
     result.map_err(|_| "launch_at_login_unavailable")
+}
+
+/// Whether the operating system login entry exists, or `None` when it could
+/// not be checked.
+#[cfg(desktop)]
+fn launch_at_login_entry_exists(app: &tauri::AppHandle) -> Option<bool> {
+    use tauri_plugin_autostart::ManagerExt;
+
+    app.autolaunch().is_enabled().ok()
+}
+
+#[cfg(mobile)]
+fn launch_at_login_entry_exists(_app: &tauri::AppHandle) -> Option<bool> {
+    None
 }
 
 #[cfg(mobile)]

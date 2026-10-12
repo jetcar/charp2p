@@ -729,11 +729,18 @@ leading version field:
 
 - Postcard (serde, unsigned varint integers, length-prefixed byte strings and
   sequences, fields in declaration order) for signed events, invitations, and
-  MLS-protected plaintexts (reply bodies, message edits, group metadata).
+  MLS-protected plaintexts (reply bodies, message edits, message deletions,
+  group metadata, invite-permission changes).
 - A hand-written big-endian codec for the join exchange: a `u16` version, then
   `u16` or `u32` length-prefixed fields (group ID, invitation, KeyPackage) or
   a one-byte response tag followed by a `u32`-prefixed Welcome or a one-byte
   rejection code. Declared lengths are checked before allocation.
+- The same big-endian framing for the member invite exchange
+  (`/charp2p/invite/1.0.0`): a request is a `u16` version, a `u16`-prefixed
+  group ID, and a `u32` requested lifetime in seconds (1 second to 30 days); a
+  response is a `u16` version, then tag `1` with a `u16`-prefixed canonical
+  invitation text or tag `2` with a one-byte rejection code (`1`
+  unauthorized, `2` busy). Trailing bytes are rejected.
 
 Signatures and identifiers cover the re-encoded canonical body behind a
 domain-separation prefix (`charp2p-event-signature-v1\0`,
@@ -763,6 +770,9 @@ Every parser checks the outer size before decoding:
 | Join request / response wire | sum of the field limits and prefixes |
 | Message or edit text | 16 KiB (body 16 KiB + 64 bytes) |
 | Group metadata plaintext | 128 bytes |
+| Message deletion plaintext | 64 bytes |
+| Invite-permission plaintext | 128 bytes |
+| Invite request / response wire | 136 bytes / 8 KiB + 5 bytes |
 | Sync author summary or reported heads | 1,024 entries |
 | Sync event-ID page or event batch | 256 items |
 | Sync event data per response | 2 MiB |
@@ -850,7 +860,10 @@ packaging remain production gates.
 It can:
 
 - Enforce per-IP and per-peer connection and bandwidth limits.
-- Reject malformed, unsigned, oversized, or expired records.
+- Reject malformed, oversized, or expired records. Provider records are
+  unsigned stock Kademlia records, so the node bounds them by key length,
+  address count and size, and per-key provider count instead of verifying a
+  signature, and it stores no value records.
 - End relay reservations and reject peer identities locally.
 - Respond within its technical capability to valid orders concerning the node.
 

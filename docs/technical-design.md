@@ -552,8 +552,10 @@ but cannot guarantee erasure from devices that already received it. A
 `MessageDeleted` event carries a versioned deletion (target `MessageCreated`
 event identifier) as an MLS application message. Clients hide the target only
 when the deletion's author is the target message's author, whether the target
-is already readable (its local display copy is removed) or arrives later. The
-original signed event is retained. Members may push their own deletions in the
+is already readable (its local display copy is removed) or arrives later. A
+deleted, locally hidden or retention-expired message keeps no readable copy of
+its text or of any edit's replacement text, including edits that arrive later.
+The original signed event is retained. Members may push their own deletions in the
 same way as their own messages.
 
 Creating an owner MLS group also creates the owner's sequence-one

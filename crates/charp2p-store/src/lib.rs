@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -673,10 +673,31 @@ impl EventStore {
         let transaction = self.connection.transaction()?;
         let outcome = put_event_in_transaction(&transaction, event)?;
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted_snapshot)?;
+        // A message already hidden here, or deleted by its author's
+        // tombstone, keeps no readable copy; the deleted one is recorded as
+        // hidden so it is not offered for materialization again.
+        transaction.execute(
+            "INSERT INTO hidden_local_messages (event_id, group_id)
+             SELECT ?1, ?2
+             WHERE EXISTS (
+                 SELECT 1 FROM applied_message_deletions
+                 WHERE target_event_id = ?1 AND group_id = ?2 AND author_id = ?3
+             )
+             ON CONFLICT(event_id) DO NOTHING",
+            params![
+                event.id().as_bytes().as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes(),
+            ],
+        )?;
         let materialized = transaction.execute(
             "INSERT INTO materialized_messages (
                 event_id, group_id, author_id, created_at_unix_ms, encrypted_body
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM hidden_local_messages WHERE event_id = ?1
+             )
              ON CONFLICT(event_id) DO NOTHING",
             params![
                 event.id().as_bytes().as_slice(),
@@ -793,6 +814,7 @@ impl EventStore {
                  WHERE latest.target_event_id = m.event_id
                    AND latest.group_id = m.group_id
                    AND latest.author_id = m.author_id
+                   AND latest.encrypted_body IS NOT NULL
                  ORDER BY latest.author_sequence DESC
                  LIMIT 1
              )
@@ -1033,6 +1055,7 @@ impl EventStore {
              ON CONFLICT(event_id) DO NOTHING",
             params![event_id.as_slice(), group_id.to_bytes()],
         )?;
+        clear_message_edit_bodies_in_transaction(&transaction, group_id, event_id)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -1058,6 +1081,16 @@ impl EventStore {
                  SELECT event_id FROM materialized_messages
                  WHERE created_at_unix_ms < ?1
              )",
+            [cutoff],
+        )?;
+        transaction.execute(
+            "UPDATE applied_message_edits SET encrypted_body = NULL
+             WHERE encrypted_body IS NOT NULL
+               AND target_event_id IN (
+                   SELECT event_id FROM materialized_messages
+                   WHERE created_at_unix_ms < ?1
+                     AND group_id = applied_message_edits.group_id
+               )",
             [cutoff],
         )?;
         let removed = transaction.execute(
@@ -1233,7 +1266,8 @@ impl EventStore {
     /// Atomically stores a decrypted message edit, its locally encrypted
     /// replacement text, and the advanced encrypted MLS provider state. The
     /// edit is displayed only for a target message by the same author; the
-    /// edit with the highest author sequence wins.
+    /// edit with the highest author sequence wins. No readable replacement
+    /// text is kept for a target already hidden or deleted here.
     pub fn put_message_edit_and_encrypted_mls_provider_snapshot(
         &mut self,
         event: &SignedEvent,
@@ -1255,7 +1289,18 @@ impl EventStore {
             "INSERT INTO applied_message_edits (
                 event_id, group_id, author_id, author_sequence, target_event_id,
                 encrypted_body
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM hidden_local_messages
+                     WHERE event_id = ?5 AND group_id = ?2
+                 ) OR EXISTS (
+                     SELECT 1 FROM applied_message_deletions
+                     WHERE target_event_id = ?5 AND group_id = ?2 AND author_id = ?3
+                 ) THEN NULL
+                 ELSE ?6
+             END
+             WHERE true
              ON CONFLICT(event_id) DO NOTHING",
             params![
                 event.id().as_bytes().as_slice(),
@@ -1323,6 +1368,15 @@ impl EventStore {
                 params![target_event_id.as_slice(), event.group_id().to_bytes()],
             )?;
         }
+        transaction.execute(
+            "UPDATE applied_message_edits SET encrypted_body = NULL
+             WHERE target_event_id = ?1 AND group_id = ?2 AND author_id = ?3",
+            params![
+                target_event_id.as_slice(),
+                event.group_id().to_bytes(),
+                event.author_id().to_bytes()
+            ],
+        )?;
         transaction.commit()?;
         Ok(outcome)
     }
@@ -2845,7 +2899,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=30 => {}
+            6..=31 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3083,8 +3137,9 @@ impl EventStore {
                     author_id BLOB NOT NULL,
                     author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
                     target_event_id BLOB NOT NULL CHECK(length(target_event_id) = 32),
-                    encrypted_body BLOB NOT NULL
-                        CHECK(length(encrypted_body) BETWEEN 1 AND 16426)
+                    encrypted_body BLOB
+                        CHECK(encrypted_body IS NULL
+                            OR length(encrypted_body) BETWEEN 1 AND 16426)
                  ) STRICT;
 
                  CREATE INDEX IF NOT EXISTS applied_message_edits_by_target
@@ -3317,6 +3372,74 @@ impl EventStore {
             transaction.commit()?;
         }
 
+        if version <= 31 {
+            let transaction = connection.transaction()?;
+            let body_required: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('applied_message_edits')
+                    WHERE name = 'encrypted_body' AND [notnull] = 1
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            if body_required {
+                transaction.execute_batch(
+                    "CREATE TABLE applied_message_edits_nullable_body (
+                        event_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(event_id) = 32)
+                            REFERENCES events(event_id) ON DELETE CASCADE,
+                        group_id BLOB NOT NULL,
+                        author_id BLOB NOT NULL,
+                        author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                        target_event_id BLOB NOT NULL CHECK(length(target_event_id) = 32),
+                        encrypted_body BLOB
+                            CHECK(encrypted_body IS NULL
+                                OR length(encrypted_body) BETWEEN 1 AND 16426)
+                     ) STRICT;
+
+                     INSERT INTO applied_message_edits_nullable_body
+                        SELECT event_id, group_id, author_id, author_sequence,
+                               target_event_id, encrypted_body
+                        FROM applied_message_edits;
+                     DROP TABLE applied_message_edits;
+                     ALTER TABLE applied_message_edits_nullable_body
+                        RENAME TO applied_message_edits;
+                     CREATE INDEX IF NOT EXISTS applied_message_edits_by_target
+                        ON applied_message_edits(target_event_id, author_sequence);",
+                )?;
+            }
+            // Edits stored before this migration may still hold readable
+            // text for messages already hidden or deleted here.
+            let has_hide_tables: bool = transaction.query_row(
+                "SELECT COUNT(*) = 2 FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name IN ('hidden_local_messages', 'applied_message_deletions')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_hide_tables {
+                transaction.execute_batch(
+                    "UPDATE applied_message_edits SET encrypted_body = NULL
+                     WHERE encrypted_body IS NOT NULL
+                       AND (
+                           EXISTS (
+                               SELECT 1 FROM hidden_local_messages h
+                               WHERE h.event_id = applied_message_edits.target_event_id
+                                 AND h.group_id = applied_message_edits.group_id
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM applied_message_deletions d
+                               WHERE d.target_event_id = applied_message_edits.target_event_id
+                                 AND d.group_id = applied_message_edits.group_id
+                                 AND d.author_id = applied_message_edits.author_id
+                           )
+                       );",
+                )?;
+            }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
         Ok(Self { connection })
     }
 }
@@ -3359,6 +3482,22 @@ fn validate_mls_key_package(encoded: &[u8]) -> Result<(), StoreError> {
     if encoded.is_empty() || encoded.len() > MAX_JOIN_MLS_MESSAGE_BYTES {
         return Err(StoreError::InvalidMlsKeyPackageSize(encoded.len()));
     }
+    Ok(())
+}
+
+/// Clears the readable replacement text of every applied edit of a message
+/// hidden on this device; the edit rows stay so their events are not
+/// materialized again.
+fn clear_message_edit_bodies_in_transaction(
+    transaction: &Transaction<'_>,
+    group_id: PeerId,
+    target_event_id: &[u8; 32],
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE applied_message_edits SET encrypted_body = NULL
+         WHERE target_event_id = ?1 AND group_id = ?2",
+        params![target_event_id.as_slice(), group_id.to_bytes()],
+    )?;
     Ok(())
 }
 
@@ -6312,6 +6451,197 @@ mod tests {
                 .is_empty()
         );
         assert!(store.unread_message_counts().unwrap().is_empty());
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hidden_or_deleted_messages_keep_no_readable_edit_text() {
+        let mut store = EventStore::in_memory().unwrap();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let event = |sequence, created_at, kind| {
+            SignedEvent::create(
+                &author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: created_at,
+                    kind,
+                    protected_payload: b"MLS ciphertext",
+                },
+            )
+            .unwrap()
+        };
+        let readable_edit_bodies = |store: &EventStore, target: &SignedEvent| -> i64 {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM applied_message_edits
+                     WHERE target_event_id = ?1 AND encrypted_body IS NOT NULL",
+                    [target.id().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let hidden = event(1, 5_000, EventKind::MessageCreated);
+        let deleted = event(2, 5_000, EventKind::MessageCreated);
+        let expired = event(3, 1_000, EventKind::MessageCreated);
+        let kept = event(4, 5_000, EventKind::MessageCreated);
+        for message in [&hidden, &deleted, &expired, &kept] {
+            store
+                .put_message_and_encrypted_mls_provider_snapshot(message, b"snapshot", b"original")
+                .unwrap();
+        }
+        for (sequence, target) in [(5, &hidden), (6, &deleted), (7, &expired), (8, &kept)] {
+            store
+                .put_message_edit_and_encrypted_mls_provider_snapshot(
+                    &event(sequence, 5_000, EventKind::MessageEdited),
+                    b"snapshot",
+                    target.id().as_bytes(),
+                    b"replacement",
+                )
+                .unwrap();
+            assert_eq!(readable_edit_bodies(&store, target), 1);
+        }
+
+        assert!(
+            store
+                .hide_message_locally(group.group_id(), hidden.id().as_bytes())
+                .unwrap()
+        );
+        store
+            .put_message_deletion_and_encrypted_mls_provider_snapshot(
+                &event(9, 5_000, EventKind::MessageDeleted),
+                b"snapshot",
+                deleted.id().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(store.hide_messages_created_before(2_000).unwrap(), 1);
+        for target in [&hidden, &deleted, &expired] {
+            assert_eq!(readable_edit_bodies(&store, target), 0);
+        }
+        assert_eq!(readable_edit_bodies(&store, &kept), 1);
+
+        // Later edits of a hidden or deleted target store no readable text,
+        // and their events are not offered for materialization again.
+        for (sequence, target) in [(10, &hidden), (11, &deleted)] {
+            store
+                .put_message_edit_and_encrypted_mls_provider_snapshot(
+                    &event(sequence, 5_000, EventKind::MessageEdited),
+                    b"snapshot",
+                    target.id().as_bytes(),
+                    b"late replacement",
+                )
+                .unwrap();
+            assert_eq!(readable_edit_bodies(&store, target), 0);
+        }
+        assert!(
+            store
+                .unmaterialized_message_events(group.group_id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        let page = store.encrypted_messages(group.group_id()).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].event_id, *kept.id().as_bytes());
+
+        // A message already hidden here keeps no readable copy when stored
+        // again.
+        store
+            .put_message_and_encrypted_mls_provider_snapshot(&hidden, b"snapshot", b"original")
+            .unwrap();
+        let readable: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM materialized_messages WHERE event_id = ?1",
+                [hidden.id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(readable, 0);
+    }
+
+    #[test]
+    fn version_thirty_one_database_clears_hidden_message_edit_text() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let message = message_event(&author, &group, 1, b"protected message");
+        let edit = SignedEvent::create(
+            &author,
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 2,
+                causal_parents: &[],
+                created_at_unix_ms: 1_800_000_000_000,
+                kind: EventKind::MessageEdited,
+                protected_payload: b"protected edit",
+            },
+        )
+        .unwrap();
+        {
+            let mut store = EventStore::open(path).unwrap();
+            store.put_event(&message).unwrap();
+            store.put_event(&edit).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE applied_message_edits;
+                     CREATE TABLE applied_message_edits (
+                        event_id BLOB PRIMARY KEY NOT NULL
+                            CHECK(length(event_id) = 32)
+                            REFERENCES events(event_id) ON DELETE CASCADE,
+                        group_id BLOB NOT NULL,
+                        author_id BLOB NOT NULL,
+                        author_sequence INTEGER NOT NULL CHECK(author_sequence > 0),
+                        target_event_id BLOB NOT NULL CHECK(length(target_event_id) = 32),
+                        encrypted_body BLOB NOT NULL
+                            CHECK(length(encrypted_body) BETWEEN 1 AND 16426)
+                     ) STRICT;
+                     PRAGMA user_version = 31;",
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO applied_message_edits VALUES (?1, ?2, ?3, 2, ?4, x'01')",
+                    params![
+                        edit.id().as_bytes().as_slice(),
+                        group.group_id().to_bytes(),
+                        author.peer_id().to_bytes(),
+                        message.id().as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO hidden_local_messages (event_id, group_id) VALUES (?1, ?2)",
+                    params![
+                        message.id().as_bytes().as_slice(),
+                        group.group_id().to_bytes()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let store = EventStore::open(path).unwrap();
+        let (rows, readable): (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(encrypted_body) FROM applied_message_edits",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, readable), (1, 0));
         assert!(
             store
                 .unmaterialized_message_events(group.group_id(), 10)

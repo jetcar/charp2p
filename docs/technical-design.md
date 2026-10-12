@@ -827,7 +827,8 @@ state, and minimal security telemetry. It does not store group events or
 message payloads.
 
 The standalone node implements bootstrap and Kademlia routing with in-memory
-DHT state plus Circuit Relay v2. It rejects group synchronization requests.
+DHT state plus Circuit Relay v2. It rejects group synchronization, join and
+invite requests as unauthorized.
 Relay reservations and circuits have fixed count, duration, byte, per-peer,
 and upstream per-IP rate bounds; the operator may lower the circuit count and
 per-circuit byte limit or disable relaying, but never exceed those bounds. An

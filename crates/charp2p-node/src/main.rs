@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use charp2p_core::{JoinRejectReason, SyncRejectReason};
+use charp2p_core::{InviteRejectReason, JoinRejectReason, SyncRejectReason};
 use charp2p_network::{DiscoveryOperation, NetworkEvent, NetworkNode, RelayLimits};
 use clap::Parser;
 use libp2p::{Multiaddr, PeerId, identity::Keypair};
@@ -120,6 +120,9 @@ async fn main() -> Result<(), NodeError> {
                 }
                 NetworkEvent::JoinRequestReceived { request_id, .. } => {
                     node.reject_join_request(request_id, JoinRejectReason::Unauthorized)?;
+                }
+                NetworkEvent::InviteRequestReceived { request_id, .. } => {
+                    node.reject_invite_request(request_id, InviteRejectReason::Unauthorized)?;
                 }
                 NetworkEvent::DiscoveryFailed { operation, .. } => {
                     eprintln!("DHT {} operation failed", operation_name(operation));

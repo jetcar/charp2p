@@ -8,7 +8,8 @@
 use charp2p_core::{
     DeviceIdentity, DeviceIdentitySecret, DiscoveryKey, EventId, EventKind, GroupIdentity,
     GroupIdentitySecret, GroupMetadata, HistoryPolicy, Invitation, InvitationError,
-    InvitePermission, MessageBody, MessageDeletion, MessageEdit, SignedEvent,
+    InvitePermission, InviteRejectReason, InviteRequest, InviteResponse, JoinRejectReason,
+    JoinRequest, JoinResponse, MessageBody, MessageDeletion, MessageEdit, SignedEvent,
 };
 
 /// Protobuf-encoded Ed25519 keypair from the seed `[0x11; 32]`.
@@ -71,6 +72,32 @@ const GROUP_METADATA_V2: &str = "020c566563746f722067726f757003";
 /// Version 1 grant of the invite permission to the vector device.
 const INVITE_PERMISSION: &str =
     "0126002408011220d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701";
+
+/// Length-prefixed protobuf encoding of `GROUP_ID` as framed by the join and
+/// invite request codecs: big-endian `u16` length 38, then the identifier.
+const FRAMED_GROUP_ID: &str =
+    "0026002408011220a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+/// Big-endian `u16` length of `INVITATION` (298 Base64URL characters).
+const FRAMED_INVITATION_LENGTH: &str = "012a";
+/// Key package `[1, 2, 3]` behind a big-endian `u32` length, closing a join
+/// request version 1 for `GROUP_ID` and `INVITATION`.
+const JOIN_REQUEST_KEY_PACKAGE: &str = "00000003010203";
+/// Join response version 1 accepting with the Welcome `[4, 5, 6]`.
+const JOIN_RESPONSE_ACCEPTED: &str = "00010100000003040506";
+/// Join response version 1 rejections in reason-code order.
+const JOIN_RESPONSE_REJECTIONS: [(JoinRejectReason, &str); 4] = [
+    (JoinRejectReason::Unauthorized, "00010201"),
+    (JoinRejectReason::Busy, "00010202"),
+    (JoinRejectReason::UnsupportedProfile, "00010203"),
+    (JoinRejectReason::AwaitingApproval, "00010204"),
+];
+/// Invite request version 1 for `GROUP_ID` with a one-day lifetime.
+const INVITE_REQUEST_LIFETIME: &str = "00015180";
+/// Invite response version 1 rejections in reason-code order.
+const INVITE_RESPONSE_REJECTIONS: [(InviteRejectReason, &str); 2] = [
+    (InviteRejectReason::Unauthorized, "00010201"),
+    (InviteRejectReason::Busy, "00010202"),
+];
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -338,4 +365,72 @@ fn versioned_plaintexts_reject_an_unknown_version() {
     assert!(MessageDeletion::decode(&bump(MESSAGE_DELETION, 0)).is_err());
     assert!(GroupMetadata::decode(&bump(GROUP_METADATA_V1, 0)).is_err());
     assert!(InvitePermission::decode(&bump(INVITE_PERMISSION, 0)).is_err());
+}
+
+#[test]
+fn join_wire_encodings_are_fixed() {
+    let invitation = Invitation::decode(INVITATION, VERIFIED_AT_UNIX).expect("vector verifies");
+    let request = JoinRequest::from_invitation(&invitation, vec![1, 2, 3]).expect("request");
+    let expected = format!(
+        "0001{FRAMED_GROUP_ID}{FRAMED_INVITATION_LENGTH}{}{JOIN_REQUEST_KEY_PACKAGE}",
+        hex(INVITATION.as_bytes())
+    );
+    assert_eq!(hex(&request.encode().expect("encode")), expected);
+    let decoded = JoinRequest::decode(&unhex(&expected)).expect("decode");
+    assert_eq!(decoded.group_id().to_string(), GROUP_ID);
+    assert_eq!(decoded.invitation(), INVITATION);
+    assert_eq!(decoded.key_package(), &[1, 2, 3]);
+
+    let accepted = JoinResponse::accepted(vec![4, 5, 6]).expect("accepted");
+    assert_eq!(
+        hex(&accepted.encode().expect("encode")),
+        JOIN_RESPONSE_ACCEPTED
+    );
+    let decoded = JoinResponse::decode(&unhex(JOIN_RESPONSE_ACCEPTED)).expect("decode");
+    assert_eq!(decoded.welcome(), Some([4, 5, 6].as_slice()));
+
+    for (reason, vector) in JOIN_RESPONSE_REJECTIONS {
+        let rejected = JoinResponse::rejected(reason);
+        assert_eq!(hex(&rejected.encode().expect("encode")), vector);
+        let decoded = JoinResponse::decode(&unhex(vector)).expect("decode");
+        assert_eq!(decoded.rejection(), Some(reason));
+    }
+}
+
+#[test]
+fn invite_wire_encodings_are_fixed() {
+    let request = InviteRequest::new(group().group_id(), 86_400).expect("request");
+    let expected = format!("0001{FRAMED_GROUP_ID}{INVITE_REQUEST_LIFETIME}");
+    assert_eq!(hex(&request.encode()), expected);
+    let decoded = InviteRequest::decode(&unhex(&expected)).expect("decode");
+    assert_eq!(decoded, request);
+
+    let invitation = Invitation::decode(INVITATION, VERIFIED_AT_UNIX).expect("vector verifies");
+    let issued = InviteResponse::issued(&invitation).expect("issued");
+    let expected = format!(
+        "000101{FRAMED_INVITATION_LENGTH}{}",
+        hex(INVITATION.as_bytes())
+    );
+    assert_eq!(hex(&issued.encode()), expected);
+    let decoded = InviteResponse::decode(&unhex(&expected)).expect("decode");
+    assert_eq!(decoded.invitation(), Some(INVITATION));
+
+    for (reason, vector) in INVITE_RESPONSE_REJECTIONS {
+        assert_eq!(hex(&InviteResponse::rejected(reason).encode()), vector);
+        let decoded = InviteResponse::decode(&unhex(vector)).expect("decode");
+        assert_eq!(decoded.rejection(), Some(reason));
+    }
+}
+
+#[test]
+fn join_and_invite_wire_codecs_reject_an_unknown_version() {
+    let mut join = unhex(JOIN_RESPONSE_ACCEPTED);
+    join[1] = 2;
+    assert!(JoinResponse::decode(&join).is_err());
+    let mut invite = unhex(INVITE_RESPONSE_REJECTIONS[0].1);
+    invite[1] = 2;
+    assert!(InviteResponse::decode(&invite).is_err());
+    let mut request = unhex(&format!("0001{FRAMED_GROUP_ID}{INVITE_REQUEST_LIFETIME}"));
+    request[1] = 2;
+    assert!(InviteRequest::decode(&request).is_err());
 }

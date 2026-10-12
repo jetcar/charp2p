@@ -167,8 +167,18 @@ const BACKGROUND_GROUP_SYNC_STEP_MS = 5_000;
 const BACKGROUND_GROUP_SYNC_START_DELAY_MS = 15_000;
 const PENDING_JOIN_RETRY_INTERVAL_MS = 60_000;
 const PENDING_JOIN_START_DELAY_MS = 1_000;
-// Join failures that mean no group owner answered yet; anything else stops automatic retries.
-const RETRYABLE_JOIN_ERRORS = new Set(["network_join_failed", "network_join_timed_out", "join_busy", "join_awaiting_approval"]);
+// Join failures that mean no group owner answered yet (offline, not found,
+// unreachable or busy); anything else stops automatic retries.
+const RETRYABLE_JOIN_ERRORS = new Set([
+  "network_join_failed",
+  "network_join_timed_out",
+  "network_peer_not_found",
+  "network_peer_unreachable",
+  "network_search_timed_out",
+  "network_unavailable",
+  "join_busy",
+  "join_awaiting_approval",
+]);
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;

@@ -168,6 +168,13 @@
 - [x] Protocol vectors: pin invitation v3/v4 (single-use, approval, history policy variants).
 - [x] Protocol vectors: pin the join and invite request/response wire codecs.
 
+- [x] Join: keep retrying pending joins automatically when the owner is not found, unreachable, the search times out or the device is offline (`network_peer_not_found`, `network_peer_unreachable`, `network_search_timed_out`, `network_unavailable`; product flow "retains the pending invitation and retries").
+- [ ] Network page: record the owner advertising node's member connections as the last connection type so owner-only devices do not show "Not connected yet" while members are connected (product page 9).
+- [ ] Settings: report "Start when you sign in" as on only when the stored preference is on and the OS autostart entry still exists (product page 10).
+- [ ] Docs/UI: join admission is by the pinned owner device only; reword product-design join flow/statement and the join preview note ("until the group owner is reachable").
+- [ ] Docs: technical-design Discovery says owned groups are advertised while open; document background advertising of every owned group and the device-wide 256-key cap; Connectivity: TCP fallback and the 5-minute background sync of joined groups.
+- [ ] Invitations: retire owner rendezvous keys of expired or revoked invitations that admitted no device, so a group is not limited to 64 invitations in its lifetime (ADR-025 provenance follow-up; needs an ADR for invitation-to-admission provenance). Split before starting.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -341,3 +348,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-12T11:28:35Z Protocol vectors (MLS plaintexts): pinned plain/reply message body, edit, deletion, group metadata v1/v2 and invite permission encodings plus unknown-version rejection; split remaining invitation v3/v4 and join/invite codec vectors into sub-items. fmt, clippy, workspace tests, npm build pass.
 - 2026-10-12T12:30:30Z Protocol vectors (invitations v3/v4): pinned a single-use hinted v3 invitation (FromInvitation, one QUIC hint) and a reusable approval v4 invitation (AllRetained, no hints) with IDs and discovery keys, plus a test that relabelling the version byte fails verification. fmt, clippy, workspace tests, npm build pass.
 - 2026-10-12T13:42:39Z Protocol vectors (join/invite wire codecs): pinned join request (framed group ID, invitation, key package), accepted and all four rejected join responses, invite request (one-day lifetime), issued and both rejected invite responses, plus unknown-version rejection. fmt, clippy, workspace tests, npm build pass.
+- 2026-10-12T14:34:58Z Pending join retry on unreachable owner: gap analysis added six backlog items; automatic pending-join retries now continue on network_peer_not_found, network_peer_unreachable, network_search_timed_out and network_unavailable (showing the waiting chip instead of an error). fmt, clippy, workspace tests, npm build pass (src-tauri unchanged).

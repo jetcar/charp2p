@@ -1730,7 +1730,8 @@ impl MlsProviderService {
                     reason: match error {
                         SynchronizationError::Protocol(_)
                         | SynchronizationError::PushedAuthorMismatch
-                        | SynchronizationError::UnsupportedPushedEvent => {
+                        | SynchronizationError::UnsupportedPushedEvent
+                        | SynchronizationError::PushedSequenceGap => {
                             SyncRejectReason::InvalidRequest
                         }
                         SynchronizationError::RemovedAuthor => SyncRejectReason::Unauthorized,

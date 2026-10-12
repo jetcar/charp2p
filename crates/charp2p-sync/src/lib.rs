@@ -128,7 +128,10 @@ pub fn record_reported_heads(
 ///
 /// Uploads are restricted to messages, message edits and deletions signed by
 /// the connected device; membership commits and key refreshes arrive only by
-/// pull. Membership authorization remains the caller's responsibility.
+/// pull. New events must continue the uploader's stored gap-free head in
+/// sequence order, so an upload never leaves a gap; events at or below that
+/// head are resubmissions the store deduplicates. Membership authorization
+/// remains the caller's responsibility.
 pub fn accept_pushed_events(
     store: &mut EventStore,
     authenticated_peer: PeerId,
@@ -140,6 +143,7 @@ pub fn accept_pushed_events(
     };
 
     let mut events = Vec::with_capacity(encoded_events.len());
+    let mut next_sequences: HashMap<PeerId, u64> = HashMap::new();
     for encoded in encoded_events {
         let event = SignedEvent::decode(encoded)?;
         if event.author_id() != authenticated_peer {
@@ -156,6 +160,17 @@ pub fn accept_pushed_events(
             .is_some_and(|cutoff| event.author_sequence() > cutoff)
         {
             return Err(SynchronizationError::RemovedAuthor);
+        }
+        let next_sequence = match next_sequences.entry(event.group_id()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                local_author_head(store, event.group_id(), authenticated_peer)?.saturating_add(1),
+            ),
+        };
+        if event.author_sequence() == *next_sequence {
+            *next_sequence = next_sequence.saturating_add(1);
+        } else if event.author_sequence() > *next_sequence {
+            return Err(SynchronizationError::PushedSequenceGap);
         }
         events.push(event);
     }
@@ -565,6 +580,10 @@ pub enum SynchronizationError {
     /// An uploaded event was authored by a removed device after its removal.
     #[error("uploaded event was authored after its device's removal")]
     RemovedAuthor,
+    /// An uploaded event does not continue the uploader's gap-free stored
+    /// sequence.
+    #[error("uploaded event leaves a gap in its author's sequence")]
+    PushedSequenceGap,
     /// A pulled event was not among the event IDs requested from the peer.
     #[error("synchronization response contains an unrequested event")]
     UnrequestedEvent,
@@ -854,6 +873,60 @@ mod tests {
             accept_pushed_events(&mut store, authenticated.peer_id(), &request),
             Err(SynchronizationError::PushedAuthorMismatch)
         ));
+    }
+
+    #[test]
+    fn push_must_continue_the_uploaders_gap_free_head() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let events: Vec<_> = (1..=4)
+            .map(|sequence| message_event(&author, &group, sequence, b"message"))
+            .collect();
+        let push = |events: &[&SignedEvent]| SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: events.iter().map(|event| event.encode().unwrap()).collect(),
+        };
+        let mut store = EventStore::in_memory().unwrap();
+
+        for gapped in [
+            push(&[&events[1]]),
+            push(&[&events[0], &events[2]]),
+            push(&[&events[1], &events[0]]),
+        ] {
+            assert!(matches!(
+                accept_pushed_events(&mut store, author.peer_id(), &gapped),
+                Err(SynchronizationError::PushedSequenceGap)
+            ));
+        }
+        assert!(
+            store
+                .synchronization_summary(group.group_id())
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            accept_pushed_events(
+                &mut store,
+                author.peer_id(),
+                &push(&[&events[0], &events[1]])
+            )
+            .unwrap()
+            .inserted,
+            2
+        );
+        assert!(matches!(
+            accept_pushed_events(&mut store, author.peer_id(), &push(&[&events[3]])),
+            Err(SynchronizationError::PushedSequenceGap)
+        ));
+        // Stored events may be resubmitted ahead of the next new one.
+        let outcome = accept_pushed_events(
+            &mut store,
+            author.peer_id(),
+            &push(&[&events[0], &events[1], &events[2], &events[3]]),
+        )
+        .unwrap();
+        assert_eq!((outcome.inserted, outcome.already_present), (2, 2));
     }
 
     #[test]

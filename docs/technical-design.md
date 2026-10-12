@@ -326,8 +326,8 @@ its MLS sender is a member of the current epoch; older messages, and late
 messages from removed devices, are recorded as permanently unreadable.
 After pulling, a joined member uploads bounded batches of its locally authored
 message events to the pinned owner over the same authenticated connection. The
-owner accepts only `MessageCreated` events whose signature author matches the
-transport peer and that continue the uploader's gap-free stored sequence
+owner accepts only `MessageCreated`, `MessageEdited` and `MessageDeleted`
+events whose signature author matches the transport peer and that continue the uploader's gap-free stored sequence
 (events at or below that head are idempotent resubmissions; a page that would
 leave a gap is rejected), stores them idempotently, and materializes readable plaintext
 into encrypted local display copies. Other members receive those events from

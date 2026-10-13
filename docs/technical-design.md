@@ -189,6 +189,13 @@ the provider: their addresses are only dial hints. Authenticity comes from the
 authenticated libp2p connection, whose remote peer ID must equal the inviter
 device peer ID pinned under the group-root signature (see below).
 
+A client node publishes its relay circuit addresses and at most four direct
+listen addresses whose IP is globally routable, QUIC first; private, shared,
+link-local, loopback and other non-global addresses and identify-observed
+addresses are never published (ADR-056). Joiners dial a DHT-found provider's
+direct addresses before its relay circuits, in the same order as remembered
+addresses (see Connectivity).
+
 A record contains no group name, membership, messages, or group encryption
 keys. Records
 expire quickly and online peers periodically re-advertise: nodes keep received

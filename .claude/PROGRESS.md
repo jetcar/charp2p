@@ -190,8 +190,9 @@
 - [x] Docs: rewrite stale apps/charp2p-app/README.md paragraphs (background advertising of owned groups, community nodes/TCP bootstrap, reply/edit/delete for everyone, owner member actions, owner notices and background sync).
 - [x] Docs: technical-design timeline read paragraph describes the (creation time, event ID) cursor paging.
 - [ ] Connectivity: DHT-found owners are dialed direct before relay circuits. Split:
-  - [ ] 1/2 ADR: which direct addresses an advertising owner publishes in provider records (privacy of private LAN addresses).
-  - [ ] 2/2 Hold relay circuit dials on the DHT path behind pending direct dials (`DIRECT_DIAL_GRACE`), with a test mirroring the `dial_peer_at` test.
+  - [x] 1/3 ADR: which direct addresses an advertising owner publishes in provider records (privacy of private LAN addresses).
+  - [ ] 2/3 Client nodes confirm globally routable direct listen addresses (at most four, QUIC first) as external so provider records carry them (ADR-056), with unit tests for the address filter.
+  - [ ] 3/3 Hold relay circuit dials on the DHT path behind pending direct dials (`DIRECT_DIAL_GRACE`), with a test mirroring the `dial_peer_at` test.
 
 ## Needs human
 
@@ -385,3 +386,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-13T06:27Z Join preview automatic owner reachability check: verified preview starts the check on open; button relabelled "Check again" after a result. Frontend-only; build, fmt, clippy, tests pass.
 2026-10-13T07:27:49Z README stale paragraphs: rewrote background advertising of every owned group (active + retained keys), bootstrap sources (community nodes ADR-038, env var, 16-node cap, TCP fallback ADR-047), reply/edit/delete-for-everyone vs local hide, owner EventsAvailable notices (ADR-049) and 5-minute background sync, cursor timeline paging, and owner member actions (approval, invite permission, readmission, key refresh, local block). Docs only; workspace fmt/clippy/test and npm build pass.
 2026-10-13T08:22:57Z Docs: timeline cursor paging paragraph: described (creation time, event ID) cursor, 256-message pages, poll merge; docs-only, no build needed
+2026-10-13T09:24:56Z Connectivity 1/3 ADR-056 provider-record addresses: publish relay circuits plus at most four globally routable direct listen addresses (QUIC first), never private/shared/link-local or identify-observed addresses; joiners dial direct before circuits. Technical design DHT section updated; item split into 3 sub-items (confirm-address implementation added as 2/3). Docs only; fmt check passes.

@@ -229,7 +229,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   community_nodes_unavailable: "The community node list could not be read or saved.",
   network_invite_failed: "The invitation request failed. Try again.",
   network_invite_timed_out: "The group owner did not answer the invitation request in time. Try again.",
-  invite_busy: "The group owner is busy or another member's invitation is active. Try again later.",
+  invite_busy: "The group owner cannot issue an invitation right now. It may be busy or have too many active invitations. Try again later.",
   invite_permission_missing: "This device is not allowed to invite to this group.",
   invite_permission_owner: "The owner device can always invite; its permission cannot be changed.",
   invite_request_invalid: "The invitation request is not valid.",

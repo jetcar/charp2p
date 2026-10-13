@@ -185,6 +185,13 @@
 - [x] UI: map remaining user-reachable backend error codes (`mls_wrapping_key_missing`, `mls_wrapping_key_record_invalid`, `identity_store_unsupported`, `group_not_owned`, `mls_group_inactive`, `owner_discovery_key_missing`, `storage_use_unavailable`, `routing_peers_unavailable`, `removed_members_unavailable`, `group_authors_unavailable`).
 - [x] Docs: product-design create flow says advertising starts at group creation; it starts with the first invitation (reorder/reword steps 4-5).
 - [x] charp2p-node: reload the peer blocklist on SIGHUP (closing connections of newly blocked peers, ending their reservations) and stop cleanly on SIGTERM (product node-operator role, technical-design project-node capabilities).
+- [x] Invitations: show whether owner approval is needed on issued invitations (member invitation panel and owner issued list; `IssuedInvitation.approval_required`) (product page 8).
+- [ ] Join preview: check owner reachability automatically when a verified preview opens; keep the button as "Check again" (product join flow step 3, page 4).
+- [ ] Docs: rewrite stale apps/charp2p-app/README.md paragraphs (background advertising of owned groups, community nodes/TCP bootstrap, reply/edit/delete for everyone, owner member actions, owner notices and background sync).
+- [ ] Docs: technical-design timeline read paragraph describes the (creation time, event ID) cursor paging.
+- [ ] Connectivity: DHT-found owners are dialed direct before relay circuits. Split:
+  - [ ] 1/2 ADR: which direct addresses an advertising owner publishes in provider records (privacy of private LAN addresses).
+  - [ ] 2/2 Hold relay circuit dials on the DHT path behind pending direct dials (`DIRECT_DIAL_GRACE`), with a test mirroring the `dial_peer_at` test.
 
 ## Needs human
 
@@ -374,3 +381,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-13T02:26:32Z UI error codes: added ERROR_MESSAGES entries for the 10 remaining backend codes (identity_store_unsupported, group_not_owned, owner_discovery_key_missing, mls_group_inactive, mls_wrapping_key_missing/record_invalid, storage_use_unavailable, routing_peers_unavailable, removed_members_unavailable, group_authors_unavailable). fmt, clippy, workspace tests, npm build pass (src-tauri unchanged).
 2026-10-13T03:28:25Z Docs: product-design create-flow advertising order: reordered steps 4-5 so advertising starts with the first invitation and continues for admitted members; docs-only, all checks pass.
 - 2026-10-13T04:28:01Z charp2p-node SIGHUP/SIGTERM: Unix SIGHUP re-reads the blocked peer list and applies only changes (block closes connections and so relay reservations/circuits; removed peers unblocked); unreadable/invalid reload keeps current list; SIGTERM and interrupt stop cleanly. README and technical-design updated; unit test for change diff; manual smoke run verified reload, invalid reload and SIGTERM. fmt, clippy, workspace tests, npm build pass (src-tauri unchanged).
+- 2026-10-13T05:39:58Z Invitation approval display: `IssuedInvitation.approval_required` from `requires_owner_approval()` (issued, restored and member-requested invitations); member invitation panel says owner approval needed/not needed, owner issued list marks approval invitations; new gap backlog written from docs audit; src-tauri cargo check now builds after apt-installing webkit2gtk/gtk dev libs; all checks pass.

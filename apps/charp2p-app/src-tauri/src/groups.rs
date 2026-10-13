@@ -81,6 +81,8 @@ pub struct IssuedInvitation {
     pub link: String,
     pub expires_at_unix: u64,
     pub reusable: bool,
+    /// The owner approves each device joining with this invitation (ADR-041).
+    pub approval_required: bool,
     /// Member device that asked the owner for this invitation (ADR-036), or
     /// `None` when the owner created it.
     pub requested_by: Option<String>,
@@ -1625,6 +1627,7 @@ fn issued_invitation(
         link: format!("charp2p://join/{encoded}"),
         expires_at_unix: invitation.expires_at_unix(),
         reusable: invitation.is_reusable(),
+        approval_required: invitation.requires_owner_approval(),
         requested_by: requested_by.map(|device| device.to_string()),
     }
 }
@@ -2063,6 +2066,7 @@ mod tests {
         assert_eq!(restored[0].group_id, issued.group_id);
         assert_eq!(restored[0].expires_at_unix, issued.expires_at_unix);
         assert_eq!(restored[0].reusable, issued.reusable);
+        assert!(!restored[0].approval_required);
         assert_eq!(restored[0].requested_by, None);
         assert!(Invitation::decode_input(&restored[0].link, NOW).is_ok());
 
@@ -2710,6 +2714,35 @@ mod tests {
         assert!(cache.list_at(NOW, |_| false).unwrap().is_empty());
         cache.save(accepted).unwrap();
         assert!(cache.list_at(NOW + 86_400, |_| true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn issued_invitation_reports_owner_approval() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service
+            .create(CreateGroupSpec {
+                approval_required: true,
+                ..spec("Project Atlas")
+            })
+            .unwrap();
+        let group_id = created.group_id.parse().unwrap();
+
+        let issued = service
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
+            .unwrap();
+        assert!(issued.approval_required);
+        assert!(Invitation::decode_input(&issued.link, NOW)
+            .unwrap()
+            .requires_owner_approval());
+        let restored = service.issued_invitations_at(NOW).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].approval_required);
     }
 
     #[test]

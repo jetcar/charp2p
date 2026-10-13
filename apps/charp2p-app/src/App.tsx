@@ -44,6 +44,7 @@ type IssuedInvitation = {
   link: string;
   expiresAtUnix: number;
   reusable: boolean;
+  approvalRequired: boolean;
   requestedBy: string | null;
 };
 type PeerSearchResult = {
@@ -723,6 +724,7 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
           <p className="preview-note">
             {expiryDescription(current.expiresAtUnix)}
             {current.reusable ? " · Reusable until expiry" : " · Single use"}
+            {current.approvalRequired ? " · Owner approval needed" : " · No owner approval needed"}
             {" · Issued by the group owner"}
           </p>
           {qrCode && (
@@ -4858,6 +4860,7 @@ function App() {
                           <span>
                             {expiryDescription(invitation.expiresAtUnix)}
                             {invitation.reusable ? " · Reusable until expiry" : " · Single use"}
+                            {invitation.approvalRequired ? " · Owner approval needed" : ""}
                           </span>
                           <code title={invitation.invitationId}>{shortPeerId(invitation.invitationId)}</code>
                         </div>

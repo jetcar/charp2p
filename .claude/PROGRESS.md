@@ -204,6 +204,12 @@
 - [x] Owner advertising and member serving nodes start without configured bootstrap nodes (remembered routing peers, or LAN/hint reachability only), or reword the technical-design claim that hinted invitations work without bootstrap nodes.
 - [x] Docs: technical-design join retry says it authenticates "the QUIC peer" though TCP is also used (ADR-047); built-in bootstrap list is empty/unversioned pending deployment.
 
+- [x] Docs: technical-design revocation paragraph, threat-model "Revoked invitation" row and ADR-021 say revocation stops the provider and request listener; since ADR-025/054 the shared advertiser keeps running and only stops announcing retired keys.
+- [ ] UI: reword `invite_busy` ("another member's invitation is active" is stale since ADR-043; the owner answers busy when temporarily unavailable or at its invitation/rendezvous-key limits) (product page 8).
+- [ ] Docs/vectors: document the MLS device-credential identity encoding and the ADR-051 removal cut-off authenticated data in technical-design "Serialization and size limits", and pin both with fixed-byte tests in charp2p-mls (gate 4).
+- [ ] Member invitations: let a permitted member choose a shorter expiry when requesting an invitation (`request_member_invitation` lifetimeSeconds; owner caps at group lifetime) (product pages 3/8).
+- [ ] Docs: crates/charp2p-node/README.md says the node rejects synchronization requests only (also join and invite); rename docs/decisions/008-protected-pending-invitations.md to 0008-… and update ADR-055's reference.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -408,3 +414,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-13T18:26:28Z Queued pushes after local changes: sending, editing or deleting in an open joined group while another synchronization is in flight queues that group, and it synchronizes as soon as the running one finishes instead of at the next periodic pass. Frontend only; fmt, clippy, workspace tests, npm build pass.
 2026-10-13T19:23:33Z Bootstrap-free hinted invitations: reworded the technical design instead of changing code, since ADR-046 says remembered routing peers must not satisfy the bootstrap requirement; the doc now says only the joiner needs no bootstrap node, while the owner advertising node still requires a configured one. Docs only; no code checks needed.
 2026-10-13T20:23:48Z Docs join retry transport and bootstrap list: technical design now says the retry authenticates the peer over QUIC or the TCP fallback (ADR-047), and that the built-in bootstrap list is compiled into each release and stays empty until public nodes are deployed (environment and community nodes meanwhile). Docs only; no code checks needed.
+2026-10-13T21:33:59Z Docs revocation vs shared advertiser: re-derived backlog (5 gaps: revocation docs, invite_busy text, MLS credential/cut-off vectors, member invitation expiry, node README/ADR filename). technical-design revocation paragraph, threat-model row and ADR-021 status now say revocation leaves the shared advertiser running and retires the key per ADR-054 (kept for admitted members). Docs only; fmt, clippy, workspace tests, npm build pass.

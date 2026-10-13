@@ -416,8 +416,12 @@ issued-invitation index, and an exact constant-time match with the protected
 bearer record. It returns only non-secret invitation metadata. This proves that
 the owner currently recognizes the bearer. Revocation removes the protected
 bearer first and then its SQLite index while holding the shared storage lock,
-so authorization fails closed if either deletion is interrupted. It also stops
-the active provider and request-listener task. Following ADR-043, a group holds
+so authorization fails closed if either deletion is interrupted. Revocation
+does not stop the shared owner advertising node, which keeps serving the
+group's other invitations and admitted members (ADR-025); the bearer's
+rendezvous key is retired when no current admission records it, and the running
+advertiser stops announcing it on its next key update (ADR-054). Following
+ADR-043, a group holds
 up to 16 active invitations, revocation names one invitation and leaves the
 others active, and the owner's issued list shows the member device that
 requested each member invitation. Single-use consumption follows

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; stopping the DHT provider and request listener is superseded
+by ADR-025 and ADR-054.
 
 ## Date
 

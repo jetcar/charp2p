@@ -2378,6 +2378,9 @@ function App() {
   useEffect(() => {
     setPreviewReachability(null);
     setPreviewCopied(null);
+    // A verified preview checks owner reachability on its own (product join
+    // flow step 3); the button stays available to check again.
+    if (invitationPreview) void checkPreviewReachability(inviteInputRef.current);
   }, [invitationPreview]);
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
   const [activeGroupId, setActiveGroupId] = useState("");
@@ -3124,10 +3127,9 @@ function App() {
     }
   }
 
-  async function checkPreviewReachability() {
-    if (!inviteInput.trim() || checkingPreviewReachability || !isTauri()) return;
+  async function checkPreviewReachability(input = inviteInput) {
+    if (!input.trim() || checkingPreviewReachability || !isTauri()) return;
 
-    const input = inviteInput;
     setError("");
     setCheckingPreviewReachability(true);
     try {
@@ -5177,7 +5179,11 @@ function App() {
                   onClick={() => void checkPreviewReachability()}
                   type="button"
                 >
-                  {checkingPreviewReachability ? "Checking connection…" : "Check whether the group owner is reachable"}
+                  {checkingPreviewReachability
+                    ? "Checking connection…"
+                    : previewReachability
+                      ? "Check again"
+                      : "Check whether the group owner is reachable"}
                 </button>
                 <p className="preview-note">Checking looks up the invitation's discovery key on the network. Only the group owner device admits new devices, so joining waits until it is reachable.</p>
               </div>

@@ -195,6 +195,15 @@
   - [x] 3/3 Hold relay circuit dials on the DHT path behind pending direct dials (`DIRECT_DIAL_GRACE`), with a test mirroring the `dial_peer_at` test.
 - [x] Invitations: static HTTPS fallback page for `https://join.charp2p.example/i#<invitation>` (technical-design Invitations and links, ADR-010 prerequisite) explaining installation and handing the fragment to the app as a `charp2p://join/` link, with no third-party resources or requests.
 
+- [x] Join: remember the address that reached the owner and record the initial pull as the first synchronization (hint-only joins forgot the owner's addresses with the bearer, so later syncs needed bootstrap nodes; technical-design Invitations hints, Local data).
+- [ ] Evidence export applies message retention first, like listings (technical-design Message protection retention).
+- [ ] Owner advertiser announces newly issued (e.g. member-requested) invitation keys inside the running task instead of restarting it on the next UI recheck, which drops member and relay connections (technical-design Invitations/Discovery).
+- [ ] Owner address hints: the first invitation of an owner whose advertiser is not running yet has no hints; start the owner node (or wait briefly for listen addresses) before issuing (technical-design Invitations hints).
+- [ ] Member-served pull collects DHT results until the search ends or four candidates are found before dialing, instead of only the first Kademlia step (technical-design Connectivity, ADR-040).
+- [ ] Sending, editing or deleting while another group's background sync runs pushes after it finishes instead of waiting for the one-minute retry (product flow 'Connected members receive and verify it').
+- [ ] Owner advertising and member serving nodes start without configured bootstrap nodes (remembered routing peers, or LAN/hint reachability only), or reword the technical-design claim that hinted invitations work without bootstrap nodes.
+- [ ] Docs: technical-design join retry says it authenticates "the QUIC peer" though TCP is also used (ADR-047); built-in bootstrap list is empty/unversioned pending deployment.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -203,7 +212,7 @@
 - [ ] Manual UI testing of cold-start and running-instance deep links on Windows and Android.
 - [ ] Decide supported Windows and Android versions (implementation gate 6).
 - [ ] Choose the project licence, third-party licence notice process, and security contact to show on the Settings page.
-- [ ] Android background retry of pending invitations (WorkManager/foreground service) needs device validation.
+- [ ] Android background retry of pending invitations (WorkManager/foreground service): not implemented in code yet (no Kotlin worker); implementation and device validation.
 - [ ] Measure worst-case Welcome size to set the product group-size limit.
 
 ## Blocked
@@ -391,3 +400,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-13T10:30:01Z Connectivity 2/3 ADR-056 direct address confirmation: client nodes track globally routable direct listen addresses (IPv4 excluding private/loopback/link-local/shared/documentation/benchmarking/reserved/multicast; IPv6 global unicast excluding documentation), confirm at most four as external (QUIC first) and withdraw expired or displaced ones; unit tests for the filter and selection. fmt, clippy, workspace tests and npm build pass.
 2026-10-13T11:41:10Z Connectivity 3/3 DHT path direct-first dials: dial_peer reads the addresses Kademlia would contribute (routing table plus ongoing provider queries) and, when they include relay circuits, dials direct addresses first via dial_peer_at so circuits wait for DIRECT_DIAL_GRACE; peers without known circuits dial as before. Shared test helper; new test fails without the change. fmt, clippy, tests, npm build pass; src-tauri unchanged.
 2026-10-13T12:29:00Z Invitations HTTPS fallback page: added web/join/i (index.html, join.js, join.css, README) with meta CSP (self-only script/style, no connect), no-referrer, base64url and 8 KiB fragment check, Open in CharP2P and copy as charp2p://join/ link; technical design notes it. Verified in Chromium (link built, invalid fragment shows missing state, no off-page requests, no console errors); fmt, clippy, tests, npm build pass.
+2026-10-13T13:46:41Z Join remembers owner address: JoinGroupResult returns the connected owner address and initial pull time; join_group records them as the first synchronization and a remembered peer address (best effort). Gap analysis added 7 backlog items. Hinted-join test asserts both. fmt, clippy, workspace tests, src-tauri clippy/tests (webkit libs installed via apt), npm build pass.

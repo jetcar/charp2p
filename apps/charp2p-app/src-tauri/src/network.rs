@@ -345,6 +345,13 @@ pub struct JoinGroupResult {
     pub status: &'static str,
     pub group_id: String,
     pub synchronized_events: usize,
+    /// Completion time of the initial pull from the owner, or `None` when
+    /// it failed and the next synchronization fetches the history.
+    pub synchronized_at_unix: Option<u64>,
+    /// Address that reached the owner, remembered for later
+    /// synchronizations; never sent to the frontend.
+    #[serde(skip)]
+    pub peer_address: Multiaddr,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -1732,7 +1739,9 @@ impl NetworkService {
             .pending_join
             .prepare_join_request(local_peer, invitation)?;
         let key = DiscoveryKey::from_invitation(invitation);
-        let ProviderConnection { mut node, .. } = self
+        let ProviderConnection {
+            mut node, address, ..
+        } = self
             .connect_to_group_provider(identity, key, expected_inviter, &hints)
             .await?;
 
@@ -1771,7 +1780,7 @@ impl NetworkService {
         let welcome = response.welcome().ok_or("network_join_failed")?;
         self.pending_join
             .complete_join(invitation.group_id(), welcome)?;
-        let synchronized_events = self
+        let pulled = self
             .pull_from_connected_peer(
                 &mut node,
                 expected_inviter,
@@ -1779,12 +1788,22 @@ impl NetworkService {
                 None,
                 &mut ConnectionPath::Direct,
             )
-            .await
-            .map_or(0, |(inserted, _)| inserted);
+            .await;
+        let synchronized_at_unix = match pulled {
+            Ok(_) => Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| "system_clock_invalid")?
+                    .as_secs(),
+            ),
+            Err(_) => None,
+        };
         Ok(JoinGroupResult {
             status: "joined",
             group_id: invitation.group_id().to_string(),
-            synchronized_events,
+            synchronized_events: pulled.map_or(0, |(inserted, _)| inserted),
+            synchronized_at_unix,
+            peer_address: address,
         })
     }
 
@@ -4223,7 +4242,7 @@ mod tests {
             let hint: libp2p::Multiaddr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
                 .parse()
                 .unwrap();
-            let invitation = hinted_invitation(&group, owner_id, &[hint], now);
+            let invitation = hinted_invitation(&group, owner_id, std::slice::from_ref(&hint), now);
 
             let pending_join = Arc::new(RecordingPendingJoinService::default());
             let joiner_service = NetworkService::from_sources_with_authorizer(
@@ -4249,6 +4268,12 @@ mod tests {
 
             assert_eq!(result.status, "joined");
             assert!(pending_join.completed.load(Ordering::SeqCst));
+            // The hint that reached the owner is returned for remembering.
+            assert!(result
+                .peer_address
+                .to_string()
+                .starts_with(&hint.to_string()));
+            assert!(result.synchronized_at_unix.is_some());
         });
     }
 

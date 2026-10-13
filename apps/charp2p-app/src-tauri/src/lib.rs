@@ -526,6 +526,7 @@ async fn join_group(
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
 ) -> Result<JoinedGroup, String> {
     let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
+    let mut joined = None;
     if !mls_service.has_group(group_id).map_err(str::to_owned)? {
         let identity = identity_service
             .load_network_identity()
@@ -533,14 +534,41 @@ async fn join_group(
         let invitation = pending_service
             .load_invitation(group_id)
             .map_err(str::to_owned)?;
-        network_service
+        let result = network_service
             .join(identity, &invitation)
             .await
             .map_err(str::to_owned)?;
+        joined = Some((invitation.inviter_device_id(), result));
     }
-    pending_service
+    let mut group = pending_service
         .complete_join(group_id)
-        .map_err(str::to_owned)
+        .map_err(str::to_owned)?;
+    // The invitation's address hints leave with its bearer, so the address
+    // that reached the owner is remembered for later synchronizations, and
+    // the initial pull counts as the first synchronization. Failing to
+    // record either only costs a DHT lookup or an earlier retry.
+    if let Some((owner_device_id, result)) = joined {
+        if let Some(synchronized_at_unix) = result.synchronized_at_unix {
+            if pending_service
+                .record_synchronization(group_id, synchronized_at_unix)
+                .is_ok()
+            {
+                group.last_synchronized_at_unix = Some(synchronized_at_unix);
+            }
+            let peer_address = result.peer_address.to_vec();
+            if !peer_address.is_empty()
+                && peer_address.len() <= charp2p_store::MAX_PEER_ADDRESS_BYTES
+            {
+                let _ = pending_service.record_peer_address(
+                    group_id,
+                    owner_device_id,
+                    &peer_address,
+                    synchronized_at_unix,
+                );
+            }
+        }
+    }
+    Ok(group)
 }
 
 #[tauri::command]

@@ -335,6 +335,16 @@ const ERROR_MESSAGES: Record<string, string> = {
   identity_backup_invalid: "The backup does not contain a valid device identity.",
   evidence_selection_invalid: "Select between 1 and 64 messages to export as evidence.",
   system_clock_invalid: "The device clock must be corrected before validating invitations.",
+  identity_store_unsupported: "Protected device storage is not supported on this platform.",
+  group_not_owned: "Only this group's owner can change it.",
+  owner_discovery_key_missing: "Create an invitation before advertising this group.",
+  mls_group_inactive: "This device is no longer an active member of that group.",
+  mls_wrapping_key_missing: "The protected key for secure group state is missing on this device.",
+  mls_wrapping_key_record_invalid: "The protected key for secure group state is damaged.",
+  storage_use_unavailable: "Local storage use could not be read.",
+  routing_peers_unavailable: "Remembered routing peers could not be read or saved.",
+  removed_members_unavailable: "Removed devices could not be loaded.",
+  group_authors_unavailable: "Group members' activity could not be loaded.",
 };
 
 function errorMessage(error: unknown) {

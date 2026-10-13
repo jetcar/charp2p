@@ -393,6 +393,11 @@ enum ProviderFound {
 struct ActiveAdvertisement {
     keys: Vec<DiscoveryKey>,
     expires_at_unix: Option<u64>,
+    owner: PeerId,
+    inviter_name: String,
+    /// Hands a changed key set to the running task, which announces new keys
+    /// and stops refreshing retired ones without restarting the node.
+    key_updates: mpsc::UnboundedSender<Vec<DiscoveryKey>>,
     task: JoinHandle<()>,
 }
 
@@ -1018,14 +1023,28 @@ impl NetworkService {
         }
 
         let mut active = self.advertisement.lock().await;
-        if let Some(existing) = active.as_ref() {
-            if existing.keys == keys
-                && existing.expires_at_unix == expires_at_unix
-                && !existing.task.is_finished()
-            {
+        if let Some(existing) = active.as_mut() {
+            let same_provider = existing.expires_at_unix == expires_at_unix
+                && existing.owner == owner_identity.peer_id()
+                && existing.inviter_name == inviter_name
+                && !existing.task.is_finished();
+            if same_provider && existing.keys == keys {
                 return Ok(AdvertisementResult {
                     status: "advertising",
                     expires_at_unix: existing.expires_at_unix.unwrap_or(0),
+                });
+            }
+            // Newly issued keys join the running provider so connected members
+            // and relay reservations survive; only a bearer-bound advertisement
+            // restarts, as its expiry ends the task.
+            if same_provider
+                && expires_at_unix.is_none()
+                && existing.key_updates.send(keys.clone()).is_ok()
+            {
+                existing.keys = keys;
+                return Ok(AdvertisementResult {
+                    status: "advertising",
+                    expires_at_unix: 0,
                 });
             }
         }
@@ -1136,8 +1155,12 @@ impl NetworkService {
         let owner_peers = Arc::clone(&self.owner_peers);
         let last_connection = Arc::clone(&self.last_connection);
         let mut stored_events = self.stored_events.subscribe();
-        let task_keys = keys.clone();
+        let mut task_keys = keys.clone();
+        let owner_identity_peer = owner_identity.peer_id();
+        let (key_updates, mut updated_keys) = mpsc::unbounded_channel::<Vec<DiscoveryKey>>();
+        let task_inviter_name = inviter_name.clone();
         let task = tokio::spawn(async move {
+            let inviter_name = task_inviter_name;
             let mut refresh = interval_at(
                 Instant::now() + ADVERTISEMENT_REFRESH_INTERVAL,
                 ADVERTISEMENT_REFRESH_INTERVAL,
@@ -1161,6 +1184,11 @@ impl NetworkService {
                     },
                     _ = refresh.tick() => {
                         if task_keys.iter().any(|key| node.announce_group(*key).is_err()) {
+                            break;
+                        }
+                    }
+                    Some(keys) = updated_keys.recv() => {
+                        if !update_announced_keys(&mut node, &mut task_keys, keys) {
                             break;
                         }
                     }
@@ -1268,6 +1296,9 @@ impl NetworkService {
         *active = Some(ActiveAdvertisement {
             keys,
             expires_at_unix,
+            owner: owner_identity_peer,
+            inviter_name,
+            key_updates,
             task,
         });
         Ok(AdvertisementResult {
@@ -2754,6 +2785,27 @@ fn discovery_outcome<T>(result: &Result<T, &'static str>) -> Option<&'static str
         Err("network_peer_not_found" | "network_search_timed_out") => Some("missing"),
         Err(_) => None,
     }
+}
+
+/// Switches the running owner advertising node to a changed key set:
+/// announces keys it did not hold and stops announcing retired ones, whose
+/// provider records then expire with their network TTL. Returns false when an
+/// announcement could not start, which ends the advertiser so the next
+/// recheck restarts it.
+fn update_announced_keys(
+    node: &mut NetworkNode,
+    current: &mut Vec<DiscoveryKey>,
+    keys: Vec<DiscoveryKey>,
+) -> bool {
+    for retired in current.iter().filter(|key| !keys.contains(key)) {
+        node.stop_announcing_group(*retired);
+    }
+    let announced = keys
+        .iter()
+        .filter(|key| !current.contains(key))
+        .all(|key| node.announce_group(*key).is_ok());
+    *current = keys;
+    announced
 }
 
 /// Records a listen address of the owner advertising node as an invitation
@@ -4858,6 +4910,124 @@ mod tests {
         // The advertiser listens on every interface; on hosts with a
         // non-private interface address that address may win the dial.
         assert!(matches!(result.connection_type, Some("lan" | "direct")));
+    }
+
+    #[test]
+    fn owner_advertisement_announces_new_keys_without_restarting() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (_, owner_secret) = DeviceIdentity::generate_persistable().unwrap();
+        let owner_id = DeviceIdentity::from_persisted_secret(&owner_secret)
+            .unwrap()
+            .peer_id();
+        let issue = |group_name| {
+            Invitation::issue(
+                &group,
+                owner_id,
+                InvitationSpec {
+                    group_name,
+                    inviter_name: "Maya",
+                    expires_at_unix: now + 3_600,
+                    history_policy: HistoryPolicy::None,
+                    reusable: false,
+                },
+                now,
+            )
+            .unwrap()
+        };
+        let first = issue("Design Crew");
+        let requested = issue("Design Crew");
+        let first_key = DiscoveryKey::from_invitation(&first);
+        let requested_key = DiscoveryKey::from_invitation(&requested);
+        assert_ne!(first_key, requested_key);
+        let result = tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}"))
+                .unwrap()
+                .without_lan_discovery();
+            let advertise = service.advertise_owner_group(
+                DeviceIdentity::from_persisted_secret(&owner_secret).unwrap(),
+                DeviceIdentity::from_persisted_secret(&owner_secret).unwrap(),
+                "Maya's PC".to_owned(),
+                vec![first_key],
+            );
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+            let first_task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should be active")
+                .task
+                .id();
+
+            let updated = service
+                .advertise_owner_group(
+                    DeviceIdentity::from_persisted_secret(&owner_secret).unwrap(),
+                    DeviceIdentity::from_persisted_secret(&owner_secret).unwrap(),
+                    "Maya's PC".to_owned(),
+                    vec![first_key, requested_key],
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated.status, "advertising");
+            let updated_task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should remain active")
+                .task
+                .id();
+            assert_eq!(updated_task_id, first_task_id);
+            assert_eq!(
+                service
+                    .owned_group_discovery_status(&[first_key, requested_key])
+                    .await
+                    .status,
+                "advertising"
+            );
+
+            let search = service.search(DeviceIdentity::generate(), &requested);
+            tokio::pin!(search);
+            let result = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut search => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("provider search should complete")
+            .unwrap();
+            service.stop_advertising().await;
+            result
+        });
+
+        assert_eq!(result.status, "peerReachable");
+        assert_eq!(result.discovered_peers, 1);
     }
 
     #[test]

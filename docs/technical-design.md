@@ -241,7 +241,10 @@ provenance was recorded are kept. One background
 provider advertises the retained keys of every owned group while the app runs,
 whichever group is open in the interface. It refreshes publication every five
 minutes, and the interface rechecks it every 30 seconds and restarts a failed
-advertiser after 5 seconds. Retained keys are bounded to 64 per group and 256
+advertiser after 5 seconds. A recheck that finds newly issued or retired
+keys hands them to the running provider, which announces the new keys and
+stops refreshing retired ones without dropping member or relay connections.
+Retained keys are bounded to 64 per group and 256
 across all owned groups on the device, counting keys of active invitations and
 keys that admitted a current member rather than every invitation ever issued;
 issuing an invitation that would exceed either bound is refused. Closing the app removes the live provider, while

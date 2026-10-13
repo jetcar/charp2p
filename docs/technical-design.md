@@ -742,7 +742,7 @@ event. This action never creates a group-wide `MessageDeleted` event.
 An optional device-local retention period (ADR-035, 1 to 3650 days) applies the
 same local deletion to every readable message whose signed creation time is
 older than the period, when the preference is saved and before messages or
-unread counts are listed.
+unread counts are listed or evidence is exported.
 
 An evidence export (ADR-029) contains the re-verified signed envelopes of up to
 64 user-selected readable messages and their latest same-author edits, with

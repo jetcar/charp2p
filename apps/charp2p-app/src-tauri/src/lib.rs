@@ -754,6 +754,7 @@ fn export_message_evidence(
     event_ids: Vec<String>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    retention_service: tauri::State<'_, RetentionService>,
 ) -> Result<EvidenceExport, String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     if event_ids.is_empty() || event_ids.len() > MAX_EVIDENCE_EVENTS {
@@ -763,6 +764,8 @@ fn export_message_evidence(
         .iter()
         .map(|event_id| parse_event_id(event_id))
         .collect::<Result<Vec<_>, _>>()?;
+    // Expired messages leave no readable copy, so they cannot be exported.
+    apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;

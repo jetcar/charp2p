@@ -38,8 +38,10 @@ availability. A node operator does not become a group administrator.
 2. The user chooses a group name. The current secure profile shares messages
    sent after a member joins.
 3. The app creates the group identity and initial membership state.
-4. The app starts advertising an opaque discovery key while it is online.
-5. The user can create an expiring invitation.
+4. The user can create an expiring invitation.
+5. From the first invitation on, the app advertises that invitation's opaque
+   discovery key while it is online, and keeps advertising it for members it
+   admitted after the invitation ends.
 
 ### Join from an invitation
 

@@ -10,6 +10,7 @@ mod request_limits;
 
 use std::{
     collections::{HashMap, HashSet},
+    net::{Ipv4Addr, Ipv6Addr},
     time::{Duration, Instant},
 };
 
@@ -63,6 +64,9 @@ const MAX_RELAY_CIRCUITS: u32 = 32;
 /// Relay circuits of a remembered address set are dialled only after every
 /// direct address failed or after this grace period without a connection.
 const DIRECT_DIAL_GRACE: Duration = Duration::from_secs(1);
+/// Client nodes publish at most this many direct listen addresses in provider
+/// records, leaving room for relay circuits (ADR-056).
+const MAX_PUBLISHED_DIRECT_ADDRESSES: usize = 4;
 const MEBIBYTE: u64 = 1024 * 1024;
 const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 1_024;
@@ -323,6 +327,9 @@ pub struct NetworkNode {
     dialed_addresses: HashMap<PeerId, Multiaddr>,
     /// Relay circuit addresses held back while direct addresses are dialled.
     relay_fallbacks: HashMap<PeerId, RelayFallback>,
+    /// Globally routable direct listen addresses of a client node, in the
+    /// order the swarm reported them; the first few are confirmed external.
+    routable_listen_addresses: Vec<Multiaddr>,
     routing_peer_observer: Option<RoutingPeerObserver>,
 }
 
@@ -446,6 +453,7 @@ impl NetworkNode {
             request_limits,
             dialed_addresses: HashMap::new(),
             relay_fallbacks: HashMap::new(),
+            routable_listen_addresses: Vec::new(),
             routing_peer_observer: None,
         }
     }
@@ -760,6 +768,20 @@ impl NetworkNode {
             .is_none_or(|limits| limits.allow(peer, Instant::now()))
     }
 
+    /// Confirms the preferred globally routable direct listen addresses as
+    /// external and withdraws the rest, so provider records carry at most
+    /// [`MAX_PUBLISHED_DIRECT_ADDRESSES`] of them, QUIC first (ADR-056).
+    fn confirm_direct_addresses(&mut self) {
+        let published = published_direct_addresses(&self.routable_listen_addresses);
+        for address in &self.routable_listen_addresses {
+            if published.contains(address) {
+                self.swarm.add_external_address(address.clone());
+            } else {
+                self.swarm.remove_external_address(address);
+            }
+        }
+    }
+
     /// Waits for the next application-relevant network event.
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
@@ -767,8 +789,26 @@ impl NetworkNode {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     if self.relay_server {
                         self.swarm.add_external_address(address.clone());
+                    } else if is_publishable_direct_address(&address)
+                        && !self.routable_listen_addresses.contains(&address)
+                    {
+                        self.routable_listen_addresses.push(address.clone());
+                        self.confirm_direct_addresses();
                     }
                     return NetworkEvent::Listening { address };
+                }
+                SwarmEvent::ExpiredListenAddr { address, .. } => {
+                    if self.relay_server {
+                        self.swarm.remove_external_address(&address);
+                    } else if let Some(position) = self
+                        .routable_listen_addresses
+                        .iter()
+                        .position(|candidate| candidate == &address)
+                    {
+                        self.routable_listen_addresses.remove(position);
+                        self.swarm.remove_external_address(&address);
+                        self.confirm_direct_addresses();
+                    }
                 }
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
@@ -1511,6 +1551,56 @@ fn is_quic_address(address: &Multiaddr) -> bool {
         && !is_relayed(address)
 }
 
+/// Selects the direct addresses a client node publishes: QUIC first, then in
+/// reported order, at most [`MAX_PUBLISHED_DIRECT_ADDRESSES`] (ADR-056).
+fn published_direct_addresses(candidates: &[Multiaddr]) -> Vec<Multiaddr> {
+    let mut published = candidates.to_vec();
+    prefer_quic(&mut published);
+    published.truncate(MAX_PUBLISHED_DIRECT_ADDRESSES);
+    published
+}
+
+/// Whether a listen address may appear in provider records: a direct address
+/// whose IP is globally routable (ADR-056).
+fn is_publishable_direct_address(address: &Multiaddr) -> bool {
+    if is_relayed(address) {
+        return false;
+    }
+    match address.iter().next() {
+        Some(Protocol::Ip4(ip)) => is_global_ipv4(ip),
+        Some(Protocol::Ip6(ip)) => is_global_ipv6(ip),
+        _ => false,
+    }
+}
+
+fn is_global_ipv4(ip: Ipv4Addr) -> bool {
+    let [first, second, third, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        // Shared address space (carrier-grade NAT).
+        || (first == 100 && second & 0b1100_0000 == 64)
+        // IETF protocol assignments.
+        || (first == 192 && second == 0 && third == 0)
+        // Benchmarking.
+        || (first == 198 && second & 0b1111_1110 == 18)
+        // Reserved, including the limited broadcast block.
+        || first >= 240
+        || first == 0)
+}
+
+fn is_global_ipv6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    let second = ip.segments()[1];
+    // Global unicast is 2000::/3; documentation is 2001:db8::/32 and 3fff::/20.
+    // Unique-local (fc00::/7) and link-local (fe80::/10) fall outside 2000::/3.
+    first & 0xe000 == 0x2000 && !(first == 0x2001 && second == 0x0db8) && first & 0xfff0 != 0x3ff0
+}
+
 fn is_relayed(address: &Multiaddr) -> bool {
     address
         .iter()
@@ -1543,6 +1633,87 @@ mod tests {
     fn dht_uses_a_dedicated_protocol_name() {
         assert_eq!(DHT_PROTOCOL.as_ref(), "/charp2p/kad/1.0.0");
         assert_ne!(DHT_PROTOCOL, kad::PROTOCOL_NAME);
+    }
+
+    #[test]
+    fn only_globally_routable_direct_addresses_are_publishable() {
+        for address in [
+            "/ip4/203.0.114.7/udp/4001/quic-v1",
+            "/ip4/8.8.8.8/tcp/4001",
+            "/ip6/2a01:4f8::1/udp/4001/quic-v1",
+        ] {
+            assert!(
+                super::is_publishable_direct_address(&address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in [
+            "/ip4/0.0.0.0/udp/4001/quic-v1",
+            "/ip4/127.0.0.1/tcp/4001",
+            "/ip4/10.1.2.3/tcp/4001",
+            "/ip4/172.16.0.1/tcp/4001",
+            "/ip4/192.168.1.8/udp/4001/quic-v1",
+            "/ip4/169.254.1.1/tcp/4001",
+            "/ip4/100.64.0.1/tcp/4001",
+            "/ip4/100.127.255.254/tcp/4001",
+            "/ip4/192.0.2.1/tcp/4001",
+            "/ip4/198.51.100.1/tcp/4001",
+            "/ip4/203.0.113.1/tcp/4001",
+            "/ip4/198.18.0.1/tcp/4001",
+            "/ip4/198.19.255.1/tcp/4001",
+            "/ip4/192.0.0.1/tcp/4001",
+            "/ip4/240.0.0.1/tcp/4001",
+            "/ip4/255.255.255.255/tcp/4001",
+            "/ip4/224.0.0.1/udp/4001/quic-v1",
+            "/ip6/::/udp/4001/quic-v1",
+            "/ip6/::1/tcp/4001",
+            "/ip6/fd00::1/tcp/4001",
+            "/ip6/fe80::1/tcp/4001",
+            "/ip6/2001:db8::1/tcp/4001",
+            "/ip6/3fff::1/tcp/4001",
+            "/ip6/ff02::1/udp/4001/quic-v1",
+            "/dns4/example.com/tcp/4001",
+        ] {
+            assert!(
+                !super::is_publishable_direct_address(&address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        let circuit: Multiaddr = "/ip4/8.8.8.8/tcp/4001"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(PeerId::random()))
+            .with(Protocol::P2pCircuit);
+        assert!(!super::is_publishable_direct_address(&circuit));
+        assert!(super::is_publishable_direct_address(
+            &"/ip4/100.63.255.255/tcp/4001".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn at_most_four_direct_addresses_are_published_quic_first() {
+        let candidates: Vec<Multiaddr> = [
+            "/ip4/8.8.8.1/tcp/4001",
+            "/ip4/8.8.8.2/tcp/4001",
+            "/ip4/8.8.8.3/tcp/4001",
+            "/ip4/8.8.8.1/udp/4001/quic-v1",
+            "/ip6/2a01:4f8::1/tcp/4001",
+            "/ip6/2a01:4f8::1/udp/4001/quic-v1",
+        ]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        let published = super::published_direct_addresses(&candidates);
+        assert_eq!(
+            published,
+            vec![
+                candidates[3].clone(),
+                candidates[5].clone(),
+                candidates[0].clone(),
+                candidates[1].clone(),
+            ]
+        );
+        assert!(super::published_direct_addresses(&[]).is_empty());
     }
 
     #[test]

@@ -1693,4 +1693,27 @@ mod tests {
             Err("message_not_found".to_owned())
         );
     }
+
+    #[test]
+    fn webview_content_security_policy_stays_restrictive() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = config["app"]["security"]["csp"].as_str().unwrap();
+        let directives = csp
+            .split(';')
+            .map(|directive| directive.trim())
+            .collect::<Vec<_>>();
+        for expected in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "style-src 'self'",
+            "img-src 'self' data:",
+            "connect-src ipc: http://ipc.localhost",
+            "object-src 'none'",
+        ] {
+            assert!(directives.contains(&expected), "missing {expected}");
+        }
+        assert!(!csp.contains("unsafe-"));
+        assert!(!csp.contains('*'));
+    }
 }

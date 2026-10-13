@@ -40,12 +40,16 @@ protocol registration.
 
 The pending-group screen can run a bounded Kademlia provider search and an
 authenticated direct, local-network, or relayed reachability check with the
-restored device identity. An owner with an active invitation advertises its
-opaque rendezvous key while the app is
-running, through the invitation expiry. Release builds will use the versioned
-built-in bootstrap list. During local development, set
-`CHARP2P_BOOTSTRAP_NODES` to up to 16 semicolon-separated QUIC multiaddresses
-ending in `/p2p/<peer-id>`. With no configured node, the app reports that a
+restored device identity. While the app runs, it advertises the opaque
+rendezvous keys of every owned group in the background, not only the group
+currently open: active invitation keys until they expire, plus the retained
+keys that already admitted members use to rediscover the owner. Release builds
+will use the versioned built-in bootstrap list. The Network page can add and
+remove up to 8 device-local community nodes (ADR-038), and during local
+development `CHARP2P_BOOTSTRAP_NODES` accepts semicolon-separated
+multiaddresses ending in `/p2p/<peer-id>`; the combined list holds at most 16
+nodes. Nodes connect over QUIC with a Noise and Yamux TCP fallback (ADR-047)
+for networks that block UDP. With no configured node, the app reports that a
 bootstrap node is required.
 
 Owner advertisements request a Circuit Relay v2 reservation from configured
@@ -97,9 +101,12 @@ The owner and joined-group screens can create bounded text messages as MLS
 private application messages and persist each signed `MessageCreated` event
 atomically with sender ratchet state. They also keep an event-bound encrypted
 local display copy and restore the timeline after restart. Timeline actions can
-copy text or delete only the readable copy on this device. A durable local
-marker prevents the retained signed event from recreating a deleted copy;
-other members keep their copies. A durable acknowledgement head distinguishes
+copy text, reply to a message (the reply reference travels inside the protected
+payload), edit this device's own messages through a signed `MessageEdited`
+event, and delete them for everyone through a signed `MessageDeleted`
+tombstone. Hiding a message removes only the readable copy on this device; a
+durable local marker prevents the retained signed event from recreating it,
+and other members keep their copies. A durable acknowledgement head distinguishes
 messages saved only on this device from messages accepted by at least one peer.
 
 Joined members upload bounded batches of their own signed message events to the
@@ -108,13 +115,18 @@ matches the authenticated connection, persists accepted events idempotently,
 and makes them available to other members through later pulls. Creating a
 joined-member message triggers an immediate synchronization attempt; the
 minute retry loop retains locally saved messages while the owner is offline.
+After storing new events, an owner sends a data-free `EventsAvailable` notice
+over existing connections to current members (ADR-049), and a member that
+accepts it from its pinned owner pulls at once. Joined groups that are not
+open are synchronized in the background every five minutes.
 Successful synchronization times persist and remain visible after restart.
 The current session status also identifies direct, local-network, and relayed
 connections.
 An active group screen refreshes its encrypted local timeline every two
 seconds, so the owner sees newly accepted member messages without reopening the
-group. Timeline reads are bounded to the latest 256 messages and disclose when
-older locally retained messages are outside the current view.
+group. Timeline reads return pages of at most 256 messages; "Show earlier
+messages" loads the page before the oldest shown message by its creation time
+and event ID.
 
 While an owner advertises an active invitation, authenticated devices already
 present in its MLS group can request bounded synchronization summaries, event
@@ -146,4 +158,8 @@ decryption, so messages continue to fan out after more members join.
 The group screen also exposes a responsive Members & devices view backed by the
 current verified MLS leaf credentials. It identifies the local device and owner
 device without inventing account-level names or presence that the protocol does
-not yet provide. Owners can remove non-owner devices from this view.
+not yet provide. Owners can remove non-owner devices from this view, approve or
+decline pending join requests, grant or withdraw a member's permission to
+request invitations (ADR-036), allow a removed device to be admitted again
+(ADR-034), and refresh the group keys (ADR-045). Any device can block another
+device's messages locally.

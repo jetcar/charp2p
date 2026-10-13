@@ -141,8 +141,10 @@ invitation is a bearer credential and must be treated as sensitive.
 Clients accept only the raw encoded payload, the exact custom URI form above,
 or the exact HTTPS host and path above. The HTTPS form must carry the payload in
 the fragment. Query-string credentials and lookalike hosts are rejected. The UI
-may display authenticated invitation metadata after validation, but it must not
-receive or display the discovery secret.
+may display authenticated invitation metadata after validation. It holds an
+encoded invitation only as opaque text the user pasted, opened or is sharing,
+and passes it unchanged to Rust; no command returns the decoded discovery
+secret, discovery key, capability or hints to it (ADR-055).
 
 The operating system routes custom-scheme links through Tauri's maintained
 deep-link plugin. The application consumes both cold-start and already-running

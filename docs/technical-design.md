@@ -811,6 +811,19 @@ MLS-protected plaintexts reject trailing bytes. Message text without a reply
 is plain UTF-8; a reply starts with the marker byte `0xFF`. The fixed-seed
 vectors in `crates/charp2p-core/tests/protocol_vectors.rs` pin these forms.
 
+Two CharP2P byte strings travel inside MLS structures, both big-endian:
+
+- The MLS Basic Credential identity of a device leaf is
+  `"charp2p-device-credential\0"`, a `u16` version (`1`), then the device peer
+  ID bytes (at most 128). Another credential type, prefix, or version, or an
+  invalid peer ID, rejects the leaf.
+- The authenticated data of an owner member-removal Commit (ADR-051) is
+  `"charp2p-removal-cutoff\0"`, a `u16` version (`1`), a `u64` cut-off
+  sequence, then the removed device peer ID bytes. Data that does not decode
+  records no cut-off.
+
+`crates/charp2p-mls/tests/protocol_vectors.rs` pins both.
+
 Synchronization requests and responses use the libp2p CBOR request-response
 codec. That envelope is neither signed nor canonical; every event inside it is
 a canonical signed envelope that the receiver decodes and verifies itself.

@@ -39,9 +39,13 @@ connections. Every address must be available or startup stops.
 
 To refuse abusive peers, list their peer IDs one per line in a text file and
 pass it with `--blocked-peers <file>` or `CHARP2P_NODE_BLOCKED_PEERS`. Blank
-lines and lines starting with `#` are ignored. The file is read once at
-startup, is limited to 256 KiB and 4,096 peer IDs, and an invalid line stops
-startup. Blocked peers cannot connect, route through the DHT, or reserve relay
+lines and lines starting with `#` are ignored. The file is read at startup, is
+limited to 256 KiB and 4,096 peer IDs, and an invalid line stops startup. On
+Unix, send `SIGHUP` to re-read it without restarting: newly listed peers are
+disconnected, which also ends their relay reservations and circuits, and peers
+removed from the file may connect again. A reload that fails to read or parse
+the file is reported and keeps the current list. `SIGTERM` and interrupt stop
+the node. Blocked peers cannot connect, route through the DHT, or reserve relay
 circuits on this node; the block does not affect other nodes or any group.
 
 On Unix, a new identity file is created with mode `0600`; startup fails when an

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -87,7 +88,7 @@ async fn main() -> Result<(), NodeError> {
     let config = Config::parse();
     let relay_limits = config.relay_limits()?;
     let identity = load_or_create_identity(&config.identity)?;
-    let blocked_peers = match &config.blocked_peers {
+    let mut blocked_peers = match &config.blocked_peers {
         Some(path) => read_blocked_peers(path)?,
         None => Vec::new(),
     };
@@ -114,6 +115,7 @@ async fn main() -> Result<(), NodeError> {
         println!("Blocked peer identities: {}", blocked_peers.len());
     }
 
+    let mut signals = OperatorSignals::new().map_err(NodeError::ShutdownSignal)?;
     loop {
         tokio::select! {
             event = node.next_event() => match event {
@@ -134,12 +136,112 @@ async fn main() -> Result<(), NodeError> {
                 }
                 _ => {}
             },
-            result = tokio::signal::ctrl_c() => {
-                result.map_err(NodeError::ShutdownSignal)?;
-                println!("Stopping CharP2P routing node");
-                return Ok(());
+            signal = signals.next() => {
+                match signal.map_err(NodeError::ShutdownSignal)? {
+                    OperatorSignal::Stop => {
+                        println!("Stopping CharP2P routing node");
+                        return Ok(());
+                    }
+                    OperatorSignal::Reload => {
+                        reload_blocked_peers(&config, &mut node, &mut blocked_peers);
+                    }
+                }
             }
         }
+    }
+}
+
+/// Re-reads the blocked peer list and applies only its changes. A list that
+/// cannot be read or parsed leaves the current blocks in place.
+fn reload_blocked_peers(config: &Config, node: &mut NetworkNode, blocked_peers: &mut Vec<PeerId>) {
+    let Some(path) = &config.blocked_peers else {
+        println!("No blocked peer list configured; nothing to reload");
+        return;
+    };
+    let reloaded = match read_blocked_peers(path) {
+        Ok(reloaded) => reloaded,
+        Err(error) => {
+            eprintln!("Blocked peer list not reloaded: {error}");
+            return;
+        }
+    };
+    let (added, removed) = blocked_peer_changes(blocked_peers, &reloaded);
+    for peer_id in &added {
+        node.block_peer(*peer_id);
+    }
+    for peer_id in &removed {
+        node.unblock_peer(*peer_id);
+    }
+    *blocked_peers = reloaded;
+    println!(
+        "Blocked peer identities: {} ({} added, {} removed)",
+        blocked_peers.len(),
+        added.len(),
+        removed.len()
+    );
+}
+
+/// Returns the peers newly present in `reloaded` and those no longer in it.
+fn blocked_peer_changes(current: &[PeerId], reloaded: &[PeerId]) -> (Vec<PeerId>, Vec<PeerId>) {
+    let current_set = current.iter().collect::<HashSet<_>>();
+    let reloaded_set = reloaded.iter().collect::<HashSet<_>>();
+    let added = reloaded
+        .iter()
+        .filter(|peer_id| !current_set.contains(peer_id))
+        .copied()
+        .collect();
+    let removed = current
+        .iter()
+        .filter(|peer_id| !reloaded_set.contains(peer_id))
+        .copied()
+        .collect();
+    (added, removed)
+}
+
+enum OperatorSignal {
+    Stop,
+    Reload,
+}
+
+/// Interrupt and SIGTERM stop the node; SIGHUP reloads the blocked peer list.
+#[cfg(unix)]
+struct OperatorSignals {
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl OperatorSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    async fn next(&mut self) -> io::Result<OperatorSignal> {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map(|()| OperatorSignal::Stop),
+            _ = self.terminate.recv() => Ok(OperatorSignal::Stop),
+            _ = self.hangup.recv() => Ok(OperatorSignal::Reload),
+        }
+    }
+}
+
+/// Interrupt stops the node; other platforms have no reload signal.
+#[cfg(not(unix))]
+struct OperatorSignals;
+
+#[cfg(not(unix))]
+impl OperatorSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn next(&mut self) -> io::Result<OperatorSignal> {
+        tokio::signal::ctrl_c().await.map(|()| OperatorSignal::Stop)
     }
 }
 
@@ -290,7 +392,7 @@ enum NodeError {
     RelayLimitsInvalid,
     #[error("network operation failed")]
     Network(#[from] charp2p_network::NetworkError),
-    #[error("shutdown signal handler failed")]
+    #[error("operator signal handler failed")]
     ShutdownSignal(io::Error),
 }
 
@@ -305,8 +407,8 @@ mod tests {
     use libp2p::identity::Keypair;
 
     use super::{
-        Config, MAX_BLOCKED_PEERS, NodeError, create_private_file, load_or_create_identity,
-        parse_blocked_peers, read_blocked_peers, read_identity,
+        Config, MAX_BLOCKED_PEERS, NodeError, blocked_peer_changes, create_private_file,
+        load_or_create_identity, parse_blocked_peers, read_blocked_peers, read_identity,
     };
 
     fn write_private(path: &Path, bytes: &[u8]) {
@@ -389,6 +491,20 @@ mod tests {
             read_blocked_peers(&directory.path().join("missing.txt")),
             Err(NodeError::BlockedPeersIo(_))
         ));
+    }
+
+    #[test]
+    fn blocked_peer_reload_applies_only_changes() {
+        let [kept, dropped, added] =
+            std::array::from_fn(|_| Keypair::generate_ed25519().public().to_peer_id());
+
+        let (newly_blocked, unblocked) = blocked_peer_changes(&[kept, dropped], &[added, kept]);
+        assert_eq!(newly_blocked, vec![added]);
+        assert_eq!(unblocked, vec![dropped]);
+
+        let (newly_blocked, unblocked) = blocked_peer_changes(&[kept], &[kept]);
+        assert!(newly_blocked.is_empty() && unblocked.is_empty());
+        assert_eq!(blocked_peer_changes(&[kept], &[]), (vec![], vec![kept]));
     }
 
     #[test]

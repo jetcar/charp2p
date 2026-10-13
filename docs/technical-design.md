@@ -870,8 +870,11 @@ invite requests as unauthorized.
 Relay reservations and circuits have fixed count, duration, byte, per-peer,
 and upstream per-IP rate bounds; the operator may lower the circuit count and
 per-circuit byte limit or disable relaying, but never exceed those bounds. An
-operator-supplied list of blocked peer IDs, read at startup, refuses those
-identities' connections on that node only.
+operator-supplied list of blocked peer IDs, read at startup and re-read on
+`SIGHUP` on Unix, refuses those identities' connections on that node only;
+newly blocked peers are disconnected, ending their relay reservations and
+circuits, and an unreadable or invalid reload keeps the current list.
+`SIGTERM` and interrupt stop the node.
 Routing nodes and opted-in desktop contributors bound inbound connections: at
 most 128 pending and 1,024 established inbound connections, 16 established
 direct inbound connections per remote IP address, and 4 established

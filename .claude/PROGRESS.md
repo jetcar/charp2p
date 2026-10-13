@@ -202,7 +202,7 @@
 - [x] Member-served pull collects DHT results until the search ends or four candidates are found before dialing, instead of only the first Kademlia step (technical-design Connectivity, ADR-040).
 - [x] Sending, editing or deleting while another group's background sync runs pushes after it finishes instead of waiting for the one-minute retry (product flow 'Connected members receive and verify it').
 - [x] Owner advertising and member serving nodes start without configured bootstrap nodes (remembered routing peers, or LAN/hint reachability only), or reword the technical-design claim that hinted invitations work without bootstrap nodes.
-- [ ] Docs: technical-design join retry says it authenticates "the QUIC peer" though TCP is also used (ADR-047); built-in bootstrap list is empty/unversioned pending deployment.
+- [x] Docs: technical-design join retry says it authenticates "the QUIC peer" though TCP is also used (ADR-047); built-in bootstrap list is empty/unversioned pending deployment.
 
 ## Needs human
 
@@ -407,3 +407,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-13T17:33:01Z Member-served pull collects candidates across DHT steps: MemberCandidates gathers up to four current members until the search ends, fails or times out (partial results are still tried); unit test added; all checks pass (installed webkit/gtk dev libs for src-tauri).
 2026-10-13T18:26:28Z Queued pushes after local changes: sending, editing or deleting in an open joined group while another synchronization is in flight queues that group, and it synchronizes as soon as the running one finishes instead of at the next periodic pass. Frontend only; fmt, clippy, workspace tests, npm build pass.
 2026-10-13T19:23:33Z Bootstrap-free hinted invitations: reworded the technical design instead of changing code, since ADR-046 says remembered routing peers must not satisfy the bootstrap requirement; the doc now says only the joiner needs no bootstrap node, while the owner advertising node still requires a configured one. Docs only; no code checks needed.
+2026-10-13T20:23:48Z Docs join retry transport and bootstrap list: technical design now says the retry authenticates the peer over QUIC or the TCP fallback (ADR-047), and that the built-in bootstrap list is compiled into each release and stays empty until public nodes are deployed (environment and community nodes meanwhile). Docs only; no code checks needed.

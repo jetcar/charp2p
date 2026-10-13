@@ -215,8 +215,12 @@ at most 1,024 keys with 20 providers per key, and never store value records,
 which CharP2P does not publish. Final TTL, refresh interval, and per-peer
 quotas will be fixed through load testing.
 
-Clients enter the network through a versioned list of built-in bootstrap
-multiaddresses. Invitations and learned routing tables provide additional
+Clients enter the network through a list of built-in bootstrap
+multiaddresses compiled into each app release, so the list is versioned with
+the app. The list stays empty until public bootstrap nodes are deployed; until
+then development builds take bootstrap nodes from the `CHARP2P_BOOTSTRAP_NODES`
+environment variable and users can add community bootstrap nodes (ADR-038).
+Invitations and learned routing tables provide additional
 entry points: a client remembers up to 8 routing peers it recently reached in a
 device-local file and adds them as extra DHT entry points when its node starts
 (ADR-046). No internet address scanning occurs.
@@ -330,7 +334,8 @@ response is validated and event batches commit atomically. The session has a
 hard exchange limit. Initial synchronization failure does not roll back an
 already durable MLS membership. A joined member can retry synchronization from
 the group screen: it loads the protected derived discovery key, rediscovers the
-invitation's pinned owner, authenticates the QUIC peer, and repeats the bounded
+invitation's pinned owner, authenticates the peer over QUIC or the TCP
+fallback (ADR-047), and repeats the bounded
 pull. When the member serving node (ADR-040) already holds an authenticated
 connection to the pinned owner, the pull and push run over that connection
 instead, and the serving node resumes once they end. While the joined-group

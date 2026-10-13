@@ -64,6 +64,51 @@ const MAX_OWNER_PEERS: usize = 1024;
 /// Largest binary multiaddress an invitation accepts as a hint (ADR-037).
 const MAX_ADDRESS_HINT_BYTES: usize = 256;
 
+/// Current members found as providers of a member rendezvous key, in the
+/// order the DHT search reported them (ADR-040).
+struct MemberCandidates<'a> {
+    local_peer: PeerId,
+    members: &'a [PeerId],
+    found: Vec<PeerId>,
+}
+
+impl<'a> MemberCandidates<'a> {
+    fn new(local_peer: PeerId, members: &'a [PeerId]) -> Self {
+        Self {
+            local_peer,
+            members,
+            found: Vec::new(),
+        }
+    }
+
+    /// Adds the listed current members among `providers` other than this
+    /// device, and returns whether the provider limit is reached.
+    fn add(&mut self, providers: Vec<PeerId>) -> bool {
+        for provider in providers {
+            if self.found.len() == MAX_MEMBER_PROVIDERS {
+                break;
+            }
+            if provider != self.local_peer
+                && self.members.contains(&provider)
+                && !self.found.contains(&provider)
+            {
+                self.found.push(provider);
+            }
+        }
+        self.found.len() == MAX_MEMBER_PROVIDERS
+    }
+
+    /// Returns the collected candidates once the search stopped, or the
+    /// reason it stopped when it found none.
+    fn finish(self, stopped: Option<&'static str>) -> Result<Vec<PeerId>, &'static str> {
+        if self.found.is_empty() {
+            Err(stopped.unwrap_or("network_peer_not_found"))
+        } else {
+            Ok(self.found)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JoinRequestAuthorization {
     Authorized,
@@ -2107,7 +2152,10 @@ impl NetworkService {
 
         // Providers connected while the search ran need no second dial.
         let mut connected = Vec::new();
-        let candidates = timeout(PROVIDER_SEARCH_TIMEOUT, async {
+        // Each Kademlia step may report other providers, so candidates are
+        // collected until the search ends or the provider limit is reached.
+        let mut candidates = MemberCandidates::new(local_peer, members);
+        let searched = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             loop {
                 match node.next_event().await {
                     NetworkEvent::PeerConnected {
@@ -2119,31 +2167,25 @@ impl NetworkService {
                         key: found_key,
                         providers,
                     } if found_key == key => {
-                        let candidates = providers
-                            .into_iter()
-                            .filter(|provider| {
-                                *provider != local_peer && members.contains(provider)
-                            })
-                            .take(MAX_MEMBER_PROVIDERS)
-                            .collect::<Vec<_>>();
-                        if !candidates.is_empty() {
-                            return Ok(candidates);
+                        if candidates.add(providers) {
+                            return None;
                         }
                     }
                     NetworkEvent::GroupPeerSearchFinished { key: found_key }
                         if found_key == key =>
                     {
-                        return Err("network_peer_not_found");
+                        return Some("network_peer_not_found");
                     }
                     NetworkEvent::DiscoveryFailed {
                         key: failed_key, ..
-                    } if failed_key == key => return Err("network_unavailable"),
+                    } if failed_key == key => return Some("network_unavailable"),
                     _ => {}
                 }
             }
         })
         .await
-        .map_err(|_| "network_search_timed_out")??;
+        .unwrap_or(Some("network_search_timed_out"));
+        let candidates = candidates.finish(searched)?;
 
         let mut last_error = "network_peer_unreachable";
         for provider in candidates {
@@ -3090,10 +3132,11 @@ mod tests {
         parse_bootstrap_peer, pinned_address_hints, record_member_connection, record_owner_address,
         record_owner_peer, select_address_hints, upgraded_path, AdvertisementResult,
         BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
-        MemberAdmissionService, MembershipComparison, NetworkService, NetworkStatus,
-        PeerSearchResult, PendingJoinService, PullSession, SessionProgress, SynchronizationService,
-        UnavailableJoinRequestAuthorizer, UnavailableMemberAdmissionService,
-        UnavailablePendingJoinService, DIAGNOSTICS_FORMAT, MAX_GROUP_CONNECTION_STATES,
+        MemberAdmissionService, MemberCandidates, MembershipComparison, NetworkService,
+        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
+        SynchronizationService, UnavailableJoinRequestAuthorizer,
+        UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
+        MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -5533,6 +5576,38 @@ mod tests {
         ] {
             assert!(!super::owner_unreachable(error), "{error}");
         }
+    }
+
+    #[test]
+    fn member_candidates_collect_across_search_steps() {
+        let local = DeviceIdentity::generate().peer_id();
+        let stranger = DeviceIdentity::generate().peer_id();
+        let members: Vec<_> = (0..5)
+            .map(|_| DeviceIdentity::generate().peer_id())
+            .chain([local])
+            .collect();
+        let mut candidates = MemberCandidates::new(local, &members);
+        assert!(!candidates.add(vec![stranger, local, members[0]]));
+        assert!(!candidates.add(vec![members[0], members[1]]));
+        assert!(candidates.add(vec![members[2], members[3], members[4]]));
+        assert_eq!(
+            candidates.finish(None),
+            Ok(members[..MAX_MEMBER_PROVIDERS].to_vec())
+        );
+
+        let mut partial = MemberCandidates::new(local, &members);
+        partial.add(vec![members[4]]);
+        assert_eq!(
+            partial.finish(Some("network_peer_not_found")),
+            Ok(vec![members[4]])
+        );
+
+        let mut empty = MemberCandidates::new(local, &members);
+        empty.add(vec![stranger, local]);
+        assert_eq!(
+            empty.finish(Some("network_search_timed_out")),
+            Err("network_search_timed_out")
+        );
     }
 
     #[test]

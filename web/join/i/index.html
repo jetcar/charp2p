@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CharP2P invitation</title>
+    <link rel="stylesheet" href="join.css" />
+    <script src="join.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>You have a CharP2P invitation</h1>
+      <p>
+        CharP2P is a private group chat without a central chat database. Your
+        invitation stays in this page's address after the <code>#</code> sign,
+        which your browser does not send to this web server.
+      </p>
+
+      <section id="invitation-ready" hidden>
+        <h2>Open it in CharP2P</h2>
+        <p>
+          If CharP2P is installed, open the invitation in the app. The app checks
+          the invitation's signature and shows the group before you join.
+        </p>
+        <p class="actions">
+          <a id="open-app" class="button" href="#">Open in CharP2P</a>
+          <button id="copy-invitation" type="button">Copy invitation</button>
+        </p>
+        <p id="copy-status" role="status"></p>
+        <p class="note">
+          An invitation is a key to the group until it expires. Share it only
+          with the people it is meant for.
+        </p>
+      </section>
+
+      <section id="invitation-missing" hidden>
+        <h2>No invitation found</h2>
+        <p>
+          This link does not carry a usable invitation. Ask the person who
+          invited you to send the invitation link again.
+        </p>
+      </section>
+
+      <section>
+        <h2>Install CharP2P</h2>
+        <ul>
+          <li>
+            <strong>Windows:</strong> install the CharP2P desktop app, then open
+            this link again or paste the copied invitation under
+            <em>Join from link</em>.
+          </li>
+          <li>
+            <strong>Android:</strong> install the CharP2P app, then open this
+            link again or paste the copied invitation under
+            <em>Join from link</em>.
+          </li>
+        </ul>
+        <p class="note">
+          Joining completes when the group owner's device is online. Until then
+          the app keeps the invitation and retries.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

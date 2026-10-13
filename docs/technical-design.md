@@ -93,7 +93,9 @@ https://join.charp2p.example/i#<base64url-invitation>
 
 Installed applications will claim the verified HTTPS link once the release
 host, Android application association, and signing identities exist. The
-fallback web page explains installation. Windows and Android currently claim
+fallback web page in `web/join` explains installation and hands the fragment
+to the app as a `charp2p://join/` link without decoding it, loading other
+resources, or making requests. Windows and Android currently claim
 the custom scheme:
 
 ```text

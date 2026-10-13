@@ -2310,6 +2310,9 @@ function App() {
   const [synchronizationResult, setSynchronizationResult] =
     useState<SynchronizeGroupResult | null>(null);
   const synchronizationInFlight = useRef(false);
+  // Groups with local changes made while another synchronization ran; they
+  // push as soon as it finishes instead of waiting for their next pass.
+  const queuedSynchronizations = useRef(new Set<string>());
   const [outgoingMessage, setOutgoingMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
@@ -3307,7 +3310,18 @@ function App() {
       }
       synchronizationInFlight.current = false;
       if (activeGroupIdRef.current === groupId) setSynchronizingGroup(false);
+      const [queued] = queuedSynchronizations.current;
+      if (queued !== undefined) {
+        queuedSynchronizations.current.delete(queued);
+        void performJoinedGroupSynchronization(queued, false);
+      }
     }
+  }
+
+  /** Pushes a local change now, or right after a synchronization in flight. */
+  function synchronizeAfterLocalChange(groupId: string) {
+    if (synchronizationInFlight.current) queuedSynchronizations.current.add(groupId);
+    else void performJoinedGroupSynchronization(groupId, false);
   }
 
   async function synchronizeJoinedGroup() {
@@ -3502,9 +3516,7 @@ function App() {
       ]);
       setOutgoingMessage("");
       setReplyingTo(null);
-      if (joinedGroup?.groupId === groupId) {
-        void performJoinedGroupSynchronization(groupId, false);
-      }
+      if (joinedGroup?.groupId === groupId) synchronizeAfterLocalChange(groupId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -3544,9 +3556,7 @@ function App() {
         candidate.eventId === message.eventId ? { ...candidate, text, edited: true } : candidate
       )));
       setEditingMessage(null);
-      if (joinedGroup?.groupId === message.groupId) {
-        void performJoinedGroupSynchronization(message.groupId, false);
-      }
+      if (joinedGroup?.groupId === message.groupId) synchronizeAfterLocalChange(message.groupId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -4022,9 +4032,7 @@ function App() {
       if (createdMessage?.eventId === message.eventId) setCreatedMessage(null);
       if (replyingTo?.eventId === message.eventId) setReplyingTo(null);
       if (editingMessage?.eventId === message.eventId) setEditingMessage(null);
-      if (joinedGroup?.groupId === message.groupId) {
-        void performJoinedGroupSynchronization(message.groupId, false);
-      }
+      if (joinedGroup?.groupId === message.groupId) synchronizeAfterLocalChange(message.groupId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {

@@ -135,7 +135,10 @@ hints keep the version 2 encoding. The owner takes hints from the current
 listen addresses of its advertising node, circuit-relay addresses first and
 loopback or unspecified addresses excluded, both for its own invitations and
 for invitations issued at a member's request; hints that would make the
-invitation invalid or too large to protect are dropped.
+invitation invalid or too large to protect are dropped. When that node is not
+running yet, as for an owner's first invitation, issuing starts it with the
+retained keys (possibly none) and waits up to three seconds for a relay circuit
+address before taking its current addresses as hints.
 
 Invitation parsing is bounded and fully validated before network use. An
 invitation is a bearer credential and must be treated as sensitive.

@@ -403,7 +403,7 @@ fn issued_invitations(
 }
 
 #[tauri::command]
-fn create_group_invitation(
+async fn create_group_invitation(
     group_id: String,
     reusable: Option<bool>,
     lifetime_seconds: Option<u64>,
@@ -418,6 +418,25 @@ fn create_group_invitation(
         .ok_or_else(|| "identity_missing".to_owned())?;
     let inviter_name = identity::invitation_device_name(&profile.device_name);
     let inviter_device_id = parse_group_id(&profile.peer_id, "identity_record_invalid")?;
+    // The owner node starts before the first invitation so its addresses
+    // become that invitation's hints (ADR-037); a failure only drops hints.
+    let address_hints = match (
+        identity_service.load_network_identity(),
+        identity_service.load_network_identity(),
+        group_service.all_owner_discovery_keys(),
+    ) {
+        (Ok(network_identity), Ok(owner_identity), Ok(keys)) => {
+            network_service
+                .prepare_owner_address_hints(
+                    network_identity,
+                    owner_identity,
+                    inviter_name.clone(),
+                    keys,
+                )
+                .await
+        }
+        _ => network_service.owner_address_hints(),
+    };
     group_service
         .issue_invitation(
             group_id,
@@ -425,7 +444,7 @@ fn create_group_invitation(
             &inviter_name,
             reusable,
             lifetime_seconds,
-            &network_service.owner_address_hints(),
+            &address_hints,
         )
         .map_err(str::to_owned)
 }

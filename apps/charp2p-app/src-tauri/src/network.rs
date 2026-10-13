@@ -44,6 +44,9 @@ const SYNC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_SYNC_EXCHANGES: usize = 4_096;
 /// Member providers tried by one member-served pull (ADR-040).
 const MAX_MEMBER_PROVIDERS: usize = 4;
+/// How long issuing an invitation waits for a freshly started owner
+/// advertising node to obtain a relay circuit address as a hint.
+const OWNER_HINT_WAIT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONTRIBUTION_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -692,6 +695,48 @@ impl NetworkService {
             .unwrap_or_default()
     }
 
+    /// Returns the address hints for a new invitation of this owner device.
+    /// When the owner advertising node is not running yet, as for the first
+    /// invitation, it starts with the retained `keys` (possibly none) and
+    /// waits up to `OWNER_HINT_WAIT` for a relay circuit address, so even that
+    /// invitation carries hints. Empty when no bootstrap node is configured or
+    /// the node could not start; the invitation then relies on the DHT.
+    pub async fn prepare_owner_address_hints(
+        &self,
+        network_identity: DeviceIdentity,
+        owner_identity: DeviceIdentity,
+        inviter_name: String,
+        keys: Vec<DiscoveryKey>,
+    ) -> Vec<Multiaddr> {
+        let running = self
+            .advertisement
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| !active.task.is_finished());
+        if running || network_identity.peer_id() != owner_identity.peer_id() {
+            return self.owner_address_hints();
+        }
+        match self
+            .advertise_keys(network_identity, owner_identity, inviter_name, keys, None)
+            .await
+        {
+            Ok(result) if result.status == "advertising" => {}
+            _ => return Vec::new(),
+        }
+        let deadline = Instant::now() + OWNER_HINT_WAIT;
+        loop {
+            let hints = self.owner_address_hints();
+            let relayed = hints
+                .iter()
+                .any(|hint| hint.iter().any(|protocol| protocol == Protocol::P2pCircuit));
+            if relayed || Instant::now() >= deadline {
+                return hints;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Builds the short-lived client node used to advertise or reach a group
     /// provider.
     fn group_client_node(&self, identity: DeviceIdentity) -> NetworkNode {
@@ -1005,7 +1050,9 @@ impl NetworkService {
         expires_at_unix: Option<u64>,
     ) -> Result<AdvertisementResult, &'static str> {
         keys.dedup();
-        if keys.is_empty() {
+        // Only an owner preparing its first invitation's hints starts the
+        // provider without keys; a bearer advertisement always has one.
+        if keys.is_empty() && expires_at_unix.is_some() {
             return Err("owner_discovery_key_missing");
         }
         if keys.len() > MAX_OWNER_DISCOVERY_KEYS {
@@ -1072,6 +1119,9 @@ impl NetworkService {
 
         let announced = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut pending = keys.clone();
+            if pending.is_empty() {
+                return Ok(());
+            }
             loop {
                 match node.next_event().await {
                     NetworkEvent::Listening { address } => {
@@ -5028,6 +5078,100 @@ mod tests {
 
         assert_eq!(result.status, "peerReachable");
         assert_eq!(result.discovered_peers, 1);
+    }
+
+    #[test]
+    fn first_invitation_hints_start_the_owner_node_without_keys() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (_, owner_secret) = DeviceIdentity::generate_persistable().unwrap();
+        let owner = || DeviceIdentity::from_persisted_secret(&owner_secret).unwrap();
+        let owner_id = owner().peer_id();
+        tauri::async_runtime::block_on(async {
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources(&[], &format!("{address}/p2p/{routing_id}"))
+                .unwrap()
+                .without_lan_discovery();
+            assert!(service.owner_address_hints().is_empty());
+            let prepare = service.prepare_owner_address_hints(
+                owner(),
+                owner(),
+                "Maya's PC".to_owned(),
+                Vec::new(),
+            );
+            tokio::pin!(prepare);
+            let hints = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        hints = &mut prepare => break hints,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("hint preparation should complete");
+            // A loopback relay yields no circuit hint, so the wait ends with
+            // the node's direct addresses.
+            assert!(!hints.is_empty());
+            let first_task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("owner node should keep running")
+                .task
+                .id();
+
+            // The invitation issued with these hints joins the same node.
+            let invitation = hinted_invitation(&group, owner_id, &hints, now);
+            let key = DiscoveryKey::from_invitation(&invitation);
+            let advertise =
+                service.advertise_owner_group(owner(), owner(), "Maya's PC".to_owned(), vec![key]);
+            tokio::pin!(advertise);
+            let result = timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+            assert_eq!(result.status, "advertising");
+            let task_id = service
+                .advertisement
+                .lock()
+                .await
+                .as_ref()
+                .expect("advertisement should remain active")
+                .task
+                .id();
+            assert_eq!(task_id, first_task_id);
+            assert_eq!(
+                service
+                    .prepare_owner_address_hints(
+                        owner(),
+                        owner(),
+                        "Maya's PC".to_owned(),
+                        vec![key]
+                    )
+                    .await,
+                service.owner_address_hints()
+            );
+            service.stop_advertising().await;
+        });
     }
 
     #[test]

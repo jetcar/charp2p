@@ -21,14 +21,14 @@ use charp2p_core::{
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, Transport, allow_block_list, connection_limits,
-    core::{muxing::StreamMuxerBox, transport::Boxed, upgrade},
+    core::{Endpoint, muxing::StreamMuxerBox, transport::Boxed, upgrade},
     dcutr, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
     noise, ping, quic, relay, request_response,
     swarm::{
-        NetworkBehaviour, StreamProtocol, SwarmEvent,
+        ConnectionId, NetworkBehaviour, StreamProtocol, SwarmEvent,
         behaviour::toggle::Toggle,
         dial_opts::{DialOpts, PeerCondition},
     },
@@ -500,9 +500,38 @@ impl NetworkNode {
     }
 
     /// Dials a discovered peer using addresses already learned by behaviours.
+    /// When the DHT knows relay circuits of the peer, such as those of a
+    /// DHT-found provider, its direct addresses are dialled first as in
+    /// [`Self::dial_peer_at`] (ADR-056).
     pub fn dial_peer(&mut self, peer_id: PeerId) -> Result<(), NetworkError> {
+        let known = self.dht_addresses(peer_id);
+        if known.iter().any(is_relayed) {
+            return self.dial_peer_at(peer_id, known);
+        }
         self.swarm.dial(peer_id)?;
         Ok(())
+    }
+
+    /// Addresses the DHT would contribute to a dial of `peer_id`: routing
+    /// table entries and addresses from the provider records of ongoing
+    /// queries, without duplicates.
+    fn dht_addresses(&mut self, peer_id: PeerId) -> Vec<Multiaddr> {
+        // Kademlia hands provider record addresses out only when a dial asks
+        // for them; asking the same way reads them without dialling.
+        let mut addresses = self
+            .swarm
+            .behaviour_mut()
+            .dht
+            .handle_pending_outbound_connection(
+                ConnectionId::new_unchecked(0),
+                Some(peer_id),
+                &[],
+                Endpoint::Dialer,
+            )
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        addresses.retain(|address| seen.insert(address.clone()));
+        addresses
     }
 
     /// Dials a peer at previously remembered addresses, QUIC addresses first
@@ -2129,6 +2158,29 @@ mod tests {
 
     #[tokio::test]
     async fn remembered_direct_addresses_are_dialled_before_relay_circuits() {
+        assert_direct_dialled_before_relay(|source, destination_id, relayed, direct| {
+            source
+                .dial_peer_at(destination_id, vec![relayed, direct])
+                .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dht_known_direct_addresses_are_dialled_before_relay_circuits() {
+        assert_direct_dialled_before_relay(|source, destination_id, relayed, direct| {
+            source.add_bootstrap_peer(destination_id, relayed);
+            source.add_bootstrap_peer(destination_id, direct);
+            source.dial_peer(destination_id).unwrap();
+        })
+        .await;
+    }
+
+    /// Lets `dial` reach a relayed destination that also listens directly and
+    /// asserts the direct address connects without the relay seeing the dialer.
+    async fn assert_direct_dialled_before_relay(
+        dial: impl FnOnce(&mut NetworkNode, PeerId, Multiaddr, Multiaddr),
+    ) {
         let (mut relay, mut destination, relayed_address) = relayed_destination().await;
         let destination_id = destination.peer_id();
         destination
@@ -2153,9 +2205,7 @@ mod tests {
 
         let mut source = NetworkNode::new(Keypair::generate_ed25519());
         let source_id = source.peer_id();
-        source
-            .dial_peer_at(destination_id, vec![relayed_address, direct_address])
-            .unwrap();
+        dial(&mut source, destination_id, relayed_address, direct_address);
         timeout(TEST_TIMEOUT, async {
             loop {
                 tokio::select! {

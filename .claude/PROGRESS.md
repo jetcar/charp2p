@@ -188,7 +188,7 @@
 - [x] Invitations: show whether owner approval is needed on issued invitations (member invitation panel and owner issued list; `IssuedInvitation.approval_required`) (product page 8).
 - [x] Join preview: check owner reachability automatically when a verified preview opens; keep the button as "Check again" (product join flow step 3, page 4).
 - [x] Docs: rewrite stale apps/charp2p-app/README.md paragraphs (background advertising of owned groups, community nodes/TCP bootstrap, reply/edit/delete for everyone, owner member actions, owner notices and background sync).
-- [ ] Docs: technical-design timeline read paragraph describes the (creation time, event ID) cursor paging.
+- [x] Docs: technical-design timeline read paragraph describes the (creation time, event ID) cursor paging.
 - [ ] Connectivity: DHT-found owners are dialed direct before relay circuits. Split:
   - [ ] 1/2 ADR: which direct addresses an advertising owner publishes in provider records (privacy of private LAN addresses).
   - [ ] 2/2 Hold relay circuit dials on the DHT path behind pending direct dials (`DIRECT_DIAL_GRACE`), with a test mirroring the `dial_peer_at` test.
@@ -384,3 +384,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-13T05:39:58Z Invitation approval display: `IssuedInvitation.approval_required` from `requires_owner_approval()` (issued, restored and member-requested invitations); member invitation panel says owner approval needed/not needed, owner issued list marks approval invitations; new gap backlog written from docs audit; src-tauri cargo check now builds after apt-installing webkit2gtk/gtk dev libs; all checks pass.
 - 2026-10-13T06:27Z Join preview automatic owner reachability check: verified preview starts the check on open; button relabelled "Check again" after a result. Frontend-only; build, fmt, clippy, tests pass.
 2026-10-13T07:27:49Z README stale paragraphs: rewrote background advertising of every owned group (active + retained keys), bootstrap sources (community nodes ADR-038, env var, 16-node cap, TCP fallback ADR-047), reply/edit/delete-for-everyone vs local hide, owner EventsAvailable notices (ADR-049) and 5-minute background sync, cursor timeline paging, and owner member actions (approval, invite permission, readmission, key refresh, local block). Docs only; workspace fmt/clippy/test and npm build pass.
+2026-10-13T08:22:57Z Docs: timeline cursor paging paragraph: described (creation time, event ID) cursor, 256-message pages, poll merge; docs-only, no build needed

@@ -2788,10 +2788,15 @@ function App() {
     void invoke("serve_joined_group", { groupId: servedJoinedGroupId }).catch(() => undefined);
   }, [servedJoinedGroupId]);
 
-  useEffect(() => {
-    if (!isTauri() || !joinedGroup) return;
+  // Effects keyed on the open group use its ID: a synchronization replaces
+  // the group object, which must not restart their timers or reset state.
+  const openGroupId = localGroup?.groupId ?? joinedGroup?.groupId ?? null;
+  const ownedApprovalRequired = localGroup?.approvalRequired ?? false;
 
-    const groupId = joinedGroup.groupId;
+  useEffect(() => {
+    if (!isTauri() || !servedJoinedGroupId) return;
+
+    const groupId = servedJoinedGroupId;
     let active = true;
     let timer: number | undefined;
 
@@ -2832,7 +2837,7 @@ function App() {
       if (noticeTimer !== undefined) window.clearTimeout(noticeTimer);
       stopListening?.();
     };
-  }, [joinedGroup]);
+  }, [servedJoinedGroupId]);
 
   const backgroundGroupIds = joinedGroups
     .map((group) => group.groupId)
@@ -2898,7 +2903,7 @@ function App() {
   }, [localGroup?.groupId, joinedGroup?.groupId]);
 
   useEffect(() => {
-    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
+    const groupId = openGroupId;
     earlierMessagesLoadedRef.current = false;
     if (!isTauri() || !groupId) {
       setGroupMessages([]);
@@ -2936,7 +2941,7 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [joinedGroup, localGroup]);
+  }, [openGroupId]);
 
   useEffect(() => {
     if (!isTauri() || availableGroups.length === 0) {
@@ -3005,8 +3010,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const groupId = localGroup?.groupId ?? joinedGroup?.groupId;
     setShowMembers(false);
+  }, [openGroupId]);
+
+  useEffect(() => {
+    const groupId = openGroupId;
+    const owned = localGroup !== null;
     if (!isTauri() || !groupId) {
       setGroupMembers([]);
       setBlockedDevices([]);
@@ -3030,9 +3039,9 @@ function App() {
           invoke<string[]>("blocked_group_devices", { groupId }),
           invoke<MemberActivity[]>("group_member_activity", { groupId }),
           invoke<DeviceSequenceConflict[]>("group_sequence_conflicts", { groupId }),
-          localGroup ? invoke<string[]>("removed_group_members", { groupId }) : Promise.resolve([]),
+          owned ? invoke<string[]>("removed_group_members", { groupId }) : Promise.resolve([]),
           invoke<string[]>("invite_permitted_devices", { groupId }),
-          localGroup?.approvalRequired
+          ownedApprovalRequired
             ? invoke<ApprovalRequest[]>("group_approval_requests", { groupId })
             : Promise.resolve([]),
         ]);
@@ -3059,7 +3068,7 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [joinedGroup, localGroup]);
+  }, [openGroupId, ownedApprovalRequired]);
 
   useEffect(() => {
     if (!isTauri()) return;

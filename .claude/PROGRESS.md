@@ -217,6 +217,13 @@
 - [x] Protocol vectors: pin the ADR-028 identity backup v1 bytes with a fixed backup opened in crates/charp2p-core/tests/protocol_vectors.rs (real Argon2id settings), and document its layout in technical-design "Serialization and size limits".
 - [x] Docs: crates/charp2p-node/README.md lists the inbound connection, request-rate and byte-rate bounds (ADR-050); root README mentions relay, observed-by-all delivery state, threat model and web/join.
 
+- [x] Open group effects key on the group ID: a synchronization replaced the joined group object, restarting the periodic sync after 1 s instead of 60 s, dropping loaded earlier message pages and closing the Members panel (technical-design Synchronization, Message protection).
+- [ ] Joined group connection state reports "Bootstrap node needed" for `network_bootstrap_required` instead of "Waiting for peers", and pending joins keep retrying after community nodes are added (technical-design Discovery).
+- [ ] Leave-group confirmation: rejoining needs the owner to remove the stale device membership first (ADR-027), not just a new invitation.
+- [ ] charp2p-node: `--bootstrap` multiaddrs (env `CHARP2P_NODE_BOOTSTRAP`) so standalone nodes join one Kademlia DHT, with periodic re-bootstrap, parse test and README line (technical-design topology/node roles).
+- [ ] Owner conversation header shows the owned group's online/relayed/waiting/offline connection state like the details pane (technical-design Connectivity, product page 5).
+- [ ] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -432,3 +439,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T05:28:19Z Docs: threat-model removed-device residual: now says the retained key is reachable only while its invitation is active, another current member's admission records it, or it predates provenance; otherwise retired (ADR-054). Docs only; fmt/clippy/test/build pass.
 2026-10-14T06:37:21Z Protocol vectors: fixed ADR-028 identity backup v1 ("Vector device", 163 bytes) opened with the real 64 MiB/3-pass Argon2id in core protocol_vectors.rs (~3 s); backup layout documented in technical-design "Serialization and size limits". fmt, clippy, tests, app build pass.
 2026-10-14T07:24:08Z Docs: node README lists inbound connection bounds (128 pending, 1,024 established, 4 per peer, 16 per IP), the 64-burst/8-per-second request bound and ADR-050 byte buckets, and clarifies the upstream limits are relay rate limiters; root README mentions the relay, web/join fallback page, delivery states incl. observed-by-all, and links the threat model. Docs only; fmt check passes.
+2026-10-14T08:35:20Z Open group effects keyed on group ID: re-derived backlog (6 gaps: sync loop, bootstrap-needed state, leave wording, node bootstrap flag, owner header state, bandwidth-limit docs). Periodic sync, message poll and members effects now depend on the open group ID (plus owned approvalRequired for members) so a sync no longer restarts them after 1 s, drops earlier pages or closes Members. Frontend only; fmt, clippy, workspace tests, npm build pass.

@@ -43,14 +43,22 @@ authenticated direct, local-network, or relayed reachability check with the
 restored device identity. While the app runs, it advertises the opaque
 rendezvous keys of every owned group in the background, not only the group
 currently open: active invitation keys until they expire, plus the retained
-keys that already admitted members use to rediscover the owner. Release builds
-will use the versioned built-in bootstrap list. The Network page can add and
+keys that already admitted members use to rediscover the owner. The owner
+records which invitation admitted each device, so a key whose bearer has
+expired, been revoked or been consumed is retired once no current member was
+admitted through it, and the running advertiser stops announcing it
+(ADR-054). Release builds compile in a built-in bootstrap list, which stays
+empty until public nodes are deployed. The Network page can add and
 remove up to 8 device-local community nodes (ADR-038), and during local
 development `CHARP2P_BOOTSTRAP_NODES` accepts semicolon-separated
 multiaddresses ending in `/p2p/<peer-id>`; the combined list holds at most 16
 nodes. Nodes connect over QUIC with a Noise and Yamux TCP fallback (ADR-047)
 for networks that block UDP. With no configured node, the app reports that a
-bootstrap node is required.
+bootstrap node is required, except that a joiner with a hinted invitation can
+still reach the owner: invitations carry up to four root-signed owner address
+hints (ADR-037), and the preview reachability check and the join exchange dial
+them, with the pinned owner peer ID appended, over QUIC or TCP before the DHT
+provider search. The owner itself still needs a configured node to advertise.
 
 Owner advertisements request a Circuit Relay v2 reservation from configured
 bootstrap nodes. The relay transport uses Noise and Yamux over the authenticated
@@ -119,6 +127,13 @@ After storing new events, an owner sends a data-free `EventsAvailable` notice
 over existing connections to current members (ADR-049), and a member that
 accepts it from its pinned owner pulls at once. Joined groups that are not
 open are synchronized in the background every five minutes.
+When the pinned owner cannot be reached, an open joined group pulls from
+other current members instead (ADR-040): each member advertises a rendezvous
+key derived from its current MLS epoch, answers only authenticated pull
+requests from current members, and charges what it serves to its
+synchronization data limit. Membership commits still apply only when the
+owner authored them, and the group status reports a member-served pull
+separately from an owner synchronization.
 Successful synchronization times persist and remain visible after restart.
 The current session status also identifies direct, local-network, and relayed
 connections.

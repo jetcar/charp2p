@@ -373,11 +373,31 @@ function compareMessageOrder(left: StoredMessage, right: StoredMessage) {
   return left.eventId < right.eventId ? -1 : left.eventId > right.eventId ? 1 : 0;
 }
 
-// Replaces the newest page while keeping loaded earlier messages older than it.
-function mergeLatestMessages(current: StoredMessage[], latest: StoredMessage[], keepEarlier: boolean) {
-  if (!keepEarlier || latest.length === 0) return latest;
-  const earlier = current.filter((message) => compareMessageOrder(message, latest[0]) < 0);
-  return [...earlier, ...latest];
+// Upper bound on store pages re-read per refresh when earlier pages are shown.
+const MAX_REREAD_MESSAGE_PAGES = 100;
+
+// Re-reads the store from the newest message back to the oldest loaded one,
+// so deletions, edits, retention and local blocks also apply to earlier pages.
+async function readShownMessages(
+  groupId: string,
+  markRead: boolean,
+  oldestLoaded: StoredMessage | null,
+): Promise<StoredMessagePage> {
+  let page = await invoke<StoredMessagePage>("group_messages", { groupId, markRead });
+  const messages = [...page.messages];
+  for (let read = 1; oldestLoaded && page.hasEarlier && messages.length > 0; read += 1) {
+    if (compareMessageOrder(messages[0], oldestLoaded) <= 0 || read >= MAX_REREAD_MESSAGE_PAGES) break;
+    page = await invoke<StoredMessagePage>("group_messages", {
+      groupId,
+      markRead,
+      beforeCreatedAtUnixMs: messages[0].createdAtUnixMs,
+      beforeEventId: messages[0].eventId,
+    });
+    messages.unshift(...page.messages);
+  }
+  if (!oldestLoaded) return { messages, hasEarlier: page.hasEarlier };
+  const shown = messages.filter((message) => compareMessageOrder(message, oldestLoaded) >= 0);
+  return { messages: shown, hasEarlier: shown.length < messages.length || page.hasEarlier };
 }
 
 function messageClockTime(createdAtUnixMs: number) {
@@ -2349,7 +2369,8 @@ function App() {
   const [ownedDiscovery, setOwnedDiscovery] = useState<OwnedGroupDiscoveryStatus | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
-  const earlierMessagesLoadedRef = useRef(false);
+  // Oldest message loaded with "Show earlier messages", if any.
+  const oldestLoadedMessageRef = useRef<StoredMessage | null>(null);
   const [deletingMessage, setDeletingMessage] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ eventId: string; text: string } | null>(null);
   const [replyingTo, setReplyingTo] = useState<StoredMessage | null>(null);
@@ -2933,12 +2954,13 @@ function App() {
 
   useEffect(() => {
     const groupId = openGroupId;
-    earlierMessagesLoadedRef.current = false;
+    oldestLoadedMessageRef.current = null;
     if (!isTauri() || !groupId) {
       setGroupMessages([]);
       setHasEarlierMessages(false);
       return;
     }
+    const shownGroupId: string = groupId;
 
     let active = true;
     let firstLoad = true;
@@ -2946,14 +2968,12 @@ function App() {
 
     async function refreshMessages() {
       try {
-        const page = await invoke<StoredMessagePage>("group_messages", {
-          groupId,
-          markRead: conversationShown(),
-        });
-        if (active) {
-          const keepEarlier = earlierMessagesLoadedRef.current;
-          setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
-          if (!keepEarlier) setHasEarlierMessages(page.hasEarlier);
+        const oldestLoaded = oldestLoadedMessageRef.current;
+        const page = await readShownMessages(shownGroupId, conversationShown(), oldestLoaded);
+        // An earlier page loaded meanwhile is kept until the next refresh.
+        if (active && oldestLoadedMessageRef.current === oldestLoaded) {
+          setGroupMessages(page.messages);
+          setHasEarlierMessages(page.hasEarlier);
         }
       } catch (reason) {
         if (active && firstLoad) setError(errorMessage(reason));
@@ -3358,14 +3378,12 @@ function App() {
         // Re-advertise under the member key of a newly reached MLS epoch.
         void invoke("serve_joined_group", { groupId }).catch(() => undefined);
         setSynchronizationResult(result);
-        const page = await invoke<StoredMessagePage>("group_messages", {
-          groupId,
-          markRead: conversationShown(),
-        });
-        if (activeGroupIdRef.current === groupId) {
-          const keepEarlier = earlierMessagesLoadedRef.current;
-          setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
-          if (!keepEarlier) setHasEarlierMessages(page.hasEarlier);
+        const oldestLoaded = oldestLoadedMessageRef.current;
+        const page = await readShownMessages(groupId, conversationShown(), oldestLoaded);
+        // An earlier page loaded meanwhile is kept until the next refresh.
+        if (activeGroupIdRef.current === groupId && oldestLoadedMessageRef.current === oldestLoaded) {
+          setGroupMessages(page.messages);
+          setHasEarlierMessages(page.hasEarlier);
         }
       }
     } catch (reason) {
@@ -4060,7 +4078,7 @@ function App() {
         beforeEventId: oldest.eventId,
       });
       if (activeGroupIdRef.current !== groupId) return;
-      earlierMessagesLoadedRef.current = true;
+      if (page.messages.length > 0) oldestLoadedMessageRef.current = page.messages[0];
       setGroupMessages((messages) => {
         const shown = new Set(messages.map(({ eventId }) => eventId));
         return [...page.messages.filter(({ eventId }) => !shown.has(eventId)), ...messages];

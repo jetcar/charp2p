@@ -234,7 +234,7 @@
 - [x] Owned groups report "Bootstrap node needed" instead of "Offline" in the sidebar dot and owner header when the advertiser cannot start without bootstrap nodes (technical-design Discovery/Connectivity).
 - [x] Tablet/Android Chats rows show a visible connection-state dot and joined groups' last synchronization as text (desktop sidebar too) (product page 2).
 - [x] UI: desktop sidebar "Join with link" → "Join from link" (product page 2, web/join).
-- [ ] Tests: preference_file.rs unit tests (missing file, 4096/4097-byte limit, invalid JSON, atomic write with parent creation) (technical-design Local data).
+- [x] Tests: preference_file.rs unit tests (missing file, 4096/4097-byte limit, invalid JSON, atomic write with parent creation) (technical-design Local data).
 - [ ] Docs: technical-design Invitations says a vanished single-use invitation is reported used only when the ADR-042 consumption record confirms it; revoked ones are not.
 - [ ] Settings: Privacy section opening the privacy view, and node-policy text names join/invite rejection and peer blocking (product page 10, technical-design node policy).
 
@@ -467,3 +467,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T19:27:39Z UI "Join from link" action name: renamed the Chats column button from "Join link" (product page 2, web/join fallback); fmt/clippy/tests/npm build pass.
 2026-10-14T20:37:24Z Owned group bootstrap state: re-derived backlog (6 gaps: owned bootstrap state, Chats row state/last sync, Join from link sidebar, preference_file tests, single-use docs, Settings privacy/node policy). owned_group_connection_states reports bootstrapRequired when the advertiser is not running and no bootstrap node is configured; test added; technical-design updated. fmt, clippy (workspace and src-tauri after apt webkit install), tests, npm build pass.
 2026-10-14T21:28:19Z Chats row state and last sync: tablet/Android Chats rows show the connection-state dot beside the group name and joined groups' last synchronization as text; desktop sidebar rows show the last synchronization under the name; desktop sidebar action renamed "Join from link" (also closes that item). Frontend only; fmt, clippy, workspace tests, npm build pass.
+2026-10-14T22:33:15Z Tests: preference_file.rs unit tests: added 6 tests (missing file, 4096/4097-byte limit, invalid JSON kept, nested parent creation, replace); fmt/clippy/test/npm build pass, webkit libs installed via apt for src-tauri.

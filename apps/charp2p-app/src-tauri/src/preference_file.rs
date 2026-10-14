@@ -46,3 +46,74 @@ pub fn write<T: Serialize>(path: &Path, preference: &T) -> io::Result<()> {
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(&temporary, path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_reads_as_none() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+
+        let read = read::<serde_json::Value>(&directory.path().join("missing.json"));
+
+        assert_eq!(read, Ok(None));
+    }
+
+    #[test]
+    fn write_creates_parent_directories_and_reads_back() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let path = directory.path().join("nested").join("preference.json");
+
+        write(&path, &vec![1_u32, 2, 3]).expect("preference is written");
+
+        assert_eq!(read::<Vec<u32>>(&path), Ok(Some(vec![1, 2, 3])));
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(".tmp");
+        assert!(!PathBuf::from(temporary).exists());
+    }
+
+    #[test]
+    fn write_replaces_an_existing_preference() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let path = directory.path().join("preference.json");
+
+        write(&path, &"first").expect("first preference is written");
+        write(&path, &"second").expect("second preference is written");
+
+        assert_eq!(read::<String>(&path), Ok(Some("second".to_owned())));
+    }
+
+    #[test]
+    fn file_at_the_size_limit_is_parsed() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let path = directory.path().join("preference.json");
+        let value = "a".repeat(MAX_PREFERENCE_FILE_BYTES as usize - 2);
+        std::fs::write(&path, format!("\"{value}\"")).expect("file is written");
+
+        assert_eq!(read::<String>(&path), Ok(Some(value)));
+    }
+
+    #[test]
+    fn file_over_the_size_limit_is_invalid() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let path = directory.path().join("preference.json");
+        let value = "a".repeat(MAX_PREFERENCE_FILE_BYTES as usize - 1);
+        std::fs::write(&path, format!("\"{value}\"")).expect("file is written");
+
+        assert_eq!(read::<String>(&path), Err(PreferenceReadError::Invalid));
+    }
+
+    #[test]
+    fn unparsable_file_is_invalid_and_kept() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let path = directory.path().join("preference.json");
+        std::fs::write(&path, b"{not json").expect("file is written");
+
+        assert_eq!(
+            read::<serde_json::Value>(&path),
+            Err(PreferenceReadError::Invalid)
+        );
+        assert_eq!(std::fs::read(&path).expect("file remains"), b"{not json");
+    }
+}

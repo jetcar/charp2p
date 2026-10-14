@@ -550,6 +550,11 @@ function groupConnectionDescription(state: GroupConnectionStateName) {
   return "Waiting for peers";
 }
 
+// Owner header and details subtitle: the owned group's last connection check.
+function ownedGroupConnectionDescription(state: GroupConnectionStateName | undefined) {
+  return `You own this group${state ? ` · ${groupConnectionDescription(state)}` : ""}`;
+}
+
 function joinedDiscoveryDescription(discovery: GroupDiscoveryName | null | undefined) {
   if (discovery === "found") return "Discovery record available";
   if (discovery === "missing") return "Discovery record missing";
@@ -3838,7 +3843,7 @@ function App() {
     const connectionState = connectionStates[group.groupId];
     const connection = joined
       ? connectionState ? groupConnectionDescription(connectionState) : "Connection not checked"
-      : `You own this group${connectionState ? ` · ${groupConnectionDescription(connectionState)}` : ""}`;
+      : ownedGroupConnectionDescription(connectionState);
     const sync = joined
       ? joinedSyncPill(connectionState, joined.lastSynchronizedAtUnix)
       : ownerSyncPill(advertisement?.status ?? null, advertisementRetrying);
@@ -4865,7 +4870,7 @@ function App() {
             <section className="setup-form group-ready-card">
               {renderConversationHeader(
                 localGroup,
-                "You own this group",
+                ownedGroupConnectionDescription(connectionStates[localGroup.groupId]),
                 ownerSyncPill(advertisement?.status ?? null, advertisementRetrying),
               )}
               {advertisementError && <p className="form-error preview-error" role="alert">{advertisementError}</p>}

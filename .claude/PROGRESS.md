@@ -221,7 +221,7 @@
 - [x] Joined group connection state reports "Bootstrap node needed" for `network_bootstrap_required` instead of "Waiting for peers", and pending joins keep retrying after community nodes are added (technical-design Discovery).
 - [x] Leave-group confirmation: rejoining needs the owner to remove the stale device membership first (ADR-027), not just a new invitation.
 - [x] charp2p-node: `--bootstrap` multiaddrs (env `CHARP2P_NODE_BOOTSTRAP`) so standalone nodes join one Kademlia DHT, with periodic re-bootstrap, parse test and README line (technical-design topology/node roles).
-- [ ] Owner conversation header shows the owned group's online/relayed/waiting/offline connection state like the details pane (technical-design Connectivity, product page 5).
+- [x] Owner conversation header shows the owned group's online/relayed/waiting/offline connection state like the details pane (technical-design Connectivity, product page 5).
 - [ ] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
 
 ## Needs human
@@ -443,3 +443,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T09:34:21Z Bootstrap-needed state: a synchronization failing with network_bootstrap_required records group state "bootstrapRequired" (shown as "Bootstrap node needed" in header pill, details and sidebar dot) instead of "waiting"; pending joins treat network_bootstrap_required as retryable and show "Bootstrap node needed · retrying every minute", so they join once community nodes are added. Test extended. fmt, clippy, workspace + src-tauri clippy/tests (webkit libs via apt), npm build pass.
 2026-10-14T10:27:50Z Leave-group confirmation: leave confirm dialog and Members leave note now say the owner keeps listing the device and must remove it before a new invitation can admit it again (ADR-027, ADR-034). Frontend text only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T11:29:20Z charp2p-node --bootstrap: --bootstrap/CHARP2P_NODE_BOOTSTRAP takes up to 16 /p2p/-terminated multiaddrs (duplicates and own peer ID skipped, invalid or excessive stops startup); node bootstraps at startup and every 5 minutes; parse tests, node README and technical-design node policy updated. fmt, clippy, workspace tests, app build pass.
+- 2026-10-14T12:29:47Z Owner conversation header connection state: header subtitle now shares the details-pane description (You own this group · state); fmt/clippy/tests/frontend build pass.

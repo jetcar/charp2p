@@ -2,7 +2,7 @@
 
 `charp2p-node` is a standalone community bootstrap, Kademlia routing, and
 Circuit Relay v2 node. It stores no group events or message payloads and
-rejects synchronization requests.
+rejects synchronization, join, and invitation requests.
 
 Relay service is bounded to 32 reservations, one reservation per peer, 32
 simultaneous circuits, four circuits per peer, five minutes per circuit, and

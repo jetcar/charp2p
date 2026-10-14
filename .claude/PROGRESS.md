@@ -208,7 +208,7 @@
 - [x] UI: reword `invite_busy` ("another member's invitation is active" is stale since ADR-043; the owner answers busy when temporarily unavailable or at its invitation/rendezvous-key limits) (product page 8).
 - [x] Docs/vectors: document the MLS device-credential identity encoding and the ADR-051 removal cut-off authenticated data in technical-design "Serialization and size limits", and pin both with fixed-byte tests in charp2p-mls (gate 4).
 - [x] Member invitations: let a permitted member choose a shorter expiry when requesting an invitation (`request_member_invitation` lifetimeSeconds; owner caps at group lifetime) (product pages 3/8).
-- [ ] Docs: crates/charp2p-node/README.md says the node rejects synchronization requests only (also join and invite); rename docs/decisions/008-protected-pending-invitations.md to 0008-… and update ADR-055's reference.
+- [x] Docs: crates/charp2p-node/README.md says the node rejects synchronization requests only (also join and invite); rename docs/decisions/008-protected-pending-invitations.md to 0008-… and update ADR-055's reference.
 
 ## Needs human
 
@@ -418,3 +418,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-13T22:26:01Z UI invite_busy wording: message now says the owner cannot issue an invitation right now (busy or too many active invitations), dropping the stale pre-ADR-043 'another member's invitation is active'. fmt, clippy, workspace tests, npm build pass.
 2026-10-13T23:38:07Z MLS profile vectors: technical-design 'Serialization and size limits' now documents the device-credential identity and ADR-051 removal cut-off authenticated data; new crates/charp2p-mls/tests/protocol_vectors.rs pins both byte forms (plus version and trailing-byte rejection). fmt, clippy, workspace tests, npm build pass.
 2026-10-14T00:28:12Z Member invitation expiry: the member invitation panel now offers a 1/7/14/30-day expiry select passed as lifetimeSeconds to request_member_invitation; the owner already caps it at the group limit (an already-active requested invitation is returned unchanged). Frontend only; fmt, clippy, workspace tests, npm build pass.
+2026-10-14T01:28:05Z Docs node README and ADR 0008 filename: node README now says it rejects synchronization, join, and invitation requests; renamed docs/decisions/008-protected-pending-invitations.md to 0008-… and updated ADR-055's source reference. fmt, clippy, workspace tests, npm build pass.

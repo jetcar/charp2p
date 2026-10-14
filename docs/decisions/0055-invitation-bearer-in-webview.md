@@ -42,4 +42,4 @@ input, and does not persist or log it.
 ## Sources
 
 - docs/technical-design.md (Invitations)
-- docs/decisions/008-protected-pending-invitations.md
+- docs/decisions/0008-protected-pending-invitations.md

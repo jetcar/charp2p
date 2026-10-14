@@ -1006,7 +1006,8 @@ impl NetworkService {
 
     /// Reports the connection state of each owned group from the owner
     /// advertising node: whether it runs and which current members are
-    /// connected to it now.
+    /// connected to it now. A node that cannot start for lack of bootstrap
+    /// nodes reports that instead of offline.
     pub async fn owned_group_connection_states(
         &self,
         group_ids: &[PeerId],
@@ -1017,6 +1018,7 @@ impl NetworkService {
             .await
             .as_ref()
             .is_some_and(|active| !active.task.is_finished());
+        let bootstrap_required = !serving && self.bootstrap_peers().is_empty();
         let connected = self
             .owner_peers
             .lock()
@@ -1032,7 +1034,11 @@ impl NetworkService {
                 let members = self.synchronization.notice_recipients(*group_id);
                 GroupConnectionState {
                     group_id: group_id.to_string(),
-                    state: owned_group_state(serving, &members, &connected),
+                    state: if bootstrap_required {
+                        "bootstrapRequired"
+                    } else {
+                        owned_group_state(serving, &members, &connected)
+                    },
                     discovery: None,
                     observed_at_unix,
                 }
@@ -3752,6 +3758,24 @@ mod tests {
         assert!(status.bootstrap_nodes.is_empty());
         assert_eq!(status.advertising_status, "bootstrapRequired");
         assert_eq!(status.connection_type, None);
+    }
+
+    #[test]
+    fn owned_groups_report_a_missing_bootstrap_node_instead_of_offline() {
+        let group = DeviceIdentity::generate().peer_id();
+        let states = |service: NetworkService| {
+            tauri::async_runtime::block_on(service.owned_group_connection_states(&[group]))
+        };
+
+        let without = states(NetworkService::from_sources(&[], "").unwrap());
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].group_id, group.to_string());
+        assert_eq!(without[0].state, "bootstrapRequired");
+
+        let node = DeviceIdentity::generate().peer_id();
+        let configured = format!("/ip4/127.0.0.1/udp/9000/quic-v1/p2p/{node}");
+        let with = states(NetworkService::from_sources(&[], &configured).unwrap());
+        assert_eq!(with[0].state, "offline");
     }
 
     #[test]

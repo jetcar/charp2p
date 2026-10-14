@@ -314,8 +314,9 @@ key. The UI reports a peer as reachable only after an authenticated direct,
 local-network, or relayed connection succeeds; stale provider records remain a
 separate status. An owned group reports online (or relayed) while a current
 member is connected directly (or only through a relay) to the owner device's
-serving node, waiting while that node serves with no member connected, and
-offline while it does not run.
+serving node, waiting while that node serves with no member connected,
+bootstrap node needed while it cannot start because no bootstrap node is
+configured, and offline while it does not run otherwise.
 Discovery and transport authentication do not grant group access. Until the
 join protocol authorizes a device, an advertiser rejects its synchronization
 requests.

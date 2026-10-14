@@ -231,6 +231,13 @@
 - [x] Docs: apps/charp2p-app/README.md join (hints first, QUIC/TCP), owner serving without an active invitation, revoke retires keys (ADR-037/047/054); technical-design hints also drop IPv6 link-local.
 - [x] UI: name the action "Join from link" as in product page 2 and the web/join fallback page.
 
+- [x] Owned groups report "Bootstrap node needed" instead of "Offline" in the sidebar dot and owner header when the advertiser cannot start without bootstrap nodes (technical-design Discovery/Connectivity).
+- [ ] Tablet/Android Chats rows show a visible connection-state dot and joined groups' last synchronization as text (desktop sidebar too) (product page 2).
+- [ ] UI: desktop sidebar "Join with link" → "Join from link" (product page 2, web/join).
+- [ ] Tests: preference_file.rs unit tests (missing file, 4096/4097-byte limit, invalid JSON, atomic write with parent creation) (technical-design Local data).
+- [ ] Docs: technical-design Invitations says a vanished single-use invitation is reported used only when the ADR-042 consumption record confirms it; revoked ones are not.
+- [ ] Settings: Privacy section opening the privacy view, and node-policy text names join/invite rejection and peer blocking (product page 10, technical-design node policy).
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -458,3 +465,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T17:36:39Z Reply quotes through the store: new group_reply_quotes command looks up reply targets outside the loaded pages by event ID (MAX_REPLY_QUOTES 256; hidden, deleted or expired targets omitted); the timeline re-reads them on each timeline change and quotes their text, else still "A message not shown on this device". Unit test added. fmt, clippy, workspace + src-tauri clippy/tests (webkit libs via apt), npm build pass.
 2026-10-14T18:23:36Z Docs README join hints/QUIC-TCP, owner serving without active invitation, revoke key retirement; technical-design hints drop IPv6 link-local: done (docs only; no code changed, cargo fmt check passes).
 2026-10-14T19:27:39Z UI "Join from link" action name: renamed the Chats column button from "Join link" (product page 2, web/join fallback); fmt/clippy/tests/npm build pass.
+2026-10-14T20:37:24Z Owned group bootstrap state: re-derived backlog (6 gaps: owned bootstrap state, Chats row state/last sync, Join from link sidebar, preference_file tests, single-use docs, Settings privacy/node policy). owned_group_connection_states reports bootstrapRequired when the advertiser is not running and no bootstrap node is configured; test added; technical-design updated. fmt, clippy (workspace and src-tauri after apt webkit install), tests, npm build pass.

@@ -222,7 +222,7 @@
 - [x] Leave-group confirmation: rejoining needs the owner to remove the stale device membership first (ADR-027), not just a new invitation.
 - [x] charp2p-node: `--bootstrap` multiaddrs (env `CHARP2P_NODE_BOOTSTRAP`) so standalone nodes join one Kademlia DHT, with periodic re-bootstrap, parse test and README line (technical-design topology/node roles).
 - [x] Owner conversation header shows the owned group's online/relayed/waiting/offline connection state like the details pane (technical-design Connectivity, product page 5).
-- [ ] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
+- [x] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
 
 ## Needs human
 
@@ -444,3 +444,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T10:27:50Z Leave-group confirmation: leave confirm dialog and Members leave note now say the owner keeps listing the device and must remove it before a new invitation can admit it again (ADR-027, ADR-034). Frontend text only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T11:29:20Z charp2p-node --bootstrap: --bootstrap/CHARP2P_NODE_BOOTSTRAP takes up to 16 /p2p/-terminated multiaddrs (duplicates and own peer ID skipped, invalid or excessive stops startup); node bootstraps at startup and every 5 minutes; parse tests, node README and technical-design node policy updated. fmt, clippy, workspace tests, app build pass.
 - 2026-10-14T12:29:47Z Owner conversation header connection state: header subtitle now shares the details-pane description (You own this group · state); fmt/clippy/tests/frontend build pass.
+2026-10-14T13:28:19Z Sync data limit docs: technical-design Synchronization describes the ADR-033 token bucket (scope, overshoot, waiting state, uncounted traffic incl. ADR-040 served responses) and Local data lists bandwidth preference file. Docs only; fmt, clippy, workspace tests, npm build pass.

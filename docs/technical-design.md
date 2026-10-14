@@ -658,6 +658,19 @@ repeating every five minutes after each full pass, so unread counts, last
 synchronization times and connection states stay current while the app or its
 background window runs.
 
+A device may set an optional synchronization data limit of 1 to 1,024 MiB per
+hour (ADR-033), off by default. It is a token bucket holding one hour of the
+limit, refilling continuously, held in memory and full at application start or
+when the limit changes. It counts the encoded signed event bytes this device
+requests, receives and pushes during client synchronization, plus responses it
+serves to other members (ADR-040). Before each exchange the device checks that
+budget remains; an exchange already sent completes and is charged, so the limit
+may be overshot by at most one bounded response. Synchronization that finds the
+budget spent stops in a waiting state and resumes from stored heads on a later
+attempt. Discovery, the join exchange and the first pull completing a join,
+owner answers to member requests, and contribution traffic (ADR-031) are not
+counted.
+
 SQLite is the expected local event index, with protected payloads and key
 material separated so keys can use platform secure storage.
 An event that changes MLS state and the resulting encrypted provider snapshot
@@ -899,6 +912,10 @@ Each client stores:
 - Locally materialized message bodies encrypted and authenticated against their
   signed event IDs.
 - User preferences and local blocks.
+- The optional synchronization data limit (ADR-033) in a small JSON file next
+  to the database. It holds no secrets and is not synchronized; a missing file
+  means no limit, and an unreadable or invalid file is reported on the Settings
+  page and keeps synchronization from starting until it is corrected.
 
 Pending invitation metadata is indexed in SQLite. The signed bearer credential
 is stored separately in platform-protected storage and is revalidated against

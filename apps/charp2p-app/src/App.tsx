@@ -97,6 +97,7 @@ type AppInformation = {
 };
 type UnreadMessageCount = { groupId: string; count: number };
 type GroupMessagePreview = { groupId: string; authorId: string; createdAtUnixMs: number; text: string };
+type ReplyQuote = { eventId: string; text: string };
 // "memberServed": the owner was unreachable and another current member served
 // the history (ADR-040). "bootstrapRequired": no bootstrap node or address hint
 // could reach the group peer.
@@ -183,6 +184,8 @@ const RETRYABLE_JOIN_ERRORS = new Set([
   "join_awaiting_approval",
 ]);
 const MESSAGE_REFRESH_INTERVAL_MS = 2_000;
+// Matches the backend limit on reply targets per quote request.
+const MAX_REPLY_QUOTES = 256;
 const MEMBER_REFRESH_INTERVAL_MS = 5_000;
 const MESSAGE_TEXT_LIMIT_BYTES = 16 * 1024;
 // The composer shows its byte counter only once a draft reaches this share of the limit.
@@ -2360,6 +2363,9 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<CreatedMessage | null>(null);
   const [groupMessages, setGroupMessages] = useState<StoredMessage[]>([]);
+  // Texts of replied-to messages retained locally but outside the loaded
+  // pages, keyed by event ID, for the group they were read from.
+  const [replyQuotes, setReplyQuotes] = useState<{ groupId: string; texts: Record<string, string> } | null>(null);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [messagePreviews, setMessagePreviews] = useState<Record<string, GroupMessagePreview>>({});
   const [compactShell, setCompactShell] = useState(compactShellMatches);
@@ -2991,6 +2997,38 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [openGroupId]);
+
+  // Reply targets outside the loaded pages are read from the local store on
+  // every timeline change, so later edits and deletions of them show too.
+  useEffect(() => {
+    const groupId = openGroupId;
+    if (!isTauri() || !groupId) {
+      setReplyQuotes(null);
+      return;
+    }
+    const loaded = new Set(groupMessages.map(({ eventId }) => eventId));
+    const missing = [...new Set(groupMessages
+      .map(({ replyToEventId }) => replyToEventId)
+      .filter((eventId): eventId is string => eventId !== null && !loaded.has(eventId)))]
+      .slice(0, MAX_REPLY_QUOTES);
+    if (missing.length === 0) {
+      setReplyQuotes(null);
+      return;
+    }
+    let active = true;
+    invoke<ReplyQuote[]>("group_reply_quotes", { groupId, eventIds: missing })
+      .then((quotes) => {
+        if (active) {
+          setReplyQuotes({ groupId, texts: Object.fromEntries(quotes.map(({ eventId, text }) => [eventId, text])) });
+        }
+      })
+      .catch(() => {
+        // Quotes are advisory; unresolved targets show as unseen messages.
+      });
+    return () => {
+      active = false;
+    };
+  }, [openGroupId, groupMessages]);
 
   useEffect(() => {
     if (!isTauri() || availableGroups.length === 0) {
@@ -3677,10 +3715,12 @@ function App() {
   function renderReplyQuote(message: StoredMessage) {
     if (!message.replyToEventId) return null;
     const target = groupMessages.find((candidate) => candidate.eventId === message.replyToEventId);
+    const storedText = replyQuotes?.groupId === message.groupId ? replyQuotes.texts[message.replyToEventId] : undefined;
+    const text = target?.text ?? storedText;
     return (
       <blockquote className="message-reply-quote">
         <span className="message-reply-label">Replying to</span>
-        {target ? messageSnippet(target.text) : "A message not shown on this device"}
+        {text !== undefined ? messageSnippet(text) : "A message not shown on this device"}
       </blockquote>
     );
   }

@@ -29,8 +29,8 @@ use identity::{DeviceProfile, IdentityService};
 use libp2p::Multiaddr;
 use mls_storage::{
     CreatedMessage, DeviceSequenceConflict, EvidenceExport, GroupMemberDevice, GroupMessagePreview,
-    MemberActivity, MlsProviderService, StoredMessagePage, UnreadMessageCount, MAX_EVIDENCE_EVENTS,
-    MAX_PREVIEW_GROUPS,
+    MemberActivity, MlsProviderService, ReplyQuote, StoredMessagePage, UnreadMessageCount,
+    MAX_EVIDENCE_EVENTS, MAX_PREVIEW_GROUPS, MAX_REPLY_QUOTES,
 };
 use network::{
     AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
@@ -851,6 +851,29 @@ fn group_message_previews(
         .map_err(str::to_owned)
 }
 
+/// Returns the displayed text of reply targets outside the loaded message
+/// pages; targets this device cannot show are omitted.
+#[tauri::command]
+fn group_reply_quotes(
+    group_id: String,
+    event_ids: Vec<String>,
+    mls_service: tauri::State<'_, Arc<MlsProviderService>>,
+    retention_service: tauri::State<'_, RetentionService>,
+) -> Result<Vec<ReplyQuote>, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    if event_ids.len() > MAX_REPLY_QUOTES {
+        return Err("reply_selection_invalid".to_owned());
+    }
+    let event_ids = event_ids
+        .iter()
+        .map(|event_id| parse_event_id(event_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_message_retention(&retention_service, &mls_service).map_err(str::to_owned)?;
+    mls_service
+        .reply_quotes(group_id, &event_ids)
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 fn hide_group_message(
     group_id: String,
@@ -1644,6 +1667,7 @@ pub fn run() {
             hide_group_message,
             unread_message_counts,
             group_message_previews,
+            group_reply_quotes,
             group_members,
             remove_group_member,
             refresh_group_keys,

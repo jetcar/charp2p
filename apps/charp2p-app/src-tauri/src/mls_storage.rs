@@ -62,6 +62,8 @@ const MEMBER_RENDEZVOUS_SECRET_BYTES: usize = 32;
 pub(crate) const MAX_EVIDENCE_EVENTS: usize = 64;
 /// Maximum number of groups one group list preview request may name.
 pub(crate) const MAX_PREVIEW_GROUPS: usize = 256;
+/// Maximum number of reply targets one quote request may name.
+pub(crate) const MAX_REPLY_QUOTES: usize = 256;
 const EVIDENCE_FORMAT: &str = "charp2p-evidence-v1";
 const EVIDENCE_NOTICE: &str = "Each signed event proves which device signed it and when it claims to have been created. Event payloads are end-to-end encrypted; displayedText is the text shown on the exporting device and is not covered by the signatures.";
 
@@ -185,6 +187,14 @@ pub(crate) struct GroupMessagePreview {
     pub group_id: String,
     pub author_id: String,
     pub created_at_unix_ms: u64,
+    pub text: String,
+}
+
+/// Text this device shows for a replied-to message outside the loaded pages.
+#[derive(Clone, Debug, Eq, PartialEq, SerdeSerialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplyQuote {
+    pub event_id: String,
     pub text: String,
 }
 
@@ -942,6 +952,58 @@ impl MlsProviderService {
                     group_id: message.group_id.to_string(),
                     author_id: message.author_id.to_string(),
                     created_at_unix_ms: message.created_at_unix_ms,
+                    text: displayed_message_text(message, &key)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the displayed text of the named reply targets that this device
+    /// can still show, looked up by event ID across all retained messages.
+    /// Targets that are not materialized, hidden, deleted or expired are left
+    /// out, so the timeline quotes them as unseen messages.
+    pub(crate) fn reply_quotes(
+        &self,
+        group_id: PeerId,
+        event_ids: &[[u8; 32]],
+    ) -> Result<Vec<ReplyQuote>, &'static str> {
+        if event_ids.len() > MAX_REPLY_QUOTES {
+            return Err("reply_selection_invalid");
+        }
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let targets = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| "mls_provider_service_unavailable")?;
+            let mut requested = event_ids.to_vec();
+            requested.sort_unstable();
+            requested.dedup();
+            requested
+                .iter()
+                .filter_map(|event_id| {
+                    store
+                        .encrypted_message(group_id, *event_id)
+                        .map_err(|_| "message_list_unavailable")
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = self
+            .wrapping_keys
+            .get_optional()?
+            .ok_or("mls_wrapping_key_missing")?;
+        targets
+            .iter()
+            .map(|message| {
+                Ok(ReplyQuote {
+                    event_id: hex_bytes(&message.event_id),
                     text: displayed_message_text(message, &key)?,
                 })
             })
@@ -3409,8 +3471,9 @@ mod tests {
         decrypt_join_response, decrypt_local_message, decrypt_snapshot, encrypt_join_response,
         encrypt_local_message, encrypt_snapshot, hex_bytes, join_request_hash,
         DeviceSequenceConflict, GroupMemberDevice, GroupMessagePreview, MemberActivity,
-        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, UnreadMessageCount,
-        WrappingKeyStore, MAX_EVIDENCE_EVENTS, WRAPPING_KEY_BYTES,
+        MemberAdmissionError, MlsProviderMutationError, MlsProviderService, ReplyQuote,
+        UnreadMessageCount, WrappingKeyStore, MAX_EVIDENCE_EVENTS, MAX_REPLY_QUOTES,
+        WRAPPING_KEY_BYTES,
     };
     use charp2p_store::{EventStore, LocalGroupMetadata, PendingInvitationMetadata};
 
@@ -6274,6 +6337,68 @@ mod tests {
         assert_eq!(export.events.len(), 1);
         assert_eq!(export.events[0].event_id, hex_bytes(oldest.id().as_bytes()));
         assert_eq!(export.events[0].displayed_text, "Oldest");
+    }
+
+    #[test]
+    fn reply_quotes_resolve_retained_targets_older_than_the_newest_page() {
+        let directory = tempdir().unwrap();
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let service = test_service(directory.path().join("owner.sqlite3"));
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        let oldest = service
+            .create_message_at(group_id, &owner, "Oldest", 1)
+            .unwrap();
+        let other = DeviceIdentity::generate();
+        {
+            let mut store = service.store.lock().unwrap();
+            let snapshot = store.encrypted_mls_provider_snapshot().unwrap().unwrap();
+            let body = store
+                .encrypted_message(group_id, *oldest.id().as_bytes())
+                .unwrap()
+                .unwrap()
+                .encrypted_body;
+            for sequence in 1..=charp2p_store::MAX_RECENT_MESSAGE_EVENTS as u64 {
+                let event = SignedEvent::create(
+                    &other,
+                    EventSpec {
+                        group_id,
+                        author_sequence: sequence,
+                        causal_parents: &[],
+                        created_at_unix_ms: sequence + 1,
+                        kind: EventKind::MessageCreated,
+                        protected_payload: b"MLS ciphertext",
+                    },
+                )
+                .unwrap();
+                store
+                    .put_message_and_encrypted_mls_provider_snapshot(&event, &snapshot, &body)
+                    .unwrap();
+            }
+            assert!(store.encrypted_messages(group_id).unwrap().has_earlier);
+        }
+
+        let quotes = service
+            .reply_quotes(group_id, &[*oldest.id().as_bytes(), [7; 32]])
+            .unwrap();
+        assert_eq!(
+            quotes,
+            vec![ReplyQuote {
+                event_id: hex_bytes(oldest.id().as_bytes()),
+                text: "Oldest".to_owned(),
+            }]
+        );
+        assert!(service
+            .reply_quotes(
+                GroupIdentity::generate().group_id(),
+                &[*oldest.id().as_bytes()]
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            service.reply_quotes(group_id, &vec![[1; 32]; MAX_REPLY_QUOTES + 1]),
+            Err("reply_selection_invalid")
+        );
     }
 
     #[test]

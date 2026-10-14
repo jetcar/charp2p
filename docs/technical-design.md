@@ -922,7 +922,9 @@ message payloads.
 
 The standalone node implements bootstrap and Kademlia routing with in-memory
 DHT state plus Circuit Relay v2. It rejects group synchronization, join and
-invite requests as unauthorized.
+invite requests as unauthorized. An operator may list up to 16 other routing
+nodes as bootstrap addresses; the node bootstraps from them at startup and
+every five minutes so independent nodes form one DHT.
 Relay reservations and circuits have fixed count, duration, byte, per-peer,
 and upstream per-IP rate bounds; the operator may lower the circuit count and
 per-circuit byte limit or disable relaying, but never exceed those bounds. An

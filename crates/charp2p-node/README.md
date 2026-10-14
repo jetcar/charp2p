@@ -48,6 +48,14 @@ CHARP2P_NODE_IDENTITY=data/node-identity.key
 take several comma-separated addresses, for example to also accept IPv6
 connections. Every address must be available or startup stops.
 
+To join other routing nodes into one Kademlia DHT, pass their complete
+addresses with `--bootstrap <multiaddr>/p2p/<peer-id>` (repeatable) or
+comma-separated in `CHARP2P_NODE_BOOTSTRAP`. At most 16 addresses are
+accepted, an address without a trailing peer ID stops startup, and the node's
+own address is ignored. The node bootstraps at startup and again every five
+minutes so it finds restarted peers; an unreachable bootstrap node only delays
+routing.
+
 To refuse abusive peers, list their peer IDs one per line in a text file and
 pass it with `--blocked-peers <file>` or `CHARP2P_NODE_BLOCKED_PEERS`. Blank
 lines and lines starting with `#` are ignored. The file is read at startup, is

@@ -5,12 +5,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use charp2p_core::{InviteRejectReason, JoinRejectReason, SyncRejectReason};
 use charp2p_network::{DiscoveryOperation, NetworkEvent, NetworkNode, RelayLimits};
 use clap::Parser;
-use libp2p::{Multiaddr, PeerId, identity::Keypair};
+use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -18,6 +19,8 @@ const IDENTITY_VERSION: u8 = 1;
 const MAX_IDENTITY_BYTES: usize = 512;
 const MAX_BLOCKED_PEERS_BYTES: u64 = 256 * 1024;
 const MAX_BLOCKED_PEERS: usize = 4_096;
+const MAX_BOOTSTRAP_PEERS: usize = 16;
+const REBOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,6 +57,12 @@ struct Config {
     )]
     identity: PathBuf,
 
+    /// Other routing nodes to join into one Kademlia DHT, as multiaddresses
+    /// ending in `/p2p/<peer-id>`. Repeatable, or comma-separated in the
+    /// environment value; at most 16.
+    #[arg(long, env = "CHARP2P_NODE_BOOTSTRAP", value_delimiter = ',')]
+    bootstrap: Vec<Multiaddr>,
+
     /// Optional file listing peer IDs this node refuses, one per line.
     /// Blank lines and lines starting with `#` are ignored.
     #[arg(long, env = "CHARP2P_NODE_BLOCKED_PEERS")]
@@ -81,6 +90,28 @@ impl Config {
             .map(Some)
             .map_err(|_| NodeError::RelayLimitsInvalid)
     }
+
+    /// Splits each bootstrap address into its peer ID and dialable address,
+    /// skipping duplicates and this node's own identity.
+    fn bootstrap_peers(&self, own_peer_id: PeerId) -> Result<Vec<(PeerId, Multiaddr)>, NodeError> {
+        if self.bootstrap.len() > MAX_BOOTSTRAP_PEERS {
+            return Err(NodeError::BootstrapTooMany);
+        }
+        let mut peers = Vec::new();
+        for entry in &self.bootstrap {
+            let mut address = entry.clone();
+            let Some(Protocol::P2p(peer_id)) = address.pop() else {
+                return Err(NodeError::BootstrapInvalid);
+            };
+            if address.is_empty() {
+                return Err(NodeError::BootstrapInvalid);
+            }
+            if peer_id != own_peer_id && !peers.contains(&(peer_id, address.clone())) {
+                peers.push((peer_id, address));
+            }
+        }
+        Ok(peers)
+    }
 }
 
 #[tokio::main]
@@ -97,8 +128,12 @@ async fn main() -> Result<(), NodeError> {
         node.block_peer(*blocked_peer);
     }
     let peer_id = node.peer_id();
+    let bootstrap_peers = config.bootstrap_peers(peer_id)?;
     for address in config.listen.iter().chain(&config.listen_tcp) {
         node.listen_on(address.clone())?;
+    }
+    for (bootstrap_peer, address) in &bootstrap_peers {
+        node.add_bootstrap_peer(*bootstrap_peer, address.clone());
     }
 
     println!("CharP2P routing node");
@@ -114,10 +149,25 @@ async fn main() -> Result<(), NodeError> {
     if !blocked_peers.is_empty() {
         println!("Blocked peer identities: {}", blocked_peers.len());
     }
+    if !bootstrap_peers.is_empty() {
+        println!("Bootstrap nodes: {}", bootstrap_peers.len());
+    }
 
+    // The first tick fires at once, so the node joins the DHT at startup and
+    // then refreshes its routing table so restarted peers are found again.
+    let mut rebootstrap = tokio::time::interval(REBOOTSTRAP_INTERVAL);
+    rebootstrap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut signals = OperatorSignals::new().map_err(NodeError::ShutdownSignal)?;
     loop {
         tokio::select! {
+            _ = rebootstrap.tick(), if !bootstrap_peers.is_empty() => {
+                for (bootstrap_peer, address) in &bootstrap_peers {
+                    node.add_bootstrap_peer(*bootstrap_peer, address.clone());
+                }
+                if node.bootstrap().is_err() {
+                    eprintln!("DHT bootstrap could not start");
+                }
+            }
             event = node.next_event() => match event {
                 NetworkEvent::Listening { address } => {
                     println!("Listening: {address}/p2p/{peer_id}");
@@ -390,6 +440,10 @@ enum NodeError {
     BlockedPeerInvalid { line: usize },
     #[error("relay limits must be 1 to 32 circuits and 1 to 32 MiB per circuit")]
     RelayLimitsInvalid,
+    #[error("bootstrap addresses must end in /p2p/<peer-id> after a dialable address")]
+    BootstrapInvalid,
+    #[error("at most 16 bootstrap addresses are allowed")]
+    BootstrapTooMany,
     #[error("network operation failed")]
     Network(#[from] charp2p_network::NetworkError),
     #[error("operator signal handler failed")]
@@ -407,8 +461,9 @@ mod tests {
     use libp2p::identity::Keypair;
 
     use super::{
-        Config, MAX_BLOCKED_PEERS, NodeError, blocked_peer_changes, create_private_file,
-        load_or_create_identity, parse_blocked_peers, read_blocked_peers, read_identity,
+        Config, MAX_BLOCKED_PEERS, MAX_BOOTSTRAP_PEERS, NodeError, blocked_peer_changes,
+        create_private_file, load_or_create_identity, parse_blocked_peers, read_blocked_peers,
+        read_identity,
     };
 
     fn write_private(path: &Path, bytes: &[u8]) {
@@ -579,5 +634,56 @@ mod tests {
             ]
         );
         assert!(Config::try_parse_from(["charp2p-node", "--listen", "not-an-address"]).is_err());
+    }
+
+    #[test]
+    fn bootstrap_addresses_split_peer_ids_and_skip_duplicates_and_self() {
+        let own = Keypair::generate_ed25519().public().to_peer_id();
+        let other = Keypair::generate_ed25519().public().to_peer_id();
+        let none = Config::try_parse_from(["charp2p-node"]).unwrap();
+        assert!(none.bootstrap_peers(own).unwrap().is_empty());
+
+        let first = format!("/dns4/node.example/udp/4001/quic-v1/p2p/{other}");
+        let config = Config::try_parse_from([
+            "charp2p-node".to_owned(),
+            "--bootstrap".to_owned(),
+            format!("{first},/ip4/192.0.2.1/tcp/4001/p2p/{own}"),
+            "--bootstrap".to_owned(),
+            first,
+        ])
+        .unwrap();
+        assert_eq!(
+            config.bootstrap_peers(own).unwrap(),
+            [(
+                other,
+                "/dns4/node.example/udp/4001/quic-v1".parse().unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn bootstrap_addresses_without_peer_id_or_beyond_the_limit_are_rejected() {
+        let own = Keypair::generate_ed25519().public().to_peer_id();
+        let other = Keypair::generate_ed25519().public().to_peer_id();
+        for address in [
+            "/ip4/192.0.2.1/tcp/4001".to_owned(),
+            format!("/p2p/{other}"),
+        ] {
+            let config = Config::try_parse_from(["charp2p-node", "--bootstrap", &address]).unwrap();
+            assert!(matches!(
+                config.bootstrap_peers(own),
+                Err(NodeError::BootstrapInvalid)
+            ));
+        }
+
+        let excessive = (0..=MAX_BOOTSTRAP_PEERS)
+            .map(|index| format!("/ip4/192.0.2.{index}/tcp/4001/p2p/{other}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let config = Config::try_parse_from(["charp2p-node", "--bootstrap", &excessive]).unwrap();
+        assert!(matches!(
+            config.bootstrap_peers(own),
+            Err(NodeError::BootstrapTooMany)
+        ));
     }
 }

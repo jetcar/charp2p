@@ -4501,7 +4501,7 @@ function App() {
                 onClick={openJoinFromShell}
                 type="button"
               >
-                <span aria-hidden="true">⛓</span> Join link
+                <span aria-hidden="true">⛓</span> Join from link
               </button>
               <input
                 aria-label="Search groups"

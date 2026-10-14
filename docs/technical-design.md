@@ -449,8 +449,11 @@ approval. Group creation rejects the retained-history option until its
 enforcement path exists; a single-use invitation default is accepted. The
 owner may override the group's reuse default for each invitation it issues;
 invitations issued for a member's invite request always use the group default.
-The Invitations page treats a single-use invitation that leaves the issued list
-before its expiry as consumed and says so.
+The Invitations page re-reads the issued list periodically. A single-use
+invitation that leaves the list before its expiry is reported as used only when
+the ADR-042 consumption record confirms a device was admitted through it; a
+revoked invitation leaves the list without that record and is not reported as
+used.
 Owner approval follows ADR-041: an authorized bearer whose device the owner has
 not approved yet is recorded as a bounded approval request and answered with
 the `awaiting approval` category (code 4), which the joiner treats like `busy`

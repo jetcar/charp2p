@@ -10,9 +10,20 @@ simultaneous circuits, four circuits per peer, five minutes per circuit, and
 `--relay-max-circuits <1-32>` (`CHARP2P_NODE_RELAY_MAX_CIRCUITS`) and
 `--relay-max-circuit-mib <1-32>` (`CHARP2P_NODE_RELAY_MAX_CIRCUIT_MIB`), or
 offer DHT routing only with `--disable-relay` (`CHARP2P_NODE_DISABLE_RELAY=true`).
-Values outside those bounds stop startup. The upstream per-peer and per-IP request rate limits remain
-enabled. Production metrics, deployment packaging, and load-tested quotas are
-later increments.
+Values outside those bounds stop startup. The upstream per-peer and per-IP
+relay reservation and circuit rate limits remain enabled.
+
+Inbound connections are bounded to 128 pending and 1,024 established
+connections, four established connections per peer, and 16 established direct
+connections per remote IP address. Each peer may send a burst of 64 join,
+invitation, or synchronization requests, refilled at eight per second, before
+further requests are refused. Bytes read from direct TCP and QUIC connections
+draw from two token buckets (ADR-050): per peer, a 4 MiB burst refilled at
+1 MiB per second, and per remote IP address, a 16 MiB burst refilled at 4 MiB
+per second. A read that exceeds either bucket waits for the refill, so the
+remote side slows down instead of being buffered. Relayed connections are
+bounded by the relay limits above. Production metrics, deployment packaging,
+and load-tested quotas are later increments.
 
 Run it with a persistent identity file:
 

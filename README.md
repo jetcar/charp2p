@@ -12,10 +12,18 @@ compatible nodes.
 
 The repository includes the shared Rust protocol and network foundation plus an
 adaptive Tauri application shell for Windows and Android. It also includes a
-standalone community bootstrap and DHT routing node.
+standalone community bootstrap, DHT routing, and Circuit Relay v2 node, and the
+static invitation fallback page in [web/join](web/join/README.md), which hands
+an invitation link to the installed app without decoding or sending it.
+
+Members connect directly over QUIC or TCP and fall back to relayed circuits.
+A message is shown as saved on this device, shared with at least one peer, or
+observed by all currently known members once every other current member has
+reported storing it; these are display states, not delivery guarantees.
 
 - [Product design](docs/product-design.md)
 - [Technical design](docs/technical-design.md)
+- [MVP threat model](docs/threat-model.md)
 - [Windows application mockup](design/windows-chat.png)
 - [Android tablet mockup](design/android-tablet-chat.png)
 - [Complete Windows UI flow](design/windows/README.md)

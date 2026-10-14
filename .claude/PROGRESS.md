@@ -215,7 +215,7 @@
 - [x] Docs: update apps/charp2p-app/README.md for rendezvous-key retirement (ADR-054), hint-first and TCP join, owner serving through retained keys, and member-served history (ADR-040).
 - [x] Docs: threat-model "Removed device keeps synchronizing" residual reflects ADR-054 retirement.
 - [x] Protocol vectors: pin the ADR-028 identity backup v1 bytes with a fixed backup opened in crates/charp2p-core/tests/protocol_vectors.rs (real Argon2id settings), and document its layout in technical-design "Serialization and size limits".
-- [ ] Docs: crates/charp2p-node/README.md lists the inbound connection, request-rate and byte-rate bounds (ADR-050); root README mentions relay, observed-by-all delivery state, threat model and web/join.
+- [x] Docs: crates/charp2p-node/README.md lists the inbound connection, request-rate and byte-rate bounds (ADR-050); root README mentions relay, observed-by-all delivery state, threat model and web/join.
 
 ## Needs human
 
@@ -431,3 +431,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T04:23:56Z Docs app README: rendezvous-key retirement after expiry/revocation/consumption (ADR-054), hint-first QUIC/TCP join without a joiner bootstrap node (ADR-037/047), empty built-in bootstrap list, and member-served pulls when the owner is offline (ADR-040). Docs only; no code checks needed.
 2026-10-14T05:28:19Z Docs: threat-model removed-device residual: now says the retained key is reachable only while its invitation is active, another current member's admission records it, or it predates provenance; otherwise retired (ADR-054). Docs only; fmt/clippy/test/build pass.
 2026-10-14T06:37:21Z Protocol vectors: fixed ADR-028 identity backup v1 ("Vector device", 163 bytes) opened with the real 64 MiB/3-pass Argon2id in core protocol_vectors.rs (~3 s); backup layout documented in technical-design "Serialization and size limits". fmt, clippy, tests, app build pass.
+2026-10-14T07:24:08Z Docs: node README lists inbound connection bounds (128 pending, 1,024 established, 4 per peer, 16 per IP), the 64-burst/8-per-second request bound and ADR-050 byte buckets, and clarifies the upstream limits are relay rate limiters; root README mentions the relay, web/join fallback page, delivery states incl. observed-by-all, and links the threat model. Docs only; fmt check passes.

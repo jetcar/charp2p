@@ -147,8 +147,9 @@ and event ID.
 While the owner's app runs, its advertising node serves every owned group
 whose retained rendezvous keys are still advertised, with or without an active
 invitation, and authenticated devices already present in its MLS group can
-request bounded synchronization summaries, event identifier pages, and signed events. Devices outside that MLS membership get
-only the stable unauthorized response. Immediately after joining, the new
+request bounded synchronization summaries, event identifier pages, and signed
+events. Devices outside that MLS membership get only the stable unauthorized
+response. Immediately after joining, the new
 device uses the existing authenticated connection to pull and persist the
 owner's verified signed events.
 

@@ -98,8 +98,9 @@ type AppInformation = {
 type UnreadMessageCount = { groupId: string; count: number };
 type GroupMessagePreview = { groupId: string; authorId: string; createdAtUnixMs: number; text: string };
 // "memberServed": the owner was unreachable and another current member served
-// the history (ADR-040).
-type GroupConnectionStateName = "online" | "relayed" | "memberServed" | "waiting" | "offline";
+// the history (ADR-040). "bootstrapRequired": no bootstrap node or address hint
+// could reach the group peer.
+type GroupConnectionStateName = "online" | "relayed" | "memberServed" | "waiting" | "bootstrapRequired" | "offline";
 type GroupConnectionState = {
   groupId: string;
   state: GroupConnectionStateName;
@@ -177,6 +178,7 @@ const RETRYABLE_JOIN_ERRORS = new Set([
   "network_peer_unreachable",
   "network_search_timed_out",
   "network_unavailable",
+  "network_bootstrap_required",
   "join_busy",
   "join_awaiting_approval",
 ]);
@@ -489,6 +491,7 @@ function joinedSyncPill(state: GroupConnectionStateName | undefined, synchronize
     return { reachable: true, label: `● ${state === "memberServed" ? "Synced with a member" : "Synced with peers"}`, title };
   }
   if (state === undefined) return { reachable: true, label: `○ ${lastSynchronizationLabel(synchronizedAtUnix)}`, title };
+  if (state === "bootstrapRequired") return { reachable: false, label: "● Bootstrap node needed", title };
   return { reachable: false, label: "● No peers reachable", title };
 }
 
@@ -543,6 +546,7 @@ function groupConnectionDescription(state: GroupConnectionStateName) {
   if (state === "relayed") return "Relayed";
   if (state === "memberServed") return "Member online · owner offline";
   if (state === "offline") return "Offline";
+  if (state === "bootstrapRequired") return "Bootstrap node needed";
   return "Waiting for peers";
 }
 
@@ -2377,6 +2381,9 @@ function App() {
   const [cancellingPending, setCancellingPending] = useState(false);
   const [autoJoinWaitingIds, setAutoJoinWaitingIds] = useState<string[]>([]);
   const [awaitingApprovalIds, setAwaitingApprovalIds] = useState<string[]>([]);
+  // Saved invitations whose last join found no bootstrap node or address
+  // hint; retries continue so a join starts once community nodes are added.
+  const [bootstrapNeededJoinIds, setBootstrapNeededJoinIds] = useState<string[]>([]);
   const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
   const [refreshingKeys, setRefreshingKeys] = useState(false);
@@ -2681,6 +2688,7 @@ function App() {
     if (!isTauri() || !pendingJoinGroupIds) {
       setAutoJoinWaitingIds([]);
       setAwaitingApprovalIds([]);
+      setBootstrapNeededJoinIds([]);
       return;
     }
     let active = true;
@@ -2688,6 +2696,7 @@ function App() {
     const groupIds = pendingJoinGroupIds.split(",");
     setAutoJoinWaitingIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
     setAwaitingApprovalIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
+    setBootstrapNeededJoinIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
 
     async function retryJoins() {
       let retry = false;
@@ -3242,6 +3251,7 @@ function App() {
       setOpenPendingGroupId((current) => current === groupId ? "" : current);
       setAutoJoinWaitingIds((current) => current.filter((id) => id !== groupId));
       setAwaitingApprovalIds((current) => current.filter((id) => id !== groupId));
+      setBootstrapNeededJoinIds((current) => current.filter((id) => id !== groupId));
       return false;
     } catch (reason) {
       const retryable = typeof reason === "string" && RETRYABLE_JOIN_ERRORS.has(reason);
@@ -3254,6 +3264,10 @@ function App() {
       setAwaitingApprovalIds((current) => [
         ...current.filter((id) => id !== groupId),
         ...(reason === "join_awaiting_approval" ? [groupId] : []),
+      ]);
+      setBootstrapNeededJoinIds((current) => [
+        ...current.filter((id) => id !== groupId),
+        ...(reason === "network_bootstrap_required" ? [groupId] : []),
       ]);
       if (!(automatic && retryable)) {
         setError(errorMessage(reason));
@@ -4461,8 +4475,10 @@ function App() {
                   const current = groupPageOpen && group.groupId === openPendingGroupId;
                   const state = awaitingApprovalIds.includes(group.groupId)
                     ? "Awaiting owner approval"
-                    : autoJoinWaitingIds.includes(group.groupId)
-                      ? "Waiting for owner"
+                    : bootstrapNeededJoinIds.includes(group.groupId)
+                      ? "Bootstrap node needed"
+                      : autoJoinWaitingIds.includes(group.groupId)
+                        ? "Waiting for owner"
                       : expiryDescription(group.expiresAtUnix);
                   return (
                     <li key={`pending-${group.groupId}`}>
@@ -4560,8 +4576,10 @@ function App() {
                 const current = groupPageOpen && group.groupId === openPendingGroupId;
                 const state = awaitingApprovalIds.includes(group.groupId)
                   ? "Awaiting owner approval"
-                  : autoJoinWaitingIds.includes(group.groupId)
-                    ? "Waiting for owner"
+                  : bootstrapNeededJoinIds.includes(group.groupId)
+                    ? "Bootstrap node needed"
+                    : autoJoinWaitingIds.includes(group.groupId)
+                      ? "Waiting for owner"
                     : expiryDescription(group.expiresAtUnix);
                 return (
                   <li key={`pending-${group.groupId}`}>
@@ -4738,7 +4756,9 @@ function App() {
                       ? "Joining…"
                       : awaitingApprovalIds.includes(pendingGroup.groupId)
                         ? "Awaiting owner approval · retrying every minute"
-                        : "Waiting for the group owner · retrying every minute"}
+                        : bootstrapNeededJoinIds.includes(pendingGroup.groupId)
+                          ? "Bootstrap node needed · retrying every minute"
+                          : "Waiting for the group owner · retrying every minute"}
                   </span>
                 )}
                 {!joiningGroup && !autoJoinWaitingIds.includes(pendingGroup.groupId) && awaitingApprovalIds.includes(pendingGroup.groupId) && (

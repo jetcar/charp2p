@@ -905,7 +905,9 @@ impl NetworkService {
 
     /// Remembers the outcome of the latest synchronization attempt for a
     /// group: online (direct or LAN), relayed, offline when the network is
-    /// unavailable, and waiting when the group peer could not be reached yet.
+    /// unavailable, bootstrapRequired when no bootstrap node or address hint
+    /// could reach the group peer, and waiting when the group peer could not
+    /// be reached yet.
     fn observe_group_synchronization<T>(
         &self,
         group_id: PeerId,
@@ -919,6 +921,7 @@ impl NetworkService {
                 _ => "online",
             },
             Err("network_unavailable") => "offline",
+            Err("network_bootstrap_required") => "bootstrapRequired",
             Err(_) => "waiting",
         };
         self.remember_group_state(group_id, state, discovery);
@@ -3986,6 +3989,17 @@ mod tests {
             "offline"
         );
         assert_eq!(discovery(), Some("found"));
+        let no_bootstrap = Err::<&str, _>("network_bootstrap_required");
+        let _ = service.observe_group_synchronization(
+            group,
+            no_bootstrap,
+            discovery_outcome(&no_bootstrap),
+            |path| path,
+        );
+        assert_eq!(
+            service.group_connection_states(&[group])[0].state,
+            "bootstrapRequired"
+        );
         let timed_out = Err::<&str, _>("network_search_timed_out");
         assert_eq!(discovery_outcome(&timed_out), Some("missing"));
         assert_eq!(discovery_outcome(&Ok::<_, &str>(())), Some("found"));

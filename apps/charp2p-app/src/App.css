@@ -342,6 +342,7 @@ button { cursor: pointer; }
 .sidebar-state.relayed { background: #5b9cf0; }
 .sidebar-state.memberServed { background: #a58bf0; }
 .sidebar-state.waiting { background: #f0b03a; }
+.sidebar-state.bootstrapRequired { background: #e8664f; }
 .sidebar-state.offline { background: #6e7c90; }
 .sidebar-empty { margin: 0; padding: 4px 12px; color: #8ea0b7; font-size: 14px; }
 .sidebar-footer { display: grid; gap: 2px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, .08); }

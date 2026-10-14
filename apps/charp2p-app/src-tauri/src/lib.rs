@@ -402,6 +402,22 @@ fn issued_invitations(
     service.issued_invitations().map_err(str::to_owned)
 }
 
+/// Reports whether the owner recorded that a single-use invitation admitted a
+/// device (ADR-042), which tells a used invitation apart from a revoked one.
+#[tauri::command]
+fn single_use_invitation_used(
+    group_id: String,
+    invitation_id: String,
+    service: tauri::State<'_, Arc<GroupService>>,
+) -> Result<bool, String> {
+    let group_id = parse_group_id(&group_id, "group_not_found")?;
+    let invitation_id = groups::parse_invitation_id(&invitation_id)
+        .ok_or_else(|| "issued_invitation_not_found".to_owned())?;
+    service
+        .single_use_invitation_consumed(group_id, invitation_id)
+        .map_err(str::to_owned)
+}
+
 #[tauri::command]
 async fn create_group_invitation(
     group_id: String,
@@ -1612,6 +1628,7 @@ pub fn run() {
             request_member_invitation,
             received_member_invitations,
             issued_invitations,
+            single_use_invitation_used,
             create_group,
             create_group_invitation,
             revoke_group_invitation,

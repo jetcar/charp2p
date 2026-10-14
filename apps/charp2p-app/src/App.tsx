@@ -158,7 +158,7 @@ type DeviceSequenceConflict = { deviceId: string; conflictingSequences: number; 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
-const SINGLE_USE_INVITATION_CHECK_INTERVAL_MS = 15_000;
+const ISSUED_INVITATION_REFRESH_INTERVAL_MS = 15_000;
 const JOINED_GROUP_SYNC_INTERVAL_MS = 60_000;
 const JOINED_GROUP_SYNC_START_DELAY_MS = 1_000;
 // Owner new-event notices (ADR-049) arriving during a synchronization wait for it to finish.
@@ -2548,38 +2548,53 @@ function App() {
     setInvitationExpiry(localGroup?.invitationLifetimeSeconds ?? 604800);
   }, [localGroup?.groupId, localGroup?.invitationLifetimeSeconds]);
 
-  // The owner retires a single-use invitation once a device is admitted
-  // through it (ADR-042), so its disappearance before expiry means it was used.
+  // The saved invitations are re-read periodically: member-requested ones
+  // (ADR-036) appear, revoked ones disappear, and the owner retires a
+  // single-use invitation once a device is admitted through it (ADR-042).
+  // Only a recorded consumption reports a vanished invitation as used.
+  const issuedInvitationsRef = useRef<IssuedInvitation[]>([]);
   useEffect(() => {
-    const watched = issuedInvitations.filter(({ reusable }) => !reusable);
-    if (watched.length === 0 || !isTauri()) return;
+    issuedInvitationsRef.current = issuedInvitations;
+  }, [issuedInvitations]);
+  const ownsGroups = localGroups.length > 0;
+  useEffect(() => {
+    if (!ownsGroups || !isTauri()) return;
     let active = true;
     const timer = window.setInterval(() => {
       void invoke<IssuedInvitation[]>("issued_invitations")
-        .then((invitations) => {
+        .then(async (invitations) => {
           if (!active) return;
-          const used = watched.filter((current) =>
-            current.expiresAtUnix * 1000 > Date.now()
+          const previous = issuedInvitationsRef.current;
+          const vanished = previous.filter((current) =>
+            !current.reusable
+            && current.expiresAtUnix * 1000 > Date.now()
             && !invitations.some(({ invitationId }) => invitationId === current.invitationId));
+          const usedFlags = await Promise.all(vanished.map(({ groupId, invitationId }) =>
+            invoke<boolean>("single_use_invitation_used", { groupId, invitationId })
+              .catch(() => false)));
+          if (!active) return;
+          const used = vanished.filter((_, index) => usedFlags[index]);
+          const sameIds = invitations.length === previous.length
+            && invitations.every(({ invitationId }) =>
+              previous.some((current) => current.invitationId === invitationId));
+          if (!sameIds) {
+            setIssuedInvitations(invitations);
+            setInvitationCopied(false);
+          }
           if (used.length === 0) return;
-          const usedIds = used.map(({ invitationId }) => invitationId);
           const usedGroupIds = used.map(({ groupId }) => groupId);
-          setIssuedInvitations((issued) => issued.filter(
-            ({ invitationId }) => !usedIds.includes(invitationId),
-          ));
           setUsedInvitationGroupIds((groupIds) => [
             ...groupIds.filter((groupId) => !usedGroupIds.includes(groupId)),
             ...usedGroupIds,
           ]);
-          setInvitationCopied(false);
         })
         .catch(() => undefined);
-    }, SINGLE_USE_INVITATION_CHECK_INTERVAL_MS);
+    }, ISSUED_INVITATION_REFRESH_INTERVAL_MS);
     return () => {
       active = false;
       window.clearInterval(timer);
     };
-  }, [issuedInvitations]);
+  }, [ownsGroups]);
 
   useEffect(() => {
     if (issuedInvitations.length === 0) return;
@@ -3401,6 +3416,8 @@ function App() {
       setGroupMembers(members);
       setRemovedDevices(await invoke<string[]>("removed_group_members", { groupId: localGroup.groupId }));
       setInvitePermittedDevices(await invoke<string[]>("invite_permitted_devices", { groupId: localGroup.groupId }));
+      // Removal revokes the invitations the device requested (ADR-036).
+      setIssuedInvitations(await invoke<IssuedInvitation[]>("issued_invitations"));
     } catch (reason) {
       setMembersError(errorMessage(reason));
     } finally {

@@ -225,7 +225,7 @@
 - [x] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
 
 - [x] Joined group synchronization applies the owner's shared icon change to the Groups list and header (copied only the name; technical-design Group protocol GroupMetadataChanged v2).
-- [ ] Owner Invitations list refreshes from `issued_invitations` periodically and after removing a member (member-requested invitations never appeared; revoked ones stayed listed and were reported as used) (technical-design Invitations, ADR-036/043).
+- [x] Owner Invitations list refreshes from `issued_invitations` periodically and after removing a member (member-requested invitations never appeared; revoked ones stayed listed and were reported as used) (technical-design Invitations, ADR-036/043).
 - [ ] Loaded earlier message pages re-read on poll/sync so delete-for-everyone, edits, retention and local blocks apply to them (technical-design Message protection).
 - [ ] Replies to older locally stored messages resolve their quote through the store instead of "A message not shown on this device" (technical-design reply display).
 - [ ] Docs: apps/charp2p-app/README.md join (hints first, QUIC/TCP), owner serving without an active invitation, revoke retires keys (ADR-037/047/054); technical-design hints also drop IPv6 link-local.
@@ -453,3 +453,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 - 2026-10-14T12:29:47Z Owner conversation header connection state: header subtitle now shares the details-pane description (You own this group · state); fmt/clippy/tests/frontend build pass.
 2026-10-14T13:28:19Z Sync data limit docs: technical-design Synchronization describes the ADR-033 token bucket (scope, overshoot, waiting state, uncounted traffic incl. ADR-040 served responses) and Local data lists bandwidth preference file. Docs only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T14:31:37Z Joined group icon sync: re-derived backlog (6 gaps: icon sync, owner invitation list refresh, loaded earlier pages, older reply quotes, app README, Join from link label). performJoinedGroupSynchronization now copies the refreshed icon. Frontend only; fmt, clippy, workspace tests, npm build pass.
+2026-10-14T15:30:51Z Owner Invitations list refresh: owners re-read issued_invitations every 15 s and after removing a member; a vanished single-use invitation is reported used only when the new single_use_invitation_used command confirms the ADR-042 consumption record (revoked ones no longer reported as used). fmt, clippy (workspace and src-tauri after apt webkit install), workspace tests, npm build pass.

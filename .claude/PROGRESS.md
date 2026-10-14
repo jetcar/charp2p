@@ -213,7 +213,7 @@
 - [x] Groups page: clear unread markers only while the conversation is actually shown (not while Network/Settings/Members/a pending group is open or the window is hidden); `group_messages` takes a `markRead` flag.
 - [x] Docs: mark ADR-018 superseded in part by ADR-041/042, ADR-025 by ADR-054 and background advertising, ADR-033 by ADR-040 (member-served answers are charged), and ADR-036's "version 2 invitation" by ADR-037/044.
 - [x] Docs: update apps/charp2p-app/README.md for rendezvous-key retirement (ADR-054), hint-first and TCP join, owner serving through retained keys, and member-served history (ADR-040).
-- [ ] Docs: threat-model "Removed device keeps synchronizing" residual reflects ADR-054 retirement.
+- [x] Docs: threat-model "Removed device keeps synchronizing" residual reflects ADR-054 retirement.
 - [ ] Protocol vectors: pin the ADR-028 identity backup v1 bytes with a fixed backup opened in crates/charp2p-core/tests/protocol_vectors.rs (real Argon2id settings), and document its layout in technical-design "Serialization and size limits".
 - [ ] Docs: crates/charp2p-node/README.md lists the inbound connection, request-rate and byte-rate bounds (ADR-050); root README mentions relay, observed-by-all delivery state, threat model and web/join.
 
@@ -429,3 +429,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T02:37:06Z Unread markers only while shown: re-derived backlog (6 gaps: unread clearing, ADR status lines, app README, threat-model removed-device row, identity backup vector, node/root README). group_messages takes markRead; the UI passes it only while the group conversation is on screen (not Network/Settings/Members/pending page) and the document is visible, so polls while hidden to the tray keep unread counts. Unit test extended. fmt, clippy, workspace + src-tauri tests, npm build pass (installed webkit/gtk dev libs).
 2026-10-14T03:26:54Z Docs: ADR-018/025/033/036 status lines name the superseding ADRs (041/042/044, 054 + background provider, 040, 037/044): docs only; fmt, clippy, tests, app build pass.
 2026-10-14T04:23:56Z Docs app README: rendezvous-key retirement after expiry/revocation/consumption (ADR-054), hint-first QUIC/TCP join without a joiner bootstrap node (ADR-037/047), empty built-in bootstrap list, and member-served pulls when the owner is offline (ADR-040). Docs only; no code checks needed.
+2026-10-14T05:28:19Z Docs: threat-model removed-device residual: now says the retained key is reachable only while its invitation is active, another current member's admission records it, or it predates provenance; otherwise retired (ADR-054). Docs only; fmt/clippy/test/build pass.

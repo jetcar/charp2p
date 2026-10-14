@@ -640,6 +640,7 @@ function Stepper({ step }: { step: SetupStep }) {
 function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupName: string }) {
   const [invitation, setInvitation] = useState<IssuedInvitation | null>(null);
   const [requesting, setRequesting] = useState(false);
+  const [lifetimeSeconds, setLifetimeSeconds] = useState(INVITATION_LIFETIMES[INVITATION_LIFETIMES.length - 1].seconds);
   const [copied, setCopied] = useState(false);
   const [qrCode, setQrCode] = useState("");
   const [error, setError] = useState("");
@@ -687,7 +688,7 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
     setCopied(false);
     setRequesting(true);
     try {
-      setInvitation(await invoke<IssuedInvitation>("request_member_invitation", { groupId }));
+      setInvitation(await invoke<IssuedInvitation>("request_member_invitation", { groupId, lifetimeSeconds }));
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -740,6 +741,19 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
       ) : (
         <>
           <p className="preview-note">The group owner allowed this device to invite. The owner device must be reachable to issue the invitation and still admits every join request.</p>
+          <div className="invitation-defaults">
+            <label htmlFor="member-invitation-expiry">This invitation expires after</label>
+            <select
+              id="member-invitation-expiry"
+              onChange={(event) => setLifetimeSeconds(Number(event.target.value))}
+              value={lifetimeSeconds}
+            >
+              {INVITATION_LIFETIMES.map(({ label, seconds }) => (
+                <option key={seconds} value={seconds}>{label}</option>
+              ))}
+            </select>
+            <p className="preview-note">The owner shortens it to the group's invitation limit if that is lower.</p>
+          </div>
           <button className="primary-button" disabled={requesting || !isTauri()} onClick={requestInvitation} type="button">
             {requesting ? "Requesting invitation…" : "Request invitation"}
           </button>

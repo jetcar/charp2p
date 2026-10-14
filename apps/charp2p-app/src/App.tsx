@@ -4541,7 +4541,16 @@ function App() {
                         </i>
                         <span className="chats-row-text">
                           <span className="chats-row-top">
-                            <strong>{group.groupName}</strong>
+                            <span className="chats-row-name">
+                              <strong>{group.groupName}</strong>
+                              {connectionStates[group.groupId] && (
+                                <i
+                                  aria-label={groupConnectionDescription(connectionStates[group.groupId])}
+                                  className={`sidebar-state ${connectionStates[group.groupId]}`}
+                                  title={groupConnectionDescription(connectionStates[group.groupId])}
+                                />
+                              )}
+                            </span>
                             {preview && <time>{previewTimeLabel(preview.createdAtUnixMs)}</time>}
                           </span>
                           <span className="chats-row-bottom">
@@ -4552,6 +4561,9 @@ function App() {
                               </em>
                             )}
                           </span>
+                          {group.lastSynchronizedAtUnix !== undefined && (
+                            <small className="chats-row-sync">{lastSynchronizationLabel(group.lastSynchronizedAtUnix)}</small>
+                          )}
                         </span>
                       </button>
                     </li>
@@ -4618,7 +4630,7 @@ function App() {
             onClick={openJoinFromShell}
             type="button"
           >
-            <span aria-hidden="true">⛓</span> Join with link
+            <span aria-hidden="true">⛓</span> Join from link
           </button>
           <nav className="sidebar-groups" aria-label="Your groups">
             <h2>Groups</h2>
@@ -4641,7 +4653,12 @@ function App() {
                       <i aria-hidden="true" className={`sidebar-group-icon icon-${group.icon ?? 0}`}>
                         {GROUP_ICONS[group.icon ?? 0]}
                       </i>
-                      <span className="sidebar-group-name">{group.groupName}</span>
+                      <span className="sidebar-group-name">
+                        {group.groupName}
+                        {group.lastSynchronizedAtUnix !== undefined && (
+                          <small>{lastSynchronizationLabel(group.lastSynchronizedAtUnix)}</small>
+                        )}
+                      </span>
                       {group.groupId !== activeGroupId && unread > 0 && (
                         <em aria-label={`${unread} unread`} className="unread-count">
                           {unread > 99 ? "99+" : unread}

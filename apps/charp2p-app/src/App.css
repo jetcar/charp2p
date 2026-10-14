@@ -384,9 +384,11 @@ button { cursor: pointer; }
 .chats-list .sidebar-group-icon.pending-icon-small { border-color: #9aa8bb; color: #6d7695; }
 .chats-row-text { min-width: 0; flex: 1; display: grid; gap: 4px; }
 .chats-row-top, .chats-row-bottom { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.chats-row-name { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .chats-row-top strong { min-width: 0; overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
 .chats-row-top time { flex: none; color: #6d7695; font-size: 13px; }
 .chats-row-bottom small { min-width: 0; overflow: hidden; color: #5f6b85; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.chats-row-sync { overflow: hidden; color: #8a94ab; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .chats-list .unread-count { min-width: 24px; flex: none; padding: 2px 7px; border-radius: 999px; color: white; background: #ea584e; font-size: 12px; font-style: normal; font-weight: 800; text-align: center; }
 .chats-links { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .chats-links button { padding: 0; border: 0; color: #6d7695; background: transparent; font-size: 12px; }

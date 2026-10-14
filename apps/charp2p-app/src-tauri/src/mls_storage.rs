@@ -696,16 +696,19 @@ impl MlsProviderService {
         group_id: PeerId,
         local_device_id: PeerId,
     ) -> Result<StoredMessagePage, &'static str> {
-        self.messages_before(group_id, local_device_id, None)
+        self.messages_before(group_id, local_device_id, None, true)
     }
 
     /// Lists the newest locally retained messages older than `before`, or the
-    /// newest overall without a cursor.
+    /// newest overall without a cursor. With `mark_read` the group's unread
+    /// markers are cleared, so callers pass it only while the conversation is
+    /// shown.
     pub(crate) fn messages_before(
         &self,
         group_id: PeerId,
         local_device_id: PeerId,
         before: Option<MessageCursor>,
+        mark_read: bool,
     ) -> Result<StoredMessagePage, &'static str> {
         let _operation = self
             .operations
@@ -740,9 +743,11 @@ impl MlsProviderService {
         let encrypted_page = store
             .encrypted_messages_before(group_id, before)
             .map_err(|_| "message_list_unavailable")?;
-        store
-            .mark_messages_read(group_id)
-            .map_err(|_| "message_list_unavailable")?;
+        if mark_read {
+            store
+                .mark_messages_read(group_id)
+                .map_err(|_| "message_list_unavailable")?;
+        }
         let acknowledged_heads = store
             .acknowledged_author_heads(group_id, local_device_id)
             .map_err(|_| "message_list_unavailable")?;
@@ -5330,6 +5335,22 @@ mod tests {
         }
 
         assert_eq!(inserted, 4);
+        assert_eq!(
+            member_service.unread_message_counts().unwrap(),
+            vec![UnreadMessageCount {
+                group_id: group_id.to_string(),
+                count: 1,
+            }]
+        );
+        // Listing while the conversation is not shown keeps the markers.
+        assert_eq!(
+            member_service
+                .messages_before(group_id, member_id, None, false)
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
         assert_eq!(
             member_service.unread_message_counts().unwrap(),
             vec![UnreadMessageCount {

@@ -738,9 +738,12 @@ fn delete_group_message(
 
 /// Lists the newest retained messages of a group, or with a cursor (the
 /// oldest shown message's timestamp and event ID) the page before it.
+/// `mark_read` clears the group's unread markers; the UI sets it only while
+/// the conversation is on screen.
 #[tauri::command]
 fn group_messages(
     group_id: String,
+    mark_read: bool,
     before_created_at_unix_ms: Option<u64>,
     before_event_id: Option<String>,
     identity_service: tauri::State<'_, IdentityService>,
@@ -761,7 +764,7 @@ fn group_messages(
         .load_network_identity()
         .map_err(str::to_owned)?;
     mls_service
-        .messages_before(group_id, identity.peer_id(), before)
+        .messages_before(group_id, identity.peer_id(), before, mark_read)
         .map_err(str::to_owned)
 }
 

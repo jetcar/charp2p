@@ -210,6 +210,13 @@
 - [x] Member invitations: let a permitted member choose a shorter expiry when requesting an invitation (`request_member_invitation` lifetimeSeconds; owner caps at group lifetime) (product pages 3/8).
 - [x] Docs: crates/charp2p-node/README.md says the node rejects synchronization requests only (also join and invite); rename docs/decisions/008-protected-pending-invitations.md to 0008-… and update ADR-055's reference.
 
+- [x] Groups page: clear unread markers only while the conversation is actually shown (not while Network/Settings/Members/a pending group is open or the window is hidden); `group_messages` takes a `markRead` flag.
+- [ ] Docs: mark ADR-018 superseded in part by ADR-041/042, ADR-025 by ADR-054 and background advertising, ADR-033 by ADR-040 (member-served answers are charged), and ADR-036's "version 2 invitation" by ADR-037/044.
+- [ ] Docs: update apps/charp2p-app/README.md for rendezvous-key retirement (ADR-054), hint-first and TCP join, owner serving through retained keys, and member-served history (ADR-040).
+- [ ] Docs: threat-model "Removed device keeps synchronizing" residual reflects ADR-054 retirement.
+- [ ] Protocol vectors: pin the ADR-028 identity backup v1 bytes with a fixed backup opened in crates/charp2p-core/tests/protocol_vectors.rs (real Argon2id settings), and document its layout in technical-design "Serialization and size limits".
+- [ ] Docs: crates/charp2p-node/README.md lists the inbound connection, request-rate and byte-rate bounds (ADR-050); root README mentions relay, observed-by-all delivery state, threat model and web/join.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -419,3 +426,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-13T23:38:07Z MLS profile vectors: technical-design 'Serialization and size limits' now documents the device-credential identity and ADR-051 removal cut-off authenticated data; new crates/charp2p-mls/tests/protocol_vectors.rs pins both byte forms (plus version and trailing-byte rejection). fmt, clippy, workspace tests, npm build pass.
 2026-10-14T00:28:12Z Member invitation expiry: the member invitation panel now offers a 1/7/14/30-day expiry select passed as lifetimeSeconds to request_member_invitation; the owner already caps it at the group limit (an already-active requested invitation is returned unchanged). Frontend only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T01:28:05Z Docs node README and ADR 0008 filename: node README now says it rejects synchronization, join, and invitation requests; renamed docs/decisions/008-protected-pending-invitations.md to 0008-… and updated ADR-055's source reference. fmt, clippy, workspace tests, npm build pass.
+2026-10-14T02:37:06Z Unread markers only while shown: re-derived backlog (6 gaps: unread clearing, ADR status lines, app README, threat-model removed-device row, identity backup vector, node/root README). group_messages takes markRead; the UI passes it only while the group conversation is on screen (not Network/Settings/Members/pending page) and the document is visible, so polls while hidden to the tray keep unread counts. Unit test extended. fmt, clippy, workspace + src-tauri tests, npm build pass (installed webkit/gtk dev libs).

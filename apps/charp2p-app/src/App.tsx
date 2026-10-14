@@ -2402,6 +2402,11 @@ function App() {
   const [localGroups, setLocalGroups] = useState<LocalGroup[]>([]);
   const [activeGroupId, setActiveGroupId] = useState("");
   const activeGroupIdRef = useRef("");
+  // Whether the open group's conversation is on screen; only then do message
+  // listings clear its unread markers.
+  const conversationShownRef = useRef(false);
+  const conversationShown = () =>
+    conversationShownRef.current && document.visibilityState === "visible";
   const [issuedInvitations, setIssuedInvitations] = useState<IssuedInvitation[]>([]);
   const [createGroupMode, setCreateGroupMode] = useState(false);
   const [groupName, setGroupName] = useState("");
@@ -2907,7 +2912,10 @@ function App() {
 
     async function refreshMessages() {
       try {
-        const page = await invoke<StoredMessagePage>("group_messages", { groupId });
+        const page = await invoke<StoredMessagePage>("group_messages", {
+          groupId,
+          markRead: conversationShown(),
+        });
         if (active) {
           const keepEarlier = earlierMessagesLoadedRef.current;
           setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
@@ -3301,7 +3309,10 @@ function App() {
         // Re-advertise under the member key of a newly reached MLS epoch.
         void invoke("serve_joined_group", { groupId }).catch(() => undefined);
         setSynchronizationResult(result);
-        const page = await invoke<StoredMessagePage>("group_messages", { groupId });
+        const page = await invoke<StoredMessagePage>("group_messages", {
+          groupId,
+          markRead: conversationShown(),
+        });
         if (activeGroupIdRef.current === groupId) {
           const keepEarlier = earlierMessagesLoadedRef.current;
           setGroupMessages((messages) => mergeLatestMessages(messages, page.messages, keepEarlier));
@@ -3993,6 +4004,7 @@ function App() {
     try {
       const page = await invoke<StoredMessagePage>("group_messages", {
         groupId,
+        markRead: conversationShown(),
         beforeCreatedAtUnixMs: oldest.createdAtUnixMs,
         beforeEventId: oldest.eventId,
       });
@@ -4309,6 +4321,8 @@ function App() {
   const filteredPendingGroups = pendingGroups.filter(({ groupName }) =>
     groupName.toLowerCase().includes(groupSearchTerm),
   );
+  // Set during render so the timeline effects of the same commit see it.
+  conversationShownRef.current = groupPageOpen && !pendingGroup && !showMembers;
   const detailsGroup =
     appShell && groupPageOpen && showGroupInfo && !pendingGroup && !showMembers ? joinedGroup ?? localGroup : null;
 

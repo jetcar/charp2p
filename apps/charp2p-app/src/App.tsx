@@ -1197,7 +1197,7 @@ function MembersView({
           <button className="member-remove" disabled={leaving} onClick={onLeave} type="button">
             {leaving ? "Leaving…" : "Leave group"}
           </button>
-          <p className="preview-note">Leaving deletes this group's messages, keys, and discovery record from this device only. The owner still lists this device until it removes it, and other members keep their copies.</p>
+          <p className="preview-note">Leaving deletes this group's messages, keys, and discovery record from this device only. The owner still lists this device until it removes it, and other members keep their copies. Joining again needs the owner to remove this device first, then a new invitation.</p>
         </div>
       )}
       <button className="secondary-button" onClick={onClose} type="button">Back to conversation</button>
@@ -3490,7 +3490,7 @@ function App() {
 
   async function leaveJoinedGroup() {
     if (!joinedGroup || leavingGroup || !isTauri()) return;
-    if (!window.confirm(`Leave ${joinedGroup.groupName}? Its messages and keys will be deleted from this device. You need a new invitation to join again.`)) return;
+    if (!window.confirm(`Leave ${joinedGroup.groupName}? Its messages and keys will be deleted from this device. The owner still lists this device as a member until removing it; to join again, the owner must remove this device first, then send a new invitation.`)) return;
     const groupId = joinedGroup.groupId;
     setMembersError("");
     setLeavingGroup(true);

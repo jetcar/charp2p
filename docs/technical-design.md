@@ -137,7 +137,7 @@ remembered routing peers do not satisfy that on their own (ADR-046).
 Invitations without
 hints keep the version 2 encoding. The owner takes hints from the current
 listen addresses of its advertising node, circuit-relay addresses first and
-loopback or unspecified addresses excluded, both for its own invitations and
+loopback, unspecified or IPv6 link-local addresses excluded, both for its own invitations and
 for invitations issued at a member's request; hints that would make the
 invitation invalid or too large to protect are dropped. When that node is not
 running yet, as for an owner's first invitation, issuing starts it with the

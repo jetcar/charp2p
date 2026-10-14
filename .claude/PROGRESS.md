@@ -228,7 +228,7 @@
 - [x] Owner Invitations list refreshes from `issued_invitations` periodically and after removing a member (member-requested invitations never appeared; revoked ones stayed listed and were reported as used) (technical-design Invitations, ADR-036/043).
 - [x] Loaded earlier message pages re-read on poll/sync so delete-for-everyone, edits, retention and local blocks apply to them (technical-design Message protection).
 - [x] Replies to older locally stored messages resolve their quote through the store instead of "A message not shown on this device" (technical-design reply display).
-- [ ] Docs: apps/charp2p-app/README.md join (hints first, QUIC/TCP), owner serving without an active invitation, revoke retires keys (ADR-037/047/054); technical-design hints also drop IPv6 link-local.
+- [x] Docs: apps/charp2p-app/README.md join (hints first, QUIC/TCP), owner serving without an active invitation, revoke retires keys (ADR-037/047/054); technical-design hints also drop IPv6 link-local.
 - [ ] UI: name the action "Join from link" as in product page 2 and the web/join fallback page.
 
 ## Needs human
@@ -456,3 +456,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T15:30:51Z Owner Invitations list refresh: owners re-read issued_invitations every 15 s and after removing a member; a vanished single-use invitation is reported used only when the new single_use_invitation_used command confirms the ADR-042 consumption record (revoked ones no longer reported as used). fmt, clippy (workspace and src-tauri after apt webkit install), workspace tests, npm build pass.
 2026-10-14T16:27:10Z Loaded earlier pages re-read: message poll and post-sync refresh now re-read the store from the newest message back to the oldest page loaded with Show earlier messages (bounded to 100 pages), so delete-for-everyone, edits, retention and local blocks apply to earlier pages; a refresh racing an earlier-page load is discarded. Frontend only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T17:36:39Z Reply quotes through the store: new group_reply_quotes command looks up reply targets outside the loaded pages by event ID (MAX_REPLY_QUOTES 256; hidden, deleted or expired targets omitted); the timeline re-reads them on each timeline change and quotes their text, else still "A message not shown on this device". Unit test added. fmt, clippy, workspace + src-tauri clippy/tests (webkit libs via apt), npm build pass.
+2026-10-14T18:23:36Z Docs README join hints/QUIC-TCP, owner serving without active invitation, revoke key retirement; technical-design hints drop IPv6 link-local: done (docs only; no code changed, cargo fmt check passes).

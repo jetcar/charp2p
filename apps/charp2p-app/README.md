@@ -74,7 +74,8 @@ local groups are reconciled with MLS state at startup. Expired invitations are
 removed from both stores. The owner can explicitly revoke an active invitation;
 the bearer and index are removed immediately. Its protected rendezvous key is
 retained so already admitted members can still discover the owner, while new
-join attempts are rejected. The owner view renders the signed invitation as a
+join attempts are rejected; the key is retired once no current member was
+admitted through it (ADR-054). The owner view renders the signed invitation as a
 QR code for Windows and Android handoff without sending it to a QR service.
 Invitations always expire and can be reusable or single-use; a consumed
 single-use invitation is retired but still lets its admitted device finish
@@ -143,16 +144,18 @@ group. Timeline reads return pages of at most 256 messages; "Show earlier
 messages" loads the page before the oldest shown message by its creation time
 and event ID.
 
-While an owner advertises an active invitation, authenticated devices already
-present in its MLS group can request bounded synchronization summaries, event
-identifier pages, and signed events. Devices outside that MLS membership get
+While the owner's app runs, its advertising node serves every owned group
+whose retained rendezvous keys are still advertised, with or without an active
+invitation, and authenticated devices already present in its MLS group can
+request bounded synchronization summaries, event identifier pages, and signed events. Devices outside that MLS membership get
 only the stable unauthorized response. Immediately after joining, the new
 device uses the existing authenticated connection to pull and persist the
 owner's verified signed events.
 
-The joining client now prepares and reuses one durable MLS KeyPackage, finds
-the invitation's pinned owner through the DHT, exchanges the join request over
-authenticated QUIC, validates the returned Welcome, and atomically replaces
+The joining client now prepares and reuses one durable MLS KeyPackage, dials the
+invitation's address hints first and otherwise finds its pinned owner through
+the DHT, exchanges the join request over authenticated QUIC or the TCP
+fallback, validates the returned Welcome, and atomically replaces
 the pending private material with joined MLS group state. Authenticated display
 metadata is then promoted from pending to joined storage, the bearer invitation
 is replaced by its opaque derived discovery key in protected storage, and an

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; responses a member device serves to other members are charged to the
+limit, as superseded by ADR-040.
 
 ## Date
 

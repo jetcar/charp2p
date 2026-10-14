@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; manual owner approval is superseded by ADR-041 and ADR-044, and
+single-use invitations by ADR-042. Retained-history sharing stays rejected.
 
 ## Date
 

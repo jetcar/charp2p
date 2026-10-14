@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; the "version 2" invitation is superseded by the version the owner
+issues for the group (ADR-037 address hints, ADR-044 approval required).
 
 ## Date
 

@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; keeping every retained key indefinitely is superseded by ADR-054
+rendezvous-key retirement, and publishing only while the group is open by one
+background provider for every owned group (technical design, "Discovery").
 
 ## Date
 

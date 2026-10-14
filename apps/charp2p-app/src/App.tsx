@@ -3331,7 +3331,13 @@ function App() {
         const lastSynchronizedAtUnix = result.status === "synchronized"
           ? result.synchronizedAtUnix
           : group.lastSynchronizedAtUnix;
-        return { ...group, groupName: refreshed?.groupName ?? group.groupName, lastSynchronizedAtUnix };
+        return {
+          ...group,
+          groupName: refreshed?.groupName ?? group.groupName,
+          // The owner may have changed the shared icon (GroupMetadataChanged).
+          icon: refreshed ? refreshed.icon : group.icon,
+          lastSynchronizedAtUnix,
+        };
       }));
       if (activeGroupIdRef.current === groupId) {
         // Re-advertise under the member key of a newly reached MLS epoch.

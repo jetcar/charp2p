@@ -224,6 +224,13 @@
 - [x] Owner conversation header shows the owned group's online/relayed/waiting/offline connection state like the details pane (technical-design Connectivity, product page 5).
 - [x] Docs: technical-design Synchronization describes the device-local synchronization data limit (ADR-033) and Local data lists the preference.
 
+- [x] Joined group synchronization applies the owner's shared icon change to the Groups list and header (copied only the name; technical-design Group protocol GroupMetadataChanged v2).
+- [ ] Owner Invitations list refreshes from `issued_invitations` periodically and after removing a member (member-requested invitations never appeared; revoked ones stayed listed and were reported as used) (technical-design Invitations, ADR-036/043).
+- [ ] Loaded earlier message pages re-read on poll/sync so delete-for-everyone, edits, retention and local blocks apply to them (technical-design Message protection).
+- [ ] Replies to older locally stored messages resolve their quote through the store instead of "A message not shown on this device" (technical-design reply display).
+- [ ] Docs: apps/charp2p-app/README.md join (hints first, QUIC/TCP), owner serving without an active invitation, revoke retires keys (ADR-037/047/054); technical-design hints also drop IPv6 link-local.
+- [ ] UI: name the action "Join from link" as in product page 2 and the web/join fallback page.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -445,3 +452,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T11:29:20Z charp2p-node --bootstrap: --bootstrap/CHARP2P_NODE_BOOTSTRAP takes up to 16 /p2p/-terminated multiaddrs (duplicates and own peer ID skipped, invalid or excessive stops startup); node bootstraps at startup and every 5 minutes; parse tests, node README and technical-design node policy updated. fmt, clippy, workspace tests, app build pass.
 - 2026-10-14T12:29:47Z Owner conversation header connection state: header subtitle now shares the details-pane description (You own this group · state); fmt/clippy/tests/frontend build pass.
 2026-10-14T13:28:19Z Sync data limit docs: technical-design Synchronization describes the ADR-033 token bucket (scope, overshoot, waiting state, uncounted traffic incl. ADR-040 served responses) and Local data lists bandwidth preference file. Docs only; fmt, clippy, workspace tests, npm build pass.
+2026-10-14T14:31:37Z Joined group icon sync: re-derived backlog (6 gaps: icon sync, owner invitation list refresh, loaded earlier pages, older reply quotes, app README, Join from link label). performJoinedGroupSynchronization now copies the refreshed icon. Frontend only; fmt, clippy, workspace tests, npm build pass.

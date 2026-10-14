@@ -824,6 +824,16 @@ Two CharP2P byte strings travel inside MLS structures, both big-endian:
 
 `crates/charp2p-mls/tests/protocol_vectors.rs` pins both.
 
+An encrypted identity backup (ADR-028) version 1 is the ASCII magic
+`charp2p-identity-backup`, a version byte (`1`), a 16-byte Argon2id salt, a
+24-byte XChaCha20-Poly1305 nonce, then the ciphertext and 16-byte tag. The
+header before the ciphertext is the associated data. The plaintext is the
+postcard encoding of the device display name (at most 128 bytes) followed by
+the libp2p protobuf encoding of the Ed25519 device key. The key is Argon2id
+v0x13 over the passphrase with 64 MiB of memory, 3 passes, and 1 lane, giving
+32 bytes. `crates/charp2p-core/tests/protocol_vectors.rs` pins a fixed backup
+opened with these parameters.
+
 Synchronization requests and responses use the libp2p CBOR request-response
 codec. That envelope is neither signed nor canonical; every event inside it is
 a canonical signed envelope that the receiver decodes and verifies itself.

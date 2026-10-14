@@ -9,7 +9,8 @@ use charp2p_core::{
     DeviceIdentity, DeviceIdentitySecret, DiscoveryKey, EventId, EventKind, GroupIdentity,
     GroupIdentitySecret, GroupMetadata, HistoryPolicy, Invitation, InvitationError,
     InvitePermission, InviteRejectReason, InviteRequest, InviteResponse, JoinRejectReason,
-    JoinRequest, JoinResponse, MessageBody, MessageDeletion, MessageEdit, SignedEvent,
+    JoinRequest, JoinResponse, MAX_IDENTITY_BACKUP_BYTES, MessageBody, MessageDeletion,
+    MessageEdit, SignedEvent, open_identity_backup,
 };
 
 /// Protobuf-encoded Ed25519 keypair from the seed `[0x11; 32]`.
@@ -98,6 +99,13 @@ const INVITE_RESPONSE_REJECTIONS: [(InviteRejectReason, &str); 2] = [
     (InviteRejectReason::Unauthorized, "00010201"),
     (InviteRejectReason::Busy, "00010202"),
 ];
+/// ADR-028 identity backup version 1 of the device key named "Vector device",
+/// sealed with the passphrase `IDENTITY_BACKUP_PASSPHRASE`: the magic, version
+/// 1, a 16-byte salt, a 24-byte nonce, then the XChaCha20-Poly1305 ciphertext
+/// of the postcard plaintext with its 16-byte tag.
+const IDENTITY_BACKUP: &str = "636861727032702d6964656e746974792d6261636b757001b2669ae4651557ffc0ecb2eb1eeae00016786574740e0846adc50c3369bc08f7edbdb127fb0dd7cfce2efdb4ac542260d6f6ebad780db01bea98e5b4499eedc08db3b3843a41cd12ac09db2d1ee2772ea6797a4fe403c5f3ac6eb55ce6630e277dfd1e3aa942f413bbd7ff7a258d499a4733b88f248c8352cfba75bd701ae58b4dfa0077a84e6f970117b6";
+const IDENTITY_BACKUP_PASSPHRASE: &str = "vector passphrase";
+const IDENTITY_BACKUP_MAGIC: &[u8] = b"charp2p-identity-backup";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -433,4 +441,30 @@ fn join_and_invite_wire_codecs_reject_an_unknown_version() {
     let mut request = unhex(&format!("0001{FRAMED_GROUP_ID}{INVITE_REQUEST_LIFETIME}"));
     request[1] = 2;
     assert!(InviteRequest::decode(&request).is_err());
+}
+
+#[test]
+fn fixed_identity_backup_opens_with_the_version_1_key_derivation() {
+    let backup = unhex(IDENTITY_BACKUP);
+    // Magic, version, salt and nonce; then the 83-byte plaintext and its tag.
+    assert_eq!(
+        &backup[..IDENTITY_BACKUP_MAGIC.len()],
+        IDENTITY_BACKUP_MAGIC
+    );
+    assert_eq!(backup[IDENTITY_BACKUP_MAGIC.len()], 1);
+    assert_eq!(
+        backup.len(),
+        IDENTITY_BACKUP_MAGIC.len() + 1 + 16 + 24 + 83 + 16
+    );
+    assert!(backup.len() <= MAX_IDENTITY_BACKUP_BYTES);
+
+    // Runs the real 64 MiB, 3-pass Argon2id derivation, unlike the unit tests.
+    let restored =
+        open_identity_backup(&backup, IDENTITY_BACKUP_PASSPHRASE).expect("backup vector opens");
+
+    assert_eq!(restored.device_name, "Vector device");
+    assert_eq!(
+        hex(restored.secret.expose_for_protected_storage()),
+        DEVICE_SECRET
+    );
 }

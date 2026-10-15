@@ -2010,9 +2010,11 @@ function RetentionSection() {
 
 function SettingsView({
   onOpenBackup,
+  onOpenPrivacy,
   onClose,
 }: {
   onOpenBackup: (() => void) | null;
+  onOpenPrivacy: () => void;
   onClose: () => void;
 }) {
   const [information, setInformation] = useState<AppInformation | null>(null);
@@ -2075,11 +2077,19 @@ function SettingsView({
           </p>
         </section>
         <section>
+          <h3>Privacy</h3>
+          <p>
+            What this device stores, what nodes and other members can see, and what diagnostics leave out.
+          </p>
+          <button className="secondary-button" onClick={onOpenPrivacy} type="button">Open privacy</button>
+        </section>
+        <section>
           <h3>Node policy</h3>
           <p>
             Bootstrap and relay nodes store only bounded routing records and relay reservations. They never store group
-            events or message contents, reject group synchronization, and cannot remove groups or messages from your
-            devices.
+            events or message contents, reject group synchronization, join and invitation requests, and cannot remove
+            groups or messages from your devices. A node operator may block peer identities from that node only, which
+            ends their relay reservations there.
           </p>
         </section>
         <section>
@@ -4748,6 +4758,7 @@ function App() {
           ) : settingsView ? (
             <SettingsView
               onClose={() => setSettingsView(false)}
+              onOpenPrivacy={() => setInformationView("privacy")}
               onOpenBackup={
                 profile
                   ? () => {

@@ -236,7 +236,7 @@
 - [x] UI: desktop sidebar "Join with link" → "Join from link" (product page 2, web/join).
 - [x] Tests: preference_file.rs unit tests (missing file, 4096/4097-byte limit, invalid JSON, atomic write with parent creation) (technical-design Local data).
 - [x] Docs: technical-design Invitations says a vanished single-use invitation is reported used only when the ADR-042 consumption record confirms it; revoked ones are not.
-- [ ] Settings: Privacy section opening the privacy view, and node-policy text names join/invite rejection and peer blocking (product page 10, technical-design node policy).
+- [x] Settings: Privacy section opening the privacy view, and node-policy text names join/invite rejection and peer blocking (product page 10, technical-design node policy).
 
 ## Needs human
 
@@ -469,3 +469,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-14T21:28:19Z Chats row state and last sync: tablet/Android Chats rows show the connection-state dot beside the group name and joined groups' last synchronization as text; desktop sidebar rows show the last synchronization under the name; desktop sidebar action renamed "Join from link" (also closes that item). Frontend only; fmt, clippy, workspace tests, npm build pass.
 2026-10-14T22:33:15Z Tests: preference_file.rs unit tests: added 6 tests (missing file, 4096/4097-byte limit, invalid JSON kept, nested parent creation, replace); fmt/clippy/test/npm build pass, webkit libs installed via apt for src-tauri.
 2026-10-14T23:22:50Z Docs single-use invitation used reporting: technical-design Invitations now says a vanished single-use invitation is reported used only when the ADR-042 consumption record confirms it, revoked ones are not; docs only, no code changed.
+2026-10-15T00:27:10Z Settings privacy and node policy: Settings gains a Privacy section opening the privacy view (Back returns to Settings); node-policy text names join/invitation rejection and per-node peer blocking. Frontend only; fmt, clippy, workspace tests, npm build pass.

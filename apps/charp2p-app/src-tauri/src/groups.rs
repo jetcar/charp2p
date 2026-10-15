@@ -904,6 +904,14 @@ impl GroupService {
         if invitation.group_id() != group.group_id {
             return Err(MemberAdmissionError::Unauthorized);
         }
+        // A removed device stays refused until the owner allows it again, so
+        // it is never listed as a request the owner could approve.
+        if store
+            .is_removed_mls_member(group.group_id, device_id)
+            .map_err(|_| MemberAdmissionError::Unavailable)?
+        {
+            return Err(MemberAdmissionError::Unauthorized);
+        }
         match store
             .record_owner_approval_request(
                 group.group_id,
@@ -2475,6 +2483,66 @@ mod tests {
             .owner_approval_requests(open.group_id.parse().unwrap(), NOW)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn removed_device_is_refused_without_an_approval_request() {
+        use crate::mls_storage::MemberAdmissionError;
+        use charp2p_core::{EventKind, EventSpec, SignedEvent};
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut approval = spec("Design Crew");
+        approval.approval_required = true;
+        let group_id: PeerId = service.create(approval).unwrap().group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let issued = service
+            .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", NOW)
+            .unwrap();
+        let request = join_request(&issued.link, NOW);
+        let removed = DeviceIdentity::generate().peer_id();
+        let removal = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id,
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: NOW * 1000,
+                kind: EventKind::MemberRemoved,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_member_removal(&removal, b"removal snapshot", removed, 0)
+            .unwrap();
+
+        assert_eq!(
+            service.admission_approval_at(&request, removed, NOW),
+            Err(MemberAdmissionError::Unauthorized)
+        );
+        assert!(service
+            .approval_requests_at(group_id, NOW)
+            .unwrap()
+            .is_empty());
+
+        // Once the owner allows the device again, it asks for approval anew.
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .allow_removed_mls_member_readmission(group_id, removed)
+            .unwrap());
+        assert_eq!(
+            service.admission_approval_at(&request, removed, NOW),
+            Err(MemberAdmissionError::AwaitingApproval)
+        );
+        assert_eq!(
+            service.approval_requests_at(group_id, NOW).unwrap().len(),
+            1
+        );
     }
 
     #[test]

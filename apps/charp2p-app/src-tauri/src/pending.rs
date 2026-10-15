@@ -198,16 +198,19 @@ impl PendingInvitationService {
     }
 
     /// Removes a left group's protected discovery key. It is idempotent so an
-    /// interrupted leave can be retried after the group metadata is gone.
-    pub(crate) fn forget_joined_discovery(&self, group_id: PeerId) -> Result<(), &'static str> {
+    /// interrupted leave can be retried after the group metadata is gone, and
+    /// reports whether the leave's database step had recorded the cleanup
+    /// (ADR-057).
+    pub(crate) fn forget_joined_discovery(&self, group_id: PeerId) -> Result<bool, &'static str> {
         let _operation = self
             .operations
             .lock()
             .map_err(|_| "pending_invitation_service_unavailable")?;
-        let joined = self
+        let mut metadata = self
             .metadata
             .lock()
-            .map_err(|_| "pending_invitation_service_unavailable")?
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let joined = metadata
             .joined_groups()
             .map_err(|_| "pending_invitation_store_unavailable")?
             .iter()
@@ -215,7 +218,42 @@ impl PendingInvitationService {
         if joined {
             return Err("joined_group_still_present");
         }
-        self.discovery.remove(group_id)
+        self.discovery.remove(group_id)?;
+        metadata
+            .complete_left_group_discovery_cleanup(group_id)
+            .map_err(|_| "pending_invitation_store_unavailable")
+    }
+
+    /// Completes leaves interrupted after their database step by removing the
+    /// left groups' protected discovery keys at start. A group joined again
+    /// since keeps its new key. Failures stay recorded for the next start.
+    pub(crate) fn complete_interrupted_leaves(&self) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let mut metadata = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let left = metadata
+            .left_group_discovery_cleanups()
+            .map_err(|_| "pending_invitation_store_unavailable")?;
+        if left.is_empty() {
+            return Ok(());
+        }
+        let joined = metadata
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?;
+        for group_id in left {
+            if !joined.iter().any(|joined| joined.group_id == group_id) {
+                self.discovery.remove(group_id)?;
+            }
+            metadata
+                .complete_left_group_discovery_cleanup(group_id)
+                .map_err(|_| "pending_invitation_store_unavailable")?;
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_pending(&self, group_id: PeerId) -> Result<(), &'static str> {
@@ -799,8 +837,8 @@ mod tests {
             .unwrap()
             .leave_joined_group_and_put_encrypted_mls_provider_snapshot(group_id, b"snapshot")
             .unwrap());
-        service.forget_joined_discovery(group_id).unwrap();
-        service.forget_joined_discovery(group_id).unwrap();
+        assert!(service.forget_joined_discovery(group_id).unwrap());
+        assert!(!service.forget_joined_discovery(group_id).unwrap());
         assert!(service.discovery.get_optional(group_id).unwrap().is_none());
         assert!(service.joined().unwrap().is_empty());
         assert_eq!(
@@ -811,6 +849,44 @@ mod tests {
             service.accept_at(&encoded, NOW).unwrap().group_id,
             group_id.to_string()
         );
+    }
+
+    #[test]
+    fn interrupted_leave_is_completed_at_start_unless_rejoined() {
+        let service = service();
+        let (left_encoded, left_id) = invitation();
+        let (rejoined_encoded, rejoined_id) = invitation();
+        for (encoded, group_id) in [(&left_encoded, left_id), (&rejoined_encoded, rejoined_id)] {
+            service.accept_at(encoded, NOW).unwrap();
+            service.complete_join(group_id).unwrap();
+            service.joined().unwrap();
+            assert!(service
+                .metadata
+                .lock()
+                .unwrap()
+                .leave_joined_group_and_put_encrypted_mls_provider_snapshot(group_id, b"snapshot")
+                .unwrap());
+        }
+        service.accept_at(&rejoined_encoded, NOW).unwrap();
+        service.complete_join(rejoined_id).unwrap();
+        service.joined().unwrap();
+
+        service.complete_interrupted_leaves().unwrap();
+
+        assert!(service.discovery.get_optional(left_id).unwrap().is_none());
+        assert!(service
+            .discovery
+            .get_optional(rejoined_id)
+            .unwrap()
+            .is_some());
+        assert!(service
+            .metadata
+            .lock()
+            .unwrap()
+            .left_group_discovery_cleanups()
+            .unwrap()
+            .is_empty());
+        assert!(!service.forget_joined_discovery(left_id).unwrap());
     }
 
     #[test]

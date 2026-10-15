@@ -180,7 +180,8 @@ fn joined_groups(
 }
 
 /// Leaves a joined group on this device only. Group state goes first so a
-/// failed protected-storage cleanup is retried by leaving again.
+/// failed protected-storage cleanup is completed by leaving again or at the
+/// next start (ADR-057).
 #[tauri::command]
 fn leave_joined_group(
     group_id: String,
@@ -194,10 +195,13 @@ fn leave_joined_group(
             return Err(error.to_owned());
         }
     }
-    pending_service
+    let cleaned_up = pending_service
         .forget_joined_discovery(group_id)
         .map_err(str::to_owned)?;
-    left.map_err(str::to_owned)
+    if left.is_err() && !cleaned_up {
+        return Err("joined_group_not_found".to_owned());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1549,6 +1553,8 @@ pub fn run() {
                 Arc::clone(&storage_operations),
             )
             .map_err(std::io::Error::other)?;
+            // A leave whose key removal failed is retried at the next start.
+            let _ = pending.complete_interrupted_leaves();
             let database_path = data_directory.join("charp2p.sqlite3");
             let groups = Arc::new(
                 GroupService::open(&database_path, Arc::clone(&storage_operations))

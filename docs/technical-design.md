@@ -510,7 +510,9 @@ protects future messages; removal cannot erase data already received.
 A member leaves a joined group only on its own device (ADR-027): one
 transaction deletes the group's metadata, signed events, dependent local
 records, and OpenMLS state from the provider snapshot, and the protected
-discovery key is removed afterwards. The owner keeps the device as a member
+discovery key is removed afterwards. The transaction records the group in a
+cleanup table, so a leave interrupted before the key removal is completed by a
+retry or at the next start (ADR-057). The owner keeps the device as a member
 until it removes it.
 
 ## Group protocol

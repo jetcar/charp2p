@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use charp2p_core::SyncAuthorHead as AuthorHead;
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 /// Largest authenticated ciphertext accepted for one MLS provider snapshot.
 pub const MAX_ENCRYPTED_MLS_PROVIDER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024 + 128;
@@ -2242,9 +2242,38 @@ impl EventStore {
         ] {
             transaction.execute(statement, [&group_id])?;
         }
+        transaction.execute(
+            "INSERT OR IGNORE INTO left_group_discovery_cleanups (group_id) VALUES (?1)",
+            [&group_id],
+        )?;
         put_encrypted_mls_provider_snapshot_in_transaction(&transaction, encrypted)?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Lists left joined groups whose protected discovery key may still need
+    /// removal, so a leave interrupted after its database step is completed
+    /// by a retry or at the next start (ADR-057).
+    pub fn left_group_discovery_cleanups(&self) -> Result<Vec<PeerId>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT group_id FROM left_group_discovery_cleanups ORDER BY group_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| PeerId::from_bytes(&row?).map_err(|_| StoreError::CorruptIndex))
+            .collect()
+    }
+
+    /// Forgets a left group's pending discovery-key cleanup after the key was
+    /// removed, or because the group was joined again. Returns whether one was
+    /// recorded.
+    pub fn complete_left_group_discovery_cleanup(
+        &mut self,
+        group_id: PeerId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM left_group_discovery_cleanups WHERE group_id = ?1",
+            [group_id.to_bytes()],
+        )? != 0)
     }
 
     /// Records an authorized join request for an approval-required group and
@@ -2978,7 +3007,7 @@ impl EventStore {
                 transaction.pragma_update(None, "user_version", 6)?;
                 transaction.commit()?;
             }
-            6..=32 => {}
+            6..=33 => {}
             SCHEMA_VERSION => {}
             unsupported => return Err(StoreError::UnsupportedSchema(unsupported)),
         }
@@ -3551,6 +3580,17 @@ impl EventStore {
                      UPDATE owner_discovery_keys SET retirable = 0;",
                 )?;
             }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+
+        if version <= 33 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS left_group_discovery_cleanups (
+                    group_id BLOB PRIMARY KEY NOT NULL
+                 ) STRICT;",
+            )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -4602,6 +4642,10 @@ mod tests {
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"snapshot without the group"
         );
+        assert_eq!(
+            store.left_group_discovery_cleanups().unwrap(),
+            vec![left.group_id()]
+        );
         assert!(
             !store
                 .leave_joined_group_and_put_encrypted_mls_provider_snapshot(
@@ -4614,6 +4658,17 @@ mod tests {
             store.encrypted_mls_provider_snapshot().unwrap().unwrap(),
             b"snapshot without the group"
         );
+        assert!(
+            store
+                .complete_left_group_discovery_cleanup(left.group_id())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .complete_left_group_discovery_cleanup(left.group_id())
+                .unwrap()
+        );
+        assert!(store.left_group_discovery_cleanups().unwrap().is_empty());
     }
 
     #[test]

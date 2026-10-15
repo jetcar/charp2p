@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; superseded in part. ADR-057 records left groups so an
+interrupted leave is also completed at the next start.
 
 ## Date
 
@@ -24,7 +25,8 @@ applied commits), peer acknowledgements and local blocks, and stores the
 encrypted MLS provider snapshot from which the OpenMLS group state was deleted.
 The joined-group discovery key is then removed from platform-protected storage.
 That removal is idempotent and refused while the group metadata still exists,
-so an interrupted leave is completed by leaving again.
+so an interrupted leave is completed by leaving again or, per ADR-057, at the
+next start.
 
 Owners cannot leave their own group; owned groups are not joined groups.
 

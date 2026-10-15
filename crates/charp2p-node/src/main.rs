@@ -173,13 +173,21 @@ async fn main() -> Result<(), NodeError> {
                     println!("Listening: {address}/p2p/{peer_id}");
                 }
                 NetworkEvent::SyncRequestReceived { request_id, .. } => {
-                    node.reject_sync_request(request_id, SyncRejectReason::Unauthorized)?;
+                    // A peer that closed its stream before the answer was sent
+                    // must not stop the node.
+                    if node.reject_sync_request(request_id, SyncRejectReason::Unauthorized).is_err() {
+                        eprintln!("Synchronization rejection not delivered: peer stream closed");
+                    }
                 }
                 NetworkEvent::JoinRequestReceived { request_id, .. } => {
-                    node.reject_join_request(request_id, JoinRejectReason::Unauthorized)?;
+                    if node.reject_join_request(request_id, JoinRejectReason::Unauthorized).is_err() {
+                        eprintln!("Join rejection not delivered: peer stream closed");
+                    }
                 }
                 NetworkEvent::InviteRequestReceived { request_id, .. } => {
-                    node.reject_invite_request(request_id, InviteRejectReason::Unauthorized)?;
+                    if node.reject_invite_request(request_id, InviteRejectReason::Unauthorized).is_err() {
+                        eprintln!("Invitation rejection not delivered: peer stream closed");
+                    }
                 }
                 NetworkEvent::DiscoveryFailed { operation, .. } => {
                     eprintln!("DHT {} operation failed", operation_name(operation));

@@ -81,7 +81,12 @@ pub fn build_authorized_response(
             return Err(SynchronizationError::UnexpectedRequest);
         }
     };
-    response.validate()?;
+    // The request was valid; local state that exceeds a protocol limit is
+    // this device's problem, so callers answer `busy` rather than blaming
+    // the requester.
+    response
+        .validate()
+        .map_err(SynchronizationError::UnservableResponse)?;
     Ok(response)
 }
 
@@ -120,7 +125,9 @@ pub fn record_reported_heads(
         group_id: *group_id,
         peers,
     };
-    response.validate()?;
+    response
+        .validate()
+        .map_err(SynchronizationError::UnservableResponse)?;
     Ok(response)
 }
 
@@ -550,6 +557,10 @@ pub enum SynchronizationError {
     /// A locally stored event could not be canonically encoded.
     #[error("stored event encoding failed")]
     Event(#[from] EventError),
+    /// Locally stored state produced a response that violates protocol
+    /// limits, such as a summary with more than 1,024 authors.
+    #[error("locally built synchronization response violates protocol limits")]
+    UnservableResponse(#[source] SyncError),
     /// The response byte limit was exceeded while calculating a page.
     #[error("synchronization response exceeds its byte limit")]
     ResponseLimit,
@@ -614,8 +625,9 @@ fn local_author_head(
 #[cfg(test)]
 mod tests {
     use charp2p_core::{
-        DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity, SignedEvent, SyncAuthorHead,
-        SyncMembershipState, SyncPeerHead, SyncRequest, SyncResponse,
+        DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity, MAX_SYNC_AUTHORS,
+        SignedEvent, SyncAuthorHead, SyncError, SyncMembershipState, SyncPeerHead, SyncRequest,
+        SyncResponse,
     };
     use charp2p_store::EventStore;
 
@@ -688,6 +700,28 @@ mod tests {
             target.synchronization_summary(group.group_id()).unwrap(),
             heads
         );
+    }
+
+    #[test]
+    fn oversized_local_summary_is_unservable_not_an_invalid_request() {
+        let group = GroupIdentity::generate();
+        let events: Vec<_> = (0..=MAX_SYNC_AUTHORS)
+            .map(|_| message_event(&DeviceIdentity::generate(), &group, 1, b"message"))
+            .collect();
+        let mut store = EventStore::in_memory().unwrap();
+        store.put_events(&events).unwrap();
+
+        assert!(matches!(
+            build_authorized_response(
+                &store,
+                &SyncRequest::Summary {
+                    group_id: group.group_id(),
+                },
+            ),
+            Err(SynchronizationError::UnservableResponse(
+                SyncError::TooManyAuthors
+            ))
+        ));
     }
 
     #[test]

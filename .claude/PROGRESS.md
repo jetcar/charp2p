@@ -241,7 +241,7 @@
 - [x] Owner invitation address hints, part 1/2: charp2p-network emits a listen-address-expired event for `ExpiredListenAddr` and each address of `ListenerClosed` (closed relay reservations), with a test.
 - [x] Owner invitation address hints, part 2/2: app forgets expired owner listen addresses so new invitations carry only current hints (technical-design 'current listen addresses').
 - [x] Docs: timeline polling re-reads from the newest message back to the oldest loaded one (bounded to 100 pages), not only the newest page (technical-design Message protection).
-- [ ] Sync serving: a summary with more than 1,024 authors fails as `invalid request`; answer `busy` (or truncate and document) since the request was valid.
+- [x] Sync serving: a summary with more than 1,024 authors fails as `invalid request`; answer `busy` (or truncate and document) since the request was valid.
 
 ## Needs human
 
@@ -479,3 +479,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-15T02:29:33Z Owner invitation address hints part 1/2: charp2p-network emits ListenAddressesExpired for ExpiredListenAddr and for every address of a closed listener (relay reservation loss), sharing external-address withdrawal; test removes a TCP listener and expects its address reported. App matches use catch-all arms, src-tauri unchanged. fmt, clippy, workspace tests, npm build pass.
 2026-10-15T03:33:21Z Owner invitation address hints part 2/2: owner advertising loops (initial announce and background) drop ListenAddressesExpired addresses (peer ID stripped) from the owner hint list; unit test forgets a relayed and a direct address and re-records. fmt, clippy, workspace and src-tauri tests (webkit libs via apt), npm build pass.
 2026-10-15T04:27:47Z Docs: timeline poll re-read of earlier pages: technical-design Message protection now describes re-reading back to the oldest loaded page (bounded to 100 pages); all checks pass.
+2026-10-15T05:28:37Z Sync serving oversized summary: build_authorized_response/record_reported_heads map local response validation failures to SynchronizationError::UnservableResponse, which the app already answers as `busy`; test with 1,025 authors; technical-design Synchronization updated.

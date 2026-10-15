@@ -670,6 +670,10 @@ function Stepper({ step }: { step: SetupStep }) {
   );
 }
 
+// Tolerated clock difference between this device and the owner device when
+// comparing an issued expiry with the requested lifetime.
+const EXPIRY_CLOCK_SLACK_SECONDS = 300;
+
 function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupName: string }) {
   const [invitation, setInvitation] = useState<IssuedInvitation | null>(null);
   const [requesting, setRequesting] = useState(false);
@@ -677,10 +681,12 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
   const [copied, setCopied] = useState(false);
   const [qrCode, setQrCode] = useState("");
   const [error, setError] = useState("");
+  const [earlierReturned, setEarlierReturned] = useState(false);
 
   useEffect(() => {
     let active = true;
     setInvitation(null);
+    setEarlierReturned(false);
     if (!isTauri()) return;
     void invoke<IssuedInvitation[]>("received_member_invitations")
       .then((received) => {
@@ -721,7 +727,12 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
     setCopied(false);
     setRequesting(true);
     try {
-      setInvitation(await invoke<IssuedInvitation>("request_member_invitation", { groupId, lifetimeSeconds }));
+      const requestedAtUnix = Math.floor(Date.now() / 1000);
+      const issued = await invoke<IssuedInvitation>("request_member_invitation", { groupId, lifetimeSeconds });
+      // The owner only shortens a requested expiry, so a later one is this
+      // device's earlier active invitation returned unchanged (ADR-043).
+      setEarlierReturned(issued.expiresAtUnix > requestedAtUnix + lifetimeSeconds + EXPIRY_CLOCK_SLACK_SECONDS);
+      setInvitation(issued);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -761,6 +772,12 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
             {current.approvalRequired ? " · Owner approval needed" : " · No owner approval needed"}
             {" · Issued by the group owner"}
           </p>
+          {earlierReturned && (
+            <p className="preview-note" role="status">
+              This device already had an active invitation for this group, so the owner returned it with its later expiry
+              instead of issuing a new one.
+            </p>
+          )}
           {qrCode && (
             <figure className="invitation-qr">
               <img alt={`QR code invitation for ${groupName}`} height="320" src={qrCode} width="320" />

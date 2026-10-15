@@ -258,7 +258,7 @@
 - [x] Network contribution: start the opted-in contribution node when community nodes are added (stays "Not contributing" after adding one until restart or toggle) (ADR-031, ADR-038, product page 9).
 - [x] Docs/UI: threat-model "Bearer and secret leakage" row and the "How identity works" text still say the discovery secret / group material never reaches the webview; align with ADR-055 (encoded bearer as opaque text, CSP-dependent residual).
 - [x] Privacy page: cover what this device stores (encrypted local copies, protected keys, optional retention) and what diagnostics leave out, as the Settings "Privacy" entry and app README promise (product page 10).
-- [ ] Member invitations: when a member requests an invitation with a chosen expiry while its earlier one is still active, tell the member the earlier one is returned with its later expiry (ADR-043, product pages 3/8).
+- [x] Member invitations: when a member requests an invitation with a chosen expiry while its earlier one is still active, tell the member the earlier one is returned with its later expiry (ADR-043, product pages 3/8).
 
 ## Needs human
 
@@ -510,3 +510,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-15T16:33:52Z Network contribution restarts on community node changes: set_community_nodes now stops the contribution node with the advertising provider and re-applies the stored preference through the new list; network test added; workspace + src-tauri fmt/clippy/test and npm build pass (installed webkit2gtk/gtk dev libs for src-tauri).
 2026-10-15T17:27:17Z ADR-055 bearer text: threat-model "Bearer and secret leakage" row now describes opaque-text handling in the webview, Rust-only decoding and the CSP-dependent residual; "How identity works" says keys never reach the interface and invitation links are opaque text decoded by the core. fmt, clippy, workspace tests, npm build pass.
 2026-10-15T18:26:45Z Privacy page storage and diagnostics: added "What this device stores" (encrypted local copies, protected keys, optional retention) and "What diagnostics leave out" sections; README updated; fmt/clippy/tests/npm build pass, no Rust changes.
+2026-10-15T19:29:08Z Member invitation earlier-returned notice: member Invite panel compares the issued expiry with the requested lifetime (owner only shortens; 5-minute clock slack) and tells the member its earlier active invitation was returned with its later expiry (ADR-043). Frontend-only; fmt, clippy, workspace tests, npm build pass.

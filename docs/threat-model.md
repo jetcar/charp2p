@@ -61,7 +61,7 @@ that another device will apply.
 | Duplicate or replayed join request | Admission is idempotent per device and exact KeyPackage hash; a different KeyPackage for an admitted device is rejected (ADR-019). | A device that lost its MLS state cannot rejoin until the owner removes it. |
 | Welcome from a malicious peer | The client accepts a Welcome only from the pinned owner connection, validates every leaf, the ciphersuite, and the profile extension before persisting. | None known. |
 | Oversized join messages | 8 KiB invitation, 128 KiB KeyPackage and Welcome bounds enforced before allocation; 30 s timeout; 16 streams per connection (ADR-015). | Owner CPU spent on bounded verification. |
-| Bearer and secret leakage | Discovery secret never reaches the webview; secret-bearing buffers are redacted and zeroed; diagnostics exclude invitations and keys. | A link pasted into another app is outside CharP2P's control. |
+| Bearer and secret leakage | The webview holds an encoded invitation only as opaque text the user pasted, opened, or is sharing, and passes it unchanged to Rust; only the Rust parser decodes it, and no command returns the decoded discovery secret, discovery keys, capability, or address hints (ADR-055). The UI does not persist or log the bearer; secret-bearing buffers are redacted and zeroed; diagnostics exclude invitations and keys. | The bearer's confidentiality inside the webview rests on the bundled frontend and the Content Security Policy. A link pasted into another app is outside CharP2P's control. |
 
 ## Removal
 

@@ -1283,7 +1283,7 @@ function InformationView({
           </section>
           <section>
             <h3>Private keys remain protected</h3>
-            <p>Private identity and group material stays in platform-protected storage and is never returned to the app interface.</p>
+            <p>Private identity keys and group keys stay in platform-protected storage and are never returned to the app interface. An invitation link you paste, open, or share is handled as opaque text and decoded only by the app’s protected core. Share invitation links only with the people you intend to invite.</p>
           </section>
           <section>
             <h3>Membership verifies devices</h3>

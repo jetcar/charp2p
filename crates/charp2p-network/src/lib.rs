@@ -811,6 +811,21 @@ impl NetworkNode {
         }
     }
 
+    /// Stops publishing a listen address that is no longer bound.
+    fn forget_listen_address(&mut self, address: &Multiaddr) {
+        if self.relay_server {
+            self.swarm.remove_external_address(address);
+        } else if let Some(position) = self
+            .routable_listen_addresses
+            .iter()
+            .position(|candidate| candidate == address)
+        {
+            self.routable_listen_addresses.remove(position);
+            self.swarm.remove_external_address(address);
+            self.confirm_direct_addresses();
+        }
+    }
+
     /// Waits for the next application-relevant network event.
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
@@ -827,17 +842,18 @@ impl NetworkNode {
                     return NetworkEvent::Listening { address };
                 }
                 SwarmEvent::ExpiredListenAddr { address, .. } => {
-                    if self.relay_server {
-                        self.swarm.remove_external_address(&address);
-                    } else if let Some(position) = self
-                        .routable_listen_addresses
-                        .iter()
-                        .position(|candidate| candidate == &address)
-                    {
-                        self.routable_listen_addresses.remove(position);
-                        self.swarm.remove_external_address(&address);
-                        self.confirm_direct_addresses();
+                    self.forget_listen_address(&address);
+                    return NetworkEvent::ListenAddressesExpired {
+                        addresses: vec![address],
+                    };
+                }
+                // A closed listener, such as a lost relay reservation, does
+                // not report its addresses as expired individually.
+                SwarmEvent::ListenerClosed { addresses, .. } if !addresses.is_empty() => {
+                    for address in &addresses {
+                        self.forget_listen_address(address);
                     }
+                    return NetworkEvent::ListenAddressesExpired { addresses };
                 }
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
@@ -1242,6 +1258,12 @@ pub enum NetworkEvent {
     Listening {
         /// Bound network address.
         address: Multiaddr,
+    },
+    /// Listen addresses stopped being bound, for example because the
+    /// interface went away or a relay reservation closed.
+    ListenAddressesExpired {
+        /// Addresses that should no longer be shared with peers.
+        addresses: Vec<Multiaddr>,
     },
     /// A configured relay granted this node a bounded listen reservation.
     RelayReservationAccepted {
@@ -2855,6 +2877,30 @@ mod tests {
         let node = NetworkNode::new(Keypair::generate_ed25519());
 
         assert!(!node.swarm.behaviour().lan_discovery.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn closed_listeners_report_their_addresses_as_expired() {
+        let mut node = NetworkNode::new(Keypair::generate_ed25519());
+        let listener = node
+            .swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let address = next_listen_address(&mut node).await;
+
+        assert!(node.swarm.remove_listener(listener));
+        let expired = timeout(TEST_TIMEOUT, async {
+            loop {
+                if let NetworkEvent::ListenAddressesExpired { addresses } = node.next_event().await
+                {
+                    return addresses;
+                }
+            }
+        })
+        .await
+        .expect("listener closure is reported");
+
+        assert_eq!(expired, vec![address]);
     }
 
     async fn next_listen_address(node: &mut NetworkNode) -> Multiaddr {

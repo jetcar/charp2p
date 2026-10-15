@@ -761,8 +761,10 @@ flag indicating whether older locally retained messages exist. Older pages are
 read with a cursor of the oldest shown message's creation time and event ID;
 each page holds up to 256 messages strictly before that cursor, ordered by
 creation time with the event ID breaking equal timestamps, so pages neither
-repeat nor skip messages. A poll replaces only the newest page and keeps
-already loaded earlier pages.
+repeat nor skip messages. When earlier pages are shown, a poll re-reads pages
+from the newest message back to the oldest loaded one, bounded to 100 pages, so
+local deletions, edits, retention, and local blocks also apply to earlier
+pages.
 
 Each device keeps readable message text as one bounded local display copy
 protected with XChaCha20-Poly1305 under the platform-protected provider wrapping

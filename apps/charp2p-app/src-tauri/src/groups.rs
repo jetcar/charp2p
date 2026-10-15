@@ -1104,6 +1104,9 @@ impl GroupService {
             store
                 .remove_issued_invitation(existing.invitation_id)
                 .map_err(|_| "group_store_unavailable")?;
+            // An expired key no longer counts against the key bounds unless
+            // it admitted a current member (ADR-054).
+            self.retire_owner_discovery_key(&mut store, group_id, existing.invitation_id)?;
         }
         if active >= MAX_ACTIVE_INVITATIONS_PER_GROUP {
             return Err("invitation_limit_reached");
@@ -1285,6 +1288,11 @@ impl GroupService {
                 store
                     .remove_issued_invitation(indexed.invitation_id)
                     .map_err(|_| "group_store_unavailable")?;
+                self.retire_owner_discovery_key(
+                    &mut store,
+                    indexed.group_id,
+                    indexed.invitation_id,
+                )?;
                 continue;
             }
             active.push(indexed.invitation_id);
@@ -2935,6 +2943,33 @@ mod tests {
         assert!(service
             .owner_discovery_keys
             .get_optional(used)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn issuing_retires_keys_of_expired_invitations() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Project Atlas")).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let first = service
+            .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", NOW)
+            .unwrap();
+        let first_id = request_invitation_id(&join_request(&first.link, NOW), NOW);
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 1);
+
+        // Issuing after expiry removes the expired bearer and its unused key
+        // without waiting for the listing sweep.
+        let expired = NOW + 400 * 86_400;
+        service
+            .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", expired)
+            .unwrap();
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 1);
+        assert!(service
+            .owner_discovery_keys
+            .get_optional(first_id)
             .unwrap()
             .is_none());
     }

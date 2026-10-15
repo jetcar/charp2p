@@ -246,7 +246,8 @@ after the bearer has expired, been revoked or been retired as consumed its key
 is retired (index first, then the protected key) once no current admission
 records that invitation; removing the last member it admitted makes it
 retireable too. Revocation and consumed-bearer retirement retire the key
-immediately, and listing issued invitations, which runs before every
+immediately, issuing retires the keys of the group's expired invitations
+it removes, and listing issued invitations, which runs before every
 background advertisement recheck, sweeps the rest. Keys indexed before
 provenance was recorded are kept. One background
 provider advertises the retained keys of every owned group while the app runs,

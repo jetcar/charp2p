@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; superseded in part. ADR-058 stops the owner advertiser at once,
+restarts an opted-in contribution node immediately through the new list and
+lets a running member serving node keep its connections until it next starts.
 
 ## Date
 

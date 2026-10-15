@@ -262,7 +262,7 @@
 
 - [x] Join fallback page: load its stylesheet and script by absolute `/i/` paths so the page works at the canonical `https://join.charp2p.example/i` (no trailing slash), and document serving it at `/i` without a redirect to `/i/`, which the app rejects (technical-design Invitations and links).
 - [x] Leave: a retried leave after the database step succeeds (no `joined_group_not_found`) once the protected discovery key is removed, and a leave interrupted before key removal is completed at the next start (ADR-027).
-- [ ] Docs: ADR-038 superseded in part — the owner advertiser stops at once, an opted-in contribution node restarts immediately through new community nodes, a running member serving node keeps its connections until it next starts.
+- [x] Docs: ADR-038 superseded in part — the owner advertiser stops at once, an opted-in contribution node restarts immediately through new community nodes, a running member serving node keeps its connections until it next starts.
 
 ## Needs human
 
@@ -517,3 +517,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-15T19:29:08Z Member invitation earlier-returned notice: member Invite panel compares the issued expiry with the requested lifetime (owner only shortens; 5-minute clock slack) and tells the member its earlier active invitation was returned with its later expiry (ADR-043). Frontend-only; fmt, clippy, workspace tests, npm build pass.
 2026-10-15T20:35:29Z Join fallback page at /i: re-derived backlog (3 gaps: fallback page assets at canonical /i, interrupted leave completion, stale ADR-038). index.html now loads /i/join.css and /i/join.js by absolute path (relative paths 404 at /i, and /i/ is rejected by the app); README says serve at /i without redirect. fmt, clippy, workspace tests, npm build pass.
 2026-10-15T21:32:59Z Interrupted leave completion: store schema 34 records left groups in left_group_discovery_cleanups inside the leave transaction; key removal clears it, a retried leave after the database step now succeeds, and startup removes recorded keys unless the group was rejoined (ADR-057, ADR-027 superseded in part, technical-design updated). Store + pending tests added; workspace + src-tauri fmt/clippy/test and npm build pass.
+2026-10-15T22:28:30Z ADR-038 superseded in part: added ADR-058 (owner advertiser stops at once, opted-in contribution node restarts immediately through the new list, member serving node keeps connections until next start); ADR-038 status and technical-design Discovery updated. Docs-only; fmt, clippy, workspace tests, npm build pass.

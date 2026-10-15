@@ -221,7 +221,8 @@ Clients enter the network through a list of built-in bootstrap
 multiaddresses compiled into each app release, so the list is versioned with
 the app. The list stays empty until public bootstrap nodes are deployed; until
 then development builds take bootstrap nodes from the `CHARP2P_BOOTSTRAP_NODES`
-environment variable and users can add community bootstrap nodes (ADR-038).
+environment variable and users can add community bootstrap nodes (ADR-038), which apply to running
+nodes as ADR-058 describes.
 Invitations and learned routing tables provide additional
 entry points: a client remembers up to 8 routing peers it recently reached in a
 device-local file and adds them as extra DHT entry points when its node starts

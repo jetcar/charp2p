@@ -244,7 +244,11 @@ fn rename_group(
         .change_group_metadata(group_id, &identity, &metadata)
         .map_err(str::to_owned)?;
     network_service.notify_group_events(group_id);
-    Ok(())
+    // Invitations and admissions take the name from the local record.
+    group_service
+        .set_name(group_id, &group_name)
+        .map(|_| ())
+        .map_err(str::to_owned)
 }
 
 /// Changes an owned group's icon and shares it with members first, so a

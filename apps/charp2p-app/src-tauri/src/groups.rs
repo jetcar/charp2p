@@ -406,6 +406,31 @@ impl GroupService {
         Ok(metadata.into())
     }
 
+    /// Records an owned group's new name after its authenticated rename, so
+    /// later invitations and admissions carry the current name.
+    pub fn set_name(&self, group_id: PeerId, group_name: &str) -> Result<LocalGroup, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let group_name = normalize_group_name(group_name)?;
+        let mut store = self
+            .metadata
+            .lock()
+            .map_err(|_| "group_service_unavailable")?;
+        let mut metadata = store
+            .local_groups()
+            .map_err(|_| "group_store_unavailable")?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or("group_not_owned")?;
+        metadata.group_name = group_name;
+        store
+            .put_local_group(&metadata)
+            .map_err(|_| "group_store_unavailable")?;
+        Ok(metadata.into())
+    }
+
     /// `address_hints` are the inviter device's current addresses, carried
     /// in the invitation as root-signed hints (ADR-037). `reusable` overrides
     /// the group's default reuse policy for this invitation (ADR-042), and
@@ -2038,6 +2063,35 @@ mod tests {
         assert_eq!(service.set_icon(group_id, 5), Err("invalid_group_icon"));
         assert_eq!(
             service.set_icon(DeviceIdentity::generate().peer_id(), 1),
+            Err("group_not_owned")
+        );
+    }
+
+    #[test]
+    fn renamed_group_issues_invitations_with_its_current_name() {
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let created = service.create(spec("Atlas")).unwrap();
+        let group_id: PeerId = created.group_id.parse().unwrap();
+
+        let renamed = service.set_name(group_id, "  Phoenix ").unwrap();
+
+        assert_eq!(renamed.group_name, "Phoenix");
+        assert_eq!(renamed.icon, created.icon);
+        assert_eq!(service.list().unwrap(), vec![renamed]);
+        let issued = service
+            .issue_invitation_at(
+                group_id,
+                DeviceIdentity::generate().peer_id(),
+                "Maya's PC",
+                NOW,
+            )
+            .unwrap();
+        let decoded = Invitation::decode_input(&issued.link, NOW).unwrap();
+        assert_eq!(decoded.group_name(), "Phoenix");
+        assert_eq!(service.set_name(group_id, " "), Err("invalid_group_name"));
+        assert_eq!(
+            service.set_name(DeviceIdentity::generate().peer_id(), "Other"),
             Err("group_not_owned")
         );
     }

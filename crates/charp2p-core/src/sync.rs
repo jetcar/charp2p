@@ -283,9 +283,8 @@ fn validate_events(group_id: &PeerId, encoded_events: &[Vec<u8>]) -> Result<(), 
     if encoded_events.len() > MAX_SYNC_BATCH_ITEMS {
         return Err(SyncError::TooManyEventIds);
     }
+    // Size limits apply to the whole batch before any signature is verified.
     let mut total_bytes = 0_usize;
-    let mut event_ids = HashSet::with_capacity(encoded_events.len());
-
     for encoded in encoded_events {
         if encoded.len() > MAX_SYNC_EVENT_BYTES {
             return Err(SyncError::EventTooLarge);
@@ -296,7 +295,10 @@ fn validate_events(group_id: &PeerId, encoded_events: &[Vec<u8>]) -> Result<(), 
         if total_bytes > MAX_SYNC_RESPONSE_BYTES {
             return Err(SyncError::ResponseTooLarge);
         }
+    }
 
+    let mut event_ids = HashSet::with_capacity(encoded_events.len());
+    for encoded in encoded_events {
         let event = SignedEvent::decode(encoded)?;
         if event.group_id() != *group_id {
             return Err(SyncError::GroupMismatch);
@@ -313,8 +315,8 @@ mod tests {
     use crate::{DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity};
 
     use super::{
-        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, SyncAuthorHead, SyncError, SyncMembershipState,
-        SyncPeerHead, SyncRequest, SyncResponse,
+        MAX_SYNC_AUTHORS, MAX_SYNC_BATCH_ITEMS, MAX_SYNC_EVENT_BYTES, SyncAuthorHead, SyncError,
+        SyncMembershipState, SyncPeerHead, SyncRequest, SyncResponse,
     };
 
     #[test]
@@ -475,6 +477,34 @@ mod tests {
             }
             .validate(),
             Err(SyncError::GroupMismatch)
+        ));
+    }
+
+    #[test]
+    fn oversized_event_batches_are_rejected_before_signature_verification() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let mut forged = signed_event(&author, &group, 1).encode().unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        let mut encoded_events = vec![forged.clone()];
+        encoded_events.extend(std::iter::repeat_n(vec![0_u8; MAX_SYNC_EVENT_BYTES], 16));
+
+        assert!(matches!(
+            SyncResponse::Events {
+                group_id: group.group_id(),
+                encoded_events: vec![forged],
+            }
+            .validate(),
+            Err(SyncError::InvalidEvent(_))
+        ));
+        assert!(matches!(
+            SyncResponse::Events {
+                group_id: group.group_id(),
+                encoded_events,
+            }
+            .validate(),
+            Err(SyncError::ResponseTooLarge)
         ));
     }
 

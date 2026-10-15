@@ -1333,11 +1333,14 @@ fn community_nodes(
 }
 
 /// Stores the community bootstrap nodes and uses them for new connections;
-/// the owner advertising provider restarts on its next refresh.
+/// the owner advertising provider restarts on its next refresh and an
+/// opted-in contribution node restarts now through the new list (ADR-031).
 #[tauri::command]
 async fn set_community_nodes(
     addresses: Vec<String>,
     service: tauri::State<'_, CommunityNodesService>,
+    contribution_service: tauri::State<'_, ContributionService>,
+    identity_service: tauri::State<'_, IdentityService>,
     network_service: tauri::State<'_, NetworkService>,
 ) -> Result<Vec<String>, String> {
     let preference = CommunityNodesPreference { addresses };
@@ -1347,6 +1350,14 @@ async fn set_community_nodes(
         .map_err(str::to_owned)?;
     service.set(&preference).map_err(str::to_owned)?;
     network_service.use_community_peers(peers).await;
+    // The node list is already stored, so a contribution that cannot start
+    // shows on the Network page instead of failing the change.
+    if let Ok(status) = contribution_service.status() {
+        if status.available && status.preference.routing {
+            let _ =
+                apply_contribution(status.preference, &identity_service, &network_service).await;
+        }
+    }
     Ok(preference.addresses)
 }
 

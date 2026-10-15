@@ -634,12 +634,14 @@ impl NetworkService {
 
     /// Uses the community nodes for new connections. The owner advertising
     /// provider stops so its next refresh bootstraps and reserves relays
-    /// through the new list.
+    /// through the new list, and the contribution node stops so the caller
+    /// restarts it from the stored preference through the new list.
     pub async fn use_community_peers(&self, peers: Vec<BootstrapPeer>) {
         self.replace_community_peers(peers);
         if let Some(existing) = self.advertisement.lock().await.take() {
             existing.task.abort();
         }
+        self.contribution.lock().await.take();
         clear_owner_addresses(&self.owner_addresses);
         clear_owner_peers(&self.owner_peers);
     }
@@ -3916,6 +3918,35 @@ mod tests {
                 Ok("routingAndRelay")
             );
             service.stop_contribution().await;
+            assert_eq!(service.status().await.contribution_status, "inactive");
+        });
+    }
+
+    #[test]
+    fn contribution_starts_through_added_community_nodes() {
+        let service = NetworkService::from_sources(&[], "").unwrap();
+        let community = DeviceIdentity::generate().peer_id();
+        let address = format!("/ip4/127.0.0.1/udp/9/quic-v1/p2p/{community}");
+
+        tauri::async_runtime::block_on(async {
+            assert_eq!(
+                service
+                    .start_contribution(DeviceIdentity::generate(), None)
+                    .await,
+                Ok("bootstrapRequired")
+            );
+            let peers = service.community_peers(&[address]).unwrap();
+            service.use_community_peers(peers).await;
+            assert_eq!(
+                service
+                    .start_contribution(DeviceIdentity::generate(), None)
+                    .await,
+                Ok("routing")
+            );
+            assert_eq!(service.status().await.contribution_status, "routing");
+
+            // A changed list stops the node until the preference is re-applied.
+            service.use_community_peers(Vec::new()).await;
             assert_eq!(service.status().await.contribution_status, "inactive");
         });
     }

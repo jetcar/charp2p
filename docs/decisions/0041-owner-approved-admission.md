@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; superseded in part. A declined request is kept as a declined record
+until the owner allows the device to ask again (technical design, Connectivity),
+and single-use invitations are enforced by ADR-042.
 
 ## Date
 

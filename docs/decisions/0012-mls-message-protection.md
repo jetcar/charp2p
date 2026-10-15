@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; the fresh KeyPackage after a rejected Welcome is superseded by
+ADR-052, which retains the original KeyPackage for the pending join.
 
 ## Date
 

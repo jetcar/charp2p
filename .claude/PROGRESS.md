@@ -247,7 +247,7 @@
 - [x] Owner admission: check the removed-device marker before recording an approval request in approval-required groups, answering `unauthorized` instead of `awaiting approval` (ADR-020/041, technical-design removal).
 - [x] Members applying a `MemberRemoved` commit drop the removed device's invite permission so re-admission does not restore it (ADR-036, technical-design InvitePermissionChanged).
 - [x] Member push starts from the owner's durably acknowledged author head instead of sequence 0, so each sync does not re-upload and charge the whole own history (ADR-024, ADR-033).
-- [ ] Docs: mark ADR-006/012/015/041 superseded in part (ReportHeads/EventsAvailable and edit/delete uploads, ADR-052 retained KeyPackage, AwaitingApproval, declined requests kept, ADR-042 single-use); fix stale past-epoch comment in mls_storage.rs (ADR-048).
+- [x] Docs: mark ADR-006/012/015/041 superseded in part (ReportHeads/EventsAvailable and edit/delete uploads, ADR-052 retained KeyPackage, AwaitingApproval, declined requests kept, ADR-042 single-use); fix stale past-epoch comment in mls_storage.rs (ADR-048).
 
 ## Needs human
 
@@ -491,3 +491,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-15T08:35:30Z Owner admission removed-device check: admission_approval refuses a removed device as unauthorized before recording an approval request; test covers refusal, empty request list, and a new request once re-admission is allowed. fmt, clippy, workspace and src-tauri tests (webkit libs via apt), npm build pass.
 2026-10-15T09:35:17Z Member-side invite permission on removal: put_applied_mls_membership_commit withdraws grants of devices a MemberRemoved commit left outside the group, so re-admission does not restore them; test covers removal then re-admission; technical-design InvitePermissionChanged updated. fmt, clippy, workspace and src-tauri tests (webkit libs via apt), npm build pass.
 2026-10-15T10:33:57Z Member push from acknowledged head: push_to_connected_peer starts after the owner's durably acknowledged head of the member's own events (new SynchronizationService::acknowledged_head); test pushes a second message after acknowledgement and uploads only it; technical-design Synchronization updated. fmt, clippy, workspace and src-tauri tests (webkit libs via apt), npm build pass.
+2026-10-15T11:33:22Z Docs ADR status: ADR-006, 012, 015, 041 marked superseded in part (ReportHeads/EventsAvailable and edit/delete uploads, ADR-052 retained KeyPackage, awaiting approval and durable admission, declined records kept, ADR-042 single-use); mls_storage.rs pull comment now describes the ADR-048 past-epoch window. fmt, clippy, workspace tests, src-tauri check (webkit libs via apt), npm build pass.

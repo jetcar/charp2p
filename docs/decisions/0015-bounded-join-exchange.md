@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; superseded in part. ADR-041 adds a fourth rejection category,
+`awaiting approval`, and profile-valid requests are now admitted through the
+durable MLS acceptance handler (ADR-019) instead of answered `busy`.
 
 ## Date
 

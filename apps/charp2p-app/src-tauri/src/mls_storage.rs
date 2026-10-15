@@ -1917,9 +1917,10 @@ impl MlsProviderService {
         let progress = session
             .handle_response(&mut store, response)
             .map_err(|_| "synchronization_failed")?;
-        // Messages are read before each later commit is applied: the group
-        // keeps no past-epoch secrets, so a message pulled together with the
-        // commit that ends its epoch is readable only before that commit.
+        // Messages are read before each later commit is applied, so a message
+        // pulled together with the commit that ends its epoch is read in its
+        // own epoch even when that epoch later leaves the past-epoch window
+        // (ADR-048).
         loop {
             self.materialize_pending_messages(&mut provider, &mut store, session.group_id())?;
             if !self.apply_next_group_commit(&mut provider, &mut store, session.group_id())? {

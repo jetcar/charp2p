@@ -1735,8 +1735,9 @@ impl EventStore {
 
     /// Atomically records an applied owner MLS commit on a member device with
     /// its membership effects (ADR-051): a removal's signed author cut-off is
-    /// recorded, and cut-offs of devices that are current members again are
-    /// cleared.
+    /// recorded, invite permissions of devices a removal left outside the
+    /// group are withdrawn (ADR-036), and cut-offs of devices that are current
+    /// members again are cleared.
     pub fn put_applied_mls_membership_commit(
         &mut self,
         event: &SignedEvent,
@@ -1787,6 +1788,31 @@ impl EventStore {
                 removed_member_id,
                 cutoff_sequence,
             )?;
+        }
+        // A removal withdraws the invite permission of every device it left
+        // outside the group, so re-admission does not restore it (ADR-036).
+        if event.kind() == charp2p_core::EventKind::MemberRemoved && !current_members.is_empty() {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT target_device_id FROM applied_invite_permissions
+                 WHERE group_id = ?1 AND granted = 1",
+            )?;
+            let granted = statement
+                .query_map([event.group_id().to_bytes()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            for device_id in granted {
+                let device =
+                    PeerId::from_bytes(&device_id).map_err(|_| StoreError::CorruptIndex)?;
+                if !current_members.contains(&device) {
+                    transaction.execute(
+                        "UPDATE applied_invite_permissions SET granted = 0
+                         WHERE group_id = ?1 AND target_device_id = ?2",
+                        params![event.group_id().to_bytes(), device_id],
+                    )?;
+                }
+            }
         }
         transaction.commit()?;
         Ok(inserted)
@@ -5635,6 +5661,76 @@ mod tests {
                 .removed_author_cutoff(group.group_id(), member.peer_id())
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn applied_member_removal_withdraws_invite_permission_after_readmission() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let group = GroupIdentity::generate();
+        let owner_event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"owner event",
+                },
+            )
+            .unwrap()
+        };
+        let grant = owner_event(1, EventKind::InvitePermissionChanged);
+        let other_grant = owner_event(2, EventKind::InvitePermissionChanged);
+        let removal = owner_event(3, EventKind::MemberRemoved);
+        let readded = owner_event(4, EventKind::MemberAdded);
+        for event in [&grant, &other_grant, &removal, &readded] {
+            store.put_event(event).unwrap();
+        }
+        for (event, device) in [(&grant, member), (&other_grant, other)] {
+            store
+                .put_invite_permission_and_encrypted_mls_provider_snapshot(
+                    event,
+                    b"snapshot",
+                    &charp2p_core::InvitePermission::new(device, true),
+                )
+                .unwrap();
+        }
+
+        store
+            .put_applied_mls_membership_commit(
+                &removal,
+                b"snapshot removal",
+                Some((member, 0)),
+                &[owner.peer_id(), other],
+            )
+            .unwrap();
+        assert_eq!(
+            store.invite_permitted_devices(group.group_id()).unwrap(),
+            vec![other]
+        );
+        store
+            .put_applied_mls_membership_commit(
+                &readded,
+                b"snapshot readded",
+                None,
+                &[owner.peer_id(), member, other],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .has_invite_permission(group.group_id(), member)
+                .unwrap(),
+            "re-admission does not restore a removed device's permission"
+        );
+        assert_eq!(
+            store.invite_permitted_devices(group.group_id()).unwrap(),
+            vec![other]
         );
     }
 

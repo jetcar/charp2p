@@ -583,7 +583,8 @@ An `InvitePermissionChanged` event grants or withdraws one admitted member
 device's permission to request invitations (ADR-036). It carries a versioned
 target device ID and granted flag as an MLS application message, follows the
 same owner-only authorship, highest-owner-sequence and pull-only rules as
-metadata changes, and is dropped for a removed device.
+metadata changes, and is dropped for a removed device. Owners and members
+alike withdraw it when applying the removal, so re-admission does not restore it.
 
 A `KeyEpochAdvanced` event carries an owner-authored MLS Commit with no
 proposals and a forced update path (ADR-045). It replaces the owner's path

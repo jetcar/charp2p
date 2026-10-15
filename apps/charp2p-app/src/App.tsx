@@ -2524,10 +2524,15 @@ function App() {
     if (!isTauri()) return;
 
     let active = true;
+    // Settling expired invitations may complete a join whose network
+    // exchange already went through, so joined groups are read after it.
+    const pendingInvitations = invoke<PendingGroup[]>("pending_invitations");
     Promise.allSettled([
       invoke<DeviceProfile | null>("identity_status"),
-      invoke<PendingGroup[]>("pending_invitations"),
-      invoke<JoinedGroup[]>("joined_groups"),
+      pendingInvitations,
+      pendingInvitations
+        .catch(() => undefined)
+        .then(() => invoke<JoinedGroup[]>("joined_groups")),
       invoke<LocalGroup[]>("local_groups"),
       invoke<IssuedInvitation[]>("issued_invitations"),
     ])
@@ -2712,8 +2717,15 @@ function App() {
       pendingExpiryRefreshAtRef.current = Date.now();
       setCancellingPending(true);
       void invoke<PendingGroup[]>("pending_invitations")
-        .then((pending) => {
+        .then(async (pending) => {
+          // An expired invitation whose secure join already went through
+          // was completed instead of discarded.
+          const joined = await invoke<JoinedGroup[]>("joined_groups");
           if (!active) return;
+          setJoinedGroups((groups) => [
+            ...groups,
+            ...joined.filter(({ groupId }) => !groups.some((group) => group.groupId === groupId)),
+          ]);
           setPendingGroups(pending);
           setOpenPendingGroupId((current) =>
             pending.some(({ groupId }) => groupId === current) ? current : "");
@@ -3380,9 +3392,18 @@ function App() {
     const cancelledGroupId = pendingGroup.groupId;
     setCancellingPending(true);
     try {
-      await invoke("cancel_pending_invitation", {
+      const joined = await invoke<JoinedGroup | null>("cancel_pending_invitation", {
         groupId: cancelledGroupId,
       });
+      // The secure join had already gone through, so it was completed.
+      if (joined) {
+        setJoinedGroups((groups) => [
+          ...groups.filter(({ groupId }) => groupId !== joined.groupId),
+          joined,
+        ]);
+        setActiveGroupId(joined.groupId);
+        setSynchronizationResult(null);
+      }
       setPendingGroups((groups) => groups.filter(({ groupId }) => groupId !== cancelledGroupId));
       setOpenPendingGroupId("");
       setPeerSearchResult(null);

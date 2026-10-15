@@ -913,7 +913,9 @@ Each client stores:
   paired with the provider snapshot that contains its private material. User
   cancellation or invitation expiry deletes the KeyPackage material and
   pending index while saving the resulting provider snapshot in the same
-  transaction.
+  transaction. When the Welcome was already processed (the app closed during
+  the first pull), cancellation or expiry completes the join instead, so no
+  group state is left without its joined-group record.
 - Non-secret display metadata and last successful synchronization time for
   joined groups, promoted atomically from the pending invitation after MLS
   completion.

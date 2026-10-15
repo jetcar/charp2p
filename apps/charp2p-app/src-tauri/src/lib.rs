@@ -126,15 +126,29 @@ fn pending_invitations(
 ) -> Result<Vec<PendingGroup>, String> {
     let (pending, expired) = pending_service.inspect().map_err(str::to_owned)?;
     for group_id in expired {
-        mls_service
-            .cancel_pending_join(group_id)
-            .map_err(str::to_owned)?;
-        match pending_service.cancel(group_id) {
-            Ok(()) | Err("pending_invitation_not_found") => {}
+        match discard_pending_invitation(group_id, &pending_service, &mls_service) {
+            Ok(_) | Err("pending_invitation_not_found") => {}
             Err(error) => return Err(error.to_owned()),
         }
     }
     Ok(pending)
+}
+
+/// Discards a pending invitation, unless its secure join already went
+/// through: an app closed during the first pull leaves the joined group
+/// state behind the pending record, so that join is completed instead of
+/// leaving hidden group state the owner still counts as a member. Returns the
+/// joined group in that case.
+fn discard_pending_invitation(
+    group_id: charp2p_core::PeerId,
+    pending_service: &PendingInvitationService,
+    mls_service: &MlsProviderService,
+) -> Result<Option<JoinedGroup>, &'static str> {
+    if mls_service.has_group(group_id)? {
+        return pending_service.complete_join(group_id).map(Some);
+    }
+    mls_service.cancel_pending_join(group_id)?;
+    pending_service.cancel(group_id).map(|()| None)
 }
 
 #[tauri::command]
@@ -142,15 +156,12 @@ fn cancel_pending_invitation(
     group_id: String,
     pending_service: tauri::State<'_, PendingInvitationService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
-) -> Result<(), String> {
+) -> Result<Option<JoinedGroup>, String> {
     let group_id = parse_group_id(&group_id, "pending_invitation_not_found")?;
     pending_service
         .ensure_pending(group_id)
         .map_err(str::to_owned)?;
-    mls_service
-        .cancel_pending_join(group_id)
-        .map_err(str::to_owned)?;
-    pending_service.cancel(group_id).map_err(str::to_owned)
+    discard_pending_invitation(group_id, &pending_service, &mls_service).map_err(str::to_owned)
 }
 
 #[tauri::command]

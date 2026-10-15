@@ -872,6 +872,22 @@ mod tests {
     }
 
     #[test]
+    fn expired_invitation_whose_secure_join_went_through_can_still_complete() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        service.accept_at(&encoded, NOW).unwrap();
+        let (_, expired) = service.inspect_at(NOW + 3_600).unwrap();
+        assert_eq!(expired, vec![group_id]);
+
+        let joined = service.complete_join(group_id).unwrap();
+        assert_eq!(joined.group_id, group_id.to_string());
+        assert!(service.secrets.get_optional(group_id).unwrap().is_none());
+        assert!(service.discovery.get_optional(group_id).unwrap().is_some());
+        assert_eq!(service.inspect_at(NOW + 3_600).unwrap(), (vec![], vec![]));
+        assert_eq!(service.joined().unwrap(), vec![joined]);
+    }
+
+    #[test]
     fn expired_invitation_is_removed_from_both_stores() {
         let service = service();
         let (encoded, group_id) = invitation();

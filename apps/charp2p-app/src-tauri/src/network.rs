@@ -1181,6 +1181,9 @@ impl NetworkService {
                     NetworkEvent::Listening { address } => {
                         record_owner_address(&self.owner_addresses, address);
                     }
+                    NetworkEvent::ListenAddressesExpired { addresses } => {
+                        forget_owner_addresses(&self.owner_addresses, addresses);
+                    }
                     NetworkEvent::PeerConnected { peer_id, path, .. } => {
                         record_owner_peer(&self.owner_peers, peer_id, path);
                     }
@@ -1304,6 +1307,9 @@ impl NetworkService {
                             } if task_keys.contains(&failed) => break,
                             NetworkEvent::Listening { address } => {
                                 record_owner_address(&owner_addresses, address);
+                            }
+                            NetworkEvent::ListenAddressesExpired { addresses } => {
+                                forget_owner_addresses(&owner_addresses, addresses);
                             }
                             NetworkEvent::PeerConnected { peer_id, path, .. } => {
                                 record_owner_peer(&owner_peers, peer_id, path);
@@ -2922,6 +2928,15 @@ fn record_owner_address(addresses: &std::sync::Mutex<Vec<Multiaddr>>, address: M
     }
 }
 
+/// Drops addresses the advertising node no longer listens on, so new
+/// invitations carry only current hints.
+fn forget_owner_addresses(addresses: &std::sync::Mutex<Vec<Multiaddr>>, expired: Vec<Multiaddr>) {
+    let expired: Vec<Multiaddr> = expired.into_iter().filter_map(address_hint).collect();
+    if let Ok(mut addresses) = addresses.lock() {
+        addresses.retain(|address| !expired.contains(address));
+    }
+}
+
 fn clear_owner_addresses(addresses: &std::sync::Mutex<Vec<Multiaddr>>) {
     if let Ok(mut addresses) = addresses.lock() {
         addresses.clear();
@@ -3137,10 +3152,10 @@ mod tests {
 
     use super::{
         address_hint, answer_member_sync_request, clear_owner_peers, discovery_outcome,
-        forget_owner_peer, join_response, membership_comparison_name, owned_group_state,
-        parse_bootstrap_peer, pinned_address_hints, record_member_connection, record_owner_address,
-        record_owner_peer, select_address_hints, upgraded_path, AdvertisementResult,
-        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
+        forget_owner_addresses, forget_owner_peer, join_response, membership_comparison_name,
+        owned_group_state, parse_bootstrap_peer, pinned_address_hints, record_member_connection,
+        record_owner_address, record_owner_peer, select_address_hints, upgraded_path,
+        AdvertisementResult, BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
         MemberAdmissionService, MemberCandidates, MembershipComparison, NetworkService,
         NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
         SynchronizationService, UnavailableJoinRequestAuthorizer,
@@ -3495,6 +3510,42 @@ mod tests {
             .collect();
         assert_eq!(select_address_hints(&many), many[..4].to_vec());
         assert_eq!(address_hint(libp2p::Multiaddr::empty()), None);
+    }
+
+    #[test]
+    fn expired_owner_listen_addresses_are_no_longer_hinted() {
+        let device = DeviceIdentity::generate().peer_id();
+        let relay = DeviceIdentity::generate().peer_id();
+        let direct: libp2p::Multiaddr = "/ip4/192.168.1.20/udp/4001/quic-v1".parse().unwrap();
+        let relayed: libp2p::Multiaddr =
+            format!("/ip4/203.0.113.9/udp/4001/quic-v1/p2p/{relay}/p2p-circuit")
+                .parse()
+                .unwrap();
+        let addresses = std::sync::Mutex::new(Vec::new());
+        record_owner_address(&addresses, direct.clone());
+        record_owner_address(&addresses, relayed.clone());
+
+        // A closed relay reservation reports the listen address with the
+        // local peer ID appended.
+        forget_owner_addresses(
+            &addresses,
+            vec![relayed
+                .clone()
+                .with(libp2p::multiaddr::Protocol::P2p(device))],
+        );
+        assert_eq!(
+            select_address_hints(&addresses.lock().unwrap()),
+            vec![direct.clone()]
+        );
+
+        forget_owner_addresses(&addresses, vec![direct]);
+        assert!(select_address_hints(&addresses.lock().unwrap()).is_empty());
+
+        record_owner_address(&addresses, relayed.clone());
+        assert_eq!(
+            select_address_hints(&addresses.lock().unwrap()),
+            vec![relayed]
+        );
     }
 
     #[test]

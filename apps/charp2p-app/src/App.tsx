@@ -277,6 +277,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   message_delete_failed: "The local message copy could not be deleted.",
   message_delivery_state_unavailable: "The message was shared, but its delivery state could not be saved.",
   message_not_found: "That message is no longer stored on this device.",
+  group_not_synchronized: "This group has not synchronized since joining. Sending resumes after the first successful synchronization.",
   message_not_own: "Only messages sent from this device can be edited or deleted for everyone.",
   message_list_unavailable: "Saved messages are temporarily unavailable.",
   message_record_invalid: "A saved message is damaged and cannot be opened.",

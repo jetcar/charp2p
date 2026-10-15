@@ -696,10 +696,12 @@ async fn synchronize_group(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn send_group_message(
     group_id: String,
     message: String,
     reply_to_event_id: Option<String>,
+    pending_service: tauri::State<'_, PendingInvitationService>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
     group_service: tauri::State<'_, Arc<GroupService>>,
@@ -710,6 +712,9 @@ fn send_group_message(
         .as_deref()
         .map(parse_event_id)
         .transpose()?;
+    pending_service
+        .ensure_authoring_allowed(group_id)
+        .map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -720,10 +725,12 @@ fn send_group_message(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn edit_group_message(
     group_id: String,
     event_id: String,
     message: String,
+    pending_service: tauri::State<'_, PendingInvitationService>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
     group_service: tauri::State<'_, Arc<GroupService>>,
@@ -731,6 +738,9 @@ fn edit_group_message(
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let event_id = parse_event_id(&event_id)?;
+    pending_service
+        .ensure_authoring_allowed(group_id)
+        .map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
@@ -746,6 +756,7 @@ fn edit_group_message(
 fn delete_group_message(
     group_id: String,
     event_id: String,
+    pending_service: tauri::State<'_, PendingInvitationService>,
     identity_service: tauri::State<'_, IdentityService>,
     mls_service: tauri::State<'_, Arc<MlsProviderService>>,
     group_service: tauri::State<'_, Arc<GroupService>>,
@@ -753,6 +764,9 @@ fn delete_group_message(
 ) -> Result<(), String> {
     let group_id = parse_group_id(&group_id, "group_not_found")?;
     let event_id = parse_event_id(&event_id)?;
+    pending_service
+        .ensure_authoring_allowed(group_id)
+        .map_err(str::to_owned)?;
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;

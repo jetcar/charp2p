@@ -373,6 +373,32 @@ impl PendingInvitationService {
         Ok(())
     }
 
+    /// Refuses authoring in a joined group until its first successful
+    /// synchronization after joining, so a device that rejoined after
+    /// leaving locally pulls its own earlier events before its next event
+    /// could reuse their author sequences (ADR-034). Owned groups have no
+    /// joined record and are always allowed.
+    pub(crate) fn ensure_authoring_allowed(&self, group_id: PeerId) -> Result<(), &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?;
+        let joined = self
+            .metadata
+            .lock()
+            .map_err(|_| "pending_invitation_service_unavailable")?
+            .joined_groups()
+            .map_err(|_| "pending_invitation_store_unavailable")?
+            .into_iter()
+            .find(|joined| joined.group_id == group_id);
+        match joined {
+            Some(joined) if joined.last_synchronized_at_unix.is_none() => {
+                Err("group_not_synchronized")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Returns the encoded addresses a joined group's provider was last
     /// reached at, most recent first.
     pub(crate) fn known_peer_addresses(
@@ -725,6 +751,10 @@ mod tests {
         assert_eq!(joined.group_name, pending.group_name);
         assert_eq!(joined.inviter_device_id, pending.inviter_device_id);
         assert_eq!(joined.last_synchronized_at_unix, None);
+        assert_eq!(
+            service.ensure_authoring_allowed(group_id),
+            Err("group_not_synchronized")
+        );
         assert!(service.list_at(NOW).unwrap().is_empty());
         assert_eq!(service.joined().unwrap(), vec![joined.clone()]);
         assert_eq!(service.complete_join(group_id).unwrap(), joined);
@@ -742,6 +772,9 @@ mod tests {
             service.joined().unwrap()[0].last_synchronized_at_unix,
             Some(NOW + 10)
         );
+        assert_eq!(service.ensure_authoring_allowed(group_id), Ok(()));
+        let owned_group_id = GroupIdentity::generate().group_id();
+        assert_eq!(service.ensure_authoring_allowed(owned_group_id), Ok(()));
         assert_eq!(
             service.accept_at(&encoded, NOW),
             Err("group_already_joined")

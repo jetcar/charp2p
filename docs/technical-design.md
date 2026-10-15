@@ -651,6 +651,9 @@ Requirements:
 - Events may arrive out of order; an author's events after a sequence gap
   wait until the gap is filled.
 - An author sequence cannot be reused with different content.
+  A joined group refuses sending, editing and deleting until its first
+  successful synchronization after joining, so a device that rejoined after
+  leaving locally (ADR-034) holds its own earlier events before authoring.
 - Events from unauthorized or revoked devices are rejected according to the
   membership state in which they were authored. When the owner removes a
   device it records that device's highest stored author sequence as its

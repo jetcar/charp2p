@@ -19,7 +19,8 @@ members and devices, network status, and settings. Its group list restores
 every owned and joined membership, keeps them accessible in one session, and
 opens another invitation without hiding existing groups.
 The Privacy and How identity works pages, linked from the onboarding screen and
-the group navigation, explain local message storage, observable network
+the group navigation, explain encrypted local message copies, protected keys,
+optional retention, what diagnostic exports leave out, observable network
 metadata, relay limits, device-key continuity, and identity backup from inside
 the Windows and Android interface.
 Identity creation and restart detection use Rust commands and platform-protected

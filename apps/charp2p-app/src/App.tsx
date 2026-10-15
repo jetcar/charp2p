@@ -1263,6 +1263,15 @@ function InformationView({
             <p>Message contents are protected for authorized group devices and stored on participating devices. CharP2P has no central message archive.</p>
           </section>
           <section>
+            <h3>What this device stores</h3>
+            <p>Readable message text is kept as an encrypted local copy, and group key state as an encrypted snapshot. Their wrapping key and your identity key stay in platform-protected storage: Windows Credential Manager or the Android Keystore. Signed events are kept so groups can synchronize, while their message contents remain encrypted for group devices.</p>
+            <p>Deleting a message on this device removes its readable copy. An optional retention period in Settings removes readable copies of older messages the same way; it applies only to this device.</p>
+          </section>
+          <section>
+            <h3>What diagnostics leave out</h3>
+            <p>The diagnostic export on the Network page contains the app version, platform, connection and node status, and the number of owned and joined groups. It leaves out identity keys, this device’s peer identifier, group identifiers and names, invitations, discovery keys, and message content.</p>
+          </section>
+          <section>
             <h3>Network metadata is visible</h3>
             <p>Peers, bootstrap nodes, and relays can observe connection metadata such as peer identifiers, network addresses, timing, and traffic volume. Relays forward encrypted streams without group keys.</p>
           </section>

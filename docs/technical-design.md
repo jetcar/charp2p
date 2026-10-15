@@ -383,6 +383,10 @@ from one shared with at least one peer. A partial or failed exchange does not
 advance the acknowledgement. This state does not imply that every member has
 observed the message or that a permanent copy exists.
 
+A member's push starts after the highest sequence of its own events the owner
+has durably acknowledged storing (ADR-024), so a synchronization uploads and
+charges against the data limit (ADR-033) only events the owner lacks.
+
 After pulling and pushing, a member reports its gap-free author heads to the
 owner, which records them per peer and answers with the heads of the member's
 own events reported by every other current member (ADR-030). A message whose

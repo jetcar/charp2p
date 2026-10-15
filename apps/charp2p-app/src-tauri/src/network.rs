@@ -187,6 +187,15 @@ trait SynchronizationService: Send + Sync {
         after_sequence: u64,
     ) -> Result<Option<(SyncRequest, u64)>, &'static str>;
 
+    /// Highest contiguous sequence of `author_id`'s events the peer durably
+    /// acknowledged storing (ADR-024); 0 when none.
+    fn acknowledged_head(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<u64, &'static str>;
+
     fn acknowledge_messages_shared(
         &self,
         group_id: PeerId,
@@ -247,6 +256,15 @@ impl SynchronizationService for MlsProviderService {
         after_sequence: u64,
     ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
         MlsProviderService::next_push_request(self, group_id, author_id, after_sequence)
+    }
+
+    fn acknowledged_head(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<u64, &'static str> {
+        MlsProviderService::acknowledged_head(self, group_id, peer_id, author_id)
     }
 
     fn acknowledge_messages_shared(
@@ -2482,7 +2500,11 @@ impl NetworkService {
         bandwidth: &BandwidthService,
         path: &mut ConnectionPath,
     ) -> Result<usize, &'static str> {
-        let mut after_sequence = 0_u64;
+        // Events the peer already acknowledged are not uploaded or charged
+        // again; it accepts the next upload only from its own stored head.
+        let mut after_sequence = self
+            .synchronization
+            .acknowledged_head(group_id, peer_id, author_id)?;
         let mut inserted = 0_usize;
         for _ in 0..MAX_SYNC_EXCHANGES {
             let Some((request, last_sequence)) =
@@ -2825,6 +2847,15 @@ impl SynchronizationService for UnavailableSynchronizationService {
         _author_id: PeerId,
         _after_sequence: u64,
     ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
+        Err("synchronization_unavailable")
+    }
+
+    fn acknowledged_head(
+        &self,
+        _group_id: PeerId,
+        _peer_id: PeerId,
+        _author_id: PeerId,
+    ) -> Result<u64, &'static str> {
         Err("synchronization_unavailable")
     }
 
@@ -3269,6 +3300,15 @@ mod tests {
             _after_sequence: u64,
         ) -> Result<Option<(SyncRequest, u64)>, &'static str> {
             Ok(None)
+        }
+
+        fn acknowledged_head(
+            &self,
+            _group_id: PeerId,
+            _peer_id: PeerId,
+            _author_id: PeerId,
+        ) -> Result<u64, &'static str> {
+            Ok(0)
         }
 
         fn acknowledge_messages_shared(

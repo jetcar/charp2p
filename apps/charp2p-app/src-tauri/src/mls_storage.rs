@@ -1010,6 +1010,27 @@ impl MlsProviderService {
             .collect()
     }
 
+    /// Returns the highest contiguous sequence of `author_id`'s events the
+    /// peer durably acknowledged storing, so a push resumes after it.
+    pub(crate) fn acknowledged_head(
+        &self,
+        group_id: PeerId,
+        peer_id: PeerId,
+        author_id: PeerId,
+    ) -> Result<u64, &'static str> {
+        let _operation = self
+            .operations
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?;
+        let heads = self
+            .store
+            .lock()
+            .map_err(|_| "mls_provider_service_unavailable")?
+            .acknowledged_author_heads(group_id, author_id)
+            .map_err(|_| "message_delivery_state_unavailable")?;
+        Ok(heads.get(&peer_id).copied().unwrap_or(0))
+    }
+
     pub(crate) fn acknowledge_messages_shared(
         &self,
         group_id: PeerId,
@@ -4560,6 +4581,41 @@ mod tests {
             SyncResponse::EventsAccepted {
                 group_id,
                 inserted: 0,
+            }
+        );
+
+        // A later push resumes after the owner's acknowledged head and
+        // uploads only the new event.
+        assert_eq!(
+            member_service
+                .acknowledged_head(group_id, owner.peer_id(), member.peer_id())
+                .unwrap(),
+            0
+        );
+        member_service
+            .acknowledge_messages_shared(group_id, owner.peer_id(), member.peer_id(), sequence)
+            .unwrap();
+        let acknowledged = member_service
+            .acknowledged_head(group_id, owner.peer_id(), member.peer_id())
+            .unwrap();
+        assert_eq!(acknowledged, 1);
+        member_service
+            .create_message_at(group_id, &member, "Second from member", 43)
+            .unwrap();
+        let (request, sequence) = member_service
+            .next_push_request(group_id, member.peer_id(), acknowledged)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequence, 2);
+        let SyncRequest::PushEvents { encoded_events, .. } = &request else {
+            panic!("push request expected");
+        };
+        assert_eq!(encoded_events.len(), 1);
+        assert_eq!(
+            owner_service.answer_sync_request(member.peer_id(), &request),
+            SyncResponse::EventsAccepted {
+                group_id,
+                inserted: 1,
             }
         );
     }

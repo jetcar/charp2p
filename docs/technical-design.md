@@ -135,7 +135,8 @@ needs one: its advertising node, which answers the join, starts only when a
 built-in, environment or community bootstrap node is configured, and
 remembered routing peers do not satisfy that on their own (ADR-046).
 Invitations without
-hints keep the version 2 encoding. The owner takes hints from the current
+hints keep the version 2 encoding unless the group requires owner approval,
+which always uses version 4, hinted or not. The owner takes hints from the current
 listen addresses of its advertising node, circuit-relay addresses first and
 loopback, unspecified or IPv6 link-local addresses excluded, both for its own invitations and
 for invitations issued at a member's request; hints that would make the
@@ -165,8 +166,9 @@ Only the owner device signs invitations. A member the owner has granted invite
 permission requests one from the owner device over the authenticated
 `/charp2p/invite/1.0.0` request-response protocol (ADR-036). The owner rechecks
 the requesting device's membership and current permission, then issues, stores
-and advertises a normal invitation (version 3 when it carries the owner's address
-hints) under the group settings and
+and advertises a normal invitation (version 4 when the group requires owner
+approval, hinted or not; otherwise version 3 when it carries the owner's
+address hints) under the group settings and
 records the requesting device in its issued-invitation index. Withdrawing the
 permission revokes the active invitations issued at that device's request.
 

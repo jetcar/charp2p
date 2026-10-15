@@ -78,8 +78,11 @@ on the TCP address (ADR-047). The process prints a multiaddress ending in
 that complete address to `CHARP2P_BOOTSTRAP_NODES` before starting the app.
 Multiple client bootstrap addresses are separated by semicolons.
 
-The process logs only its peer ID, listen addresses, shutdown, and coarse DHT
-operation failures. It does not log discovery keys or connected peer IDs.
+The process logs only its peer ID, listen addresses, relay limits, the counts
+of blocked peer identities and bootstrap nodes, blocked peer list reload
+results (counts and errors), shutdown, coarse DHT operation failures, and
+rejections that could not be delivered because the peer closed its stream. It
+does not log discovery keys or connected peer IDs.
 Relay operators can still observe source and destination peer metadata, timing,
 and traffic volume; relayed peer streams remain end-to-end authenticated and
 encrypted.

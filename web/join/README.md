@@ -11,5 +11,8 @@ Content Security Policy and `no-referrer`, makes no requests, and does not
 decode or display the invitation; the app verifies it.
 
 Serve the `i/` directory as-is with no analytics, third-party resources, or
-logging of full request URLs. The production host also needs the Android
+logging of full request URLs. Serve `i/index.html` at exactly `/i` without
+redirecting to `/i/`: the app accepts only the `/i` path, so the page's address
+stays a valid invitation link, and the page loads `/i/join.css` and
+`/i/join.js` by absolute path so they resolve without the trailing slash. The production host also needs the Android
 `assetlinks.json` before the HTTPS link is registered as an App Link (ADR-010).

@@ -260,6 +260,10 @@
 - [x] Privacy page: cover what this device stores (encrypted local copies, protected keys, optional retention) and what diagnostics leave out, as the Settings "Privacy" entry and app README promise (product page 10).
 - [x] Member invitations: when a member requests an invitation with a chosen expiry while its earlier one is still active, tell the member the earlier one is returned with its later expiry (ADR-043, product pages 3/8).
 
+- [x] Join fallback page: load its stylesheet and script by absolute `/i/` paths so the page works at the canonical `https://join.charp2p.example/i` (no trailing slash), and document serving it at `/i` without a redirect to `/i/`, which the app rejects (technical-design Invitations and links).
+- [ ] Leave: a retried leave after the database step succeeds (no `joined_group_not_found`) once the protected discovery key is removed, and a leave interrupted before key removal is completed at the next start (ADR-027).
+- [ ] Docs: ADR-038 superseded in part — the owner advertiser stops at once, an opted-in contribution node restarts immediately through new community nodes, a running member serving node keeps its connections until it next starts.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -511,3 +515,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-15T17:27:17Z ADR-055 bearer text: threat-model "Bearer and secret leakage" row now describes opaque-text handling in the webview, Rust-only decoding and the CSP-dependent residual; "How identity works" says keys never reach the interface and invitation links are opaque text decoded by the core. fmt, clippy, workspace tests, npm build pass.
 2026-10-15T18:26:45Z Privacy page storage and diagnostics: added "What this device stores" (encrypted local copies, protected keys, optional retention) and "What diagnostics leave out" sections; README updated; fmt/clippy/tests/npm build pass, no Rust changes.
 2026-10-15T19:29:08Z Member invitation earlier-returned notice: member Invite panel compares the issued expiry with the requested lifetime (owner only shortens; 5-minute clock slack) and tells the member its earlier active invitation was returned with its later expiry (ADR-043). Frontend-only; fmt, clippy, workspace tests, npm build pass.
+2026-10-15T20:35:29Z Join fallback page at /i: re-derived backlog (3 gaps: fallback page assets at canonical /i, interrupted leave completion, stale ADR-038). index.html now loads /i/join.css and /i/join.js by absolute path (relative paths 404 at /i, and /i/ is rejected by the app); README says serve at /i without redirect. fmt, clippy, workspace tests, npm build pass.

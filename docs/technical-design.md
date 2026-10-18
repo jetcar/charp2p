@@ -471,7 +471,10 @@ the `awaiting approval` category (code 4), which the joiner treats like `busy`
 and retries with the same pending KeyPackage. The check runs after KeyPackage
 validation and before any MLS change; a declined device is answered
 `unauthorized`, and a group already holding the maximum undecided requests
-answers `busy`. The owner lists requests on the Members page and approves,
+answers `busy`. An undecided request leaves the list when the invitation it
+was recorded through expires, is revoked, or is retired as consumed, so a
+revoked leaked link stops filling it. The owner lists requests on the Members
+page and approves,
 declines, or allows a declined device to ask again; decisions stay on the owner
 device. Create group offers the approval option, and the joiner's pending
 invitation and Groups page show that owner approval is awaited after an

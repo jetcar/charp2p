@@ -2529,15 +2529,28 @@ impl EventStore {
         Ok(invitations)
     }
 
-    /// Removes an issued invitation index after expiry or revocation.
+    /// Removes an issued invitation index after expiry, revocation or
+    /// consumption. Undecided approval requests recorded through it go with
+    /// it, so a revoked leaked link stops filling the request list (ADR-041).
     pub fn remove_issued_invitation(
         &mut self,
         invitation_id: InvitationId,
     ) -> Result<bool, StoreError> {
-        Ok(self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let removed = transaction.execute(
             "DELETE FROM issued_invitations WHERE invitation_id = ?1",
             [invitation_id.as_bytes().as_slice()],
-        )? != 0)
+        )? != 0;
+        transaction.execute(
+            "DELETE FROM owner_approval_requests
+             WHERE invitation_id = ?1 AND state = ?2",
+            params![
+                invitation_id.as_bytes().as_slice(),
+                approval_state_code(ApprovalState::Pending),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Adds the index for an owner-side rendezvous key kept in protected storage.
@@ -4890,6 +4903,67 @@ mod tests {
                 )
                 .unwrap(),
             ApprovalRequestOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn removing_an_issued_invitation_drops_its_undecided_approval_requests() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate().group_id();
+        let leaked = InvitationId::from_bytes([6; 16]);
+        let other = InvitationId::from_bytes([7; 16]);
+        let [pending, approved, declined, elsewhere] =
+            std::array::from_fn(|_| DeviceIdentity::generate().peer_id());
+        for device in [pending, approved, declined] {
+            store
+                .record_owner_approval_request(group, device, leaked, 2_000, 1_000)
+                .unwrap();
+        }
+        store
+            .record_owner_approval_request(group, elsewhere, other, 2_000, 1_000)
+            .unwrap();
+        assert!(
+            store
+                .approve_owner_approval_request(group, approved)
+                .unwrap()
+        );
+        assert!(
+            store
+                .decline_owner_approval_request(group, declined)
+                .unwrap()
+        );
+        store
+            .put_issued_invitation(&IssuedInvitationMetadata {
+                invitation_id: leaked,
+                group_id: group,
+                expires_at_unix: 2_000,
+                requested_by: None,
+            })
+            .unwrap();
+
+        assert!(store.remove_issued_invitation(leaked).unwrap());
+        let mut remaining: Vec<_> = store
+            .owner_approval_requests(group, 1_100)
+            .unwrap()
+            .into_iter()
+            .map(|request| (request.device_id, request.state))
+            .collect();
+        remaining.sort_by_key(|(device, _)| device.to_bytes());
+        let mut expected = vec![
+            (approved, ApprovalState::Approved),
+            (declined, ApprovalState::Declined),
+            (elsewhere, ApprovalState::Pending),
+        ];
+        expected.sort_by_key(|(device, _)| device.to_bytes());
+        assert_eq!(remaining, expected);
+        // Removing an index that is already gone still clears its requests.
+        store
+            .record_owner_approval_request(group, pending, leaked, 2_000, 1_100)
+            .unwrap();
+        assert!(!store.remove_issued_invitation(leaked).unwrap());
+        assert_eq!(
+            store.owner_approval_requests(group, 1_200).unwrap().len(),
+            3
         );
     }
 

@@ -1070,7 +1070,8 @@ impl MlsProviderService {
     }
 
     /// Records the heads of this device's own events that the peer reported
-    /// for every other member it knows.
+    /// for every other member it knows, capped at this device's own head so
+    /// a relayed head never marks messages not yet written as observed.
     pub(crate) fn record_observed_heads(
         &self,
         group_id: PeerId,
@@ -1085,13 +1086,20 @@ impl MlsProviderService {
             .store
             .lock()
             .map_err(|_| "mls_provider_service_unavailable")?;
+        let own_head = store
+            .synchronization_summary(group_id)
+            .map_err(|_| "message_delivery_state_unavailable")?
+            .into_iter()
+            .find(|head| head.author_id == author_id)
+            .map(|head| head.contiguous_sequence)
+            .unwrap_or(0);
         for peer in peers.iter().filter(|peer| peer.peer_id != author_id) {
             store
                 .acknowledge_author_head(
                     group_id,
                     peer.peer_id,
                     author_id,
-                    peer.contiguous_sequence,
+                    peer.contiguous_sequence.min(own_head),
                 )
                 .map_err(|_| "message_delivery_state_unavailable")?;
         }
@@ -4431,6 +4439,33 @@ mod tests {
             .unwrap();
         let messages = restored.messages(group_id, owner.peer_id()).unwrap();
         assert_eq!(messages.messages[1].delivery_state, "observedByAll");
+        restored
+            .record_observed_heads(
+                group_id,
+                owner.peer_id(),
+                &[SyncPeerHead {
+                    peer_id: member_id,
+                    contiguous_sequence: 1_000_000,
+                }],
+            )
+            .unwrap();
+        {
+            let store = restored.store.lock().unwrap();
+            let own_head = store
+                .synchronization_summary(group_id)
+                .unwrap()
+                .into_iter()
+                .find(|head| head.author_id == owner.peer_id())
+                .unwrap()
+                .contiguous_sequence;
+            assert_eq!(
+                store
+                    .acknowledged_author_heads(group_id, owner.peer_id())
+                    .unwrap()
+                    .get(&member_id),
+                Some(&own_head)
+            );
+        }
         restored
             .hide_message_locally(group_id, first.id().as_bytes())
             .unwrap();

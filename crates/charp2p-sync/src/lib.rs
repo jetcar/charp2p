@@ -94,6 +94,9 @@ pub fn build_authorized_response(
 /// and answers with the heads of that member's own events reported by every
 /// other current member. This device's head comes from its own event store.
 ///
+/// Reported heads are capped at the heads stored here, so a member cannot
+/// mark events this device does not hold, including future ones, as stored.
+///
 /// The caller authorizes the peer and supplies the current membership.
 pub fn record_reported_heads(
     store: &mut EventStore,
@@ -106,7 +109,21 @@ pub fn record_reported_heads(
     let SyncRequest::ReportHeads { group_id, heads } = request else {
         return Err(SynchronizationError::UnexpectedRequest);
     };
-    store.acknowledge_author_heads(*group_id, authenticated_peer, heads)?;
+    let stored_heads = store.synchronization_summary(*group_id)?;
+    let capped_heads: Vec<SyncAuthorHead> = heads
+        .iter()
+        .map(|head| SyncAuthorHead {
+            author_id: head.author_id,
+            contiguous_sequence: head.contiguous_sequence.min(
+                stored_heads
+                    .iter()
+                    .find(|stored| stored.author_id == head.author_id)
+                    .map(|stored| stored.contiguous_sequence)
+                    .unwrap_or(0),
+            ),
+        })
+        .collect();
+    store.acknowledge_author_heads(*group_id, authenticated_peer, &capped_heads)?;
     let acknowledged = store.acknowledged_author_heads(*group_id, authenticated_peer)?;
     let local_head = local_author_head(store, *group_id, authenticated_peer)?;
     let peers = current_members
@@ -807,6 +824,55 @@ mod tests {
             build_authorized_response(&store, &report(Vec::new())),
             Err(SynchronizationError::UnexpectedRequest)
         ));
+    }
+
+    #[test]
+    fn reported_heads_are_capped_at_the_stored_heads() {
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let sender = DeviceIdentity::generate();
+        let reader = DeviceIdentity::generate();
+        let unknown = DeviceIdentity::generate();
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .put_events(&[message_event(&sender, &group, 1, b"first")])
+            .unwrap();
+        let members = [owner.peer_id(), sender.peer_id(), reader.peer_id()];
+
+        record_reported_heads(
+            &mut store,
+            owner.peer_id(),
+            reader.peer_id(),
+            &members,
+            &SyncRequest::ReportHeads {
+                group_id: group.group_id(),
+                heads: vec![
+                    SyncAuthorHead {
+                        author_id: sender.peer_id(),
+                        contiguous_sequence: 1_000_000,
+                    },
+                    SyncAuthorHead {
+                        author_id: unknown.peer_id(),
+                        contiguous_sequence: 5,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .acknowledged_author_heads(group.group_id(), sender.peer_id())
+                .unwrap()
+                .get(&reader.peer_id()),
+            Some(&1)
+        );
+        assert!(
+            store
+                .acknowledged_author_heads(group.group_id(), unknown.peer_id())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

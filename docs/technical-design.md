@@ -392,7 +392,10 @@ charges against the data limit (ADR-033) only events the owner lacks.
 
 After pulling and pushing, a member reports its gap-free author heads to the
 owner, which records them per peer and answers with the heads of the member's
-own events reported by every other current member (ADR-030). A message whose
+own events reported by every other current member (ADR-030). The owner caps
+each reported head at the head it stores for that author, and the member caps
+each relayed head at its own head, so a member cannot mark events that do not
+exist yet as stored by a peer. A message whose
 sequence every other current member has reported storing is shown as observed
 by all currently known members. This remains a display state, not a delivery
 guarantee.

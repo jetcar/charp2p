@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; superseded in part. Discovery dials only the pinned inviter device
+(ADR-002), so the 32-provider reachability cap no longer applies: searches stop
+at the 8-second deadline and serving nodes keep at most 20 providers per key.
 
 ## Date
 

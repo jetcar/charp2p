@@ -229,7 +229,11 @@ device-local file and adds them as extra DHT entry points when its node starts
 (ADR-046). No internet address scanning occurs.
 
 The client bounds bootstrap configuration to 16 entries, provider searches to
-8 seconds, and direct reachability checks to the pinned provider and 4 seconds. When
+8 seconds, and direct reachability checks to the pinned provider: 3 seconds for
+invitation hints and remembered addresses, 4 seconds after the DHT lookup finds
+the provider, and a lookup without a record waits for mDNS at most until 2
+seconds after the client node starts. Serving nodes keep at most 20 providers
+per key. When
 no built-in or development bootstrap address is available, the UI reports that
 discovery requires a bootstrap node instead of pretending that the group is
 offline.

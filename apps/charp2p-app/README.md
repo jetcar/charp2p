@@ -29,8 +29,8 @@ are parsed and authenticated in Rust before any network access. Settings can
 export a passphrase-encrypted identity backup as a file or text, and onboarding
 can restore the device name and identity key from it.
 Accepted invitations survive restarts: safe group metadata is indexed in SQLite
-while the signed bearer credential remains in platform-protected storage. Invitation
-version 2 also pins the root-authorized inviter device; discovery ignores
+while the signed bearer credential remains in platform-protected storage. Every invitation
+version pins the root-authorized inviter device; discovery ignores
 providers with another authenticated peer identity.
 
 Windows and Android register `charp2p://` as an application link. Cold-start

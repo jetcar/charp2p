@@ -31,7 +31,10 @@ limit with built-in and environment-configured nodes (ADR-038).
 
 Used by Android and constrained devices. It queries the DHT, advertises its own
 groups while active, connects to group peers, and uses relays. It does not have
-to answer routing queries for unrelated peers.
+to answer routing queries for unrelated peers. Nodes add a peer's identified
+listen addresses to their routing table only when it serves the DHT protocol,
+so light peers and their private addresses are never handed out in routing
+answers.
 
 ### Routing peer
 

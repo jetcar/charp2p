@@ -292,6 +292,8 @@
 - [x] Owner hints: when the 16 owner listen addresses are already full of direct interface addresses, a later relay circuit address replaces the oldest direct one instead of being dropped, so invitations still carry a relay hint first (technical-design invitation hints "relay circuit addresses first").
 - [x] Publishable IPv6 filter: exclude only the documentation range 3fff::/20 (charp2p-network is_publishable_direct_address currently excludes 3ff0::/12), ADR-056.
 - [x] Sync budget refill: keep the sub-byte remainder in SyncBudget::refill (bandwidth.rs) so the ADR-033 bucket refills continuously instead of losing fractional credit on each check.
+- [x] Routing table: add identified listen addresses to the DHT routing table only for peers serving the DHT protocol, so light clients and their private addresses are not handed out (ADR-046, ADR-056).
+- [ ] Docs: technical-design says an oversized signed-event response is answered `busy`, but `Events` answers are cut at 2 MiB and the puller pages; align the docs with the paging behaviour and pin it with a test.
 
 ## Needs human
 
@@ -568,3 +570,4 @@ Mon Oct 19 13:40:23 UTC 2026 Bandwidth limit ReportHeads budget check: exchange_
 2026-10-19T16:46:00Z Owner relay hint at full address list: re-derived backlog (3 gaps: relay hint dropped when direct addresses fill the 16-entry list, 3ff0::/12 vs 3fff::/20 IPv6 filter, sync budget refill truncation). record_owner_address now evicts the oldest direct address for a relay circuit address at the cap; test added; workspace fmt/clippy/tests, src-tauri clippy/tests (apt-installed webkit2gtk/gtk dev libs), npm build pass.
 2026-10-19T17:27:15Z Publishable IPv6 filter: is_global_ipv6 now excludes only 3fff::/20 (was 3ff0::/12); tests cover 3ff0::1 and 3fff:1000::1 as publishable, 3fff:fff::1 as documentation. fmt/clippy/tests/npm build pass.
 2026-10-19T18:31:41Z Sync budget refill remainder: SyncBudget now refills in nanoseconds and carries sub-byte credit across checks (capped buckets drop it); added frequent-check test; src-tauri tests/clippy pass after apt-installing GTK/WebKit dev libs.
+2026-10-19T19:37:01Z Routing table light-peer filter: re-derived backlog (2 gaps: identify addresses of light peers entering serving nodes' k-buckets and filling address-less provider records with private addresses; Events response cut instead of busy in docs). Identify handler now calls dht.add_address only when the peer serves the DHT protocol; identify test asserts the routing node does not hold the client; provider test advertiser confirms an external address since address-less records are no longer filled from k-buckets. fmt, clippy, workspace tests, npm build pass; src-tauri unchanged.

@@ -898,13 +898,18 @@ impl NetworkNode {
                     info,
                     ..
                 })) => {
-                    for address in info.listen_addrs.iter().cloned() {
-                        self.swarm
-                            .behaviour_mut()
-                            .dht
-                            .add_address(&peer_id, address);
-                    }
                     let serves_routing = info.protocols.contains(&DHT_PROTOCOL);
+                    // Light peers never enter the routing table: serving nodes
+                    // would otherwise hand them, and their private listen
+                    // addresses, to unrelated peers (ADR-046, ADR-056).
+                    if serves_routing {
+                        for address in info.listen_addrs.iter().cloned() {
+                            self.swarm
+                                .behaviour_mut()
+                                .dht
+                                .add_address(&peer_id, address);
+                        }
+                    }
                     if serves_routing
                         && let (Some(observer), Some(address)) = (
                             self.routing_peer_observer.as_ref(),
@@ -2464,6 +2469,8 @@ mod tests {
 
         assert!(client_saw_routing);
         assert!(!routing_saw_client);
+        assert!(routing_table_contains(&mut client, routing_id));
+        assert!(!routing_table_contains(&mut routing, client_id));
     }
 
     #[tokio::test]
@@ -2871,6 +2878,12 @@ mod tests {
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
             .unwrap();
         next_listen_address(&mut advertiser).await;
+        // Loopback listen addresses are never published, and serving nodes no
+        // longer fill address-less records from identify, so confirm a dial
+        // hint for the record to carry.
+        advertiser
+            .swarm
+            .add_external_address("/ip4/198.51.100.7/udp/4001/quic-v1".parse().unwrap());
         advertiser.add_bootstrap_peer(routing_id, routing_address.clone());
         advertiser.announce_group(key).unwrap();
         timeout(TEST_TIMEOUT, async {

@@ -1121,7 +1121,8 @@ impl GroupService {
                 return Err("issued_invitation_record_invalid");
             }
             self.retain_owner_discovery_key(&mut store, &invitation)?;
-            if invitation.expires_at_unix() > now_unix {
+            let consumed = consumed_single_use(&store, &invitation)?;
+            if invitation.expires_at_unix() > now_unix && !consumed {
                 if requested_by.is_some() && existing.requested_by == requested_by {
                     let encoded = Zeroizing::new(
                         invitation
@@ -1137,8 +1138,8 @@ impl GroupService {
             store
                 .remove_issued_invitation(existing.invitation_id)
                 .map_err(|_| "group_store_unavailable")?;
-            // An expired key no longer counts against the key bounds unless
-            // it admitted a current member (ADR-054).
+            // An expired or consumed key no longer counts against the key
+            // bounds unless it admitted a current member (ADR-054).
             self.retire_owner_discovery_key(&mut store, group_id, existing.invitation_id)?;
         }
         if active >= MAX_ACTIVE_INVITATIONS_PER_GROUP {
@@ -1316,7 +1317,9 @@ impl GroupService {
                 return Err("issued_invitation_record_invalid");
             }
             self.retain_owner_discovery_key(&mut store, &invitation)?;
-            if indexed.expires_at_unix <= now_unix {
+            // A consumed single-use invitation whose retirement was
+            // interrupted is retired here as for expiry (ADR-042).
+            if indexed.expires_at_unix <= now_unix || consumed_single_use(&store, &invitation)? {
                 self.invitation_secrets.remove(indexed.invitation_id)?;
                 store
                     .remove_issued_invitation(indexed.invitation_id)
@@ -1543,6 +1546,18 @@ impl MemberAdmissionService for OwnerMemberAdmissionService {
         }
         admission
     }
+}
+
+/// Whether the owner recorded the consumption of this single-use invitation
+/// (ADR-042), so it is no longer active even before its expiry.
+fn consumed_single_use(store: &EventStore, invitation: &Invitation) -> Result<bool, &'static str> {
+    if invitation.is_reusable() {
+        return Ok(false);
+    }
+    Ok(store
+        .single_use_invitation_consumer(invitation.group_id(), invitation.invitation_id())
+        .map_err(|_| "group_store_unavailable")?
+        .is_some())
 }
 
 impl From<LocalGroupMetadata> for LocalGroup {
@@ -2458,6 +2473,139 @@ mod tests {
             ),
             Err(JoinInvitationAuthorizationError::Unauthorized)
         );
+    }
+
+    #[test]
+    fn consumed_single_use_invitation_left_unretired_is_retired_by_later_passes() {
+        use charp2p_core::{EventKind, EventSpec, SignedEvent};
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut single_use = spec("Project Atlas");
+        single_use.reusable_invitation = false;
+        let created = service.create(single_use).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let requester = DeviceIdentity::generate().peer_id();
+        let request_member_invitation = || {
+            service
+                .issue_requested_invitation_at(
+                    group_id,
+                    owner.peer_id(),
+                    "Maya's PC",
+                    Some((requester, 86_400)),
+                    None,
+                    None,
+                    &[],
+                    NOW,
+                )
+                .unwrap()
+                .0
+        };
+        let first = request_member_invitation();
+        assert!(!first.is_reusable());
+        assert_eq!(
+            request_member_invitation().invitation_id(),
+            first.invitation_id()
+        );
+
+        let added = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id,
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: NOW * 1000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        // The admission commits but retire_consumed_invitation never runs.
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_join_admission(
+                &added,
+                b"snapshot",
+                DeviceIdentity::generate().peer_id(),
+                &[1; 32],
+                b"response",
+                Some(AdmittingInvitation {
+                    invitation_id: first.invitation_id(),
+                    single_use: true,
+                }),
+            )
+            .unwrap();
+
+        // The member's repeated request gets a fresh invitation instead of
+        // the consumed one, which is retired as for revocation (ADR-042).
+        let second = request_member_invitation();
+        assert_ne!(second.invitation_id(), first.invitation_id());
+        assert!(service
+            .invitation_secrets
+            .get_optional(first.invitation_id())
+            .unwrap()
+            .is_none());
+        let listed = service.issued_invitations_at(NOW).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].invitation_id,
+            encode_identifier(second.invitation_id())
+        );
+    }
+
+    #[test]
+    fn consumed_single_use_invitation_left_unretired_leaves_the_list() {
+        use charp2p_core::{EventKind, EventSpec, SignedEvent};
+        const NOW: u64 = 1_800_000_000;
+        let service = service();
+        let mut single_use = spec("Project Atlas");
+        single_use.reusable_invitation = false;
+        let created = service.create(single_use).unwrap();
+        let group_id = created.group_id.parse().unwrap();
+        let owner = DeviceIdentity::generate();
+        let issued = service
+            .issue_invitation_at(group_id, owner.peer_id(), "Maya's PC", NOW)
+            .unwrap();
+        let invitation_id = request_invitation_id(&join_request(&issued.link, NOW), NOW);
+        let added = SignedEvent::create(
+            &owner,
+            EventSpec {
+                group_id,
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: NOW * 1000,
+                kind: EventKind::MemberAdded,
+                protected_payload: b"MLS commit",
+            },
+        )
+        .unwrap();
+        service
+            .metadata
+            .lock()
+            .unwrap()
+            .put_mls_join_admission(
+                &added,
+                b"snapshot",
+                DeviceIdentity::generate().peer_id(),
+                &[1; 32],
+                b"response",
+                Some(AdmittingInvitation {
+                    invitation_id,
+                    single_use: true,
+                }),
+            )
+            .unwrap();
+
+        assert!(service.issued_invitations_at(NOW).unwrap().is_empty());
+        assert!(service
+            .invitation_secrets
+            .get_optional(invitation_id)
+            .unwrap()
+            .is_none());
+        // The key stays while it records a current admission (ADR-054).
+        assert_eq!(service.owner_discovery_keys(group_id).unwrap().len(), 1);
     }
 
     #[test]

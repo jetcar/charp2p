@@ -324,9 +324,13 @@ pub struct NetworkNode {
     dialed_addresses: HashMap<PeerId, Multiaddr>,
     /// Relay circuit addresses held back while direct addresses are dialled.
     relay_fallbacks: HashMap<PeerId, RelayFallback>,
-    /// Globally routable direct listen addresses of a client node, in the
-    /// order the swarm reported them; the first few are confirmed external.
+    /// Globally routable (or, when publishing private addresses, all) direct
+    /// listen addresses of a client node, in the order the swarm reported
+    /// them; the first few are confirmed external.
     routable_listen_addresses: Vec<Multiaddr>,
+    /// Also publishes private and loopback direct listen addresses, for
+    /// isolated local test networks only.
+    publish_private_addresses: bool,
     routing_peer_observer: Option<RoutingPeerObserver>,
 }
 
@@ -451,8 +455,17 @@ impl NetworkNode {
             dialed_addresses: HashMap::new(),
             relay_fallbacks: HashMap::new(),
             routable_listen_addresses: Vec::new(),
+            publish_private_addresses: false,
             routing_peer_observer: None,
         }
+    }
+
+    /// Publishes every direct listen address in provider records, including
+    /// private and loopback ones that ADR-056 keeps out of the DHT. Only for
+    /// isolated local test networks, where no address is globally routable.
+    pub fn publishing_private_addresses(mut self) -> Self {
+        self.publish_private_addresses = true;
+        self
     }
 
     /// Reports routing-mode peers reached over a direct dial to `observer`,
@@ -835,7 +848,8 @@ impl NetworkNode {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     if self.relay_server {
                         self.swarm.add_external_address(address.clone());
-                    } else if is_publishable_direct_address(&address)
+                    } else if (is_publishable_direct_address(&address)
+                        || (self.publish_private_addresses && !is_relayed(&address)))
                         && !self.routable_listen_addresses.contains(&address)
                     {
                         self.routable_listen_addresses.push(address.clone());

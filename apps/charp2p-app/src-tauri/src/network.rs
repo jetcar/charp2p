@@ -560,6 +560,9 @@ pub struct NetworkService {
     owner_peers: Arc<std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>>,
     /// Whether owner and member nodes also use mDNS on the local network.
     lan_discovery: bool,
+    /// Whether nodes also publish private and loopback listen addresses in
+    /// provider records; only isolated local test networks set this.
+    publish_private_addresses: bool,
     /// Routing peers recently reached by this device (ADR-046).
     routing_peers: Option<Arc<RoutingPeersService>>,
 }
@@ -745,6 +748,7 @@ impl NetworkService {
             owner_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
             owner_peers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             lan_discovery: true,
+            publish_private_addresses: false,
             routing_peers: None,
         })
     }
@@ -805,10 +809,15 @@ impl NetworkService {
     /// provider.
     fn group_client_node(&self, identity: DeviceIdentity) -> NetworkNode {
         let keypair = identity.into_network_keypair();
-        if self.lan_discovery {
+        let node = if self.lan_discovery {
             NetworkNode::new_with_lan_discovery(keypair)
         } else {
             NetworkNode::new(keypair)
+        };
+        if self.publish_private_addresses {
+            node.publishing_private_addresses()
+        } else {
+            node
         }
     }
 
@@ -3379,9 +3388,12 @@ mod tests {
     }
 
     impl NetworkService {
-        /// Keeps tests of DHT discovery independent of mDNS on the host.
+        /// Keeps tests of DHT discovery independent of mDNS on the host, and
+        /// lets their loopback-only nodes publish provider addresses, which
+        /// ADR-056 otherwise keeps out of the DHT.
         fn without_lan_discovery(mut self) -> Self {
             self.lan_discovery = false;
+            self.publish_private_addresses = true;
             self
         }
     }
@@ -5711,7 +5723,8 @@ mod tests {
                     group_id: invitation.group_id(),
                 }),
             )
-            .unwrap();
+            .unwrap()
+            .without_lan_discovery();
             {
                 let advertise = service.advertise(owner, owner_signer, &invitation);
                 tokio::pin!(advertise);

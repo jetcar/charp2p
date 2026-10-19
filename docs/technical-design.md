@@ -785,8 +785,10 @@ signed membership state before accepting the leaf.
 
 The member-device view is derived from the verified credentials in the current
 local MLS group. It exposes device fingerprints and the locally known owner and
-current-device labels. It does not infer people, presence, or activity from a
-cryptographic device identity.
+current-device labels. For last observed activity it shows the time of the
+latest signed event this device holds from each member device. That time is
+the author's own claim, not a verified clock or presence: the view does not
+infer people, online state, or presence from a cryptographic device identity.
 
 Profile version 1 rejects an encoded MLS message larger than 128 KiB. Because a
 self-contained Welcome includes the ratchet tree, this also limits the group

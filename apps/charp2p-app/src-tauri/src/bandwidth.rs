@@ -49,6 +49,8 @@ pub struct BandwidthStatus {
 struct SyncBudget {
     limit_bytes: u64,
     available: i128,
+    /// Refill credit below one byte, in bytes times nanoseconds of the period.
+    remainder: i128,
     updated: Instant,
 }
 
@@ -58,18 +60,22 @@ impl SyncBudget {
         Self {
             limit_bytes,
             available: i128::from(limit_bytes),
+            remainder: 0,
             updated: now,
         }
     }
 
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.updated);
-        let refilled = i128::from(self.limit_bytes) * elapsed.as_millis() as i128
-            / BUDGET_PERIOD.as_millis() as i128;
-        if refilled > 0 {
-            self.available = (self.available + refilled).min(i128::from(self.limit_bytes));
-            self.updated = now;
+        let period = BUDGET_PERIOD.as_nanos() as i128;
+        let credit = i128::from(self.limit_bytes) * elapsed.as_nanos() as i128 + self.remainder;
+        self.available += credit / period;
+        self.remainder = credit % period;
+        if self.available >= i128::from(self.limit_bytes) {
+            self.available = i128::from(self.limit_bytes);
+            self.remainder = 0;
         }
+        self.updated = now;
     }
 
     fn remaining(&mut self, now: Instant) -> u64 {
@@ -285,6 +291,23 @@ mod tests {
         assert_eq!(
             budget.remaining(start + Duration::from_secs(3 * 60 * 60)),
             60 * BYTES_PER_MIB
+        );
+    }
+
+    #[test]
+    fn frequent_checks_keep_fractional_refill_credit() {
+        let start = Instant::now();
+        let mut budget = SyncBudget::new(1, start);
+        budget.charge(BYTES_PER_MIB, start);
+
+        // 1 MiB per hour refills about 0.29 bytes per millisecond, so each
+        // check alone adds less than a byte.
+        for millis in 1..=3_600_000 {
+            budget.remaining(start + Duration::from_millis(millis));
+        }
+        assert_eq!(
+            budget.remaining(start + Duration::from_secs(60 * 60)),
+            BYTES_PER_MIB
         );
     }
 

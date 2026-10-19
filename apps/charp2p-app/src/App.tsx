@@ -2945,30 +2945,43 @@ function App() {
     };
   }, [servedJoinedGroupId]);
 
-  const backgroundGroupIds = joinedGroups
+  // Read at each step, so opening or switching a group changes which groups
+  // the running schedule visits instead of restarting it.
+  const backgroundGroupIdsRef = useRef<string[]>([]);
+  backgroundGroupIdsRef.current = joinedGroups
     .map((group) => group.groupId)
-    .filter((groupId) => groupId !== joinedGroup?.groupId)
-    .join(",");
+    .filter((groupId) => groupId !== joinedGroup?.groupId);
+  const backgroundSynchronizationRef = useRef(performJoinedGroupSynchronization);
+  backgroundSynchronizationRef.current = performJoinedGroupSynchronization;
 
   useEffect(() => {
-    if (!isTauri() || !backgroundGroupIds) return;
+    if (!isTauri()) return;
 
     // Joined groups that are not open synchronize one at a time, so unread
     // counts, last synchronization and connection states in the group list
-    // stay current while the app (or its background window) runs.
-    const groupIds = backgroundGroupIds.split(",");
+    // stay current while the app (or its background window) runs. The pass
+    // starts 15 seconds after launch, visits each group 5 seconds apart and
+    // repeats five minutes after it covers every group.
     let active = true;
     let timer: number | undefined;
-    let next = 0;
+    let synchronizedThisPass = new Set<string>();
+
+    function unvisitedGroupIds() {
+      return backgroundGroupIdsRef.current.filter((groupId) => !synchronizedThisPass.has(groupId));
+    }
 
     async function synchronizeNextGroup() {
-      await performJoinedGroupSynchronization(groupIds[next % groupIds.length], false);
-      next += 1;
-      if (active) {
-        const delay = next % groupIds.length === 0
-          ? BACKGROUND_GROUP_SYNC_INTERVAL_MS
-          : BACKGROUND_GROUP_SYNC_STEP_MS;
-        timer = window.setTimeout(synchronizeNextGroup, delay);
+      const [groupId] = unvisitedGroupIds();
+      if (groupId !== undefined) {
+        synchronizedThisPass.add(groupId);
+        await backgroundSynchronizationRef.current(groupId, false);
+      }
+      if (!active) return;
+      if (unvisitedGroupIds().length === 0) {
+        synchronizedThisPass = new Set();
+        timer = window.setTimeout(synchronizeNextGroup, BACKGROUND_GROUP_SYNC_INTERVAL_MS);
+      } else {
+        timer = window.setTimeout(synchronizeNextGroup, BACKGROUND_GROUP_SYNC_STEP_MS);
       }
     }
 
@@ -2977,7 +2990,7 @@ function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [backgroundGroupIds]);
+  }, []);
 
   useEffect(() => {
     let active = true;

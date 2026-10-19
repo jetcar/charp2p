@@ -608,19 +608,24 @@ impl NetworkNode {
         }
     }
 
-    /// Registers a known bootstrap peer address with the routing table.
+    /// Registers a known bootstrap peer address with the routing table. A
+    /// blocked peer is skipped so it cannot re-enter the table.
     pub fn add_bootstrap_peer(&mut self, peer_id: PeerId, address: Multiaddr) {
-        self.swarm
-            .behaviour_mut()
-            .dht
-            .add_address(&peer_id, address);
+        let behaviour = self.swarm.behaviour_mut();
+        if behaviour.blocked_peers.blocked_peers().contains(&peer_id) {
+            return;
+        }
+        behaviour.dht.add_address(&peer_id, address);
     }
 
-    /// Refuses every connection with `peer_id` and closes existing ones. The
-    /// block is local to this node and lasts until it is lifted or the node
-    /// stops.
+    /// Refuses every connection with `peer_id`, closes existing ones and
+    /// removes it from the routing table so DHT queries do not route through
+    /// it. The block is local to this node and lasts until it is lifted or the
+    /// node stops.
     pub fn block_peer(&mut self, peer_id: PeerId) {
-        self.swarm.behaviour_mut().blocked_peers.block_peer(peer_id);
+        let behaviour = self.swarm.behaviour_mut();
+        behaviour.blocked_peers.block_peer(peer_id);
+        behaviour.dht.remove_peer(&peer_id);
     }
 
     /// Lifts a local block so `peer_id` may connect again.
@@ -2549,6 +2554,33 @@ mod tests {
         })
         .await
         .expect("blocking should close the existing connection");
+    }
+
+    fn routing_table_contains(node: &mut NetworkNode, peer_id: PeerId) -> bool {
+        node.swarm.behaviour_mut().dht.kbuckets().any(|bucket| {
+            bucket
+                .iter()
+                .any(|entry| *entry.node.key.preimage() == peer_id)
+        })
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_leaves_and_stays_out_of_the_routing_table() {
+        let mut node = NetworkNode::new_routing(Keypair::generate_ed25519());
+        let peer_id = Keypair::generate_ed25519().public().to_peer_id();
+        let address: Multiaddr = "/ip4/192.0.2.1/udp/4001/quic-v1".parse().unwrap();
+
+        node.add_bootstrap_peer(peer_id, address.clone());
+        assert!(routing_table_contains(&mut node, peer_id));
+
+        node.block_peer(peer_id);
+        assert!(!routing_table_contains(&mut node, peer_id));
+        node.add_bootstrap_peer(peer_id, address.clone());
+        assert!(!routing_table_contains(&mut node, peer_id));
+
+        node.unblock_peer(peer_id);
+        node.add_bootstrap_peer(peer_id, address);
+        assert!(routing_table_contains(&mut node, peer_id));
     }
 
     #[tokio::test]

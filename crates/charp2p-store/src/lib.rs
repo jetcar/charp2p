@@ -2,11 +2,7 @@
 
 //! Durable local persistence for verified CharP2P protocol data.
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use charp2p_core::{
     EventError, EventId, HistoryPolicy, InvitationId, MAX_JOIN_MLS_MESSAGE_BYTES,
@@ -1839,31 +1835,45 @@ impl EventStore {
     }
 
     /// Returns gap-free author heads for compact synchronization comparison.
+    ///
+    /// Heads come from the indexed author and sequence columns, which
+    /// `put_events` writes from verified events, so no stored event is
+    /// decoded or re-verified.
     pub fn synchronization_summary(&self, group_id: PeerId) -> Result<Vec<AuthorHead>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT encoded FROM events WHERE group_id = ?1")?;
-        let encoded = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut sequences: HashMap<PeerId, BTreeSet<u64>> = HashMap::new();
+        let mut statement = self.connection.prepare(
+            "SELECT author_id, author_sequence FROM events
+             WHERE group_id = ?1
+             ORDER BY author_id, author_sequence",
+        )?;
+        let rows = statement.query_map([group_id.to_bytes()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut summary: Vec<AuthorHead> = Vec::new();
+        // Whether the current author's sequences are still gap-free.
+        let mut contiguous = false;
 
-        for bytes in encoded {
-            let event = SignedEvent::decode(&bytes?)?;
-            if event.group_id() != group_id {
-                return Err(StoreError::CorruptIndex);
+        for row in rows {
+            let (author_id, sequence) = row?;
+            let author_id = PeerId::from_bytes(&author_id).map_err(|_| StoreError::CorruptIndex)?;
+            let sequence = u64::try_from(sequence).map_err(|_| StoreError::CorruptIndex)?;
+            if summary
+                .last()
+                .is_none_or(|head| head.author_id != author_id)
+            {
+                summary.push(AuthorHead {
+                    author_id,
+                    contiguous_sequence: 0,
+                });
+                contiguous = true;
             }
-            sequences
-                .entry(event.author_id())
-                .or_default()
-                .insert(event.author_sequence());
+            let head = summary.last_mut().expect("an author head was just pushed");
+            if contiguous && sequence == head.contiguous_sequence + 1 {
+                head.contiguous_sequence = sequence;
+            } else {
+                contiguous = false;
+            }
         }
 
-        let mut summary: Vec<_> = sequences
-            .into_iter()
-            .map(|(author_id, sequences)| AuthorHead {
-                author_id,
-                contiguous_sequence: contiguous_head(&sequences),
-            })
-            .collect();
         summary.sort_by_key(|head| head.author_id.to_bytes());
         Ok(summary)
     }
@@ -3941,17 +3951,6 @@ pub enum StoreError {
     CorruptIndex,
 }
 
-fn contiguous_head(sequences: &BTreeSet<u64>) -> u64 {
-    sequences
-        .iter()
-        .copied()
-        .zip(1..)
-        .take_while(|(actual, expected)| actual == expected)
-        .map(|(sequence, _)| sequence)
-        .last()
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use charp2p_core::{
@@ -4165,12 +4164,28 @@ mod tests {
         );
 
         store.put_event(&missing).unwrap();
-        let summary = store.synchronization_summary(group.group_id()).unwrap();
-        let first_head = summary
-            .iter()
-            .find(|head| head.author_id == first_author.peer_id())
+        store
+            .put_event(&message_event(&second_author, &group, 1, b"start"))
             .unwrap();
-        assert_eq!(first_head.contiguous_sequence, 3);
+        store
+            .put_event(&message_event(&second_author, &group, 4, b"later gap"))
+            .unwrap();
+        let summary = store.synchronization_summary(group.group_id()).unwrap();
+        let head_of = |author: &DeviceIdentity| {
+            summary
+                .iter()
+                .find(|head| head.author_id == author.peer_id())
+                .unwrap()
+                .contiguous_sequence
+        };
+        assert_eq!(head_of(&first_author), 3);
+        assert_eq!(head_of(&second_author), 2);
+        assert!(
+            store
+                .synchronization_summary(GroupIdentity::generate().group_id())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

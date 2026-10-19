@@ -1998,6 +1998,7 @@ impl NetworkService {
             expected_peer,
             group_id,
             local_peer,
+            bandwidth,
             &mut connection_path,
         )
         .await?;
@@ -2435,8 +2436,10 @@ impl NetworkService {
         peer_id: PeerId,
         group_id: PeerId,
         author_id: PeerId,
+        bandwidth: &BandwidthService,
         path: &mut ConnectionPath,
     ) -> Result<(), &'static str> {
+        bandwidth.ensure_sync_budget()?;
         let request = self.synchronization.report_heads_request(group_id)?;
         let request_id = node
             .send_sync_request(peer_id, request)
@@ -3987,6 +3990,36 @@ mod tests {
             service.group_connection_states(&[group_id])[0].state,
             "waiting"
         );
+    }
+
+    #[test]
+    fn spent_synchronization_budget_skips_the_report_heads_exchange() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        bandwidth
+            .set(BandwidthPreference {
+                sync_limit_mib_per_hour: Some(1),
+            })
+            .unwrap();
+        bandwidth.charge_sync_bytes(2 * 1024 * 1024);
+        let service = NetworkService::from_sources(&[], "").unwrap();
+
+        let result = tauri::async_runtime::block_on(async {
+            let mut node = NetworkNode::new(DeviceIdentity::generate().into_network_keypair());
+            let mut path = ConnectionPath::Direct;
+            service
+                .exchange_observed_heads(
+                    &mut node,
+                    DeviceIdentity::generate().peer_id(),
+                    DeviceIdentity::generate().peer_id(),
+                    DeviceIdentity::generate().peer_id(),
+                    &bandwidth,
+                    &mut path,
+                )
+                .await
+        });
+
+        assert_eq!(result.unwrap_err(), "synchronization_bandwidth_limited");
     }
 
     #[test]

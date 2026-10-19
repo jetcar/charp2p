@@ -790,26 +790,33 @@ function MemberInvitationPanel({ groupId, groupName }: { groupId: string; groupN
           </button>
         </>
       ) : (
-        <>
-          <p className="preview-note">The group owner allowed this device to invite. The owner device must be reachable to issue the invitation and still admits every join request.</p>
-          <div className="invitation-defaults">
-            <label htmlFor="member-invitation-expiry">This invitation expires after</label>
-            <select
-              id="member-invitation-expiry"
-              onChange={(event) => setLifetimeSeconds(Number(event.target.value))}
-              value={lifetimeSeconds}
-            >
-              {INVITATION_LIFETIMES.map(({ label, seconds }) => (
-                <option key={seconds} value={seconds}>{label}</option>
-              ))}
-            </select>
-            <p className="preview-note">The owner shortens it to the group's invitation limit if that is lower.</p>
-          </div>
-          <button className="primary-button" disabled={requesting || !isTauri()} onClick={requestInvitation} type="button">
-            {requesting ? "Requesting invitation…" : "Request invitation"}
-          </button>
-        </>
+        <p className="preview-note">The group owner allowed this device to invite. The owner device must be reachable to issue the invitation and still admits every join request.</p>
       )}
+      {/* A used or revoked invitation still shows until it expires, so a new
+          request stays available; the owner returns this device's invitation
+          unchanged while it is still active (ADR-043). */}
+      {current && (
+        <p className="preview-note">
+          If this invitation was already used or revoked, request a new one. While it is still active, the owner returns
+          this same invitation.
+        </p>
+      )}
+      <div className="invitation-defaults">
+        <label htmlFor="member-invitation-expiry">This invitation expires after</label>
+        <select
+          id="member-invitation-expiry"
+          onChange={(event) => setLifetimeSeconds(Number(event.target.value))}
+          value={lifetimeSeconds}
+        >
+          {INVITATION_LIFETIMES.map(({ label, seconds }) => (
+            <option key={seconds} value={seconds}>{label}</option>
+          ))}
+        </select>
+        <p className="preview-note">The owner shortens it to the group's invitation limit if that is lower.</p>
+      </div>
+      <button className="primary-button" disabled={requesting || !isTauri()} onClick={requestInvitation} type="button">
+        {requesting ? "Requesting invitation…" : current ? "Request a new invitation" : "Request invitation"}
+      </button>
       {error && <p className="form-error preview-error" role="alert">{error}</p>}
       <p className="preview-note">This invitation is kept only until the app closes. The owner can revoke it at any time.</p>
     </section>

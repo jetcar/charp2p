@@ -49,7 +49,7 @@ const IDENTIFY_PROTOCOL: &str = "/charp2p/identify/1.0.0";
 const DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/charp2p/kad/1.0.0");
 const AGENT_VERSION: &str = concat!("charp2p/", env!("CARGO_PKG_VERSION"));
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
-const SYNC_PROTOCOL: &str = "/charp2p/sync/2.0.0";
+const SYNC_PROTOCOL: &str = "/charp2p/sync/3.0.0";
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_PROTOCOL: &str = "/charp2p/join/1.0.0";
 const JOIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -175,11 +175,8 @@ impl Behaviour {
                 .with_request_timeout(INVITE_REQUEST_TIMEOUT)
                 .with_max_concurrent_streams(16),
         );
-        let sync_codec = request_response::cbor::codec::Codec::default()
-            .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
-            .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES);
         let sync = request_response::Behaviour::with_codec(
-            sync_codec,
+            sync_codec(),
             [(
                 StreamProtocol::new(SYNC_PROTOCOL),
                 request_response::ProtocolSupport::Full,
@@ -1663,6 +1660,13 @@ fn is_relayed(address: &Multiaddr) -> bool {
         .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
 }
 
+/// Synchronization codec that stops reading at the wire bounds.
+fn sync_codec() -> request_response::cbor::codec::Codec<SyncRequest, SyncResponse> {
+    request_response::cbor::codec::Codec::default()
+        .set_request_size_maximum(MAX_SYNC_WIRE_REQUEST_BYTES)
+        .set_response_size_maximum(MAX_SYNC_WIRE_RESPONSE_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1678,12 +1682,61 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        ConnectionPath, DHT_PROTOCOL, MAX_PROVIDER_ADDRESSES, NetworkEvent, NetworkNode,
-        RELAY_CIRCUIT_DURATION, RelayLimits, accepted_provider_record, record_key,
+        ConnectionPath, DHT_PROTOCOL, MAX_PROVIDER_ADDRESSES, MAX_SYNC_WIRE_REQUEST_BYTES,
+        MAX_SYNC_WIRE_RESPONSE_BYTES, NetworkEvent, NetworkNode, RELAY_CIRCUIT_DURATION,
+        RelayLimits, SYNC_PROTOCOL, accepted_provider_record, record_key, sync_codec,
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NOW: u64 = 1_800_000_000;
+
+    #[tokio::test]
+    async fn full_sync_event_batches_fit_the_wire_bounds() {
+        use futures::io::Cursor;
+        use libp2p::{StreamProtocol, request_response::Codec};
+
+        let group_id = GroupIdentity::generate().group_id();
+        // 256 events of 8 KiB are exactly the 2 MiB event-data limit; bytes
+        // that look random cost the most in an integer-sequence encoding.
+        let event: Vec<u8> = (0..8 * 1024_u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let encoded_events = vec![event; charp2p_core::MAX_SYNC_BATCH_ITEMS];
+        let protocol = StreamProtocol::new(SYNC_PROTOCOL);
+        let mut codec = sync_codec();
+
+        let request = SyncRequest::PushEvents {
+            group_id,
+            encoded_events: encoded_events.clone(),
+        };
+        let mut wire = Cursor::new(Vec::new());
+        codec
+            .write_request(&protocol, &mut wire, request.clone())
+            .await
+            .unwrap();
+        assert!(wire.get_ref().len() as u64 <= MAX_SYNC_WIRE_REQUEST_BYTES);
+        wire.set_position(0);
+        assert_eq!(
+            codec.read_request(&protocol, &mut wire).await.unwrap(),
+            request
+        );
+
+        let response = SyncResponse::Events {
+            group_id,
+            encoded_events,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        codec
+            .write_response(&protocol, &mut wire, response.clone())
+            .await
+            .unwrap();
+        assert!(wire.get_ref().len() as u64 <= MAX_SYNC_WIRE_RESPONSE_BYTES);
+        wire.set_position(0);
+        assert_eq!(
+            codec.read_response(&protocol, &mut wire).await.unwrap(),
+            response
+        );
+    }
 
     #[test]
     fn dht_uses_a_dedicated_protocol_name() {

@@ -5,7 +5,8 @@
 Accepted; superseded in part. The exchange list is extended by `ReportHeads`
 (ADR-030) and `EventsAvailable` (ADR-049), and owners also accept uploaded
 `MessageEdited` and `MessageDeleted` events (technical design,
-Connectivity).
+Connectivity). Encoded events are carried as CBOR byte strings over
+`/charp2p/sync/3.0.0` (ADR-059).
 
 ## Date
 

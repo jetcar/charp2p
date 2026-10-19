@@ -892,8 +892,10 @@ v0x13 over the passphrase with 64 MiB of memory, 3 passes, and 1 lane, giving
 opened with these parameters.
 
 Synchronization requests and responses use the libp2p CBOR request-response
-codec. That envelope is neither signed nor canonical; every event inside it is
-a canonical signed envelope that the receiver decodes and verifies itself.
+codec over `/charp2p/sync/3.0.0`. That envelope is neither signed nor
+canonical; every event inside it is a canonical signed envelope, carried as a
+CBOR byte string so a full 2 MiB batch fits the wire bound (ADR-059), that the
+receiver decodes and verifies itself.
 
 Every parser checks the outer size before decoding:
 

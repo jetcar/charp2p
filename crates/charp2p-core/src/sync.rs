@@ -74,6 +74,7 @@ pub enum SyncRequest {
     /// Offers locally authored signed events to the group owner.
     PushEvents {
         group_id: PeerId,
+        #[serde(with = "encoded_event_list")]
         encoded_events: Vec<Vec<u8>>,
     },
     /// Reports the sender's gap-free author heads after a completed exchange
@@ -132,6 +133,7 @@ pub enum SyncResponse {
     /// Canonical signed event envelopes.
     Events {
         group_id: PeerId,
+        #[serde(with = "encoded_event_list")]
         encoded_events: Vec<Vec<u8>>,
     },
     /// Confirms an authenticated push and reports newly persisted events.
@@ -308,6 +310,92 @@ fn validate_events(group_id: &PeerId, encoded_events: &[Vec<u8>]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Serializes encoded signed events as byte strings rather than sequences of
+/// integers, so a self-describing wire format such as CBOR keeps a full batch
+/// within the synchronization wire bound instead of nearly doubling it.
+mod encoded_event_list {
+    use std::fmt;
+
+    use serde::{
+        Deserializer, Serializer,
+        de::{self, SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    use super::MAX_SYNC_BATCH_ITEMS;
+
+    struct EventBytes<'a>(&'a [u8]);
+
+    impl serde::Serialize for EventBytes<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    struct OwnedEventBytes(Vec<u8>);
+
+    impl<'de> serde::Deserialize<'de> for OwnedEventBytes {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_byte_buf(EventBytesVisitor)
+        }
+    }
+
+    struct EventBytesVisitor;
+
+    impl Visitor<'_> for EventBytesVisitor {
+        type Value = OwnedEventBytes;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an encoded signed event")
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            Ok(OwnedEventBytes(value.to_vec()))
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(OwnedEventBytes(value))
+        }
+    }
+
+    struct EventListVisitor;
+
+    impl<'de> Visitor<'de> for EventListVisitor {
+        type Value = Vec<Vec<u8>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a list of encoded signed events")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            // The peer-supplied length only sizes the first allocation.
+            let capacity = sequence.size_hint().unwrap_or(0).min(MAX_SYNC_BATCH_ITEMS);
+            let mut events = Vec::with_capacity(capacity);
+            while let Some(OwnedEventBytes(event)) = sequence.next_element()? {
+                events.push(event);
+            }
+            Ok(events)
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        events: &[Vec<u8>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(events.len()))?;
+        for event in events {
+            sequence.serialize_element(&EventBytes(event))?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<u8>>, D::Error> {
+        deserializer.deserialize_seq(EventListVisitor)
+    }
 }
 
 #[cfg(test)]

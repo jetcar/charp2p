@@ -1731,15 +1731,20 @@ impl NetworkService {
         identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<PeerSearchResult, &'static str> {
-        let result = self.search_providers(identity, invitation).await;
-        self.observe_connection(result, |found| found.connection_type)
+        if invitation.inviter_device_id() == identity.peer_id() {
+            return Err("invitation_inviter_mismatch");
+        }
+        // The raw dial outcome is observed before it becomes a preview
+        // status, so dial failures show as offline like join and sync do.
+        let dialed = self.search_providers(identity, invitation).await;
+        search_result(self.observe_connection(dialed, |path| Some(connection_type_name(*path))))
     }
 
     async fn search_providers(
         &self,
         identity: DeviceIdentity,
         invitation: &Invitation,
-    ) -> Result<PeerSearchResult, &'static str> {
+    ) -> Result<ConnectionPath, &'static str> {
         // The preview reaches the pinned inviter the way the join does:
         // address hints first (ADR-037), then the DHT lookup with an mDNS
         // announcement dialed alongside it; the transport authenticates the
@@ -1753,7 +1758,7 @@ impl NetworkService {
                 &hints,
             )
             .await;
-        search_result(result.map(|connection| connection.path))
+        result.map(|connection| connection.path)
     }
 
     pub async fn join(
@@ -2974,9 +2979,6 @@ fn pinned_address_hints(invitation: &Invitation) -> Vec<Multiaddr> {
         .collect()
 }
 
-/// Starts listening on QUIC and on TCP (ADR-047) on every IPv4 and IPv6
-/// interface, each on a port chosen by the operating system. IPv4 is
-/// required; IPv6 is skipped on devices or networks without it.
 /// Maps a provider dial outcome to the join preview's reachability result.
 fn search_result(
     dialed: Result<ConnectionPath, &'static str>,
@@ -2998,6 +3000,9 @@ fn search_result(
     })
 }
 
+/// Starts listening on QUIC and on TCP (ADR-047) on every IPv4 and IPv6
+/// interface, each on a port chosen by the operating system. IPv4 is
+/// required; IPv6 is skipped on devices or networks without it.
 fn listen_on_all_interfaces(node: &mut NetworkNode) -> Result<(), &'static str> {
     for address in ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"] {
         node.listen_on(
@@ -4217,6 +4222,29 @@ mod tests {
                 "ownedGroups",
             ]
         );
+    }
+
+    #[test]
+    fn search_refuses_an_invitation_this_device_issued() {
+        let identity = DeviceIdentity::generate();
+        let invitation = Invitation::issue(
+            &GroupIdentity::generate(),
+            identity.peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap();
+        let service = NetworkService::from_sources(&[], "").unwrap();
+
+        let result = tauri::async_runtime::block_on(service.search(identity, &invitation));
+
+        assert_eq!(result, Err("invitation_inviter_mismatch"));
     }
 
     #[test]

@@ -2404,13 +2404,8 @@ impl NetworkService {
                 return Err("synchronization_failed");
             }
             bandwidth.ensure_sync_budget()?;
-            // Pushed events are charged once sent, whatever the answer.
-            let pushed_bytes = request_event_bytes(&request);
-            let request_id = node
-                .send_sync_request(peer_id, request)
-                .map_err(|_| "synchronization_failed")?;
+            let request_id = send_push_request(node, peer_id, request, bandwidth)?;
             let response = await_sync_response(node, peer_id, request_id, path).await?;
-            bandwidth.charge_sync_bytes(pushed_bytes);
             match response {
                 SyncResponse::EventsAccepted {
                     group_id: response_group,
@@ -2476,6 +2471,22 @@ pub(crate) fn owner_unreachable(error: &str) -> bool {
 /// Signed event bytes a synchronization request pushes (ADR-033).
 /// Waits for the answer to one synchronization request. A relayed
 /// connection to the peer hole-punched meanwhile (DCUtR) turns `path` direct.
+/// Sends pushed events and charges them once sent, whatever the answer, so
+/// a peer that never answers cannot lift the upload limit (ADR-033).
+fn send_push_request(
+    node: &mut NetworkNode,
+    peer_id: PeerId,
+    request: SyncRequest,
+    bandwidth: &BandwidthService,
+) -> Result<OutboundSyncRequestId, &'static str> {
+    let pushed_bytes = request_event_bytes(&request);
+    let request_id = node
+        .send_sync_request(peer_id, request)
+        .map_err(|_| "synchronization_failed")?;
+    bandwidth.charge_sync_bytes(pushed_bytes);
+    Ok(request_id)
+}
+
 async fn await_sync_response(
     node: &mut NetworkNode,
     peer_id: PeerId,
@@ -3068,9 +3079,10 @@ mod tests {
     };
 
     use charp2p_core::{
-        DeviceIdentity, DiscoveryKey, GroupIdentity, HistoryPolicy, Invitation, InvitationSpec,
-        JoinRejectReason, JoinRequest, JoinResponse, PeerId, SyncMembershipState, SyncPeerHead,
-        SyncRejectReason, SyncRequest, SyncResponse,
+        DeviceIdentity, DiscoveryKey, EventKind, EventSpec, GroupIdentity, HistoryPolicy,
+        Invitation, InvitationSpec, JoinRejectReason, JoinRequest, JoinResponse, PeerId,
+        SignedEvent, SyncMembershipState, SyncPeerHead, SyncRejectReason, SyncRequest,
+        SyncResponse,
     };
     use charp2p_mls::{
         device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
@@ -3084,14 +3096,14 @@ mod tests {
     use crate::routing_peers::RoutingPeersService;
 
     use super::{
-        address_hint, answer_member_sync_request, clear_owner_peers, discovery_outcome,
-        forget_owner_addresses, forget_owner_peer, join_response, membership_comparison_name,
-        owned_group_state, parse_bootstrap_peer, pinned_address_hints, record_member_connection,
-        record_owner_address, record_owner_peer, select_address_hints, upgraded_path,
-        AdvertisementResult, BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
-        MemberAdmissionService, MemberCandidates, MembershipComparison, NetworkService,
-        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
-        SynchronizationService, UnavailableJoinRequestAuthorizer,
+        address_hint, answer_member_sync_request, await_sync_response, clear_owner_peers,
+        discovery_outcome, forget_owner_addresses, forget_owner_peer, join_response,
+        membership_comparison_name, owned_group_state, parse_bootstrap_peer, pinned_address_hints,
+        record_member_connection, record_owner_address, record_owner_peer, select_address_hints,
+        send_push_request, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
+        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, MemberCandidates,
+        MembershipComparison, NetworkService, NetworkStatus, PeerSearchResult, PendingJoinService,
+        PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
         MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS,
     };
@@ -3897,6 +3909,55 @@ mod tests {
         let status = tauri::async_runtime::block_on(service.status());
         assert_eq!(status.connection_type, Some("offline"));
         assert!(status.connection_observed_at_unix > 0);
+    }
+
+    #[test]
+    fn pushed_events_are_charged_when_no_answer_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = BandwidthService::new(directory.path().join("bandwidth.json"));
+        bandwidth
+            .set(BandwidthPreference {
+                sync_limit_mib_per_hour: Some(1),
+            })
+            .unwrap();
+        let group = GroupIdentity::generate();
+        let event = SignedEvent::create(
+            &DeviceIdentity::generate(),
+            EventSpec {
+                group_id: group.group_id(),
+                author_sequence: 1,
+                causal_parents: &[],
+                created_at_unix_ms: NOW * 1000,
+                kind: EventKind::MessageCreated,
+                protected_payload: &[7; 4096],
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let pushed_bytes = event.len() as u64;
+        let request = SyncRequest::PushEvents {
+            group_id: group.group_id(),
+            encoded_events: vec![event],
+        };
+
+        tauri::async_runtime::block_on(async {
+            let mut node = NetworkNode::new(DeviceIdentity::generate().into_network_keypair());
+            let unreachable = DeviceIdentity::generate().peer_id();
+            let request_id =
+                send_push_request(&mut node, unreachable, request, &bandwidth).unwrap();
+            let mut path = ConnectionPath::Direct;
+            assert!(
+                await_sync_response(&mut node, unreachable, request_id, &mut path)
+                    .await
+                    .is_err()
+            );
+        });
+
+        assert_eq!(
+            bandwidth.status().unwrap().remaining_sync_bytes,
+            Some(1024 * 1024 - pushed_bytes)
+        );
     }
 
     #[test]

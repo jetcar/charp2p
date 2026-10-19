@@ -277,6 +277,8 @@
 - [x] Docs: technical-design Identity gives `group_id = multihash("charp2p-group-v1" || key)`; code and protocol vectors use the group root's libp2p peer ID — reword to match.
 - [x] Identity backup: reject a backup too short to hold the 16-byte tag as `InvalidSize` before running Argon2id (technical-design "Every parser checks the outer size before decoding").
 
+- [x] Bandwidth limit: charge pushed upload bytes as soon as the push request is sent, before awaiting the owner's answer, so a timed-out or failed exchange (re-sent every retry) still counts against the ADR-033 limit (technical-design Synchronization data limit).
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -542,3 +544,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-19T06:30:44Z charp2p-node blocklist routing table: NetworkNode::block_peer now also calls dht.remove_peer and add_bootstrap_peer skips blocked peers (covers start and rebootstrap tick); unit test added; fmt, clippy, workspace tests, app build pass.
 2026-10-19T07:27:55Z Docs group ID derivation: technical-design now defines group_id as the root Ed25519 key's libp2p peer ID (identity multihash of the protobuf key), matching code and wire formats; docs-only, all checks pass.
 2026-10-19T08:27:38Z Identity backup short-tag size check: open_identity_backup now refuses backups shorter than header + 16-byte tag as InvalidSize before Argon2id; tests added; fmt, clippy, tests, app build pass.
+2026-10-19T09:36:31Z Bandwidth push charging: push_to_connected_peer now charges pushed events via send_push_request right after sending, before await_sync_response can fail; test with an unanswered push; workspace fmt/clippy/tests, src-tauri clippy and lib tests (after apt-installing webkit2gtk/gtk dev libs), app build pass.

@@ -698,8 +698,12 @@ a member device answers them `unauthorized`. A member acknowledges
 Summaries and head reports contain at most 1,024 authors. Identifier pages
 contain at most 256 identifiers. Signed-event responses and pushes contain at
 most 256 events, no event above 128 KiB, and no more than 2 MiB of event data.
-A device whose stored state would produce a response above these limits
-answers a valid request `busy`, not `invalid request`.
+An `Events` answer holds the requested events it stores, in request order, up
+to the 2 MiB bound and omits the rest; the puller then requests the next
+identifier page after its new gap-free head, so large batches are paged rather
+than refused. A device whose other stored state would produce a response above
+these limits, such as a summary with more than 1,024 authors, answers a valid
+request `busy`, not `invalid request`.
 
 Requirements:
 

@@ -643,8 +643,8 @@ fn local_author_head(
 mod tests {
     use charp2p_core::{
         DeviceIdentity, EventId, EventKind, EventSpec, GroupIdentity, MAX_SYNC_AUTHORS,
-        SignedEvent, SyncAuthorHead, SyncError, SyncMembershipState, SyncPeerHead, SyncRequest,
-        SyncResponse,
+        MAX_SYNC_RESPONSE_BYTES, SignedEvent, SyncAuthorHead, SyncError, SyncMembershipState,
+        SyncPeerHead, SyncRequest, SyncResponse,
     };
     use charp2p_store::EventStore;
 
@@ -716,6 +716,55 @@ mod tests {
         assert_eq!(
             target.synchronization_summary(group.group_id()).unwrap(),
             heads
+        );
+    }
+
+    #[test]
+    fn events_answers_stop_at_the_byte_limit_and_the_puller_pages_the_rest() {
+        let group = GroupIdentity::generate();
+        let author = DeviceIdentity::generate();
+        let payload = vec![7_u8; 64 * 1024];
+        let events: Vec<_> = (1..=48)
+            .map(|sequence| message_event(&author, &group, sequence, &payload))
+            .collect();
+        let mut source = EventStore::in_memory().unwrap();
+        source.put_events(&events).unwrap();
+
+        let SyncResponse::Events { encoded_events, .. } = build_authorized_response(
+            &source,
+            &SyncRequest::Events {
+                group_id: group.group_id(),
+                event_ids: events.iter().map(SignedEvent::id).collect(),
+            },
+        )
+        .unwrap() else {
+            panic!("event request must return events");
+        };
+        // The answer is a prefix of the requested events within 2 MiB, not
+        // a `busy` refusal.
+        assert!(!encoded_events.is_empty() && encoded_events.len() < events.len());
+        assert!(encoded_events.iter().map(Vec::len).sum::<usize>() <= MAX_SYNC_RESPONSE_BYTES);
+        for (encoded, event) in encoded_events.iter().zip(&events) {
+            assert_eq!(SignedEvent::decode(encoded).unwrap().id(), event.id());
+        }
+
+        let mut target = EventStore::in_memory().unwrap();
+        let (mut session, mut request) = PullSession::start(group.group_id());
+        let mut event_requests = 0;
+        loop {
+            event_requests += usize::from(matches!(request, SyncRequest::Events { .. }));
+            let response = build_authorized_response(&source, &request).unwrap();
+            let progress = session.handle_response(&mut target, &response).unwrap();
+            let Some(next_request) = progress.next_request else {
+                break;
+            };
+            request = next_request;
+        }
+        assert!(session.is_complete());
+        assert!(event_requests > 1);
+        assert_eq!(
+            target.synchronization_summary(group.group_id()).unwrap(),
+            source.synchronization_summary(group.group_id()).unwrap()
         );
     }
 

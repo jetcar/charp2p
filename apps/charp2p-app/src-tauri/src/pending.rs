@@ -10,7 +10,10 @@ use keyring_core::Error as KeyringError;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::{identity::protected_entry, invitation::public_error_code};
+use crate::{
+    identity::protected_entry,
+    invitation::{ensure_supported_profile, public_error_code},
+};
 
 const MAX_PROTECTED_INVITATION_BYTES: usize = 2 * 1024;
 const CREDENTIAL_PREFIX: &str = "pending-invitation-v1-";
@@ -524,6 +527,7 @@ impl PendingInvitationService {
             .lock()
             .map_err(|_| "pending_invitation_service_unavailable")?;
         let invitation = Invitation::decode_input(input, now_unix).map_err(public_error_code)?;
+        ensure_supported_profile(&invitation)?;
         let encoded = invitation.encode().map_err(public_error_code)?;
         if encoded.len() > MAX_PROTECTED_INVITATION_BYTES {
             return Err("pending_invitation_too_large");
@@ -754,7 +758,7 @@ mod tests {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
                 expires_at_unix: NOW + 3_600,
-                history_policy: HistoryPolicy::FromInvitation,
+                history_policy: HistoryPolicy::None,
                 reusable: false,
             },
             NOW,
@@ -763,6 +767,32 @@ mod tests {
         .encode()
         .unwrap();
         (encoded, owner.group_id())
+    }
+
+    #[test]
+    fn invitation_with_unsupported_history_policy_is_not_saved() {
+        let service = service();
+        let encoded = Invitation::issue(
+            &GroupIdentity::generate(),
+            DeviceIdentity::generate().peer_id(),
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: NOW + 3_600,
+                history_policy: HistoryPolicy::AllRetained,
+                reusable: false,
+            },
+            NOW,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        assert_eq!(
+            service.accept_at(&encoded, NOW),
+            Err("invitation_history_unsupported")
+        );
+        assert_eq!(service.list_at(NOW).unwrap(), Vec::new());
     }
 
     #[test]

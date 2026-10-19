@@ -34,7 +34,19 @@ fn current_unix() -> Result<u64, &'static str> {
 }
 
 fn decode_invitation_at(input: &str, now_unix: u64) -> Result<Invitation, &'static str> {
-    Invitation::decode_input(input, now_unix).map_err(public_error_code)
+    let invitation = Invitation::decode_input(input, now_unix).map_err(public_error_code)?;
+    ensure_supported_profile(&invitation)?;
+    Ok(invitation)
+}
+
+/// The current group profile fixes history to messages sent after joining,
+/// so an invitation signed with another history policy is refused rather than
+/// previewed or saved with a permission the group cannot grant.
+pub(crate) fn ensure_supported_profile(invitation: &Invitation) -> Result<(), &'static str> {
+    if invitation.history_policy() != HistoryPolicy::None {
+        return Err("invitation_history_unsupported");
+    }
+    Ok(())
 }
 
 fn preview_invitation_at(input: &str, now_unix: u64) -> Result<InvitationPreview, &'static str> {
@@ -83,7 +95,7 @@ mod tests {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
                 expires_at_unix: NOW + 3_600,
-                history_policy: HistoryPolicy::FromInvitation,
+                history_policy: HistoryPolicy::None,
                 reusable: false,
             },
             NOW,
@@ -97,7 +109,7 @@ mod tests {
         assert_eq!(preview.inviter_name, "Maya");
         assert_eq!(preview.inviter_device_id, inviter_device_id.to_string());
         assert_eq!(preview.group_id, owner.group_id().to_string());
-        assert_eq!(preview.history_policy, "fromInvitation");
+        assert_eq!(preview.history_policy, "none");
         assert!(!preview.reusable);
         assert!(!preview.approval_required);
     }
@@ -112,7 +124,7 @@ mod tests {
                 group_name: "Design Crew",
                 inviter_name: "Maya",
                 expires_at_unix: NOW + 3_600,
-                history_policy: HistoryPolicy::FromInvitation,
+                history_policy: HistoryPolicy::None,
                 reusable: true,
             },
             &[],
@@ -128,6 +140,37 @@ mod tests {
                 .unwrap()
                 .approval_required
         );
+    }
+
+    #[test]
+    fn invitation_with_unsupported_history_policy_is_refused() {
+        let owner = GroupIdentity::generate();
+        for history_policy in [HistoryPolicy::FromInvitation, HistoryPolicy::AllRetained] {
+            let encoded = Invitation::issue(
+                &owner,
+                DeviceIdentity::generate().peer_id(),
+                InvitationSpec {
+                    group_name: "Design Crew",
+                    inviter_name: "Maya",
+                    expires_at_unix: NOW + 3_600,
+                    history_policy,
+                    reusable: false,
+                },
+                NOW,
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+
+            assert_eq!(
+                preview_invitation_at(&encoded, NOW).unwrap_err(),
+                "invitation_history_unsupported"
+            );
+            assert_eq!(
+                decode_invitation_at(&encoded, NOW).err(),
+                Some("invitation_history_unsupported")
+            );
+        }
     }
 
     #[test]

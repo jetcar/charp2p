@@ -219,6 +219,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_history_policy: "Choose a valid history policy.",
   invalid_invitation_lifetime: "Choose a supported invitation expiry.",
   invitation_expired: "This invitation has expired.",
+  invitation_history_unsupported: "This invitation offers message history the current secure group profile does not support.",
   invitation_owned_locally: "This device already owns that group.",
   invitation_invalid: "This is not a valid CharP2P invitation.",
   invitation_inviter_mismatch: "This device is not authorized to answer that invitation.",

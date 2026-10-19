@@ -470,7 +470,10 @@ device is rejected so network loss cannot create duplicate MLS leaves.
 The current group profile also fixes history to messages sent after joining and
 lets a valid invitation grant access directly unless the group requires owner
 approval. Group creation rejects the retained-history option until its
-enforcement path exists; a single-use invitation default is accepted. The
+enforcement path exists, and a joining device refuses to preview or save an
+invitation signed with any history policy other than messages sent after
+joining (`invitation_history_unsupported`); a single-use invitation default is
+accepted. The
 owner may override the group's reuse default for each invitation it issues;
 invitations issued for a member's invite request always use the group default.
 The Invitations page re-reads the issued list periodically. A single-use

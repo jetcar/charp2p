@@ -12,6 +12,9 @@ const SIGNING_DOMAIN: &[u8] = b"charp2p-event-signature-v1\0";
 const MAX_ENCODED_EVENT_BYTES: usize = 128 * 1024;
 const MAX_PROTECTED_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_CAUSAL_PARENTS: usize = 16;
+/// Largest advisory creation time: it must fit the store's signed 64-bit
+/// columns and stay exact as a JavaScript number in the UI.
+const MAX_CREATED_AT_UNIX_MS: u64 = (1 << 53) - 1;
 
 /// Stable event identifier derived from the canonical event body.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
@@ -251,6 +254,9 @@ pub enum EventError {
     /// The event contains too many causal parents or duplicates one.
     #[error("causal parents are invalid")]
     InvalidParents,
+    /// The advisory creation time exceeds its protocol limit.
+    #[error("event creation time is out of range")]
+    InvalidTimestamp,
     /// The group identifier is malformed.
     #[error("group identifier is invalid")]
     InvalidGroupId,
@@ -306,6 +312,9 @@ fn validate_body(body: &EventBody) -> Result<(), EventError> {
     }
     if body.causal_parents.len() > MAX_CAUSAL_PARENTS {
         return Err(EventError::InvalidParents);
+    }
+    if body.created_at_unix_ms > MAX_CREATED_AT_UNIX_MS {
+        return Err(EventError::InvalidTimestamp);
     }
     let unique_parents: HashSet<_> = body.causal_parents.iter().collect();
     if unique_parents.len() != body.causal_parents.len() {
@@ -474,6 +483,41 @@ mod tests {
         assert!(matches!(
             create_message(&author, &group, 1, &[], &payload),
             Err(EventError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn out_of_range_creation_time_is_rejected() {
+        let author = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let create_at = |created_at_unix_ms| {
+            SignedEvent::create(
+                &author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: 1,
+                    causal_parents: &[],
+                    created_at_unix_ms,
+                    kind: EventKind::MessageCreated,
+                    protected_payload: b"payload",
+                },
+            )
+        };
+
+        assert!(create_at((1 << 53) - 1).is_ok());
+        assert!(matches!(
+            create_at(1 << 53),
+            Err(EventError::InvalidTimestamp)
+        ));
+
+        let event = create_at(1_800_000_000_000).unwrap();
+        let mut wire: SignedEventWire = postcard::from_bytes(&event.encode().unwrap()).unwrap();
+        wire.body.created_at_unix_ms = u64::MAX;
+        let tampered = postcard::to_allocvec(&wire).unwrap();
+
+        assert!(matches!(
+            SignedEvent::decode(&tampered),
+            Err(EventError::InvalidTimestamp)
         ));
     }
 }

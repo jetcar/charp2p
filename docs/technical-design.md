@@ -550,7 +550,10 @@ signature
 ```
 
 Wall-clock time is display metadata and cannot determine authorization or
-conflict resolution. Authorization derives from the signed membership state
+conflict resolution. Events whose `created_at` exceeds 2^53 - 1 milliseconds
+are malformed and rejected before signature verification, so one member's
+out-of-range timestamp cannot stop the store from materializing the group's
+later events. Authorization derives from the signed membership state
 referenced by the event.
 
 Ordering and completeness use each author's gap-free `author_sequence`, not
@@ -895,6 +898,7 @@ Every parser checks the outer size before decoding:
 | Encoded signed event | 128 KiB |
 | Event protected payload | 64 KiB |
 | Event causal parents | 16, unique |
+| Event `created_at` | at most 2^53 - 1 ms |
 | Invitation payload (Base64) | 8 KiB; pasted links 8 KiB + 256 bytes |
 | Group and inviter display names | 80 bytes |
 | Inviter device ID, join group ID | 128 bytes |

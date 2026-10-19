@@ -67,12 +67,16 @@ sealed with XChaCha20-Poly1305 under a key derived from a user passphrase with
 Argon2id at fixed per-version parameters. It excludes group state. ADR-028
 records the format.
 
-A group has a root public key. Its stable identifier is a versioned hash of
-that key:
+A group has a root Ed25519 public key. Its stable identifier is that key's
+libp2p peer ID:
 
 ```text
-group_id = multihash("charp2p-group-v1" || group_root_public_key)
+group_id = PeerId(group_root_public_key)
 ```
+
+For an Ed25519 key this is the identity multihash of the protobuf-encoded
+public key, so the group ID commits to the root key and the key can be
+recovered from it. Wire formats carry the binary peer ID encoding.
 
 The initial owner controls the corresponding administration key. Membership
 and device authorization are expressed as signed group events. The protocol

@@ -355,6 +355,10 @@ connection to the pinned owner, the pull and push run over that connection
 instead, and the serving node resumes once they end. While the joined-group
 screen is loaded, the client performs an initial automatic pull and retries
 once per minute. Manual retry remains available.
+While a joined group is open, its member serving node dials the pinned owner
+at the remembered owner addresses when it starts and redials every 20 seconds
+while no connection to the owner is open, so the owner usually holds a connection
+over which to send notices without dialing members.
 When the owner stores new events it may send an `EventsAvailable` notice over
 an existing connection to a member; the member acknowledges only its joined
 group's pinned owner and then runs the same bounded pull immediately

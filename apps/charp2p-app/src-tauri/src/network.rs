@@ -2471,9 +2471,6 @@ pub(crate) fn owner_unreachable(error: &str) -> bool {
     )
 }
 
-/// Signed event bytes a synchronization request pushes (ADR-033).
-/// Waits for the answer to one synchronization request. A relayed
-/// connection to the peer hole-punched meanwhile (DCUtR) turns `path` direct.
 /// Sends pushed events and charges them once sent, whatever the answer, so
 /// a peer that never answers cannot lift the upload limit (ADR-033).
 fn send_push_request(
@@ -2490,6 +2487,8 @@ fn send_push_request(
     Ok(request_id)
 }
 
+/// Waits for the answer to one synchronization request. A relayed
+/// connection to the peer hole-punched meanwhile (DCUtR) turns `path` direct.
 async fn await_sync_response(
     node: &mut NetworkNode,
     peer_id: PeerId,
@@ -2532,6 +2531,7 @@ fn upgraded_path(path: ConnectionPath, event: &NetworkEvent, peer_id: PeerId) ->
     }
 }
 
+/// Signed event bytes a synchronization request pushes (ADR-033).
 fn request_event_bytes(request: &SyncRequest) -> u64 {
     match request {
         SyncRequest::PushEvents { encoded_events, .. } => encoded_bytes(encoded_events),

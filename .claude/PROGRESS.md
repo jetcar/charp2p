@@ -275,7 +275,7 @@
 - [x] Events: reject `created_at` above 2^53 - 1 ms in core event validation (create and decode, before signature verification), so a member's `u64::MAX` timestamp cannot make every materialization pass fail with `TimestampTooLarge` and stall later messages and commits (technical-design Group protocol, size limits).
 - [x] charp2p-node blocklist: remove a blocked peer from the Kademlia routing table (`dht.remove_peer`) and skip blocked peers when (re)adding `--bootstrap` peers at start and on the rebootstrap tick (node README "cannot route through the DHT").
 - [x] Docs: technical-design Identity gives `group_id = multihash("charp2p-group-v1" || key)`; code and protocol vectors use the group root's libp2p peer ID — reword to match.
-- [ ] Identity backup: reject a backup too short to hold the 16-byte tag as `InvalidSize` before running Argon2id (technical-design "Every parser checks the outer size before decoding").
+- [x] Identity backup: reject a backup too short to hold the 16-byte tag as `InvalidSize` before running Argon2id (technical-design "Every parser checks the outer size before decoding").
 
 ## Needs human
 
@@ -541,3 +541,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-19T05:38:21Z Event timestamp bound: re-derived backlog (4 gaps: unbounded created_at stalls materialization, blocked peers kept in node DHT, stale group_id formula doc, truncated backup runs KDF). validate_body rejects created_at > 2^53-1 as EventError::InvalidTimestamp; create/decode test; technical-design size table and Group protocol updated. fmt, clippy, workspace tests, npm build pass; src-tauri cargo check needs gdk/webkit system libs (unchanged by this item).
 2026-10-19T06:30:44Z charp2p-node blocklist routing table: NetworkNode::block_peer now also calls dht.remove_peer and add_bootstrap_peer skips blocked peers (covers start and rebootstrap tick); unit test added; fmt, clippy, workspace tests, app build pass.
 2026-10-19T07:27:55Z Docs group ID derivation: technical-design now defines group_id as the root Ed25519 key's libp2p peer ID (identity multihash of the protobuf key), matching code and wire formats; docs-only, all checks pass.
+2026-10-19T08:27:38Z Identity backup short-tag size check: open_identity_backup now refuses backups shorter than header + 16-byte tag as InvalidSize before Argon2id; tests added; fmt, clippy, tests, app build pass.

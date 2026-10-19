@@ -12,6 +12,7 @@ const BACKUP_VERSION: u8 = 1;
 const SALT_BYTES: usize = 16;
 const NONCE_BYTES: usize = 24;
 const KEY_BYTES: usize = 32;
+const TAG_BYTES: usize = 16;
 const HEADER_BYTES: usize = BACKUP_MAGIC.len() + 1 + SALT_BYTES + NONCE_BYTES;
 /// Largest encoded identity backup accepted for restore.
 pub const MAX_IDENTITY_BACKUP_BYTES: usize = 1024;
@@ -102,7 +103,7 @@ pub fn seal_identity_backup(
         .and_then(|()| getrandom::fill(&mut nonce))
         .map_err(|_| IdentityBackupError::EncryptionFailed)?;
 
-    let mut backup = Vec::with_capacity(HEADER_BYTES + encoded.len() + 16);
+    let mut backup = Vec::with_capacity(HEADER_BYTES + encoded.len() + TAG_BYTES);
     backup.extend_from_slice(BACKUP_MAGIC);
     backup.push(BACKUP_VERSION);
     backup.extend_from_slice(&salt);
@@ -144,7 +145,9 @@ pub fn open_identity_backup(
     if version != BACKUP_VERSION {
         return Err(IdentityBackupError::UnsupportedVersion(version));
     }
-    if backup.len() <= HEADER_BYTES {
+    // The ciphertext always carries the Poly1305 tag, so anything shorter
+    // is refused before the costly key derivation.
+    if backup.len() < HEADER_BYTES + TAG_BYTES {
         return Err(IdentityBackupError::InvalidSize);
     }
     validate_passphrase(passphrase)?;
@@ -217,8 +220,8 @@ fn derive_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKUP_MAGIC, IdentityBackupError, MAX_IDENTITY_BACKUP_BYTES, open_identity_backup,
-        seal_identity_backup,
+        BACKUP_MAGIC, HEADER_BYTES, IdentityBackupError, MAX_IDENTITY_BACKUP_BYTES, TAG_BYTES,
+        open_identity_backup, seal_identity_backup,
     };
     use crate::{DeviceIdentity, DeviceIdentitySecret};
 
@@ -321,6 +324,14 @@ mod tests {
         assert_eq!(
             open_identity_backup(&backup[..BACKUP_MAGIC.len() + 1], PASSPHRASE).err(),
             Some(IdentityBackupError::InvalidSize)
+        );
+        assert_eq!(
+            open_identity_backup(&backup[..HEADER_BYTES + TAG_BYTES - 1], PASSPHRASE).err(),
+            Some(IdentityBackupError::InvalidSize)
+        );
+        assert_eq!(
+            open_identity_backup(&backup[..HEADER_BYTES + TAG_BYTES], PASSPHRASE).err(),
+            Some(IdentityBackupError::DecryptionFailed)
         );
     }
 }

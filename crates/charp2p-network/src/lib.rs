@@ -1651,7 +1651,9 @@ fn is_global_ipv6(ip: Ipv6Addr) -> bool {
     let second = ip.segments()[1];
     // Global unicast is 2000::/3; documentation is 2001:db8::/32 and 3fff::/20.
     // Unique-local (fc00::/7) and link-local (fe80::/10) fall outside 2000::/3.
-    first & 0xe000 == 0x2000 && !(first == 0x2001 && second == 0x0db8) && first & 0xfff0 != 0x3ff0
+    first & 0xe000 == 0x2000
+        && !(first == 0x2001 && second == 0x0db8)
+        && !(first == 0x3fff && second & 0xf000 == 0)
 }
 
 fn is_relayed(address: &Multiaddr) -> bool {
@@ -1750,6 +1752,8 @@ mod tests {
             "/ip4/203.0.114.7/udp/4001/quic-v1",
             "/ip4/8.8.8.8/tcp/4001",
             "/ip6/2a01:4f8::1/udp/4001/quic-v1",
+            "/ip6/3ff0::1/tcp/4001",
+            "/ip6/3fff:1000::1/tcp/4001",
         ] {
             assert!(
                 super::is_publishable_direct_address(&address.parse().unwrap()),
@@ -1780,6 +1784,7 @@ mod tests {
             "/ip6/fe80::1/tcp/4001",
             "/ip6/2001:db8::1/tcp/4001",
             "/ip6/3fff::1/tcp/4001",
+            "/ip6/3fff:fff::1/tcp/4001",
             "/ip6/ff02::1/udp/4001/quic-v1",
             "/dns4/example.com/tcp/4001",
         ] {

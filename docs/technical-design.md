@@ -229,7 +229,7 @@ device-local file and adds them as extra DHT entry points when its node starts
 (ADR-046). No internet address scanning occurs.
 
 The client bounds bootstrap configuration to 16 entries, provider searches to
-8 seconds, and direct reachability checks to 32 providers and 4 seconds. When
+8 seconds, and direct reachability checks to the pinned provider and 4 seconds. When
 no built-in or development bootstrap address is available, the UI reports that
 discovery requires a bootstrap node instead of pretending that the group is
 offline.
@@ -274,7 +274,8 @@ invitation-bound discovery and authenticated protocols. A connection reached
 through an mDNS-announced address is reported as LAN even when the address is
 outside private ranges. When the multicast socket cannot be opened the node
 continues without LAN discovery. The app's owner advertising node and its
-join and synchronization nodes enable LAN discovery. While looking up a group
+join preview reachability check, join and synchronization nodes enable LAN
+discovery. While looking up a group
 provider, a client that hears the expected provider peer ID over mDNS dials it
 alongside the DHT lookup and uses whichever connection completes first; a DHT
 lookup that ends without a record waits up to two seconds after the node

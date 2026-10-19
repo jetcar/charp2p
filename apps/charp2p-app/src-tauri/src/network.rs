@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,7 +31,6 @@ const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
 const BOOTSTRAP_ENVIRONMENT_VARIABLE: &str = "CHARP2P_BOOTSTRAP_NODES";
 const MAX_BOOTSTRAP_PEERS: usize = 16;
 const MAX_BOOTSTRAP_ADDRESS_BYTES: usize = 512;
-const MAX_DISCOVERED_PEERS: usize = 32;
 const MAX_OWNER_DISCOVERY_KEYS: usize = crate::groups::MAX_ADVERTISED_DISCOVERY_KEYS;
 const PROVIDER_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -1741,145 +1740,20 @@ impl NetworkService {
         identity: DeviceIdentity,
         invitation: &Invitation,
     ) -> Result<PeerSearchResult, &'static str> {
+        // The preview reaches the pinned inviter the way the join does:
+        // address hints first (ADR-037), then the DHT lookup with an mDNS
+        // announcement dialed alongside it; the transport authenticates the
+        // inviter on every path.
         let hints = pinned_address_hints(invitation);
-        if self.bootstrap_peers().is_empty() && hints.is_empty() {
-            return Ok(PeerSearchResult {
-                status: "bootstrapRequired",
-                discovered_peers: 0,
-                reachable_peers: 0,
-                connection_type: None,
-            });
-        }
-
-        let key = DiscoveryKey::from_invitation(invitation);
-        let expected_inviter = invitation.inviter_device_id();
-        let mut node = NetworkNode::new(identity.into_network_keypair());
-        listen_on_all_interfaces(&mut node)?;
-        // Invitation address hints (ADR-037) are dialed before the DHT
-        // search; the transport authenticates the pinned inviter.
-        if !hints.is_empty() && node.dial_peer_at(expected_inviter, hints).is_ok() {
-            let connected = timeout(KNOWN_ADDRESS_CONNECT_TIMEOUT, async {
-                loop {
-                    if let NetworkEvent::PeerConnected { peer_id, path, .. } =
-                        node.next_event().await
-                    {
-                        if peer_id == expected_inviter {
-                            break path;
-                        }
-                    }
-                }
-            })
+        let result = self
+            .dial_group_provider(
+                identity,
+                DiscoveryKey::from_invitation(invitation),
+                invitation.inviter_device_id(),
+                &hints,
+            )
             .await;
-            if let Ok(path) = connected {
-                return Ok(PeerSearchResult {
-                    status: "peerReachable",
-                    discovered_peers: 1,
-                    reachable_peers: 1,
-                    connection_type: Some(connection_type_name(path)),
-                });
-            }
-        }
-        if self.bootstrap_peers().is_empty() {
-            return Ok(PeerSearchResult {
-                status: "bootstrapRequired",
-                discovered_peers: 0,
-                reachable_peers: 0,
-                connection_type: None,
-            });
-        }
-        for bootstrap in &self.bootstrap_peers() {
-            node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
-        }
-        self.use_remembered_routing_peers(&mut node);
-        node.bootstrap().map_err(|_| "network_unavailable")?;
-        node.find_group_peers(key);
-
-        let discovery = timeout(PROVIDER_SEARCH_TIMEOUT, async {
-            let mut discovered = BTreeSet::new();
-            let mut connected = BTreeMap::new();
-            loop {
-                match node.next_event().await {
-                    NetworkEvent::PeerConnected { peer_id, path, .. } => {
-                        connected.insert(peer_id, path);
-                    }
-                    NetworkEvent::GroupPeersFound {
-                        key: found_key,
-                        providers,
-                    } if found_key == key => {
-                        for provider in providers.into_iter().take(MAX_DISCOVERED_PEERS) {
-                            if provider == expected_inviter && provider != node.peer_id() {
-                                discovered.insert(provider);
-                            }
-                        }
-                        if !discovered.is_empty() {
-                            return Ok((discovered, connected));
-                        }
-                    }
-                    NetworkEvent::GroupPeerSearchFinished { key: found_key }
-                        if found_key == key =>
-                    {
-                        return Err(PeerSearchResult {
-                            status: "noPeers",
-                            discovered_peers: 0,
-                            reachable_peers: 0,
-                            connection_type: None,
-                        });
-                    }
-                    NetworkEvent::DiscoveryFailed {
-                        key: failed_key, ..
-                    } if failed_key == key => {
-                        return Err(PeerSearchResult {
-                            status: "unavailable",
-                            discovered_peers: 0,
-                            reachable_peers: 0,
-                            connection_type: None,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| "network_search_timed_out")?;
-        let (discovered, connected) = match discovery {
-            Ok(found) => found,
-            Err(result) => return Ok(result),
-        };
-
-        if let Some(path) = discovered.iter().find_map(|peer| connected.get(peer)) {
-            return Ok(PeerSearchResult {
-                status: "peerReachable",
-                discovered_peers: discovered.len(),
-                reachable_peers: 1,
-                connection_type: Some(connection_type_name(*path)),
-            });
-        }
-
-        for peer_id in discovered.iter().copied() {
-            let _ = node.dial_peer(peer_id);
-        }
-        let reachable = timeout(CONNECT_TIMEOUT, async {
-            loop {
-                if let NetworkEvent::PeerConnected { peer_id, path, .. } = node.next_event().await {
-                    if discovered.contains(&peer_id) {
-                        return path;
-                    }
-                }
-            }
-        })
-        .await
-        .ok();
-
-        Ok(PeerSearchResult {
-            status: if reachable.is_some() {
-                "peerReachable"
-            } else {
-                "peersFound"
-            },
-            discovered_peers: discovered.len(),
-            reachable_peers: usize::from(reachable.is_some()),
-            connection_type: reachable.map(connection_type_name),
-        })
+        search_result(result.map(|connection| connection.path))
     }
 
     pub async fn join(
@@ -3103,6 +2977,27 @@ fn pinned_address_hints(invitation: &Invitation) -> Vec<Multiaddr> {
 /// Starts listening on QUIC and on TCP (ADR-047) on every IPv4 and IPv6
 /// interface, each on a port chosen by the operating system. IPv4 is
 /// required; IPv6 is skipped on devices or networks without it.
+/// Maps a provider dial outcome to the join preview's reachability result.
+fn search_result(
+    dialed: Result<ConnectionPath, &'static str>,
+) -> Result<PeerSearchResult, &'static str> {
+    let (status, discovered_peers, path) = match dialed {
+        Ok(path) => ("peerReachable", 1, Some(path)),
+        Err("network_bootstrap_required") => ("bootstrapRequired", 0, None),
+        Err("network_peer_not_found") => ("noPeers", 0, None),
+        Err("network_unavailable") => ("unavailable", 0, None),
+        // The lookup found the inviter's record but no dial reached it.
+        Err("network_peer_unreachable") => ("peersFound", 1, None),
+        Err(error) => return Err(error),
+    };
+    Ok(PeerSearchResult {
+        status,
+        discovered_peers,
+        reachable_peers: usize::from(path.is_some()),
+        connection_type: path.map(connection_type_name),
+    })
+}
+
 fn listen_on_all_interfaces(node: &mut NetworkNode) -> Result<(), &'static str> {
     for address in ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"] {
         node.listen_on(
@@ -4828,6 +4723,93 @@ mod tests {
                     .discovery,
                 None
             );
+        });
+    }
+
+    #[test]
+    fn reachability_check_finds_the_owner_over_lan_when_the_dht_has_no_record() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
+        let invitation = Invitation::issue(
+            &group,
+            owner_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+
+        tauri::async_runtime::block_on(async {
+            // Owner and member use separate routing nodes, so the member's
+            // DHT lookup cannot find the owner's provider record.
+            let mut owner_routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let mut member_routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let mut bootstraps = Vec::new();
+            for routing in [&mut owner_routing, &mut member_routing] {
+                routing
+                    .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                    .unwrap();
+                let address = loop {
+                    if let NetworkEvent::Listening { address } = routing.next_event().await {
+                        break address;
+                    }
+                };
+                bootstraps.push(format!("{address}/p2p/{}", routing.peer_id()));
+            }
+            let owner_service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &bootstraps[0],
+                Arc::new(UnavailableJoinRequestAuthorizer),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: DeviceIdentity::generate().peer_id(),
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap();
+            let advertise = owner_service.advertise(owner, owner_signer, &invitation);
+            tokio::pin!(advertise);
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => break result,
+                        _ = owner_routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("advertisement should complete")
+            .unwrap();
+
+            let member_service = NetworkService::from_sources(&[], &bootstraps[1]).unwrap();
+            let search = member_service.search(DeviceIdentity::generate(), &invitation);
+            tokio::pin!(search);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut search => break result,
+                        _ = owner_routing.next_event() => {}
+                        _ = member_routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("LAN reachability check should complete")
+            .unwrap();
+
+            assert_eq!(result.status, "peerReachable");
+            assert_eq!(result.reachable_peers, 1);
+            assert_eq!(result.connection_type, Some("lan"));
         });
     }
 

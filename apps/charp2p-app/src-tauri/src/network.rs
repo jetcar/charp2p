@@ -2848,9 +2848,24 @@ fn record_owner_address(addresses: &std::sync::Mutex<Vec<Multiaddr>>, address: M
         return;
     };
     if let Ok(mut addresses) = addresses.lock() {
-        if !addresses.contains(&hint) && addresses.len() < MAX_OWNER_LISTEN_ADDRESSES {
-            addresses.push(hint);
+        if addresses.contains(&hint) {
+            return;
         }
+        if addresses.len() >= MAX_OWNER_LISTEN_ADDRESSES {
+            // Relay circuit addresses arrive after the reservation, once the
+            // direct interface addresses may already fill the list; they
+            // replace the oldest direct address so invitations keep a hint
+            // that reaches an owner behind NAT.
+            let relayed = |address: &Multiaddr| address.iter().any(|p| p == Protocol::P2pCircuit);
+            let oldest_direct = addresses.iter().position(|address| !relayed(address));
+            match oldest_direct {
+                Some(index) if relayed(&hint) => {
+                    addresses.remove(index);
+                }
+                _ => return,
+            }
+        }
+        addresses.push(hint);
     }
 }
 
@@ -3108,7 +3123,7 @@ mod tests {
         MembershipComparison, NetworkService, NetworkStatus, PeerSearchResult, PendingJoinService,
         PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
-        MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS,
+        MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS, MAX_OWNER_LISTEN_ADDRESSES,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -3467,6 +3482,31 @@ mod tests {
             .collect();
         assert_eq!(select_address_hints(&many), many[..4].to_vec());
         assert_eq!(address_hint(libp2p::Multiaddr::empty()), None);
+    }
+
+    #[test]
+    fn relay_owner_address_is_kept_when_direct_addresses_fill_the_list() {
+        let relay = DeviceIdentity::generate().peer_id();
+        let addresses = std::sync::Mutex::new(Vec::new());
+        for octet in 0..MAX_OWNER_LISTEN_ADDRESSES {
+            record_owner_address(
+                &addresses,
+                format!("/ip4/192.168.1.{}/udp/4001/quic-v1", octet + 1)
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        let relayed: libp2p::Multiaddr =
+            format!("/ip4/203.0.113.9/udp/4001/quic-v1/p2p/{relay}/p2p-circuit")
+                .parse()
+                .unwrap();
+        record_owner_address(&addresses, relayed.clone());
+        record_owner_address(&addresses, "/ip4/192.168.2.1/tcp/4001".parse().unwrap());
+
+        let addresses = addresses.lock().unwrap();
+        assert_eq!(addresses.len(), MAX_OWNER_LISTEN_ADDRESSES);
+        assert!(!addresses.contains(&"/ip4/192.168.1.1/udp/4001/quic-v1".parse().unwrap()));
+        assert_eq!(select_address_hints(&addresses)[0], relayed);
     }
 
     #[test]

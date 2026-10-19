@@ -351,8 +351,12 @@ When the owner stores new events it may send an `EventsAvailable` notice over
 an existing connection to a member; the member acknowledges only its joined
 group's pinned owner and then runs the same bounded pull immediately
 (ADR-049). The notice carries no event data.
-Each successful pull/push session records its completion time in joined-group
-metadata so the interface can restore the last synchronization time.
+Each successful pull/push session with the pinned owner records its completion
+time in joined-group metadata so the interface can restore the last
+synchronization time. A pull served by another member (ADR-040) is reported in
+the connection state only: it does not record that time and does not lift the
+first-synchronization authoring gate, because only the owner holds every
+author's accepted events.
 After each verified batch commits, the client authenticates and decrypts any
 new MLS application messages it can read, binds the MLS sender credential to
 the signed event author, and adds event-bound encrypted local display copies.
@@ -664,7 +668,7 @@ Requirements:
   wait until the gap is filled.
 - An author sequence cannot be reused with different content.
   A joined group refuses sending, editing and deleting until its first
-  successful synchronization after joining, so a device that rejoined after
+  successful synchronization with the pinned owner after joining, so a device that rejoined after
   leaving locally (ADR-034) holds its own earlier events before authoring.
 - Events from unauthorized or revoked devices are rejected according to the
   membership state in which they were authored. When the owner removes a

@@ -280,7 +280,7 @@
 - [x] Bandwidth limit: charge pushed upload bytes as soon as the push request is sent, before awaiting the owner's answer, so a timed-out or failed exchange (re-sent every retry) still counts against the ADR-033 limit (technical-design Synchronization data limit).
 
 - [x] Sync wire encoding: carry PushEvents/Events encoded events as CBOR byte strings (serde integer sequences nearly doubled random bytes, so batches above ~1.1 MiB of the allowed 2 MiB exceeded the 2.125 MiB codec bound and failed on every retry); protocol /charp2p/sync/3.0.0, ADR-059.
-- [ ] Docs: technical-design Synchronization overview ("three bounded request-response exchanges") lists all six SyncRequest kinds (Summary, EventIds, Events, PushEvents, ReportHeads, EventsAvailable) with the owner-only upload and member-served pull rules (ADR-030, ADR-040, ADR-049).
+- [x] Docs: technical-design Synchronization overview ("three bounded request-response exchanges") lists all six SyncRequest kinds (Summary, EventIds, Events, PushEvents, ReportHeads, EventsAvailable) with the owner-only upload and member-served pull rules (ADR-030, ADR-040, ADR-049).
 
 ## Needs human
 
@@ -549,3 +549,4 @@ Wed Oct  7 16:27:29 UTC 2026 Member invitations 2a-i (core event kind + payload)
 2026-10-19T08:27:38Z Identity backup short-tag size check: open_identity_backup now refuses backups shorter than header + 16-byte tag as InvalidSize before Argon2id; tests added; fmt, clippy, tests, app build pass.
 2026-10-19T09:36:31Z Bandwidth push charging: push_to_connected_peer now charges pushed events via send_push_request right after sending, before await_sync_response can fail; test with an unanswered push; workspace fmt/clippy/tests, src-tauri clippy and lib tests (after apt-installing webkit2gtk/gtk dev libs), app build pass.
 2026-10-19T10:39:43Z Sync wire encoding: re-derived backlog (2 gaps: CBOR integer-sequence event encoding overflowing the sync wire bound, stale sync exchange overview). encoded_events now serialize as CBOR byte strings via a bounded serde module; SYNC_PROTOCOL bumped to /charp2p/sync/3.0.0; ADR-059 added, ADR-006 status and technical-design updated; codec round-trip test for a full 256 x 8 KiB batch (fails before the fix at ~3.8 MiB). fmt, clippy, workspace tests, src-tauri clippy/tests, npm build pass.
+2026-10-19T11:28:32Z Docs sync exchange overview: technical-design Synchronization now lists all six SyncRequest kinds with owner-only PushEvents/ReportHeads, member-served pulls (ADR-040), owner-only EventsAvailable acknowledgement (ADR-049) and per-exchange bounds; docs-only, fmt, clippy, workspace tests, npm build pass. Backlog empty; next run re-derives gaps.

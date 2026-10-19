@@ -665,10 +665,29 @@ gap-free sequence and the current membership state. They then request missing
 event identifiers in batches of at most 256, verify each envelope, and commit
 valid events transactionally to local storage.
 
-Synchronization uses three bounded request-response exchanges: author summary,
-ordered event identifiers after a sequence, and signed envelopes by identifier.
-Summaries contain at most 1,024 authors. Signed-event responses contain at most
-256 events, no event above 128 KiB, and no more than 2 MiB of event data.
+Synchronization uses six bounded request-response exchanges on the
+synchronization protocol:
+
+- `Summary`: the receiver's gap-free author heads and membership state.
+- `EventIds`: an ordered page of event identifiers for one author after a
+  sequence.
+- `Events`: signed envelopes by identifier.
+- `PushEvents`: locally authored signed events offered for storage.
+- `ReportHeads`: the sender's gap-free author heads after a completed
+  exchange, answered with the heads other members reported for the sender's
+  own events (ADR-030).
+- `EventsAvailable`: an owner notice that new events are stored, carrying no
+  event data (ADR-049).
+
+The three pull exchanges (`Summary`, `EventIds`, `Events`) are answered by the
+owner and, for current MLS members, by member devices serving history
+(ADR-040). `PushEvents` and `ReportHeads` are answered only by the group owner;
+a member device answers them `unauthorized`. A member acknowledges
+`EventsAvailable` only from the pinned owner.
+
+Summaries and head reports contain at most 1,024 authors. Identifier pages
+contain at most 256 identifiers. Signed-event responses and pushes contain at
+most 256 events, no event above 128 KiB, and no more than 2 MiB of event data.
 A device whose stored state would produce a response above these limits
 answers a valid request `busy`, not `invalid request`.
 

@@ -1718,10 +1718,20 @@ impl MlsProviderService {
         };
         let group_id = sync_request_group_id(request);
         let mls_group_id = GroupId::from_slice(&group_id.to_bytes());
-        let Ok(Some(group)) = MlsGroup::load(provider.storage(), &mls_group_id) else {
-            return SyncResponse::Rejected {
-                reason: SyncRejectReason::Unauthorized,
-            };
+        // A missing group is the requester's problem; a storage failure is
+        // this device's, so it answers `busy` and the requester retries.
+        let group = match MlsGroup::load(provider.storage(), &mls_group_id) {
+            Ok(Some(group)) => group,
+            Ok(None) => {
+                return SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                };
+            }
+            Err(_) => {
+                return SyncResponse::Rejected {
+                    reason: SyncRejectReason::Busy,
+                };
+            }
         };
         let authorized = group.members().any(|member| {
             device_id_from_credential(&member.credential)
@@ -5468,6 +5478,49 @@ mod tests {
             service.answer_sync_request(DeviceIdentity::generate().peer_id(), &request),
             SyncResponse::Rejected {
                 reason: SyncRejectReason::Unauthorized,
+            }
+        );
+    }
+
+    #[test]
+    fn synchronization_answers_busy_when_the_mls_group_cannot_be_loaded() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("charp2p.sqlite3");
+        let group_id = GroupIdentity::generate().group_id();
+        let owner = DeviceIdentity::generate();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (_, key_package) = member_key_package(member_id);
+        let service = MlsProviderService::open_with_key_store(
+            &path,
+            Arc::new(Mutex::new(())),
+            Box::new(MemoryWrappingKeyStore::default()),
+        )
+        .unwrap();
+        service.initialize_owner_group(group_id, &owner).unwrap();
+        service
+            .admit_member_at(group_id, &owner, member_id, key_package.encoded(), 42)
+            .unwrap();
+        // Corrupt the stored epoch secrets so loading the group fails with a
+        // storage error instead of finding no group.
+        for (key, value) in service
+            .provider
+            .lock()
+            .unwrap()
+            .storage()
+            .values
+            .write()
+            .unwrap()
+            .iter_mut()
+        {
+            if key.starts_with(b"EpochSecrets") {
+                *value = vec![0xff];
+            }
+        }
+
+        assert_eq!(
+            service.answer_sync_request(member_id, &SyncRequest::Summary { group_id }),
+            SyncResponse::Rejected {
+                reason: SyncRejectReason::Busy,
             }
         );
     }

@@ -361,7 +361,9 @@ once per minute. Manual retry remains available.
 While a joined group is open, its member serving node dials the pinned owner
 at the remembered owner addresses when it starts and redials every 20 seconds
 while no connection to the owner is open, so the owner usually holds a connection
-over which to send notices without dialing members.
+over which to send notices without dialing members. Without a configured
+bootstrap node the serving node cannot announce the member key, but it still
+starts and keeps this owner connection when remembered owner addresses exist.
 When the owner stores new events it may send an `EventsAvailable` notice over
 an existing connection to a member; the member acknowledges only its joined
 group's pinned owner and then runs the same bounded pull immediately

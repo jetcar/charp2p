@@ -478,6 +478,9 @@ struct ActiveMemberServing {
     group_id: PeerId,
     key: DiscoveryKey,
     owner: PeerId,
+    /// Whether the node announces the member key; without bootstrap nodes it
+    /// only keeps the owner connection.
+    advertised: bool,
     /// Asks the serving task to lend its node while it holds an
     /// authenticated connection to `owner`.
     lend: mpsc::Sender<oneshot::Sender<LentOwnerConnection>>,
@@ -1544,7 +1547,9 @@ impl NetworkService {
     /// epoch advanced. Served bytes are charged to `bandwidth`. The node
     /// also keeps a connection to the pinned `owner`, dialled at its
     /// remembered `owner_addresses` and redialled after it closes, over
-    /// which the owner sends new-event notices (ADR-049).
+    /// which the owner sends new-event notices (ADR-049). Without bootstrap
+    /// nodes the node still keeps that owner connection at the remembered
+    /// addresses but cannot advertise the key, and reports bootstrapRequired.
     pub async fn serve_member_group(
         &self,
         network_identity: DeviceIdentity,
@@ -1555,55 +1560,69 @@ impl NetworkService {
         bandwidth: Arc<BandwidthService>,
     ) -> Result<&'static str, &'static str> {
         let mut active = self.member_serving.lock().await;
-        if self.bootstrap_peers().is_empty() {
+        let bootstrap_peers = self.bootstrap_peers();
+        let advertised = !bootstrap_peers.is_empty();
+        let status = if advertised {
+            "advertising"
+        } else {
+            "bootstrapRequired"
+        };
+        // Without bootstrap nodes only remembered owner addresses can be
+        // dialled.
+        if !advertised && owner_addresses.is_empty() {
             active.take();
-            return Ok("bootstrapRequired");
+            return Ok(status);
         }
         if let Some(existing) = active.as_ref() {
-            if existing.group_id == group_id && existing.key == key && !existing.task.is_finished()
+            if existing.group_id == group_id
+                && existing.key == key
+                && existing.advertised == advertised
+                && !existing.task.is_finished()
             {
-                return Ok("advertising");
+                return Ok(status);
             }
         }
         active.take();
 
         let mut node = self.group_client_node(network_identity);
         listen_on_all_interfaces(&mut node)?;
-        for bootstrap in &self.bootstrap_peers() {
+        for bootstrap in &bootstrap_peers {
             node.add_bootstrap_peer(bootstrap.peer_id, bootstrap.address.clone());
             node.reserve_relay(bootstrap.peer_id, bootstrap.address.clone())
                 .map_err(|_| "network_unavailable")?;
         }
-        self.use_remembered_routing_peers(&mut node);
-        node.bootstrap().map_err(|_| "network_unavailable")?;
-        node.announce_group(key)
-            .map_err(|_| "network_unavailable")?;
 
         let synchronization = Arc::clone(&self.synchronization);
         let notices = self.event_notices.clone();
         let (lend, mut lend_requests) = mpsc::channel::<oneshot::Sender<LentOwnerConnection>>(4);
-        timeout(PROVIDER_SEARCH_TIMEOUT, async {
-            loop {
-                match node.next_event().await {
-                    NetworkEvent::GroupAnnounced { key: announced } if announced == key => {
-                        return Ok(());
+        if advertised {
+            self.use_remembered_routing_peers(&mut node);
+            node.bootstrap().map_err(|_| "network_unavailable")?;
+            node.announce_group(key)
+                .map_err(|_| "network_unavailable")?;
+            timeout(PROVIDER_SEARCH_TIMEOUT, async {
+                loop {
+                    match node.next_event().await {
+                        NetworkEvent::GroupAnnounced { key: announced } if announced == key => {
+                            return Ok(());
+                        }
+                        NetworkEvent::DiscoveryFailed {
+                            key: failed,
+                            operation: charp2p_network::DiscoveryOperation::Announcement,
+                        } if failed == key => return Err("network_unavailable"),
+                        event => answer_member_node_event(
+                            &mut node,
+                            event,
+                            synchronization.as_ref(),
+                            &bandwidth,
+                            &notices,
+                        ),
                     }
-                    NetworkEvent::DiscoveryFailed {
-                        key: failed,
-                        operation: charp2p_network::DiscoveryOperation::Announcement,
-                    } if failed == key => return Err("network_unavailable"),
-                    event => answer_member_node_event(
-                        &mut node,
-                        event,
-                        synchronization.as_ref(),
-                        &bandwidth,
-                        &notices,
-                    ),
                 }
-            }
-        })
-        .await
-        .map_err(|_| "network_advertisement_timed_out")??;
+            })
+            .await
+            .map_err(|_| "network_advertisement_timed_out")??;
+        }
 
         let task = tokio::spawn(async move {
             let mut refresh = interval_at(
@@ -1619,7 +1638,7 @@ impl NetworkService {
             let mut owner_connection: Option<(ConnectionPath, Multiaddr)> = None;
             loop {
                 tokio::select! {
-                    _ = refresh.tick() => {
+                    _ = refresh.tick(), if advertised => {
                         if node.announce_group(key).is_err() {
                             break;
                         }
@@ -1695,10 +1714,11 @@ impl NetworkService {
             group_id,
             key,
             owner,
+            advertised,
             lend,
             task,
         });
-        Ok("advertising")
+        Ok(status)
     }
 
     /// Borrows the member serving node of `group_id` while it holds an
@@ -6328,6 +6348,99 @@ mod tests {
                             _ => {}
                         },
                         _ = routing.next_event() => {}
+                    }
+                }
+            })
+            .await
+            .expect("member should acknowledge the owner's notice");
+            assert_eq!(response, SyncResponse::Acknowledged { group_id });
+            assert_eq!(notices.try_recv(), Ok(group_id));
+        });
+    }
+
+    #[test]
+    fn member_serving_node_keeps_the_owner_connection_without_bootstrap_nodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[10; 32]);
+        let member = DeviceIdentity::generate();
+        let member_id = member.peer_id();
+        tauri::async_runtime::block_on(async {
+            let owner_identity = DeviceIdentity::generate();
+            let owner_id = owner_identity.peer_id();
+            let mut owner = NetworkNode::new(owner_identity.into_network_keypair());
+            owner
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let owner_address = loop {
+                if let NetworkEvent::Listening { address } = owner.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                "",
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id,
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            // Without a remembered owner address there is nothing to dial.
+            assert_eq!(
+                service
+                    .serve_member_group(
+                        DeviceIdentity::generate(),
+                        group_id,
+                        key,
+                        owner_id,
+                        Vec::new(),
+                        Arc::clone(&bandwidth),
+                    )
+                    .await,
+                Ok("bootstrapRequired")
+            );
+            assert!(service.member_serving.lock().await.is_none());
+
+            let mut notices = service.subscribe_event_notices();
+            // The key is not advertised, but the owner connection is kept.
+            assert_eq!(
+                service
+                    .serve_member_group(
+                        member,
+                        group_id,
+                        key,
+                        owner_id,
+                        vec![owner_address],
+                        Arc::clone(&bandwidth),
+                    )
+                    .await,
+                Ok("bootstrapRequired")
+            );
+            let response = timeout(Duration::from_secs(10), async {
+                loop {
+                    match owner.next_event().await {
+                        NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id => {
+                            owner
+                                .send_sync_request(
+                                    member_id,
+                                    SyncRequest::EventsAvailable { group_id },
+                                )
+                                .unwrap();
+                        }
+                        NetworkEvent::SyncResponseReceived {
+                            peer_id, response, ..
+                        } if peer_id == member_id => break response,
+                        _ => {}
                     }
                 }
             })

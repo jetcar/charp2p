@@ -3849,7 +3849,14 @@ function App() {
     );
   }
 
+  // Authoring in a joined group opens only after its first successful synchronization (technical-design Synchronization).
+  function awaitingFirstSync(groupId: string) {
+    return joinedGroup?.groupId === groupId && joinedGroup.lastSynchronizedAtUnix === null;
+  }
+
   function renderComposer(groupId: string, idPrefix: string, receipt: string | null, waiting = false) {
+    const unsynchronized = awaitingFirstSync(groupId);
+    const noteId = `${idPrefix}-first-sync-note`;
     const overLimit = outgoingMessageBytes > MESSAGE_TEXT_LIMIT_BYTES;
     const nearLimit = outgoingMessageBytes >= MESSAGE_TEXT_LIMIT_BYTES * MESSAGE_SIZE_HINT_RATIO;
     const sizeId = `${idPrefix}-message-size`;
@@ -3859,26 +3866,32 @@ function App() {
         {renderReplyDraft(groupId)}
         <div className="message-composer-row">
           <input
-            aria-describedby={nearLimit ? sizeId : undefined}
+            aria-describedby={[unsynchronized ? noteId : null, nearLimit ? sizeId : null].filter(Boolean).join(" ") || undefined}
             aria-label="Message"
             autoComplete="off"
+            disabled={unsynchronized}
             id={`${idPrefix}-outgoing-message`}
             maxLength={16384}
             onChange={(event) => setOutgoingMessage(event.target.value)}
-            placeholder={waiting ? "New messages stay on this device until the owner is reachable." : "Write a message"}
+            placeholder={unsynchronized ? "Sending opens after the first sync" : waiting ? "New messages stay on this device until the owner is reachable." : "Write a message"}
             type="text"
             value={outgoingMessage}
           />
           <button
             aria-label={sendingMessage ? "Protecting message" : "Send message"}
             className="message-send-button"
-            disabled={!outgoingMessage.trim() || overLimit || sendingMessage || !isTauri()}
+            disabled={unsynchronized || !outgoingMessage.trim() || overLimit || sendingMessage || !isTauri()}
             title={sendingMessage ? "Protecting message…" : "Send"}
             type="submit"
           >
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 12 20 4l-6 16-3-7-7-1Z" /></svg>
           </button>
         </div>
+        {unsynchronized && (
+          <p className="preview-note" id={noteId}>
+            This group has not synchronized since joining. Sending, editing, and deleting for everyone resume after the first successful synchronization.
+          </p>
+        )}
         {nearLimit && (
           <p className={`message-size ${overLimit ? "over-limit" : ""}`} id={sizeId}>
             {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
@@ -3921,6 +3934,8 @@ function App() {
 
   function renderMessageMenu(message: StoredMessage) {
     const own = message.authorId === profile?.peerId;
+    const unsynchronized = awaitingFirstSync(message.groupId);
+    const firstSyncTitle = unsynchronized ? "Available after the first successful synchronization" : undefined;
     return (
       <details className="message-menu">
         <summary aria-label="Message actions" title="Message actions">⋯</summary>
@@ -3930,8 +3945,9 @@ function App() {
           <button onClick={() => void copyMessage(message)} type="button">Copy</button>
           {own && editingMessage?.eventId !== message.eventId && (
             <button
-              disabled={savingEdit}
+              disabled={savingEdit || unsynchronized}
               onClick={() => setEditingMessage({ eventId: message.eventId, text: message.text })}
+              title={firstSyncTitle}
               type="button"
             >
               Edit
@@ -3943,8 +3959,9 @@ function App() {
           {own && (
             <button
               className="message-menu-danger"
-              disabled={Boolean(deletingMessage)}
+              disabled={Boolean(deletingMessage) || unsynchronized}
               onClick={() => void deleteMessageForEveryone(message)}
+              title={firstSyncTitle}
               type="button"
             >
               Delete for everyone

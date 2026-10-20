@@ -317,7 +317,7 @@
 
 - [x] Joined-group waiting banner: a member-served pull (owner offline) still shows the waiting banner, and the banner/placeholder say new messages sync when the owner is reachable (technical-design Connectivity: members upload only to the pinned owner; PushEvents answered only by the owner).
 - [x] Owned-group details: describe the history policy from the owner's side ("New members receive messages sent after joining", product page 3) instead of "Messages shared after you join", and singularize "1 days" in the invitation lifetime texts.
-- [ ] Joined group before first sync: disable sending, editing and "Delete for everyone" with a note while lastSynchronizedAtUnix is null (technical-design Synchronization requirements), instead of failing with group_not_synchronized after send.
+- [x] Joined group before first sync: disable sending, editing and "Delete for everyone" with a note while lastSynchronizedAtUnix is null (technical-design Synchronization requirements), instead of failing with group_not_synchronized after send.
 
 ## Needs human
 
@@ -613,3 +613,4 @@ Mon Oct 19 23:27:47 UTC 2026 Docs member-device activity wording: technical-desi
 2026-10-20T14:27:53Z UI wording: tablet Chats action reads "Create group"; no-groups ready card actions read "Join from link" / "Create group". fmt, clippy, workspace tests, npm build pass.
 2026-10-20T15:33:17Z Joined-group waiting banner: re-derived backlog (3 gaps). joinedSyncPill gains ownerReachable (false for memberServed); composer waiting state uses it; banner reads "Waiting for the group owner" / sync when the owner is reachable, placeholder likewise. fmt, clippy, workspace tests, npm build pass (frontend-only change).
 2026-10-20T16:26:52Z Owned-group details wording: owner-side history reads "New members receive messages sent after joining"; invitation lifetime texts use lifetimeDaysLabel ("1 day"). fmt, clippy, workspace tests, npm build pass (frontend-only change).
+2026-10-20T17:27:56Z Joined group before first sync: composer input/send disabled with a first-sync note, Edit and Delete for everyone disabled with a title while lastSynchronizedAtUnix is null. fmt, clippy, workspace tests, npm build pass (frontend-only change).

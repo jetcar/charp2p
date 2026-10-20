@@ -315,6 +315,10 @@
 - [x] Groups page: show a pending invitation as Offline (not "Waiting for owner") when the last join attempt failed with `network_unavailable` (product page 2 "Clear online, relayed, waiting, and offline states").
 - [x] UI wording: label the tablet Chats action "Create group" (not "New group") and the no-groups card actions "Join from link" / "Create group" (product page 2).
 
+- [x] Joined-group waiting banner: a member-served pull (owner offline) still shows the waiting banner, and the banner/placeholder say new messages sync when the owner is reachable (technical-design Connectivity: members upload only to the pinned owner; PushEvents answered only by the owner).
+- [ ] Owned-group details: describe the history policy from the owner's side ("New members receive messages sent after joining", product page 3) instead of "Messages shared after you join", and singularize "1 days" in the invitation lifetime texts.
+- [ ] Joined group before first sync: disable sending, editing and "Delete for everyone" with a note while lastSynchronizedAtUnix is null (technical-design Synchronization requirements), instead of failing with group_not_synchronized after send.
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -607,3 +611,4 @@ Mon Oct 19 23:27:47 UTC 2026 Docs member-device activity wording: technical-desi
 2026-10-20T11:35:33Z Join owner address without initial pull: JoinGroupResult carries reached_at_unix (Welcome acceptance time); join_pending_group records the reaching address whenever a Welcome was accepted, synchronization only after a completed pull, so the authoring gate stays closed; pending test covers address remembered with authoring still refused, network join test asserts reached_at_unix. fmt, clippy, workspace + src-tauri tests (apt-installed GTK/WebKit), npm build pass.
 2026-10-20T12:28:38Z Pending invitation Offline state: App tracks offlineJoinIds from join attempts failing with network_unavailable; sidebar rows show "Pending · Offline" with the offline dot and the pending card chip reads "Offline · retrying every minute"; cleared on join or a different failure. fmt, clippy, workspace tests, npm build pass.
 2026-10-20T14:27:53Z UI wording: tablet Chats action reads "Create group"; no-groups ready card actions read "Join from link" / "Create group". fmt, clippy, workspace tests, npm build pass.
+2026-10-20T15:33:17Z Joined-group waiting banner: re-derived backlog (3 gaps). joinedSyncPill gains ownerReachable (false for memberServed); composer waiting state uses it; banner reads "Waiting for the group owner" / sync when the owner is reachable, placeholder likewise. fmt, clippy, workspace tests, npm build pass (frontend-only change).

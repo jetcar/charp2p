@@ -509,15 +509,22 @@ function lastSynchronizationLabel(synchronizedAtUnix: number | null) {
 }
 
 // Sync pill for a joined group's conversation header: a member is reachable
-// when the last connection check reached the owner or another member.
+// when the last connection check reached the owner or another member. Only
+// the owner accepts uploads, so a member-served pull leaves ownerReachable
+// false and new messages stay local.
 function joinedSyncPill(state: GroupConnectionStateName | undefined, synchronizedAtUnix: number | null) {
   const title = synchronizedAtUnix === null ? undefined : synchronizationDescription(synchronizedAtUnix);
-  if (state === "online" || state === "relayed" || state === "memberServed") {
-    return { reachable: true, label: `● ${state === "memberServed" ? "Synced with a member" : "Synced with peers"}`, title };
+  if (state === "online" || state === "relayed") {
+    return { reachable: true, ownerReachable: true, label: "● Synced with peers", title };
   }
-  if (state === undefined) return { reachable: true, label: `○ ${lastSynchronizationLabel(synchronizedAtUnix)}`, title };
-  if (state === "bootstrapRequired") return { reachable: false, label: "● Bootstrap node needed", title };
-  return { reachable: false, label: "● No peers reachable", title };
+  if (state === "memberServed") {
+    return { reachable: true, ownerReachable: false, label: "● Synced with a member", title };
+  }
+  if (state === undefined) {
+    return { reachable: true, ownerReachable: true, label: `○ ${lastSynchronizationLabel(synchronizedAtUnix)}`, title };
+  }
+  if (state === "bootstrapRequired") return { reachable: false, ownerReachable: false, label: "● Bootstrap node needed", title };
+  return { reachable: false, ownerReachable: false, label: "● No peers reachable", title };
 }
 
 // Sync pill for the owner's conversation header: members can sync only while
@@ -3815,14 +3822,15 @@ function App() {
   }
 
   // Shown above the composer while a joined group's last connection check
-  // reached no member: new messages stay local until a peer connects.
+  // did not reach the owner: members upload only to the owner, so new
+  // messages stay local until it is reachable.
   function renderWaitingBanner(synchronizedAtUnix: number | null) {
     return (
       <div className="waiting-banner" role="status">
         <span className="waiting-banner-icon" aria-hidden="true">⟳</span>
         <div>
-          <strong>Waiting for a group member</strong>
-          <p>Messages will sync when another member comes online.</p>
+          <strong>Waiting for the group owner</strong>
+          <p>New messages will sync when the owner is reachable.</p>
           <p className="waiting-banner-synced">{lastSynchronizationLabel(synchronizedAtUnix)}</p>
         </div>
         <button disabled={synchronizingGroup || !isTauri()} onClick={synchronizeJoinedGroup} type="button">
@@ -3848,7 +3856,7 @@ function App() {
             id={`${idPrefix}-outgoing-message`}
             maxLength={16384}
             onChange={(event) => setOutgoingMessage(event.target.value)}
-            placeholder={waiting ? "New messages stay on this device until a peer connects." : "Write a message"}
+            placeholder={waiting ? "New messages stay on this device until the owner is reachable." : "Write a message"}
             type="text"
             value={outgoingMessage}
           />
@@ -5053,7 +5061,7 @@ function App() {
                   ? `✓ Encrypted event ${createdMessage.authorSequence} shared with the owner.`
                   : `✓ Encrypted event ${createdMessage.authorSequence} saved. It will sync when the owner is reachable.`
                 ),
-                !joinedSyncPill(connectionStates[joinedGroup.groupId], joinedGroup.lastSynchronizedAtUnix).reachable,
+                !joinedSyncPill(connectionStates[joinedGroup.groupId], joinedGroup.lastSynchronizedAtUnix).ownerReachable,
               )}
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <p className="preview-note">Secure membership and verified group state are stored on this device.</p>

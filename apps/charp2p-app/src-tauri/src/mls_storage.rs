@@ -1956,8 +1956,13 @@ impl MlsProviderService {
         store: &mut EventStore,
         group_id: PeerId,
     ) -> Result<bool, &'static str> {
+        // Only the pinned owner device commits, and a locally owned group's
+        // commits are applied when they are created.
+        let Some(owner_id) = joined_group_owner(store, group_id)? else {
+            return Ok(false);
+        };
         let events = store
-            .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+            .unapplied_mls_commit_events(group_id, owner_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
             .map_err(|_| "mls_group_storage_unavailable")?;
         for event in events {
             let previous = provider
@@ -3261,12 +3266,22 @@ fn is_joined_group_owner(
     group_id: PeerId,
     author_id: PeerId,
 ) -> Result<bool, &'static str> {
+    Ok(joined_group_owner(store, group_id)? == Some(author_id))
+}
+
+/// The pinned owner device of a joined group, or `None` for a group this
+/// device has not joined.
+fn joined_group_owner(
+    store: &EventStore,
+    group_id: PeerId,
+) -> Result<Option<PeerId>, &'static str> {
     let joined = store
         .joined_groups()
         .map_err(|_| "message_store_unavailable")?;
     Ok(joined
         .iter()
-        .any(|group| group.group_id == group_id && group.inviter_device_id == author_id))
+        .find(|group| group.group_id == group_id)
+        .map(|group| group.inviter_device_id))
 }
 
 fn encrypt_snapshot(
@@ -4892,7 +4907,11 @@ mod tests {
         {
             let store = member_service.store.lock().unwrap();
             assert!(store
-                .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+                .unapplied_mls_commit_events(
+                    group_id,
+                    owner.peer_id(),
+                    charp2p_store::MAX_SYNC_BATCH_EVENTS
+                )
                 .unwrap()
                 .is_empty());
             assert_eq!(store.membership_state(group_id).unwrap(), owner_state);
@@ -5355,7 +5374,11 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .unapplied_mls_commit_events(group_id, charp2p_store::MAX_SYNC_BATCH_EVENTS)
+            .unapplied_mls_commit_events(
+                group_id,
+                owner.peer_id(),
+                charp2p_store::MAX_SYNC_BATCH_EVENTS,
+            )
             .unwrap();
         assert!(unapplied
             .iter()

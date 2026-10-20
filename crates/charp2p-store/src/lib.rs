@@ -1685,11 +1685,14 @@ impl EventStore {
         Ok(inserted == 1)
     }
 
-    /// Returns verified MLS commits (membership changes and owner key
+    /// Returns the owner's verified MLS commits (membership changes and key
     /// refreshes) that have not advanced the local provider snapshot yet.
+    /// Only the pinned owner device commits, so events other authors push
+    /// cannot crowd the owner's commits out of the batch.
     pub fn unapplied_mls_commit_events(
         &self,
         group_id: PeerId,
+        owner_id: PeerId,
         limit: usize,
     ) -> Result<Vec<SignedEvent>, StoreError> {
         if !(1..=MAX_SYNC_BATCH_EVENTS).contains(&limit) {
@@ -1699,14 +1702,17 @@ impl EventStore {
             "SELECT e.encoded
              FROM events e
              LEFT JOIN applied_mls_events a ON a.event_id = e.event_id
-             WHERE e.group_id = ?1 AND a.event_id IS NULL
-             ORDER BY e.author_id, e.author_sequence",
+             WHERE e.group_id = ?1 AND e.author_id = ?2 AND a.event_id IS NULL
+             ORDER BY e.author_sequence",
         )?;
-        let rows = statement.query_map([group_id.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = statement
+            .query_map(params![group_id.to_bytes(), owner_id.to_bytes()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
         let mut events = Vec::with_capacity(limit);
         for encoded in rows {
             let event = SignedEvent::decode(&encoded?)?;
-            if event.group_id() != group_id {
+            if event.group_id() != group_id || event.author_id() != owner_id {
                 return Err(StoreError::CorruptIndex);
             }
             if is_mls_commit_kind(event.kind()) {
@@ -4284,7 +4290,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 10)
+                .unapplied_mls_commit_events(group.group_id(), owner.peer_id(), 10)
                 .unwrap()
                 .iter()
                 .map(SignedEvent::id)
@@ -4298,7 +4304,7 @@ mod tests {
         );
         assert!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 10)
+                .unapplied_mls_commit_events(group.group_id(), owner.peer_id(), 10)
                 .unwrap()
                 .is_empty()
         );
@@ -5618,7 +5624,7 @@ mod tests {
         );
         assert!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 2)
+                .unapplied_mls_commit_events(group.group_id(), owner.peer_id(), 2)
                 .unwrap()
                 .iter()
                 .any(|event| event.id() == removed.id())
@@ -7895,7 +7901,7 @@ mod tests {
         store.put_event(&event).unwrap();
         assert_eq!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unapplied_mls_commit_events(group.group_id(), author.peer_id(), 1)
                 .unwrap()[0]
                 .id(),
             event.id()
@@ -7911,7 +7917,7 @@ mod tests {
         );
         assert!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unapplied_mls_commit_events(group.group_id(), author.peer_id(), 1)
                 .unwrap()
                 .is_empty()
         );
@@ -8108,6 +8114,43 @@ mod tests {
     }
 
     #[test]
+    fn unapplied_mls_commits_skip_events_other_authors_pushed() {
+        let mut store = EventStore::in_memory().unwrap();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let group = GroupIdentity::generate();
+        let commit = |author: &DeviceIdentity, sequence| {
+            SignedEvent::create(
+                author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1,
+                    kind: EventKind::MemberAdded,
+                    protected_payload: b"MLS commit",
+                },
+            )
+            .unwrap()
+        };
+        for sequence in 1..=3 {
+            store.put_event(&commit(&member, sequence)).unwrap();
+        }
+        let owner_commit = commit(&owner, 1);
+        store.put_event(&owner_commit).unwrap();
+
+        assert_eq!(
+            store
+                .unapplied_mls_commit_events(group.group_id(), owner.peer_id(), 1)
+                .unwrap()
+                .iter()
+                .map(SignedEvent::id)
+                .collect::<Vec<_>>(),
+            vec![owner_commit.id()]
+        );
+    }
+
+    #[test]
     fn version_eight_database_adds_applied_mls_events() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
@@ -8127,7 +8170,11 @@ mod tests {
         let group = GroupIdentity::generate();
         assert!(
             store
-                .unapplied_mls_commit_events(group.group_id(), 1)
+                .unapplied_mls_commit_events(
+                    group.group_id(),
+                    DeviceIdentity::generate().peer_id(),
+                    1
+                )
                 .unwrap()
                 .is_empty()
         );

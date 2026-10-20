@@ -1688,7 +1688,8 @@ impl EventStore {
     /// Returns the owner's verified MLS commits (membership changes and key
     /// refreshes) that have not advanced the local provider snapshot yet.
     /// Only the pinned owner device commits, so events other authors push
-    /// cannot crowd the owner's commits out of the batch.
+    /// cannot crowd the owner's commits out of the batch, and commits after a
+    /// gap in the owner's sequence wait until the gap is filled.
     pub fn unapplied_mls_commit_events(
         &self,
         group_id: PeerId,
@@ -1703,6 +1704,11 @@ impl EventStore {
              FROM events e
              LEFT JOIN applied_mls_events a ON a.event_id = e.event_id
              WHERE e.group_id = ?1 AND e.author_id = ?2 AND a.event_id IS NULL
+               AND e.author_sequence = (
+                   SELECT COUNT(*) FROM events s
+                   WHERE s.group_id = e.group_id AND s.author_id = e.author_id
+                     AND s.author_sequence <= e.author_sequence
+               )
              ORDER BY e.author_sequence",
         )?;
         let rows = statement
@@ -4378,6 +4384,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn owner_commits_after_a_sequence_gap_wait_until_it_is_filled() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let owner_event = |sequence, kind| {
+            SignedEvent::create(
+                &owner,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind,
+                    protected_payload: b"membership commit",
+                },
+            )
+            .unwrap()
+        };
+        let added = owner_event(1, EventKind::MemberAdded);
+        let removed = owner_event(3, EventKind::MemberRemoved);
+        store.put_event(&added).unwrap();
+        store.put_event(&removed).unwrap();
+        let unapplied = |store: &EventStore| {
+            store
+                .unapplied_mls_commit_events(group.group_id(), owner.peer_id(), 10)
+                .unwrap()
+                .iter()
+                .map(SignedEvent::id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unapplied(&store), vec![added.id()]);
+
+        store
+            .put_event(&owner_event(2, EventKind::MessageCreated))
+            .unwrap();
+        assert_eq!(unapplied(&store), vec![added.id(), removed.id()]);
     }
 
     #[test]

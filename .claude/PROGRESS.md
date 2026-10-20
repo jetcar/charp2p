@@ -319,6 +319,11 @@
 - [x] Owned-group details: describe the history policy from the owner's side ("New members receive messages sent after joining", product page 3) instead of "Messages shared after you join", and singularize "1 days" in the invitation lifetime texts.
 - [x] Joined group before first sync: disable sending, editing and "Delete for everyone" with a note while lastSynchronizedAtUnix is null (technical-design Synchronization requirements), instead of failing with group_not_synchronized after send.
 
+- [x] MLS commits: return only gap-free owner commits from `unapplied_mls_commit_events`, so a `MemberRemoved`/`MemberAdded`/`KeyEpochAdvanced` stored after a missing owner event waits until the gap is filled (technical-design Group protocol "a gap in an author's sequence stops that author's later events").
+- [ ] MLS profile: reject two leaves for the same device on the receiving side (`validate_credentials` in charp2p-mls and staged commits' resulting member set), new `ProfileError::DuplicateDevice` (technical-design Message protection "every authorized device as a distinct MLS leaf").
+- [ ] MLS commits: check a `MemberAdded` commit carries exactly one add and a `MemberRemoved` commit exactly one remove (no other proposals) before merging, like the `KeyEpochAdvanced` check (technical-design Group protocol, ADR-017 Consequences).
+- [ ] Sync owner handler: answer `busy` (not `unauthorized`) when loading the MLS group fails with a storage error, keeping `unauthorized` for a missing group (technical-design Connectivity "temporary MLS or storage failures return busy"; mls_storage.rs MlsGroup::load).
+
 ## Needs human
 
 - [ ] Visual review of the design-alignment items on real Windows and Android tablet windows against design/*.png (mockups are visual direction, not pixel specs; the avatars and person names in the mockups are intentionally not implemented per product page 7).
@@ -614,3 +619,4 @@ Mon Oct 19 23:27:47 UTC 2026 Docs member-device activity wording: technical-desi
 2026-10-20T15:33:17Z Joined-group waiting banner: re-derived backlog (3 gaps). joinedSyncPill gains ownerReachable (false for memberServed); composer waiting state uses it; banner reads "Waiting for the group owner" / sync when the owner is reachable, placeholder likewise. fmt, clippy, workspace tests, npm build pass (frontend-only change).
 2026-10-20T16:26:52Z Owned-group details wording: owner-side history reads "New members receive messages sent after joining"; invitation lifetime texts use lifetimeDaysLabel ("1 day"). fmt, clippy, workspace tests, npm build pass (frontend-only change).
 2026-10-20T17:27:56Z Joined group before first sync: composer input/send disabled with a first-sync note, Edit and Delete for everyone disabled with a title while lastSynchronizedAtUnix is null. fmt, clippy, workspace tests, npm build pass (frontend-only change).
+2026-10-20T19:39:25Z MLS commits after an owner sequence gap: re-derived backlog (4 gaps). unapplied_mls_commit_events adds the gap-free author_sequence clause; store test with owner commits at seq 1 and 3 releasing seq 3 once seq 2 arrives. fmt, clippy, workspace + src-tauri tests (apt-installed GTK/WebKit), npm build pass.

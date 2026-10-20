@@ -480,6 +480,15 @@ function historyDescription(_policy: InvitationPreview["historyPolicy"]) {
   return "Messages shared after you join";
 }
 
+function ownerHistoryDescription(_policy: InvitationPreview["historyPolicy"]) {
+  return "New members receive messages sent after joining";
+}
+
+function lifetimeDaysLabel(lifetimeSeconds: number) {
+  const days = lifetimeSeconds / 86400;
+  return `${days} ${days === 1 ? "day" : "days"}`;
+}
+
 function expiryDescription(expiresAtUnix: number) {
   const remainingSeconds = expiresAtUnix - Math.floor(Date.now() / 1000);
   if (remainingSeconds <= 0) return "Expired";
@@ -4122,9 +4131,9 @@ function App() {
           ) : localGroup ? (
             <>
               <dl className="preview-facts">
-                <div><dt>History</dt><dd>{historyDescription(localGroup.historyPolicy)}</dd></div>
+                <div><dt>History</dt><dd>{ownerHistoryDescription(localGroup.historyPolicy)}</dd></div>
                 <div><dt>Join mode</dt><dd>{localGroup.approvalRequired ? "Valid invitation, then owner approval" : "Valid invitation grants access"}</dd></div>
-                <div><dt>Invitations</dt><dd>{localGroup.reusableInvitation ? "Reusable" : "Single use"} by default · expire after {localGroup.invitationLifetimeSeconds / 86400} days</dd></div>
+                <div><dt>Invitations</dt><dd>{localGroup.reusableInvitation ? "Reusable" : "Single use"} by default · expire after {lifetimeDaysLabel(localGroup.invitationLifetimeSeconds)}</dd></div>
               </dl>
             </>
           ) : null}
@@ -5209,7 +5218,7 @@ function App() {
                     <option key={seconds} value={seconds}>{label}</option>
                   ))}
                 </select>
-                <p className="preview-note">The group allows invitations of up to {localGroup.invitationLifetimeSeconds / 86400} days.</p>
+                <p className="preview-note">The group allows invitations of up to {lifetimeDaysLabel(localGroup.invitationLifetimeSeconds)}.</p>
               </div>
               {error && <p className="form-error preview-error" role="alert">{error}</p>}
               <button className="primary-button" disabled={creatingInvitation || !isTauri()} onClick={createInvitation} type="button">

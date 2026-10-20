@@ -1889,8 +1889,21 @@ impl EventStore {
     ///
     /// Owner key refreshes count as commits because later messages depend on
     /// their epoch (ADR-045). Commits are owner-authored, so the newest one is
-    /// the commit with the highest author sequence.
+    /// the commit with the highest author sequence. For a joined group only
+    /// the pinned owner device's commits count, so commit events pulled from
+    /// other authors do not make the state look stale or diverged; an owned
+    /// group never stores another author's commits.
     pub fn membership_state(&self, group_id: PeerId) -> Result<SyncMembershipState, StoreError> {
+        let owner_id = self
+            .connection
+            .query_row(
+                "SELECT inviter_device_id FROM joined_groups WHERE group_id = ?1",
+                [group_id.to_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|bytes| PeerId::from_bytes(&bytes).map_err(|_| StoreError::CorruptIndex))
+            .transpose()?;
         let mut statement = self.connection.prepare(
             "SELECT encoded FROM events WHERE group_id = ?1
              ORDER BY author_sequence, event_id",
@@ -1901,6 +1914,9 @@ impl EventStore {
             let event = SignedEvent::decode(&bytes?)?;
             if event.group_id() != group_id {
                 return Err(StoreError::CorruptIndex);
+            }
+            if owner_id.is_some_and(|owner_id| event.author_id() != owner_id) {
+                continue;
             }
             if is_mls_commit_kind(event.kind()) {
                 state.commits += 1;
@@ -4249,6 +4265,60 @@ mod tests {
             SyncMembershipState {
                 commits: 3,
                 latest_commit: Some(refresh.id()),
+            }
+        );
+    }
+
+    #[test]
+    fn joined_group_membership_state_counts_only_the_pinned_owner_commits() {
+        let mut store = EventStore::in_memory().unwrap();
+        let group = GroupIdentity::generate();
+        let owner = DeviceIdentity::generate();
+        let member = DeviceIdentity::generate();
+        let commit = |author: &DeviceIdentity, sequence| {
+            SignedEvent::create(
+                author,
+                EventSpec {
+                    group_id: group.group_id(),
+                    author_sequence: sequence,
+                    causal_parents: &[],
+                    created_at_unix_ms: 1_800_000_000_000,
+                    kind: EventKind::MemberAdded,
+                    protected_payload: b"membership commit",
+                },
+            )
+            .unwrap()
+        };
+        let owner_commit = commit(&owner, 1);
+        let member_commits = [commit(&member, 1), commit(&member, 2)];
+        store.put_event(&owner_commit).unwrap();
+        for event in &member_commits {
+            store.put_event(event).unwrap();
+        }
+
+        // Before the group is joined, every stored commit counts.
+        assert_eq!(store.membership_state(group.group_id()).unwrap().commits, 3);
+
+        store
+            .put_pending_invitation(&PendingInvitationMetadata {
+                group_id: group.group_id(),
+                group_name: "Design Crew".to_owned(),
+                inviter_name: "Maya".to_owned(),
+                expires_at_unix: 1_800_003_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            })
+            .unwrap();
+        assert!(
+            store
+                .promote_pending_invitation_to_joined_group(group.group_id(), owner.peer_id())
+                .unwrap()
+        );
+        assert_eq!(
+            store.membership_state(group.group_id()).unwrap(),
+            SyncMembershipState {
+                commits: 1,
+                latest_commit: Some(owner_commit.id()),
             }
         );
     }

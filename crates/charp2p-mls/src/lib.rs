@@ -2,7 +2,11 @@
 
 //! The fixed MLS profile used for CharP2P group-message protection.
 
-use std::{collections::HashMap, fmt, sync::RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::RwLock,
+};
 
 pub use charp2p_core::MAX_JOIN_MLS_MESSAGE_BYTES as MAX_MLS_WIRE_BYTES;
 use charp2p_core::{Invitation, JoinError, JoinRequest, PeerId};
@@ -245,6 +249,8 @@ pub enum ProfileError {
     UnsupportedJoinConfiguration,
     /// A group leaf does not carry a valid CharP2P device credential.
     InvalidDeviceCredential,
+    /// Two group leaves carry the same CharP2P device identity.
+    DuplicateDevice,
     /// A key refresh commit carries proposals or no path update.
     UnexpectedKeyRefreshContent,
 }
@@ -414,6 +420,9 @@ pub enum PrepareMemberAdmissionError {
     /// The KeyPackage is invalid or is not bound to the transport peer.
     #[error("joining MLS KeyPackage is invalid")]
     InvalidKeyPackage(ProfileKeyPackageError),
+    /// The joining device already holds a leaf in the group.
+    #[error("joining device is already an MLS group member")]
+    AlreadyMember,
     /// OpenMLS could not stage the member addition.
     #[error("MLS member addition could not be staged")]
     MemberAdditionFailed,
@@ -839,6 +848,13 @@ pub fn prepare_profile_member_admission<Provider: OpenMlsProvider>(
     let key_package =
         validate_profile_key_package(provider, encoded_key_package, authenticated_peer)
             .map_err(PrepareMemberAdmissionError::InvalidKeyPackage)?;
+    // Every authorized device is one distinct leaf, so a second leaf for the
+    // same device is never staged.
+    if group.members().any(|member| {
+        device_id_from_credential(&member.credential).is_ok_and(|peer| peer == authenticated_peer)
+    }) {
+        return Err(PrepareMemberAdmissionError::AlreadyMember);
+    }
     let (commit, welcome, _) = group
         .add_members(provider, signer, &[key_package])
         .map_err(|_| PrepareMemberAdmissionError::MemberAdditionFailed)?;
@@ -1200,9 +1216,13 @@ fn validate_extensions(extensions: &Extensions<GroupContext>) -> Result<(), Prof
 fn validate_credentials(
     credentials: impl IntoIterator<Item = openmls::prelude::Credential>,
 ) -> Result<(), ProfileError> {
+    let mut devices = HashSet::new();
     for credential in credentials {
-        device_id_from_credential(&credential)
+        let device = device_id_from_credential(&credential)
             .map_err(|_| ProfileError::InvalidDeviceCredential)?;
+        if !devices.insert(device) {
+            return Err(ProfileError::DuplicateDevice);
+        }
     }
     Ok(())
 }
@@ -2055,6 +2075,75 @@ mod tests {
         abort_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
         assert!(owner_group.pending_commit().is_none());
         assert_eq!(owner_group.members().count(), 1);
+    }
+
+    #[test]
+    fn second_leaf_for_the_same_device_is_rejected() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let member_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        // Each leaf has its own signature key but the same device identity,
+        // as a reinstalled or restored device would.
+        let member_key_package = || {
+            let (member_credential, member_signer) = credential(member_id, &member_provider);
+            KeyPackage::builder()
+                .leaf_node_capabilities(profile_capabilities())
+                .build(
+                    CIPHERSUITE,
+                    &member_provider,
+                    &member_signer,
+                    member_credential,
+                )
+                .unwrap()
+                .key_package()
+                .clone()
+        };
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+        owner_group
+            .add_members(&owner_provider, &owner_signer, &[member_key_package()])
+            .unwrap();
+        owner_group.merge_pending_commit(&owner_provider).unwrap();
+        validate_group_profile(&owner_group).unwrap();
+
+        assert_eq!(
+            prepare_profile_member_admission(
+                &mut owner_group,
+                &owner_provider,
+                &owner_signer,
+                &member_key_package().tls_serialize_detached().unwrap(),
+                member_id,
+            )
+            .unwrap_err(),
+            PrepareMemberAdmissionError::AlreadyMember
+        );
+        assert!(owner_group.pending_commit().is_none());
+
+        // OpenMLS itself accepts a second leaf for the same device; the
+        // profile rejects the resulting group and its Welcome.
+        let (_, duplicate_welcome, _) = owner_group
+            .add_members(&owner_provider, &owner_signer, &[member_key_package()])
+            .unwrap();
+        owner_group.merge_pending_commit(&owner_provider).unwrap();
+        assert_eq!(owner_group.members().count(), 3);
+        assert_eq!(
+            validate_group_profile(&owner_group),
+            Err(ProfileError::DuplicateDevice)
+        );
+        assert!(matches!(
+            stage_profile_welcome(
+                &member_provider,
+                &duplicate_welcome.tls_serialize_detached().unwrap()
+            ),
+            Err(StageWelcomeError::Profile(ProfileError::DuplicateDevice))
+        ));
     }
 
     #[test]

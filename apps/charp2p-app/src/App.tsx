@@ -4583,7 +4583,7 @@ function App() {
                 onClick={openCreateGroupFromShell}
                 type="button"
               >
-                <span aria-hidden="true">＋</span> New group
+                <span aria-hidden="true">＋</span> Create group
               </button>
               <button
                 className={`chats-action${joinMode ? " active" : ""}`}
@@ -5338,10 +5338,10 @@ function App() {
                 </div>
               )}
               <button className="primary-button" onClick={() => setJoinMode(true)} type="button">
-                Paste invite link
+                Join from link
               </button>
               <button className="secondary-button" onClick={() => setCreateGroupMode(true)} type="button">
-                Create a group
+                Create group
               </button>
             </section>
           )}

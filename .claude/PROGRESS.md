@@ -313,7 +313,7 @@
 - [x] Sync summary: count only the pinned owner's commits in `membership_state`, so pulled member-authored commit events do not make a member report stale or diverged membership (technical-design Synchronization summary).
 - [x] Join: remember the address that reached the owner after an accepted Welcome even when the initial pull fails (record_peer_address only runs when synchronized_at_unix is set), without opening the authoring gate, so a hint-only joiner can retry sync and its serving node can redial the owner (technical-design Invitations, Local data, ADR-037).
 - [x] Groups page: show a pending invitation as Offline (not "Waiting for owner") when the last join attempt failed with `network_unavailable` (product page 2 "Clear online, relayed, waiting, and offline states").
-- [ ] UI wording: label the tablet Chats action "Create group" (not "New group") and the no-groups card actions "Join from link" / "Create group" (product page 2).
+- [x] UI wording: label the tablet Chats action "Create group" (not "New group") and the no-groups card actions "Join from link" / "Create group" (product page 2).
 
 ## Needs human
 
@@ -606,3 +606,4 @@ Mon Oct 19 23:27:47 UTC 2026 Docs member-device activity wording: technical-desi
 2026-10-20T10:31:45Z Sync summary membership state: EventStore::membership_state counts only commits authored by a joined group's pinned owner (joined_groups.inviter_device_id); owned/unknown groups unchanged; store test with member-authored commits. fmt, clippy, workspace + src-tauri tests (apt-installed GTK/WebKit), npm build pass.
 2026-10-20T11:35:33Z Join owner address without initial pull: JoinGroupResult carries reached_at_unix (Welcome acceptance time); join_pending_group records the reaching address whenever a Welcome was accepted, synchronization only after a completed pull, so the authoring gate stays closed; pending test covers address remembered with authoring still refused, network join test asserts reached_at_unix. fmt, clippy, workspace + src-tauri tests (apt-installed GTK/WebKit), npm build pass.
 2026-10-20T12:28:38Z Pending invitation Offline state: App tracks offlineJoinIds from join attempts failing with network_unavailable; sidebar rows show "Pending · Offline" with the offline dot and the pending card chip reads "Offline · retrying every minute"; cleared on join or a different failure. fmt, clippy, workspace tests, npm build pass.
+2026-10-20T14:27:53Z UI wording: tablet Chats action reads "Create group"; no-groups ready card actions read "Join from link" / "Create group". fmt, clippy, workspace tests, npm build pass.

@@ -11,8 +11,8 @@ use charp2p_core::{
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{
-    ConnectionPath, InboundJoinRequestId, InboundSyncRequestId, NetworkEvent, NetworkNode,
-    OutboundSyncRequestId, RelayLimits,
+    ConnectionPath, InboundInviteRequestId, InboundJoinRequestId, InboundSyncRequestId,
+    NetworkEvent, NetworkNode, OutboundSyncRequestId, RelayLimits,
 };
 use charp2p_sync::{MembershipComparison, PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
@@ -490,6 +490,8 @@ struct ActiveMemberServing {
     /// Whether the node announces the member key; without bootstrap nodes it
     /// only keeps the owner connection.
     advertised: bool,
+    /// Inviter name of the invitations it issues for owned groups.
+    inviter_name: String,
     /// Asks the serving task to lend its node while it holds an
     /// authenticated connection to `owner`.
     lend: mpsc::Sender<oneshot::Sender<LentOwnerConnection>>,
@@ -554,6 +556,14 @@ struct OwnerRequestHandlers {
     owner_addresses: Arc<std::sync::Mutex<Vec<Multiaddr>>>,
     owner_peers: Arc<std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>>,
     last_connection: Arc<std::sync::Mutex<Option<ObservedConnection>>>,
+}
+
+/// Owner identity, with the inviter name of the invitations it issues, under
+/// which the member serving node answers requests for this device's own
+/// groups; it must hold the same key as the node's network identity.
+pub struct OwnerAnswerIdentity {
+    pub identity: DeviceIdentity,
+    pub inviter_name: String,
 }
 
 pub struct NetworkService {
@@ -1579,15 +1589,23 @@ impl NetworkService {
     /// which the owner sends new-event notices (ADR-049). Without bootstrap
     /// nodes the node still keeps that owner connection at the remembered
     /// addresses but cannot advertise the key, and reports bootstrapRequired.
+    /// LAN discovery announces the device peer ID from this node too, so
+    /// requests for groups this device owns get the owner answers under
+    /// `own`, uncounted (ADR-033).
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve_member_group(
         &self,
         network_identity: DeviceIdentity,
+        own: OwnerAnswerIdentity,
         group_id: PeerId,
         key: DiscoveryKey,
         owner: PeerId,
         owner_addresses: Vec<Multiaddr>,
         bandwidth: Arc<BandwidthService>,
     ) -> Result<&'static str, &'static str> {
+        if network_identity.peer_id() != own.identity.peer_id() {
+            return Err("invitation_inviter_mismatch");
+        }
         let mut active = self.member_serving.lock().await;
         let bootstrap_peers = self.bootstrap_peers();
         let advertised = !bootstrap_peers.is_empty();
@@ -1606,6 +1624,7 @@ impl NetworkService {
             if existing.group_id == group_id
                 && existing.key == key
                 && existing.advertised == advertised
+                && existing.inviter_name == own.inviter_name
                 && !existing.task.is_finished()
             {
                 return Ok(status);
@@ -1623,6 +1642,8 @@ impl NetworkService {
 
         let synchronization = Arc::clone(&self.synchronization);
         let notices = self.event_notices.clone();
+        let handlers = self.owner_request_handlers();
+        let inviter_name = own.inviter_name.clone();
         let (lend, mut lend_requests) = mpsc::channel::<oneshot::Sender<LentOwnerConnection>>(4);
         if advertised {
             self.use_remembered_routing_peers(&mut node);
@@ -1645,6 +1666,8 @@ impl NetworkService {
                             synchronization.as_ref(),
                             &bandwidth,
                             &notices,
+                            &handlers,
+                            &own,
                         ),
                     }
                 }
@@ -1734,6 +1757,8 @@ impl NetworkService {
                             synchronization.as_ref(),
                             &bandwidth,
                             &notices,
+                            &handlers,
+                            &own,
                         ),
                     },
                 }
@@ -1744,6 +1769,7 @@ impl NetworkService {
             key,
             owner,
             advertised,
+            inviter_name,
             lend,
             task,
         });
@@ -2714,16 +2740,41 @@ fn send_event_notices(
 
 /// Handles an event on a member serving node: synchronization requests
 /// get the metered member answer and acknowledged owner notices are
-/// published to `notices`, while join and invitation requests are rejected
-/// because only the owner admits devices.
+/// published to `notices`. Synchronization requests for groups this device
+/// owns, and join and invitation requests, get the uncounted owner answers
+/// under `own` (ADR-033), whose authorizers only admit or issue for owned
+/// groups.
+#[allow(clippy::too_many_arguments)]
 fn answer_member_node_event(
     node: &mut NetworkNode,
     event: NetworkEvent,
     synchronization: &dyn SynchronizationService,
     bandwidth: &BandwidthService,
     notices: &broadcast::Sender<PeerId>,
+    owner: &OwnerRequestHandlers,
+    own: &OwnerAnswerIdentity,
 ) {
     match event {
+        // New-event notices come from the pinned owner of a joined group.
+        NetworkEvent::SyncRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } if !matches!(request, SyncRequest::EventsAvailable { .. })
+            && owner
+                .synchronization
+                .owns_group(sync_request_group_id(&request)) =>
+        {
+            answer_owner_sync_request(
+                node,
+                owner.synchronization.as_ref(),
+                &owner.last_connection,
+                &owner.owner_peers,
+                peer_id,
+                request_id,
+                &request,
+            );
+        }
         NetworkEvent::SyncRequestReceived {
             peer_id,
             request_id,
@@ -2737,12 +2788,33 @@ fn answer_member_node_event(
             }
             let _ = node.send_sync_response(request_id, response);
         }
-        NetworkEvent::JoinRequestReceived { request_id, .. } => {
-            let _ = node.reject_join_request(request_id, JoinRejectReason::Unauthorized);
-        }
-        NetworkEvent::InviteRequestReceived { request_id, .. } => {
-            let _ = node.reject_invite_request(request_id, InviteRejectReason::Unauthorized);
-        }
+        NetworkEvent::JoinRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => answer_owner_join_request(
+            node,
+            owner.join_authorizer.as_ref(),
+            owner.member_admission.as_ref(),
+            owner.synchronization.as_ref(),
+            &own.identity,
+            peer_id,
+            request_id,
+            &request,
+        ),
+        NetworkEvent::InviteRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => answer_handled_invite_request(
+            node,
+            owner,
+            &own.identity,
+            &own.inviter_name,
+            peer_id,
+            request_id,
+            &request,
+        ),
         _ => {}
     }
 }
@@ -2800,23 +2872,44 @@ fn answer_contribution_event(
             peer_id,
             request_id,
             request,
-        } => {
-            let hints = owner
-                .owner_addresses
-                .lock()
-                .map(|addresses| select_address_hints(&addresses))
-                .unwrap_or_default();
-            let response = owner.invite_requests.answer_invite_request(
-                owner_identity.peer_id(),
-                inviter_name,
-                peer_id,
-                &request,
-                &hints,
-            );
-            let _ = node.send_invite_response(request_id, response);
-        }
+        } => answer_handled_invite_request(
+            node,
+            owner,
+            owner_identity,
+            inviter_name,
+            peer_id,
+            request_id,
+            &request,
+        ),
         _ => {}
     }
+}
+
+/// Answers an invitation request on a node other than the owner advertising
+/// node through the owner invite service; the invitation hints are the
+/// owner advertising node's addresses.
+fn answer_handled_invite_request(
+    node: &mut NetworkNode,
+    owner: &OwnerRequestHandlers,
+    owner_identity: &DeviceIdentity,
+    inviter_name: &str,
+    peer_id: PeerId,
+    request_id: InboundInviteRequestId,
+    request: &InviteRequest,
+) {
+    let hints = owner
+        .owner_addresses
+        .lock()
+        .map(|addresses| select_address_hints(&addresses))
+        .unwrap_or_default();
+    let response = owner.invite_requests.answer_invite_request(
+        owner_identity.peer_id(),
+        inviter_name,
+        peer_id,
+        request,
+        &hints,
+    );
+    let _ = node.send_invite_response(request_id, response);
 }
 
 fn join_response(
@@ -3322,8 +3415,8 @@ mod tests {
         select_address_hints, send_push_request, upgraded_path, AdvertisementResult,
         BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
         MemberAdmissionService, MemberCandidates, MembershipComparison, NetworkService,
-        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
-        SynchronizationService, UnavailableJoinRequestAuthorizer,
+        NetworkStatus, OwnerAnswerIdentity, PeerSearchResult, PendingJoinService, PullSession,
+        SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
         MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS, MAX_OWNER_LISTEN_ADDRESSES,
         PROVIDER_SEARCH_TIMEOUT,
@@ -3538,6 +3631,20 @@ mod tests {
             DeviceIdentity::from_persisted_secret(&secret).unwrap(),
             DeviceIdentity::from_persisted_secret(&secret).unwrap(),
         )
+    }
+
+    /// Identities holding one key, as the app loads the network and owner
+    /// identities separately.
+    fn identity_copies<const N: usize>() -> [DeviceIdentity; N] {
+        let (_, secret) = DeviceIdentity::generate_persistable().unwrap();
+        std::array::from_fn(|_| DeviceIdentity::from_persisted_secret(&secret).unwrap())
+    }
+
+    fn owner_answers(identity: DeviceIdentity) -> OwnerAnswerIdentity {
+        OwnerAnswerIdentity {
+            identity,
+            inviter_name: "Maya's PC".to_owned(),
+        }
     }
 
     async fn contribute(
@@ -6355,7 +6462,7 @@ mod tests {
         ));
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[9; 32]);
-        let member = DeviceIdentity::generate();
+        let [member, member_own] = identity_copies();
         let member_id = member.peer_id();
         let (puller, puller_again) = identity_pair();
         let puller_id = puller.peer_id();
@@ -6394,6 +6501,7 @@ mod tests {
             {
                 let serve = serving.serve_member_group(
                     member,
+                    owner_answers(member_own),
                     group_id,
                     key,
                     DeviceIdentity::generate().peer_id(),
@@ -6461,14 +6569,21 @@ mod tests {
     }
 
     #[test]
-    fn member_serving_node_is_discoverable_and_serves_only_pulls() {
+    fn member_serving_node_is_discoverable_and_answers_owned_groups_as_owner() {
         let directory = tempfile::tempdir().unwrap();
         let bandwidth = Arc::new(BandwidthService::new(
             directory.path().join("bandwidth.json"),
         ));
+        // Owner answers are not charged to the spent member budget.
+        bandwidth
+            .set(BandwidthPreference {
+                sync_limit_mib_per_hour: Some(1),
+            })
+            .unwrap();
+        bandwidth.charge_sync_bytes(2 * 1024 * 1024);
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[7; 32]);
-        let (member, member_again) = identity_pair();
+        let [member, member_own, member_again, member_again_own] = identity_copies();
         let member_id = member.peer_id();
         let owner_id = DeviceIdentity::generate().peer_id();
         tauri::async_runtime::block_on(async {
@@ -6489,7 +6604,7 @@ mod tests {
                 &[],
                 &format!("{address}/p2p/{routing_id}"),
                 Arc::new(StaticJoinRequestAuthorizer(
-                    JoinRequestAuthorization::Authorized,
+                    JoinRequestAuthorization::Unavailable,
                 )),
                 Arc::new(UnavailableMemberAdmissionService),
                 Arc::new(UnavailablePendingJoinService),
@@ -6503,6 +6618,7 @@ mod tests {
             {
                 let serve = service.serve_member_group(
                     member,
+                    owner_answers(member_own),
                     group_id,
                     key,
                     owner_id,
@@ -6536,6 +6652,7 @@ mod tests {
                 service
                     .serve_member_group(
                         member_again,
+                        owner_answers(member_again_own),
                         group_id,
                         key,
                         owner_id,
@@ -6603,7 +6720,8 @@ mod tests {
                 }
             );
 
-            // Only the owner admits devices, even when the authorizer would.
+            // Join requests reach the owner authorizer, which admits only for
+            // owned groups.
             requester.send_join_request(
                 member_id,
                 JoinRequest::from_invitation(&join_invitation(), vec![1]).unwrap(),
@@ -6629,10 +6747,7 @@ mod tests {
             })
             .await
             .expect("join request should receive a response");
-            assert_eq!(
-                join_response.rejection(),
-                Some(JoinRejectReason::Unauthorized)
-            );
+            assert_eq!(join_response.rejection(), Some(JoinRejectReason::Busy));
 
             let serving_task = service
                 .member_serving
@@ -6661,7 +6776,7 @@ mod tests {
         ));
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[8; 32]);
-        let member = DeviceIdentity::generate();
+        let [member, member_own] = identity_copies();
         let member_id = member.peer_id();
         tauri::async_runtime::block_on(async {
             let owner_identity = DeviceIdentity::generate();
@@ -6705,6 +6820,7 @@ mod tests {
             {
                 let serve = service.serve_member_group(
                     member,
+                    owner_answers(member_own),
                     group_id,
                     key,
                     owner_id,
@@ -6766,7 +6882,7 @@ mod tests {
         ));
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[10; 32]);
-        let member = DeviceIdentity::generate();
+        let [member, member_own] = identity_copies();
         let member_id = member.peer_id();
         tauri::async_runtime::block_on(async {
             let owner_identity = DeviceIdentity::generate();
@@ -6796,10 +6912,12 @@ mod tests {
             .unwrap()
             .without_lan_discovery();
             // Without a remembered owner address there is nothing to dial.
+            let [unserved, unserved_own] = identity_copies();
             assert_eq!(
                 service
                     .serve_member_group(
-                        DeviceIdentity::generate(),
+                        unserved,
+                        owner_answers(unserved_own),
                         group_id,
                         key,
                         owner_id,
@@ -6817,6 +6935,7 @@ mod tests {
                 service
                     .serve_member_group(
                         member,
+                        owner_answers(member_own),
                         group_id,
                         key,
                         owner_id,
@@ -6859,7 +6978,7 @@ mod tests {
         ));
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[9; 32]);
-        let (member, member_again) = identity_pair();
+        let [member, member_own, member_again] = identity_copies();
         let member_id = member.peer_id();
         tauri::async_runtime::block_on(async {
             let owner_identity = DeviceIdentity::generate();
@@ -6903,6 +7022,7 @@ mod tests {
             {
                 let serve = service.serve_member_group(
                     member,
+                    owner_answers(member_own),
                     group_id,
                     key,
                     owner_id,
@@ -7041,7 +7161,7 @@ mod tests {
         ));
         let group_id = DeviceIdentity::generate().peer_id();
         let key = DiscoveryKey::derive(group_id, &[9; 32]);
-        let (member, member_again) = identity_pair();
+        let [member, member_own, member_again] = identity_copies();
         let member_id = member.peer_id();
         tauri::async_runtime::block_on(async {
             let owner_identity = DeviceIdentity::generate();
@@ -7085,6 +7205,7 @@ mod tests {
             {
                 let serve = service.serve_member_group(
                     member,
+                    owner_answers(member_own),
                     group_id,
                     key,
                     owner_id,

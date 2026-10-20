@@ -34,7 +34,7 @@ use mls_storage::{
 };
 use network::{
     AdvertisementResult, GroupConnectionState, NetworkDiagnostics, NetworkService, NetworkStatus,
-    OwnedGroupDiscoveryStatus, PeerSearchResult, SynchronizeGroupResult,
+    OwnedGroupDiscoveryStatus, OwnerAnswerIdentity, PeerSearchResult, SynchronizeGroupResult,
 };
 use pending::{JoinedGroup, PendingGroup, PendingInvitationService};
 use retention::{RetentionPreference, RetentionService};
@@ -1454,9 +1454,22 @@ async fn serve_joined_group(
     let identity = identity_service
         .load_network_identity()
         .map_err(str::to_owned)?;
+    // Requests for this device's own groups reaching the serving node get the
+    // owner answers.
+    let owner_identity = identity_service
+        .load_network_identity()
+        .map_err(str::to_owned)?;
+    let profile = identity_service
+        .status()
+        .map_err(str::to_owned)?
+        .ok_or("identity_missing")?;
     network_service
         .serve_member_group(
             identity,
+            OwnerAnswerIdentity {
+                identity: owner_identity,
+                inviter_name: identity::invitation_device_name(&profile.device_name),
+            },
             group_id,
             key,
             owner_device_id,

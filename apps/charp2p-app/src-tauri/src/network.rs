@@ -25,7 +25,7 @@ use tokio::{
 
 use crate::bandwidth::BandwidthService;
 use crate::groups::{requested_invitation, IssuedInvitation};
-use crate::mls_storage::{MemberAdmissionError, MlsProviderService};
+use crate::mls_storage::{sync_request_group_id, MemberAdmissionError, MlsProviderService};
 use crate::routing_peers::RoutingPeersService;
 
 const BUILT_IN_BOOTSTRAP_ADDRESSES: &[&str] = &[];
@@ -216,6 +216,10 @@ trait SynchronizationService: Send + Sync {
     /// Devices of the group's current MLS epoch that may receive the
     /// owner's new-event notices (ADR-049); empty when the group is unknown.
     fn notice_recipients(&self, group_id: PeerId) -> Vec<PeerId>;
+
+    /// Whether this device owns the group, so nodes other than the owner
+    /// advertising node may answer its requests as the owner (ADR-031).
+    fn owns_group(&self, group_id: PeerId) -> bool;
 }
 
 impl PendingJoinService for MlsProviderService {
@@ -301,6 +305,10 @@ impl SynchronizationService for MlsProviderService {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn owns_group(&self, group_id: PeerId) -> bool {
+        MlsProviderService::owns_group(self, group_id)
     }
 }
 
@@ -521,10 +529,11 @@ impl Drop for ActiveMemberServing {
     }
 }
 
-/// Running opted-in contribution node (ADR-031) and the relay limits it was
-/// started with.
+/// Running opted-in contribution node (ADR-031), the relay limits it was
+/// started with, and the inviter name it issues requested invitations under.
 struct ActiveContribution {
     relay: Option<RelayLimits>,
+    inviter_name: String,
     task: JoinHandle<()>,
 }
 
@@ -532,6 +541,19 @@ impl Drop for ActiveContribution {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// Owner-side services and state with which a node other than the owner
+/// advertising node answers requests for this device's own groups.
+#[derive(Clone)]
+struct OwnerRequestHandlers {
+    join_authorizer: Arc<dyn JoinRequestAuthorizer>,
+    member_admission: Arc<dyn MemberAdmissionService>,
+    synchronization: Arc<dyn SynchronizationService>,
+    invite_requests: Arc<dyn InviteRequestService>,
+    owner_addresses: Arc<std::sync::Mutex<Vec<Multiaddr>>>,
+    owner_peers: Arc<std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>>,
+    last_connection: Arc<std::sync::Mutex<Option<ObservedConnection>>>,
 }
 
 pub struct NetworkService {
@@ -765,6 +787,18 @@ impl NetworkService {
             .lock()
             .map(|addresses| select_address_hints(&addresses))
             .unwrap_or_default()
+    }
+
+    fn owner_request_handlers(&self) -> OwnerRequestHandlers {
+        OwnerRequestHandlers {
+            join_authorizer: Arc::clone(&self.join_authorizer),
+            member_admission: Arc::clone(&self.member_admission),
+            synchronization: Arc::clone(&self.synchronization),
+            invite_requests: Arc::clone(&self.invite_requests),
+            owner_addresses: Arc::clone(&self.owner_addresses),
+            owner_peers: Arc::clone(&self.owner_peers),
+            last_connection: Arc::clone(&self.last_connection),
+        }
     }
 
     /// Returns the address hints for a new invitation of this owner device.
@@ -1441,14 +1475,21 @@ impl NetworkService {
     }
 
     /// Runs the opted-in contribution node (ADR-031) in Kademlia server mode
-    /// with the given relay limits, restarting it only when the limits
-    /// change. Application join and synchronization requests reaching it are
-    /// rejected, as routing nodes do.
+    /// with the given relay limits, restarting it only when the limits or the
+    /// inviter name change. It shares the device peer ID, so members and
+    /// joiners of this device's own groups may reach it instead of the owner
+    /// advertising node; their requests get the owner answers, and requests
+    /// for any other group are rejected, as routing nodes do.
     pub async fn start_contribution(
         &self,
         network_identity: DeviceIdentity,
+        owner_identity: DeviceIdentity,
+        inviter_name: String,
         relay: Option<RelayLimits>,
     ) -> Result<&'static str, &'static str> {
+        if network_identity.peer_id() != owner_identity.peer_id() {
+            return Err("invitation_inviter_mismatch");
+        }
         let status = if relay.is_some() {
             "routingAndRelay"
         } else {
@@ -1460,7 +1501,10 @@ impl NetworkService {
             return Ok("bootstrapRequired");
         }
         if let Some(existing) = active.as_ref() {
-            if existing.relay == relay && !existing.task.is_finished() {
+            if existing.relay == relay
+                && existing.inviter_name == inviter_name
+                && !existing.task.is_finished()
+            {
                 return Ok(status);
             }
         }
@@ -1474,7 +1518,10 @@ impl NetworkService {
         }
         node.bootstrap().map_err(|_| "network_unavailable")?;
 
+        let owner = self.owner_request_handlers();
+        let task_inviter_name = inviter_name.clone();
         let task = tokio::spawn(async move {
+            let inviter_name = task_inviter_name;
             let mut refresh = interval_at(
                 Instant::now() + CONTRIBUTION_BOOTSTRAP_INTERVAL,
                 CONTRIBUTION_BOOTSTRAP_INTERVAL,
@@ -1485,31 +1532,21 @@ impl NetworkService {
                     _ = refresh.tick() => {
                         let _ = node.bootstrap();
                     }
-                    event = node.next_event() => match event {
-                        NetworkEvent::SyncRequestReceived { request_id, .. } => {
-                            let _ = node.reject_sync_request(
-                                request_id,
-                                SyncRejectReason::Unauthorized,
-                            );
-                        }
-                        NetworkEvent::JoinRequestReceived { request_id, .. } => {
-                            let _ = node.reject_join_request(
-                                request_id,
-                                JoinRejectReason::Unauthorized,
-                            );
-                        }
-                        NetworkEvent::InviteRequestReceived { request_id, .. } => {
-                            let _ = node.reject_invite_request(
-                                request_id,
-                                InviteRejectReason::Unauthorized,
-                            );
-                        }
-                        _ => {}
-                    },
+                    event = node.next_event() => answer_contribution_event(
+                        &mut node,
+                        event,
+                        &owner,
+                        &owner_identity,
+                        &inviter_name,
+                    ),
                 }
             }
         });
-        *active = Some(ActiveContribution { relay, task });
+        *active = Some(ActiveContribution {
+            relay,
+            inviter_name,
+            task,
+        });
         Ok(status)
     }
 
@@ -2710,6 +2747,78 @@ fn answer_member_node_event(
     }
 }
 
+/// Handles an event on the contribution node (ADR-031): synchronization
+/// requests for groups this device owns, and join and invitation requests,
+/// get the owner answers, whose authorizers only admit or issue for owned
+/// groups; synchronization requests for any other group are rejected. The
+/// invitation hints are the owner advertising node's addresses.
+fn answer_contribution_event(
+    node: &mut NetworkNode,
+    event: NetworkEvent,
+    owner: &OwnerRequestHandlers,
+    owner_identity: &DeviceIdentity,
+    inviter_name: &str,
+) {
+    match event {
+        NetworkEvent::SyncRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => {
+            if owner
+                .synchronization
+                .owns_group(sync_request_group_id(&request))
+            {
+                answer_owner_sync_request(
+                    node,
+                    owner.synchronization.as_ref(),
+                    &owner.last_connection,
+                    &owner.owner_peers,
+                    peer_id,
+                    request_id,
+                    &request,
+                );
+            } else {
+                let _ = node.reject_sync_request(request_id, SyncRejectReason::Unauthorized);
+            }
+        }
+        NetworkEvent::JoinRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => answer_owner_join_request(
+            node,
+            owner.join_authorizer.as_ref(),
+            owner.member_admission.as_ref(),
+            owner.synchronization.as_ref(),
+            owner_identity,
+            peer_id,
+            request_id,
+            &request,
+        ),
+        NetworkEvent::InviteRequestReceived {
+            peer_id,
+            request_id,
+            request,
+        } => {
+            let hints = owner
+                .owner_addresses
+                .lock()
+                .map(|addresses| select_address_hints(&addresses))
+                .unwrap_or_default();
+            let response = owner.invite_requests.answer_invite_request(
+                owner_identity.peer_id(),
+                inviter_name,
+                peer_id,
+                &request,
+                &hints,
+            );
+            let _ = node.send_invite_response(request_id, response);
+        }
+        _ => {}
+    }
+}
+
 fn join_response(
     authorization: JoinRequestAuthorization,
     member_admission: &dyn MemberAdmissionService,
@@ -2866,6 +2975,10 @@ impl SynchronizationService for UnavailableSynchronizationService {
 
     fn notice_recipients(&self, _group_id: PeerId) -> Vec<PeerId> {
         Vec::new()
+    }
+
+    fn owns_group(&self, _group_id: PeerId) -> bool {
+        false
     }
 }
 
@@ -3202,14 +3315,15 @@ mod tests {
     use crate::routing_peers::RoutingPeersService;
 
     use super::{
-        address_hint, answer_member_sync_request, await_sync_response, clear_owner_peers,
-        discovery_outcome, forget_owner_addresses, forget_owner_peer, join_response,
-        membership_comparison_name, owned_group_state, parse_bootstrap_peer, pinned_address_hints,
-        record_member_connection, record_owner_address, record_owner_peer, select_address_hints,
-        send_push_request, upgraded_path, AdvertisementResult, BootstrapNodeStatus,
-        JoinRequestAuthorization, JoinRequestAuthorizer, MemberAdmissionService, MemberCandidates,
-        MembershipComparison, NetworkService, NetworkStatus, PeerSearchResult, PendingJoinService,
-        PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
+        address_hint, answer_contribution_event, answer_member_sync_request, await_sync_response,
+        clear_owner_peers, discovery_outcome, forget_owner_addresses, forget_owner_peer,
+        join_response, membership_comparison_name, owned_group_state, parse_bootstrap_peer,
+        pinned_address_hints, record_member_connection, record_owner_address, record_owner_peer,
+        select_address_hints, send_push_request, upgraded_path, AdvertisementResult,
+        BootstrapNodeStatus, JoinRequestAuthorization, JoinRequestAuthorizer,
+        MemberAdmissionService, MemberCandidates, MembershipComparison, NetworkService,
+        NetworkStatus, PeerSearchResult, PendingJoinService, PullSession, SessionProgress,
+        SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
         MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS, MAX_OWNER_LISTEN_ADDRESSES,
         PROVIDER_SEARCH_TIMEOUT,
@@ -3365,6 +3479,10 @@ mod tests {
                 Vec::new()
             }
         }
+
+        fn owns_group(&self, group_id: PeerId) -> bool {
+            group_id == self.group_id
+        }
     }
 
     #[derive(Default)]
@@ -3420,6 +3538,16 @@ mod tests {
             DeviceIdentity::from_persisted_secret(&secret).unwrap(),
             DeviceIdentity::from_persisted_secret(&secret).unwrap(),
         )
+    }
+
+    async fn contribute(
+        service: &NetworkService,
+        relay: Option<charp2p_network::RelayLimits>,
+    ) -> Result<&'static str, &'static str> {
+        let (network, owner) = identity_pair();
+        service
+            .start_contribution(network, owner, "Maya's PC".to_owned(), relay)
+            .await
     }
 
     fn profile_join_request(device_id: PeerId) -> JoinRequest {
@@ -3922,9 +4050,7 @@ mod tests {
     fn contribution_requires_a_bootstrap_node() {
         let service = NetworkService::from_sources(&[], "").unwrap();
 
-        let started = tauri::async_runtime::block_on(
-            service.start_contribution(DeviceIdentity::generate(), None),
-        );
+        let started = tauri::async_runtime::block_on(contribute(&service, None));
 
         assert_eq!(started, Ok("bootstrapRequired"));
         assert_eq!(
@@ -3941,17 +4067,10 @@ mod tests {
         let relay = charp2p_network::RelayLimits::new(2, 1).unwrap();
 
         tauri::async_runtime::block_on(async {
-            assert_eq!(
-                service
-                    .start_contribution(DeviceIdentity::generate(), None)
-                    .await,
-                Ok("routing")
-            );
+            assert_eq!(contribute(&service, None).await, Ok("routing"));
             assert_eq!(service.status().await.contribution_status, "routing");
             assert_eq!(
-                service
-                    .start_contribution(DeviceIdentity::generate(), Some(relay))
-                    .await,
+                contribute(&service, Some(relay)).await,
                 Ok("routingAndRelay")
             );
             assert_eq!(
@@ -3959,13 +4078,110 @@ mod tests {
                 "routingAndRelay"
             );
             assert_eq!(
-                service
-                    .start_contribution(DeviceIdentity::generate(), Some(relay))
-                    .await,
+                contribute(&service, Some(relay)).await,
                 Ok("routingAndRelay")
             );
             service.stop_contribution().await;
             assert_eq!(service.status().await.contribution_status, "inactive");
+        });
+    }
+
+    #[test]
+    fn contribution_node_answers_only_owned_group_sync_requests() {
+        let owned = DeviceIdentity::generate().peer_id();
+        let other = DeviceIdentity::generate().peer_id();
+        let (network, owner) = identity_pair();
+        let requester_identity = DeviceIdentity::generate();
+        let requester_id = requester_identity.peer_id();
+        let service = NetworkService::from_sources_with_authorizer(
+            &[],
+            "",
+            Arc::new(StaticJoinRequestAuthorizer(
+                JoinRequestAuthorization::Unauthorized,
+            )),
+            Arc::new(UnavailableMemberAdmissionService),
+            Arc::new(UnavailablePendingJoinService),
+            Arc::new(MemberSynchronizationService {
+                expected_peer: requester_id,
+                group_id: owned,
+            }),
+        )
+        .unwrap();
+        let handlers = service.owner_request_handlers();
+
+        tauri::async_runtime::block_on(async {
+            let mut contribution =
+                NetworkNode::new_contributing(network.into_network_keypair(), None);
+            let contribution_id = contribution.peer_id();
+            contribution
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = contribution.next_event().await {
+                    break address;
+                }
+            };
+            let mut requester = NetworkNode::new(requester_identity.into_network_keypair());
+            requester
+                .dial(format!("{address}/p2p/{contribution_id}").parse().unwrap())
+                .unwrap();
+
+            let responses = timeout(Duration::from_secs(10), async {
+                let mut responses = BTreeMap::new();
+                loop {
+                    tokio::select! {
+                        event = contribution.next_event() => answer_contribution_event(
+                            &mut contribution,
+                            event,
+                            &handlers,
+                            &owner,
+                            "Maya's PC",
+                        ),
+                        event = requester.next_event() => match event {
+                            NetworkEvent::PeerConnected { peer_id, .. }
+                                if peer_id == contribution_id =>
+                            {
+                                for group_id in [owned, other] {
+                                    requester
+                                        .send_sync_request(
+                                            contribution_id,
+                                            SyncRequest::Summary { group_id },
+                                        )
+                                        .unwrap();
+                                }
+                            }
+                            NetworkEvent::SyncResponseReceived { response, .. } => {
+                                let group_id = match &response {
+                                    SyncResponse::Summary { group_id, .. } => *group_id,
+                                    _ => other,
+                                };
+                                responses.insert(group_id, response);
+                                if responses.len() == 2 {
+                                    break responses;
+                                }
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            })
+            .await
+            .expect("both sync requests should be answered");
+
+            assert_eq!(
+                responses[&owned],
+                SyncResponse::Summary {
+                    group_id: owned,
+                    heads: Vec::new(),
+                    membership: SyncMembershipState::default(),
+                }
+            );
+            assert_eq!(
+                responses[&other],
+                SyncResponse::Rejected {
+                    reason: SyncRejectReason::Unauthorized,
+                }
+            );
         });
     }
 
@@ -3976,20 +4192,10 @@ mod tests {
         let address = format!("/ip4/127.0.0.1/udp/9/quic-v1/p2p/{community}");
 
         tauri::async_runtime::block_on(async {
-            assert_eq!(
-                service
-                    .start_contribution(DeviceIdentity::generate(), None)
-                    .await,
-                Ok("bootstrapRequired")
-            );
+            assert_eq!(contribute(&service, None).await, Ok("bootstrapRequired"));
             let peers = service.community_peers(&[address]).unwrap();
             service.use_community_peers(peers).await;
-            assert_eq!(
-                service
-                    .start_contribution(DeviceIdentity::generate(), None)
-                    .await,
-                Ok("routing")
-            );
+            assert_eq!(contribute(&service, None).await, Ok("routing"));
             assert_eq!(service.status().await.contribution_status, "routing");
 
             // A changed list stops the node until the preference is re-applied.

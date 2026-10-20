@@ -1404,7 +1404,12 @@ async fn apply_contribution(
     }
     let relay = preference.relay_limits()?;
     let identity = identity_service.load_network_identity()?;
-    network_service.start_contribution(identity, relay).await?;
+    let owner_identity = identity_service.load_network_identity()?;
+    let profile = identity_service.status()?.ok_or("identity_missing")?;
+    let inviter_name = identity::invitation_device_name(&profile.device_name);
+    network_service
+        .start_contribution(identity, owner_identity, inviter_name, relay)
+        .await?;
     Ok(())
 }
 

@@ -333,6 +333,16 @@ impl MlsProviderService {
         result
     }
 
+    /// Whether this device created the group and so answers for it as its
+    /// owner; a joined group or an unreadable store does not count.
+    pub(crate) fn owns_group(&self, group_id: PeerId) -> bool {
+        self.store.lock().is_ok_and(|store| {
+            store
+                .local_groups()
+                .is_ok_and(|owned| owned.iter().any(|group| group.group_id == group_id))
+        })
+    }
+
     pub(crate) fn has_group(&self, group_id: PeerId) -> Result<bool, &'static str> {
         let _operation = self
             .operations
@@ -3222,7 +3232,7 @@ fn restore_provider<E>(
     Ok(())
 }
 
-fn sync_request_group_id(request: &SyncRequest) -> PeerId {
+pub(crate) fn sync_request_group_id(request: &SyncRequest) -> PeerId {
     match request {
         SyncRequest::Summary { group_id }
         | SyncRequest::EventIds { group_id, .. }

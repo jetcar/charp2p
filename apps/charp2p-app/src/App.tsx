@@ -2461,6 +2461,9 @@ function App() {
   // Saved invitations whose last join found no bootstrap node or address
   // hint; retries continue so a join starts once community nodes are added.
   const [bootstrapNeededJoinIds, setBootstrapNeededJoinIds] = useState<string[]>([]);
+  // Saved invitations whose last join failed because this device's peer
+  // network is unavailable; they show as Offline rather than waiting.
+  const [offlineJoinIds, setOfflineJoinIds] = useState<string[]>([]);
   const joiningRef = useRef(false);
   const [leavingGroup, setLeavingGroup] = useState(false);
   const [refreshingKeys, setRefreshingKeys] = useState(false);
@@ -2793,6 +2796,7 @@ function App() {
       setAutoJoinWaitingIds([]);
       setAwaitingApprovalIds([]);
       setBootstrapNeededJoinIds([]);
+      setOfflineJoinIds([]);
       return;
     }
     let active = true;
@@ -2801,6 +2805,7 @@ function App() {
     setAutoJoinWaitingIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
     setAwaitingApprovalIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
     setBootstrapNeededJoinIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
+    setOfflineJoinIds((current) => current.filter((groupId) => groupIds.includes(groupId)));
 
     async function retryJoins() {
       let retry = false;
@@ -3400,6 +3405,7 @@ function App() {
       setAutoJoinWaitingIds((current) => current.filter((id) => id !== groupId));
       setAwaitingApprovalIds((current) => current.filter((id) => id !== groupId));
       setBootstrapNeededJoinIds((current) => current.filter((id) => id !== groupId));
+      setOfflineJoinIds((current) => current.filter((id) => id !== groupId));
       return false;
     } catch (reason) {
       const retryable = typeof reason === "string" && RETRYABLE_JOIN_ERRORS.has(reason);
@@ -3416,6 +3422,10 @@ function App() {
       setBootstrapNeededJoinIds((current) => [
         ...current.filter((id) => id !== groupId),
         ...(reason === "network_bootstrap_required" ? [groupId] : []),
+      ]);
+      setOfflineJoinIds((current) => [
+        ...current.filter((id) => id !== groupId),
+        ...(reason === "network_unavailable" ? [groupId] : []),
       ]);
       if (!(automatic && retryable)) {
         setError(errorMessage(reason));
@@ -4654,6 +4664,8 @@ function App() {
                     ? "Awaiting owner approval"
                     : bootstrapNeededJoinIds.includes(group.groupId)
                       ? "Bootstrap node needed"
+                      : offlineJoinIds.includes(group.groupId)
+                        ? "Offline"
                       : autoJoinWaitingIds.includes(group.groupId)
                         ? "Waiting for owner"
                       : expiryDescription(group.expiresAtUnix);
@@ -4760,6 +4772,8 @@ function App() {
                   ? "Awaiting owner approval"
                   : bootstrapNeededJoinIds.includes(group.groupId)
                     ? "Bootstrap node needed"
+                    : offlineJoinIds.includes(group.groupId)
+                      ? "Offline"
                     : autoJoinWaitingIds.includes(group.groupId)
                       ? "Waiting for owner"
                     : expiryDescription(group.expiresAtUnix);
@@ -4777,7 +4791,10 @@ function App() {
                         {group.groupName}
                         <small>Pending · {state}</small>
                       </span>
-                      <i aria-label={state} className="sidebar-state waiting" />
+                      <i
+                        aria-label={state}
+                        className={`sidebar-state ${offlineJoinIds.includes(group.groupId) ? "offline" : "waiting"}`}
+                      />
                     </button>
                   </li>
                 );
@@ -4941,6 +4958,8 @@ function App() {
                         ? "Awaiting owner approval · retrying every minute"
                         : bootstrapNeededJoinIds.includes(pendingGroup.groupId)
                           ? "Bootstrap node needed · retrying every minute"
+                          : offlineJoinIds.includes(pendingGroup.groupId)
+                            ? "Offline · retrying every minute"
                           : "Waiting for the group owner · retrying every minute"}
                   </span>
                 )}

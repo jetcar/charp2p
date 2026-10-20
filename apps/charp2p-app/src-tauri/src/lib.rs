@@ -598,9 +598,10 @@ async fn join_group(
         .complete_join(group_id)
         .map_err(str::to_owned)?;
     // The invitation's address hints leave with its bearer, so the address
-    // that reached the owner is remembered for later synchronizations, and
-    // the initial pull counts as the first synchronization. Failing to
-    // record either only costs a DHT lookup or an earlier retry.
+    // that reached the owner is remembered for later synchronizations even
+    // when the initial pull failed, and a completed pull counts as the
+    // first synchronization. Failing to record either only costs a DHT
+    // lookup or an earlier retry.
     if let Some((owner_device_id, result)) = joined {
         if let Some(synchronized_at_unix) = result.synchronized_at_unix {
             if pending_service
@@ -609,17 +610,15 @@ async fn join_group(
             {
                 group.last_synchronized_at_unix = Some(synchronized_at_unix);
             }
-            let peer_address = result.peer_address.to_vec();
-            if !peer_address.is_empty()
-                && peer_address.len() <= charp2p_store::MAX_PEER_ADDRESS_BYTES
-            {
-                let _ = pending_service.record_peer_address(
-                    group_id,
-                    owner_device_id,
-                    &peer_address,
-                    synchronized_at_unix,
-                );
-            }
+        }
+        let peer_address = result.peer_address.to_vec();
+        if !peer_address.is_empty() && peer_address.len() <= charp2p_store::MAX_PEER_ADDRESS_BYTES {
+            let _ = pending_service.record_peer_address(
+                group_id,
+                owner_device_id,
+                &peer_address,
+                result.reached_at_unix,
+            );
         }
     }
     Ok(group)

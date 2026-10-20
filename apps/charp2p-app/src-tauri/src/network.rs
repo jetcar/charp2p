@@ -426,6 +426,10 @@ pub struct JoinGroupResult {
     /// synchronizations; never sent to the frontend.
     #[serde(skip)]
     pub peer_address: Multiaddr,
+    /// Time the owner's Welcome was accepted through `peer_address`, which
+    /// is a successful contact even when the initial pull failed.
+    #[serde(skip)]
+    pub reached_at_unix: u64,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -1904,6 +1908,10 @@ impl NetworkService {
         let welcome = response.welcome().ok_or("network_join_failed")?;
         self.pending_join
             .complete_join(invitation.group_id(), welcome)?;
+        let reached_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system_clock_invalid")?
+            .as_secs();
         let pulled = self
             .pull_from_connected_peer(
                 &mut node,
@@ -1928,6 +1936,7 @@ impl NetworkService {
             synchronized_events: pulled.map_or(0, |(inserted, _)| inserted),
             synchronized_at_unix,
             peer_address: address,
+            reached_at_unix,
         })
     }
 
@@ -5041,6 +5050,7 @@ mod tests {
                 .to_string()
                 .starts_with(&hint.to_string()));
             assert!(result.synchronized_at_unix.is_some());
+            assert!(result.reached_at_unix >= now);
         });
     }
 

@@ -458,8 +458,8 @@ impl PendingInvitationService {
             .collect())
     }
 
-    /// Remembers the address a successful synchronization reached the
-    /// group provider at.
+    /// Remembers the address a successful synchronization or accepted
+    /// Welcome reached the group provider at.
     pub(crate) fn record_peer_address(
         &self,
         group_id: PeerId,
@@ -1007,6 +1007,28 @@ mod tests {
         assert_eq!(
             service.list_at(NOW),
             Err("pending_invitation_record_invalid")
+        );
+    }
+
+    #[test]
+    fn owner_address_from_an_unsynchronized_join_is_remembered_without_allowing_authoring() {
+        let service = service();
+        let (encoded, group_id) = invitation();
+        let invitation = Invitation::decode(&encoded, NOW).unwrap();
+        service.accept_at(&encoded, NOW).unwrap();
+        service.complete_join(group_id).unwrap();
+
+        service
+            .record_peer_address(group_id, invitation.inviter_device_id(), &[4, 1], NOW + 5)
+            .unwrap();
+        assert_eq!(
+            service.known_peer_addresses(group_id, invitation.inviter_device_id()),
+            Ok(vec![vec![4, 1]])
+        );
+        assert_eq!(service.joined().unwrap()[0].last_synchronized_at_unix, None);
+        assert_eq!(
+            service.ensure_authoring_allowed(group_id),
+            Err("group_not_synchronized")
         );
     }
 

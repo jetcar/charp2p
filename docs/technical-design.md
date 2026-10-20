@@ -98,6 +98,10 @@ The preferred shared link is an HTTPS App Link:
 https://join.charp2p.example/i#<base64url-invitation>
 ```
 
+The application accepts this link only in exactly this form: an explicit
+port, a differently cased or trailing-dot host, a query, credentials, or any
+other path are rejected rather than normalized.
+
 Installed applications will claim the verified HTTPS link once the release
 host, Android application association, and signing identities exist. The
 fallback web page in `web/join` explains installation and hands the fragment

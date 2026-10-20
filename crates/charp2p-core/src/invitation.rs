@@ -22,6 +22,7 @@ const MAX_NAME_BYTES: usize = 80;
 /// Largest canonical encoded invitation payload accepted by the protocol.
 pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
 const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
+const HTTPS_LINK_PREFIX: &str = "https://join.charp2p.example/i#";
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v2\0";
 const HINTED_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v3\0";
 const APPROVAL_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v4\0";
@@ -197,7 +198,7 @@ impl Invitation {
 
     /// Encodes the invitation as the canonical HTTPS App Link.
     pub fn https_link(&self) -> Result<String, InvitationError> {
-        Ok(format!("https://join.charp2p.example/i#{}", self.encode()?))
+        Ok(format!("{HTTPS_LINK_PREFIX}{}", self.encode()?))
     }
 
     /// Decodes and verifies an invitation payload.
@@ -391,20 +392,12 @@ fn payload_from_custom_uri(input: &str) -> Result<String, InvitationError> {
         .ok_or(InvitationError::InvalidLink)
 }
 
+/// Accepts only the exact link form produced by [`Invitation::https_link`], so
+/// an explicit default port, a differently cased host, or dot segments that a
+/// URL parser would normalize away are rejected rather than silently accepted.
 fn payload_from_https_link(input: &str) -> Result<String, InvitationError> {
-    let url = Url::parse(input).map_err(|_| InvitationError::InvalidLink)?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("join.charp2p.example")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || url.path() != "/i"
-        || url.query().is_some()
-    {
-        return Err(InvitationError::InvalidLink);
-    }
-
-    url.fragment()
+    input
+        .strip_prefix(HTTPS_LINK_PREFIX)
         .filter(|payload| !payload.is_empty())
         .map(str::to_owned)
         .ok_or(InvitationError::InvalidLink)
@@ -788,6 +781,21 @@ mod tests {
             ),
             Err(InvitationError::InvalidLink)
         ));
+        for link in [
+            format!("https://join.charp2p.example:443/i#{encoded}"),
+            format!("https://JOIN.charp2p.example/i#{encoded}"),
+            format!("https://join.charp2p.example/./i#{encoded}"),
+            format!("https://join.charp2p.example./i#{encoded}"),
+            "https://join.charp2p.example/i#".to_owned(),
+        ] {
+            assert!(
+                matches!(
+                    Invitation::decode_input(&link, NOW),
+                    Err(InvitationError::InvalidLink)
+                ),
+                "{link}"
+            );
+        }
     }
 
     fn hints() -> Vec<Multiaddr> {

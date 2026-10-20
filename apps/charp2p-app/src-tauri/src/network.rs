@@ -11,7 +11,8 @@ use charp2p_core::{
 };
 use charp2p_mls::{validate_profile_key_package, ProfileKeyPackageError, ProfileProvider};
 use charp2p_network::{
-    ConnectionPath, NetworkEvent, NetworkNode, OutboundSyncRequestId, RelayLimits,
+    ConnectionPath, InboundJoinRequestId, InboundSyncRequestId, NetworkEvent, NetworkNode,
+    OutboundSyncRequestId, RelayLimits,
 };
 use charp2p_sync::{MembershipComparison, PullSession, SessionProgress};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
@@ -1202,13 +1203,31 @@ impl NetworkService {
                 .map_err(|_| "network_unavailable")?;
         }
 
+        // Subscribing before the announcement window keeps notices for
+        // events stored while it runs (ADR-049).
+        let mut stored_events = self.stored_events.subscribe();
         let announced = timeout(PROVIDER_SEARCH_TIMEOUT, async {
             let mut pending = keys.clone();
             if pending.is_empty() {
                 return Ok(());
             }
             loop {
-                match node.next_event().await {
+                let event = tokio::select! {
+                    stored = stored_events.recv() => {
+                        // Missed notices only delay members to their next retry.
+                        if let Ok(group_id) = stored {
+                            send_event_notices(
+                                &mut node,
+                                self.synchronization.as_ref(),
+                                group_id,
+                                None,
+                            );
+                        }
+                        continue;
+                    }
+                    event = node.next_event() => event,
+                };
+                match event {
                     NetworkEvent::Listening { address } => {
                         record_owner_address(&self.owner_addresses, address);
                     }
@@ -1237,24 +1256,29 @@ impl NetworkService {
                         peer_id,
                         request_id,
                         request,
-                    } => {
-                        let response = self.synchronization.answer_sync_request(peer_id, &request);
-                        let _ = node.send_sync_response(request_id, response);
-                    }
+                    } => answer_owner_sync_request(
+                        &mut node,
+                        self.synchronization.as_ref(),
+                        &self.last_connection,
+                        &self.owner_peers,
+                        peer_id,
+                        request_id,
+                        &request,
+                    ),
                     NetworkEvent::JoinRequestReceived {
                         peer_id,
                         request_id,
                         request,
-                    } => {
-                        let response = join_response(
-                            self.join_authorizer.authorize_join_request(&request),
-                            self.member_admission.as_ref(),
-                            &owner_identity,
-                            &request,
-                            peer_id,
-                        );
-                        let _ = node.send_join_response(request_id, response);
-                    }
+                    } => answer_owner_join_request(
+                        &mut node,
+                        self.join_authorizer.as_ref(),
+                        self.member_admission.as_ref(),
+                        self.synchronization.as_ref(),
+                        &owner_identity,
+                        peer_id,
+                        request_id,
+                        &request,
+                    ),
                     NetworkEvent::InviteRequestReceived {
                         peer_id,
                         request_id,
@@ -1292,7 +1316,6 @@ impl NetworkService {
         let owner_addresses = Arc::clone(&self.owner_addresses);
         let owner_peers = Arc::clone(&self.owner_peers);
         let last_connection = Arc::clone(&self.last_connection);
-        let mut stored_events = self.stored_events.subscribe();
         let mut task_keys = keys.clone();
         let owner_identity_peer = owner_identity.peer_id();
         let (key_updates, mut updated_keys) = mpsc::unbounded_channel::<Vec<DiscoveryKey>>();
@@ -1354,60 +1377,29 @@ impl NetworkService {
                                 peer_id,
                                 request_id,
                                 request,
-                            } => {
-                                let response = synchronization
-                                    .answer_sync_request(peer_id, &request);
-                                if !matches!(response, SyncResponse::Rejected { .. }) {
-                                    record_member_connection(
-                                        &last_connection,
-                                        &owner_peers,
-                                        peer_id,
-                                    );
-                                }
-                                let accepted = match response {
-                                    SyncResponse::EventsAccepted { group_id, inserted }
-                                        if inserted > 0 =>
-                                    {
-                                        Some(group_id)
-                                    }
-                                    _ => None,
-                                };
-                                let _ = node.send_sync_response(request_id, response);
-                                // The uploader already holds the events it pushed.
-                                if let Some(group_id) = accepted {
-                                    send_event_notices(
-                                        &mut node,
-                                        synchronization.as_ref(),
-                                        group_id,
-                                        Some(peer_id),
-                                    );
-                                }
-                            }
+                            } => answer_owner_sync_request(
+                                &mut node,
+                                synchronization.as_ref(),
+                                &last_connection,
+                                &owner_peers,
+                                peer_id,
+                                request_id,
+                                &request,
+                            ),
                             NetworkEvent::JoinRequestReceived {
                                 peer_id,
                                 request_id,
                                 request,
-                            } => {
-                                let response = join_response(
-                                    join_authorizer.authorize_join_request(&request),
-                                    member_admission.as_ref(),
-                                    &owner_identity,
-                                    &request,
-                                    peer_id,
-                                );
-                                let admitted = response.welcome().is_some();
-                                let _ = node.send_join_response(request_id, response);
-                                // Existing members pull the admission commit;
-                                // the new member starts from its Welcome.
-                                if admitted {
-                                    send_event_notices(
-                                        &mut node,
-                                        synchronization.as_ref(),
-                                        request.group_id(),
-                                        Some(peer_id),
-                                    );
-                                }
-                            }
+                            } => answer_owner_join_request(
+                                &mut node,
+                                join_authorizer.as_ref(),
+                                member_admission.as_ref(),
+                                synchronization.as_ref(),
+                                &owner_identity,
+                                peer_id,
+                                request_id,
+                                &request,
+                            ),
                             NetworkEvent::InviteRequestReceived {
                                 peer_id,
                                 request_id,
@@ -2610,6 +2602,62 @@ fn answer_member_sync_request(
     response
 }
 
+/// Answers a synchronization request on the owner advertising node, records
+/// the member connection unless the request was rejected, and notifies the
+/// other connected members when it stored uploaded events (ADR-049).
+fn answer_owner_sync_request(
+    node: &mut NetworkNode,
+    synchronization: &dyn SynchronizationService,
+    last_connection: &std::sync::Mutex<Option<ObservedConnection>>,
+    owner_peers: &std::sync::Mutex<BTreeMap<PeerId, ConnectionPath>>,
+    peer_id: PeerId,
+    request_id: InboundSyncRequestId,
+    request: &SyncRequest,
+) {
+    let response = synchronization.answer_sync_request(peer_id, request);
+    if !matches!(response, SyncResponse::Rejected { .. }) {
+        record_member_connection(last_connection, owner_peers, peer_id);
+    }
+    let accepted = match response {
+        SyncResponse::EventsAccepted { group_id, inserted } if inserted > 0 => Some(group_id),
+        _ => None,
+    };
+    let _ = node.send_sync_response(request_id, response);
+    // The uploader already holds the events it pushed.
+    if let Some(group_id) = accepted {
+        send_event_notices(node, synchronization, group_id, Some(peer_id));
+    }
+}
+
+/// Answers a join request on the owner advertising node and, after an
+/// admission, tells the existing connected members to pull its commit.
+#[allow(clippy::too_many_arguments)]
+fn answer_owner_join_request(
+    node: &mut NetworkNode,
+    join_authorizer: &dyn JoinRequestAuthorizer,
+    member_admission: &dyn MemberAdmissionService,
+    synchronization: &dyn SynchronizationService,
+    owner_identity: &DeviceIdentity,
+    peer_id: PeerId,
+    request_id: InboundJoinRequestId,
+    request: &JoinRequest,
+) {
+    let response = join_response(
+        join_authorizer.authorize_join_request(request),
+        member_admission,
+        owner_identity,
+        request,
+        peer_id,
+    );
+    let admitted = response.welcome().is_some();
+    let _ = node.send_join_response(request_id, response);
+    // Existing members pull the admission commit; the new member starts from
+    // its Welcome.
+    if admitted {
+        send_event_notices(node, synchronization, request.group_id(), Some(peer_id));
+    }
+}
+
 /// Sends `EventsAvailable` for an owned group to its connected current
 /// members other than `skip` (ADR-049). The owner never dials members for
 /// a notice, and their acknowledgements need no handling.
@@ -3145,9 +3193,10 @@ mod tests {
         device_credential, prepare_profile_key_package, ProfileProvider, CIPHERSUITE,
     };
     use charp2p_network::{ConnectionPath, NetworkEvent, NetworkNode};
+    use libp2p::multiaddr::Protocol;
     use openmls::prelude::{tls_codec::Serialize, CredentialWithKey, KeyPackage, OpenMlsProvider};
     use openmls_basic_credential::SignatureKeyPair;
-    use tokio::time::timeout;
+    use tokio::time::{interval, timeout};
 
     use crate::bandwidth::{BandwidthPreference, BandwidthService};
     use crate::routing_peers::RoutingPeersService;
@@ -3163,6 +3212,7 @@ mod tests {
         PullSession, SessionProgress, SynchronizationService, UnavailableJoinRequestAuthorizer,
         UnavailableMemberAdmissionService, UnavailablePendingJoinService, DIAGNOSTICS_FORMAT,
         MAX_GROUP_CONNECTION_STATES, MAX_MEMBER_PROVIDERS, MAX_OWNER_LISTEN_ADDRESSES,
+        PROVIDER_SEARCH_TIMEOUT,
     };
     use crate::mls_storage::MemberAdmissionError;
 
@@ -5903,6 +5953,140 @@ mod tests {
             })
             .await
             .expect("dropping the service should stop its advertiser");
+        });
+    }
+
+    #[test]
+    fn advertiser_serves_members_during_its_announcement_window() {
+        let now = unix_now();
+        let group = GroupIdentity::generate();
+        let (owner, owner_signer) = identity_pair();
+        let owner_id = owner.peer_id();
+        let invitation = Invitation::issue(
+            &group,
+            owner_id,
+            InvitationSpec {
+                group_name: "Design Crew",
+                inviter_name: "Maya",
+                expires_at_unix: now + 3_600,
+                history_policy: HistoryPolicy::None,
+                reusable: false,
+            },
+            now,
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(async {
+            let requester_identity = DeviceIdentity::generate();
+            let requester_id = requester_identity.peer_id();
+            // The routing node is never polled, so the announcement stays
+            // pending for the whole window.
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &format!("{address}/p2p/{routing_id}"),
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Unauthorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: requester_id,
+                    group_id: invitation.group_id(),
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let mut requester = NetworkNode::new(requester_identity.into_network_keypair());
+            requester
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+
+            let advertise = service.advertise(owner, owner_signer, &invitation);
+            tokio::pin!(advertise);
+            let mut poll = interval(Duration::from_millis(20));
+            let notice = timeout(PROVIDER_SEARCH_TIMEOUT, async {
+                let mut dialed = false;
+                loop {
+                    tokio::select! {
+                        result = &mut advertise => {
+                            panic!("announcement window ended early: {result:?}");
+                        }
+                        _ = poll.tick(), if !dialed => {
+                            let addresses = service
+                                .owner_addresses
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|address| {
+                                    address
+                                        .iter()
+                                        .any(|protocol| matches!(protocol, Protocol::Ip4(_)))
+                                        && address
+                                            .iter()
+                                            .any(|protocol| matches!(protocol, Protocol::QuicV1))
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if !addresses.is_empty() {
+                                requester.dial_peer_at(owner_id, addresses).unwrap();
+                                dialed = true;
+                            }
+                        }
+                        event = requester.next_event() => match event {
+                            NetworkEvent::PeerConnected { peer_id, .. } if peer_id == owner_id => {
+                                requester
+                                    .send_sync_request(
+                                        owner_id,
+                                        SyncRequest::Summary {
+                                            group_id: invitation.group_id(),
+                                        },
+                                    )
+                                    .unwrap();
+                            }
+                            NetworkEvent::SyncResponseReceived { peer_id, .. }
+                                if peer_id == owner_id =>
+                            {
+                                service.notify_group_events(invitation.group_id());
+                            }
+                            NetworkEvent::SyncRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } if peer_id == owner_id => {
+                                let _ = requester.send_sync_response(
+                                    request_id,
+                                    SyncResponse::Acknowledged {
+                                        group_id: invitation.group_id(),
+                                    },
+                                );
+                                break request;
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            })
+            .await
+            .expect("a member connected during the window should receive the notice");
+            assert_eq!(
+                notice,
+                SyncRequest::EventsAvailable {
+                    group_id: invitation.group_id(),
+                }
+            );
+            // The advertiser still holds its lock, so read the recorded
+            // member connection directly.
+            assert!(service.last_connection.lock().unwrap().is_some());
         });
     }
 

@@ -20,10 +20,10 @@ use charp2p_mls::{
     merge_prepared_key_refresh, merge_prepared_member_admission, merge_prepared_member_removal,
     migrate_group_join_config, prepare_profile_key_package, prepare_profile_key_refresh,
     prepare_profile_member_admission, prepare_profile_member_removal, stage_profile_welcome,
-    validate_group_profile, validate_key_refresh_commit, validate_profile_key_package,
-    validate_staged_commit_profile, PrepareMemberAdmissionError, PrepareMemberRemovalError,
-    ProfileKeyPackageError, ProfileProvider, RemovalCutoff, CIPHERSUITE, MAX_MLS_WIRE_BYTES,
-    MAX_PAST_EPOCHS,
+    validate_group_profile, validate_key_refresh_commit, validate_member_admission_commit,
+    validate_member_removal_commit, validate_profile_key_package, validate_staged_commit_profile,
+    PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
+    ProfileProvider, RemovalCutoff, CIPHERSUITE, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
 };
 use charp2p_store::{
     AdmittingInvitation, EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
@@ -2040,10 +2040,15 @@ impl MlsProviderService {
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;
             // A key refresh may only replace the owner's path secrets
             // (ADR-045).
-            if event.kind() == EventKind::KeyEpochAdvanced {
-                validate_key_refresh_commit(&staged)
-                    .map_err(|_| ApplyGroupCommitError::Unreadable)?;
-            }
+            // Admission and removal commits change exactly one leaf
+            // (ADR-017).
+            let content = match event.kind() {
+                EventKind::KeyEpochAdvanced => validate_key_refresh_commit(&staged),
+                EventKind::MemberAdded => validate_member_admission_commit(&staged),
+                EventKind::MemberRemoved => validate_member_removal_commit(&staged),
+                _ => Ok(()),
+            };
+            content.map_err(|_| ApplyGroupCommitError::Unreadable)?;
             group
                 .merge_staged_commit(&*provider, *staged)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;

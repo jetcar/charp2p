@@ -253,6 +253,10 @@ pub enum ProfileError {
     DuplicateDevice,
     /// A key refresh commit carries proposals or no path update.
     UnexpectedKeyRefreshContent,
+    /// A member admission commit carries other than exactly one Add proposal.
+    UnexpectedAdmissionContent,
+    /// A member removal commit carries other than exactly one Remove proposal.
+    UnexpectedRemovalContent,
 }
 
 /// Failure while checking and decrypting a profile Welcome.
@@ -859,9 +863,10 @@ pub fn prepare_profile_member_admission<Provider: OpenMlsProvider>(
         .add_members(provider, signer, &[key_package])
         .map_err(|_| PrepareMemberAdmissionError::MemberAdditionFailed)?;
 
-    let pending_is_valid = group
-        .pending_commit()
-        .is_some_and(|pending| validate_staged_commit_profile(pending).is_ok());
+    let pending_is_valid = group.pending_commit().is_some_and(|pending| {
+        validate_staged_commit_profile(pending).is_ok()
+            && validate_member_admission_commit(pending).is_ok()
+    });
     if !pending_is_valid {
         return Err(rollback_prepared_admission(
             group,
@@ -919,6 +924,8 @@ pub fn merge_prepared_member_admission<Provider: OpenMlsProvider>(
         .ok_or(MergeMemberAdmissionError::MissingPendingCommit)?;
     validate_staged_commit_profile(pending)
         .map_err(|_| MergeMemberAdmissionError::InvalidPendingCommit)?;
+    validate_member_admission_commit(pending)
+        .map_err(|_| MergeMemberAdmissionError::InvalidPendingCommit)?;
     group
         .merge_pending_commit(provider)
         .map_err(|_| MergeMemberAdmissionError::MergeFailed)
@@ -973,9 +980,10 @@ pub fn prepare_profile_member_removal<Provider: OpenMlsProvider>(
             group.set_aad(Vec::new());
             PrepareMemberRemovalError::MemberRemovalFailed
         })?;
-    let pending_is_valid = group
-        .pending_commit()
-        .is_some_and(|pending| validate_staged_commit_profile(pending).is_ok());
+    let pending_is_valid = group.pending_commit().is_some_and(|pending| {
+        validate_staged_commit_profile(pending).is_ok()
+            && validate_member_removal_commit(pending).is_ok()
+    });
     if !pending_is_valid {
         return Err(rollback_prepared_removal(
             group,
@@ -1022,6 +1030,8 @@ pub fn merge_prepared_member_removal<Provider: OpenMlsProvider>(
         .pending_commit()
         .ok_or(MergeMemberRemovalError::MissingPendingCommit)?;
     validate_staged_commit_profile(pending)
+        .map_err(|_| MergeMemberRemovalError::InvalidPendingCommit)?;
+    validate_member_removal_commit(pending)
         .map_err(|_| MergeMemberRemovalError::InvalidPendingCommit)?;
     group
         .merge_pending_commit(provider)
@@ -1110,6 +1120,26 @@ pub fn merge_prepared_key_refresh<Provider: OpenMlsProvider>(
 pub fn validate_key_refresh_commit(commit: &StagedCommit) -> Result<(), ProfileError> {
     if commit.queued_proposals().next().is_some() || commit.update_path_leaf_node().is_none() {
         return Err(ProfileError::UnexpectedKeyRefreshContent);
+    }
+    Ok(())
+}
+
+/// Rejects an authenticated commit carried by a member admission event
+/// unless its only proposal is one Add. Call this, after
+/// `validate_staged_commit_profile`, before merging such a commit.
+pub fn validate_member_admission_commit(commit: &StagedCommit) -> Result<(), ProfileError> {
+    if commit.queued_proposals().count() != 1 || commit.add_proposals().count() != 1 {
+        return Err(ProfileError::UnexpectedAdmissionContent);
+    }
+    Ok(())
+}
+
+/// Rejects an authenticated commit carried by a member removal event unless
+/// its only proposal is one Remove. Call this, after
+/// `validate_staged_commit_profile`, before merging such a commit.
+pub fn validate_member_removal_commit(commit: &StagedCommit) -> Result<(), ProfileError> {
+    if commit.queued_proposals().count() != 1 || commit.remove_proposals().count() != 1 {
+        return Err(ProfileError::UnexpectedRemovalContent);
     }
     Ok(())
 }
@@ -1266,6 +1296,7 @@ mod tests {
         prepare_profile_key_package, prepare_profile_key_refresh, prepare_profile_member_admission,
         prepare_profile_member_removal, profile_capabilities, profile_extensions,
         stage_profile_welcome, validate_group_profile, validate_key_refresh_commit,
+        validate_member_admission_commit, validate_member_removal_commit,
         validate_profile_key_package, validate_staged_commit_profile,
     };
 
@@ -1942,6 +1973,14 @@ mod tests {
         };
         validate_staged_commit_profile(&staged).unwrap();
         validate_key_refresh_commit(&staged).unwrap();
+        assert_eq!(
+            validate_member_admission_commit(&staged),
+            Err(ProfileError::UnexpectedAdmissionContent)
+        );
+        assert_eq!(
+            validate_member_removal_commit(&staged),
+            Err(ProfileError::UnexpectedRemovalContent)
+        );
         member_group
             .merge_staged_commit(&member_provider, *staged)
             .unwrap();
@@ -2000,6 +2039,87 @@ mod tests {
             validate_key_refresh_commit(&staged),
             Err(ProfileError::UnexpectedKeyRefreshContent)
         );
+        validate_member_removal_commit(&staged).unwrap();
+        assert_eq!(
+            validate_member_admission_commit(&staged),
+            Err(ProfileError::UnexpectedAdmissionContent)
+        );
+    }
+
+    #[test]
+    fn member_admission_commit_carries_exactly_one_add() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let first_provider = OpenMlsRustCrypto::default();
+        let second_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let key_package = |provider: &OpenMlsRustCrypto| {
+            let peer_id = DeviceIdentity::generate().peer_id();
+            let (member_credential, member_signer) = credential(peer_id, provider);
+            let encoded = KeyPackage::builder()
+                .leaf_node_capabilities(profile_capabilities())
+                .build(CIPHERSUITE, provider, &member_signer, member_credential)
+                .unwrap()
+                .key_package()
+                .tls_serialize_detached()
+                .unwrap();
+            (peer_id, encoded)
+        };
+        let (first_id, first_key_package) = key_package(&first_provider);
+        let (second_id, second_key_package) = key_package(&second_provider);
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+        let first = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &first_key_package,
+            first_id,
+        )
+        .unwrap();
+        let mut first_group = stage_profile_welcome(&first_provider, first.welcome())
+            .unwrap()
+            .into_group(&first_provider)
+            .unwrap();
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+
+        let second = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &second_key_package,
+            second_id,
+        )
+        .unwrap();
+        let processed = first_group
+            .process_message(
+                &first_provider,
+                decode_profile_message(second.commit())
+                    .unwrap()
+                    .try_into_protocol_message()
+                    .unwrap(),
+            )
+            .unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("expected a staged commit");
+        };
+        validate_staged_commit_profile(&staged).unwrap();
+        validate_member_admission_commit(&staged).unwrap();
+        assert_eq!(
+            validate_member_removal_commit(&staged),
+            Err(ProfileError::UnexpectedRemovalContent)
+        );
+        assert_eq!(
+            validate_key_refresh_commit(&staged),
+            Err(ProfileError::UnexpectedKeyRefreshContent)
+        );
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        assert_eq!(owner_group.members().count(), 3);
     }
 
     #[test]

@@ -5,7 +5,6 @@ use libp2p_identity::{DecodingError, PeerId, PublicKey, SigningError};
 use multiaddr::{Multiaddr, Protocol};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use url::Url;
 
 use crate::GroupIdentity;
 
@@ -22,6 +21,7 @@ const MAX_NAME_BYTES: usize = 80;
 /// Largest canonical encoded invitation payload accepted by the protocol.
 pub const MAX_INVITATION_ENCODED_BYTES: usize = 8 * 1024;
 const MAX_INPUT_BYTES: usize = MAX_INVITATION_ENCODED_BYTES + 256;
+const CUSTOM_URI_PREFIX: &str = "charp2p://join/";
 const HTTPS_LINK_PREFIX: &str = "https://join.charp2p.example/i#";
 const SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v2\0";
 const HINTED_SIGNING_DOMAIN: &[u8] = b"charp2p-invitation-v3\0";
@@ -193,7 +193,7 @@ impl Invitation {
     /// Encodes the invitation as the application custom URI registered by the
     /// Windows and Android clients.
     pub fn custom_uri(&self) -> Result<String, InvitationError> {
-        Ok(format!("charp2p://join/{}", self.encode()?))
+        Ok(format!("{CUSTOM_URI_PREFIX}{}", self.encode()?))
     }
 
     /// Encodes the invitation as the canonical HTTPS App Link.
@@ -372,22 +372,13 @@ pub enum InvitationError {
     RandomnessUnavailable,
 }
 
+/// Accepts only the exact URI form produced by [`Invitation::custom_uri`], so
+/// dot segments, an empty port, or embedded tabs and newlines that a URL
+/// parser would normalize away are rejected rather than silently accepted.
 fn payload_from_custom_uri(input: &str) -> Result<String, InvitationError> {
-    let url = Url::parse(input).map_err(|_| InvitationError::InvalidLink)?;
-    if url.scheme() != "charp2p"
-        || url.host_str() != Some("join")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(InvitationError::InvalidLink);
-    }
-
-    url.path()
-        .strip_prefix('/')
-        .filter(|payload| !payload.is_empty() && !payload.contains('/'))
+    input
+        .strip_prefix(CUSTOM_URI_PREFIX)
+        .filter(|payload| is_link_payload(payload))
         .map(str::to_owned)
         .ok_or(InvitationError::InvalidLink)
 }
@@ -398,9 +389,18 @@ fn payload_from_custom_uri(input: &str) -> Result<String, InvitationError> {
 fn payload_from_https_link(input: &str) -> Result<String, InvitationError> {
     input
         .strip_prefix(HTTPS_LINK_PREFIX)
-        .filter(|payload| !payload.is_empty())
+        .filter(|payload| is_link_payload(payload))
         .map(str::to_owned)
         .ok_or(InvitationError::InvalidLink)
+}
+
+/// A link carries a non-empty unpadded URL-safe Base64 payload and nothing
+/// else, so a query or extra path after it is a malformed link.
+fn is_link_payload(payload: &str) -> bool {
+    !payload.is_empty()
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -787,6 +787,18 @@ mod tests {
             format!("https://join.charp2p.example/./i#{encoded}"),
             format!("https://join.charp2p.example./i#{encoded}"),
             "https://join.charp2p.example/i#".to_owned(),
+            format!("charp2p://join/./{encoded}"),
+            format!("charp2p://join/x/../{encoded}"),
+            format!("charp2p://join/%2e/{encoded}"),
+            format!("charp2p://join:/{encoded}"),
+            format!("charp2p://JOIN/{encoded}"),
+            format!("charp2p://join/{encoded}/"),
+            format!(
+                "charp2p://jo\tin/{}\n{}",
+                &encoded[..encoded.len() / 2],
+                &encoded[encoded.len() / 2..]
+            ),
+            "charp2p://join/".to_owned(),
         ] {
             assert!(
                 matches!(

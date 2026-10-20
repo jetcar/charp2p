@@ -1892,9 +1892,19 @@ impl NetworkService {
         }
         let request =
             InviteRequest::new(group_id, lifetime_seconds).map_err(|_| "invite_request_invalid")?;
-        let ProviderConnection { mut node, .. } = self
-            .connect_to_group_provider(identity, key, owner_device_id, known_addresses)
-            .await?;
+        // The member serving node's open owner connection is reused before
+        // dialing (technical-design Connectivity order 1).
+        let mut lent = self.lend_owner_connection(group_id, owner_device_id).await;
+        let mut dialed = None;
+        let node = match lent.as_mut() {
+            Some(lent) => lent.node(),
+            None => {
+                let ProviderConnection { node, .. } = self
+                    .connect_to_group_provider(identity, key, owner_device_id, known_addresses)
+                    .await?;
+                dialed.insert(node)
+            }
+        };
         let request_id = node.send_invite_request(owner_device_id, request);
         let response = timeout(JOIN_RESPONSE_TIMEOUT, async {
             loop {
@@ -6630,6 +6640,152 @@ mod tests {
             .expect("member should acknowledge the owner's notice");
             assert_eq!(response, SyncResponse::Acknowledged { group_id });
             assert_eq!(notices.try_recv(), Ok(group_id));
+        });
+    }
+
+    #[test]
+    fn member_invitation_request_reuses_the_member_serving_connection_to_the_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let bandwidth = Arc::new(BandwidthService::new(
+            directory.path().join("bandwidth.json"),
+        ));
+        let group_id = DeviceIdentity::generate().peer_id();
+        let key = DiscoveryKey::derive(group_id, &[9; 32]);
+        let (member, member_again) = identity_pair();
+        let member_id = member.peer_id();
+        tauri::async_runtime::block_on(async {
+            let owner_identity = DeviceIdentity::generate();
+            let owner_id = owner_identity.peer_id();
+            let mut routing =
+                NetworkNode::new_routing(DeviceIdentity::generate().into_network_keypair());
+            let routing_id = routing.peer_id();
+            routing
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let address = loop {
+                if let NetworkEvent::Listening { address } = routing.next_event().await {
+                    break address;
+                }
+            };
+            let mut owner = NetworkNode::new(owner_identity.into_network_keypair());
+            owner
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            let owner_address = loop {
+                if let NetworkEvent::Listening { address } = owner.next_event().await {
+                    break address;
+                }
+            };
+            let service = NetworkService::from_sources_with_authorizer(
+                &[],
+                &format!("{address}/p2p/{routing_id}"),
+                Arc::new(StaticJoinRequestAuthorizer(
+                    JoinRequestAuthorization::Authorized,
+                )),
+                Arc::new(UnavailableMemberAdmissionService),
+                Arc::new(UnavailablePendingJoinService),
+                Arc::new(MemberSynchronizationService {
+                    expected_peer: owner_id,
+                    group_id,
+                }),
+            )
+            .unwrap()
+            .without_lan_discovery();
+            let mut member_connections = 0;
+            {
+                let serve = service.serve_member_group(
+                    member,
+                    group_id,
+                    key,
+                    owner_id,
+                    vec![owner_address.clone()],
+                    Arc::clone(&bandwidth),
+                );
+                tokio::pin!(serve);
+                let status = timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut serve => break result,
+                            _ = routing.next_event() => {}
+                            event = owner.next_event() => {
+                                if matches!(
+                                    event,
+                                    NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id
+                                ) {
+                                    member_connections += 1;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("member advertisement should complete")
+                .unwrap();
+                assert_eq!(status, "advertising");
+            }
+            // Wait until the serving node holds its connection to the owner.
+            timeout(Duration::from_secs(10), async {
+                while member_connections == 0 {
+                    tokio::select! {
+                        _ = routing.next_event() => {}
+                        event = owner.next_event() => {
+                            if matches!(
+                                event,
+                                NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id
+                            ) {
+                                member_connections += 1;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("member serving node should connect to the owner");
+
+            // No remembered address and no discovery record: only the open
+            // serving connection can reach the owner.
+            let request = service.request_member_invitation(
+                member_again,
+                key,
+                group_id,
+                owner_id,
+                &[],
+                3_600,
+            );
+            tokio::pin!(request);
+            let result = timeout(Duration::from_secs(15), async {
+                loop {
+                    tokio::select! {
+                        result = &mut request => break result,
+                        _ = routing.next_event() => {}
+                        event = owner.next_event() => match event {
+                            NetworkEvent::PeerConnected { peer_id, .. } if peer_id == member_id => {
+                                member_connections += 1;
+                            }
+                            NetworkEvent::InviteRequestReceived {
+                                peer_id,
+                                request_id,
+                                request,
+                            } if peer_id == member_id => {
+                                assert_eq!(request.group_id(), group_id);
+                                owner
+                                    .send_invite_response(
+                                        request_id,
+                                        charp2p_core::InviteResponse::rejected(
+                                            charp2p_core::InviteRejectReason::Unauthorized,
+                                        ),
+                                    )
+                                    .unwrap();
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            })
+            .await
+            .expect("invitation request should complete");
+            assert_eq!(result.err(), Some("invite_unauthorized"));
+            assert_eq!(member_connections, 1);
         });
     }
 

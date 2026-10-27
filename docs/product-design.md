@@ -184,5 +184,4 @@ nodes.
 
 ## Product decisions still to validate
 
-- Maximum supported group size.
 - Accessibility and localization.

@@ -258,6 +258,8 @@ pub enum JoinRejectReason {
     /// The owner recorded the request and must approve the device first
     /// (ADR-041).
     AwaitingApproval,
+    /// The group has reached the profile member limit (ADR-060).
+    GroupFull,
 }
 
 impl JoinRejectReason {
@@ -267,6 +269,7 @@ impl JoinRejectReason {
             Self::Busy => 2,
             Self::UnsupportedProfile => 3,
             Self::AwaitingApproval => 4,
+            Self::GroupFull => 5,
         }
     }
 
@@ -276,6 +279,7 @@ impl JoinRejectReason {
             2 => Ok(Self::Busy),
             3 => Ok(Self::UnsupportedProfile),
             4 => Ok(Self::AwaitingApproval),
+            5 => Ok(Self::GroupFull),
             _ => Err(JoinError::Malformed),
         }
     }
@@ -535,8 +539,14 @@ mod tests {
             decoded.rejection(),
             Some(JoinRejectReason::AwaitingApproval)
         );
-        let mut unknown = awaiting;
-        *unknown.last_mut().unwrap() = 5;
+        let full = JoinResponse::rejected(JoinRejectReason::GroupFull)
+            .encode()
+            .unwrap();
+        assert_eq!(full.last(), Some(&5));
+        let decoded = JoinResponse::decode(&full).unwrap();
+        assert_eq!(decoded.rejection(), Some(JoinRejectReason::GroupFull));
+        let mut unknown = full;
+        *unknown.last_mut().unwrap() = 6;
         assert!(matches!(
             JoinResponse::decode(&unknown),
             Err(JoinError::Malformed)

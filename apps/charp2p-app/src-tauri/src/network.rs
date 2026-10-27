@@ -1903,6 +1903,7 @@ impl NetworkService {
                 JoinRejectReason::Busy => "join_busy",
                 JoinRejectReason::UnsupportedProfile => "join_unsupported_profile",
                 JoinRejectReason::AwaitingApproval => "join_awaiting_approval",
+                JoinRejectReason::GroupFull => "join_group_full",
             });
         }
         let welcome = response.welcome().ok_or("network_join_failed")?;
@@ -2953,6 +2954,9 @@ fn join_response(
                     Err(MemberAdmissionError::AwaitingApproval) => {
                         JoinResponse::rejected(JoinRejectReason::AwaitingApproval)
                     }
+                    Err(MemberAdmissionError::GroupFull) => {
+                        JoinResponse::rejected(JoinRejectReason::GroupFull)
+                    }
                 }
             }
             Err(
@@ -3468,6 +3472,19 @@ mod tests {
         }
     }
 
+    struct FullMemberAdmissionService;
+
+    impl MemberAdmissionService for FullMemberAdmissionService {
+        fn admit_member(
+            &self,
+            _request: &JoinRequest,
+            _owner_identity: &DeviceIdentity,
+            _authenticated_peer: PeerId,
+        ) -> Result<JoinResponse, MemberAdmissionError> {
+            Err(MemberAdmissionError::GroupFull)
+        }
+    }
+
     struct MemberSynchronizationService {
         expected_peer: PeerId,
         group_id: PeerId,
@@ -3954,6 +3971,18 @@ mod tests {
             )
             .rejection(),
             Some(JoinRejectReason::AwaitingApproval)
+        );
+
+        assert_eq!(
+            join_response(
+                JoinRequestAuthorization::Authorized,
+                &FullMemberAdmissionService,
+                &owner,
+                &request,
+                peer_id,
+            )
+            .rejection(),
+            Some(JoinRejectReason::GroupFull)
         );
 
         let accepted = join_response(

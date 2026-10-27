@@ -55,6 +55,12 @@ pub const CIPHERSUITE: Ciphersuite =
 /// readable while its epoch is within this window.
 pub const MAX_PAST_EPOCHS: usize = 4;
 
+/// Maximum number of device leaves in one profile-v1 group (ADR-060).
+///
+/// The owner leaf counts toward this limit. This keeps generated Welcome
+/// messages below the profile wire bound and bounds per-group state growth.
+pub const MAX_GROUP_MEMBERS: usize = 100;
+
 /// Profile provider whose secret-bearing storage can be snapshotted for
 /// application-managed encrypted persistence.
 #[derive(Default)]
@@ -251,6 +257,8 @@ pub enum ProfileError {
     InvalidDeviceCredential,
     /// Two group leaves carry the same CharP2P device identity.
     DuplicateDevice,
+    /// The group has more device leaves than profile version 1 permits.
+    TooManyMembers,
     /// A key refresh commit carries proposals or no path update.
     UnexpectedKeyRefreshContent,
     /// A member admission commit carries other than exactly one Add proposal.
@@ -427,6 +435,9 @@ pub enum PrepareMemberAdmissionError {
     /// The joining device already holds a leaf in the group.
     #[error("joining device is already an MLS group member")]
     AlreadyMember,
+    /// The fixed profile-v1 device-leaf limit has been reached.
+    #[error("MLS group has reached the profile member limit")]
+    GroupFull,
     /// OpenMLS could not stage the member addition.
     #[error("MLS member addition could not be staged")]
     MemberAdditionFailed,
@@ -859,6 +870,9 @@ pub fn prepare_profile_member_admission<Provider: OpenMlsProvider>(
     }) {
         return Err(PrepareMemberAdmissionError::AlreadyMember);
     }
+    if group.members().count() >= MAX_GROUP_MEMBERS {
+        return Err(PrepareMemberAdmissionError::GroupFull);
+    }
     let (commit, welcome, _) = group
         .add_members(provider, signer, &[key_package])
         .map_err(|_| PrepareMemberAdmissionError::MemberAdditionFailed)?;
@@ -1253,6 +1267,9 @@ fn validate_credentials(
         if !devices.insert(device) {
             return Err(ProfileError::DuplicateDevice);
         }
+        if devices.len() > MAX_GROUP_MEMBERS {
+            return Err(ProfileError::TooManyMembers);
+        }
     }
     Ok(())
 }
@@ -1286,7 +1303,7 @@ mod tests {
     use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::{
-        CIPHERSUITE, DeviceCredentialError, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
+        CIPHERSUITE, DeviceCredentialError, MAX_GROUP_MEMBERS, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
         MergeKeyRefreshError, MergeMemberAdmissionError, MigrateGroupConfigError, MlsWireError,
         PrepareKeyPackageError, PrepareMemberAdmissionError, ProfileError, ProfileKeyPackageError,
         ProfileProvider, ProfileProviderSnapshotError, REMOVAL_CUTOFF_DOMAIN, RemovalCutoff,
@@ -2263,6 +2280,114 @@ mod tests {
                 &duplicate_welcome.tls_serialize_detached().unwrap()
             ),
             Err(StageWelcomeError::Profile(ProfileError::DuplicateDevice))
+        ));
+    }
+
+    #[test]
+    fn profile_member_limit_keeps_the_largest_welcome_bounded() {
+        let owner_provider = OpenMlsRustCrypto::default();
+        let member_provider = OpenMlsRustCrypto::default();
+        let owner_id = DeviceIdentity::generate().peer_id();
+        let (owner_credential, owner_signer) = credential(owner_id, &owner_provider);
+        let mut owner_group = MlsGroup::new(
+            &owner_provider,
+            &owner_signer,
+            &group_create_config(),
+            owner_credential,
+        )
+        .unwrap();
+
+        for _ in 1..(MAX_GROUP_MEMBERS - 1) {
+            let member_id = DeviceIdentity::generate().peer_id();
+            let (member_credential, member_signer) = credential(member_id, &member_provider);
+            let member_key_package = KeyPackage::builder()
+                .leaf_node_capabilities(profile_capabilities())
+                .build(
+                    CIPHERSUITE,
+                    &member_provider,
+                    &member_signer,
+                    member_credential,
+                )
+                .unwrap()
+                .key_package()
+                .clone();
+            owner_group
+                .add_members(&owner_provider, &owner_signer, &[member_key_package])
+                .unwrap();
+            owner_group.merge_pending_commit(&owner_provider).unwrap();
+        }
+        assert_eq!(owner_group.members().count(), MAX_GROUP_MEMBERS - 1);
+
+        let last_member_id = DeviceIdentity::generate().peer_id();
+        let (last_credential, last_signer) = credential(last_member_id, &member_provider);
+        let last_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(CIPHERSUITE, &member_provider, &last_signer, last_credential)
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        let admission = prepare_profile_member_admission(
+            &mut owner_group,
+            &owner_provider,
+            &owner_signer,
+            &last_key_package,
+            last_member_id,
+        )
+        .unwrap();
+        assert!(admission.commit().len() <= MAX_MLS_WIRE_BYTES);
+        assert!(admission.welcome().len() <= MAX_MLS_WIRE_BYTES);
+        merge_prepared_member_admission(&mut owner_group, &owner_provider).unwrap();
+        assert_eq!(owner_group.members().count(), MAX_GROUP_MEMBERS);
+
+        let overflow_member_id = DeviceIdentity::generate().peer_id();
+        let (overflow_credential, overflow_signer) =
+            credential(overflow_member_id, &member_provider);
+        let overflow_key_package = KeyPackage::builder()
+            .leaf_node_capabilities(profile_capabilities())
+            .build(
+                CIPHERSUITE,
+                &member_provider,
+                &overflow_signer,
+                overflow_credential,
+            )
+            .unwrap()
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            prepare_profile_member_admission(
+                &mut owner_group,
+                &owner_provider,
+                &owner_signer,
+                &overflow_key_package,
+                overflow_member_id,
+            )
+            .unwrap_err(),
+            PrepareMemberAdmissionError::GroupFull
+        );
+        assert!(owner_group.pending_commit().is_none());
+
+        let overflow_key_package = validate_profile_key_package(
+            &owner_provider,
+            &overflow_key_package,
+            overflow_member_id,
+        )
+        .unwrap();
+        let (_, overflow_welcome, _) = owner_group
+            .add_members(&owner_provider, &owner_signer, &[overflow_key_package])
+            .unwrap();
+        owner_group.merge_pending_commit(&owner_provider).unwrap();
+        assert_eq!(
+            validate_group_profile(&owner_group),
+            Err(ProfileError::TooManyMembers)
+        );
+        assert!(matches!(
+            stage_profile_welcome(
+                &member_provider,
+                &overflow_welcome.tls_serialize_detached().unwrap()
+            ),
+            Err(StageWelcomeError::Profile(ProfileError::TooManyMembers))
         ));
     }
 

@@ -964,6 +964,12 @@ Every parser checks the outer size before decoding:
 | MLS provider snapshot | 8 MiB, 4,096 records |
 | Device-local preference files | 4 KiB |
 
+Profile version 1 permits at most 100 MLS device leaves in one group, including
+the owner. The owner rejects a valid additional join with the permanent
+`group full` reason instead of asking the device to retry. This bound keeps the
+generated Welcome below the 128 KiB join-message limit and caps per-group tree,
+roster, and synchronization work (ADR-060).
+
 The join transport reads one byte beyond each outer bound and the sync codec
 stops reading at its bound, so an oversized message is rejected without
 buffering more. Changing an encoding, domain prefix, or limit

@@ -294,6 +294,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   joined_discovery_store_unavailable: "Protected peer discovery storage is unavailable.",
   join_busy: "The group owner is busy. Try again shortly.",
   join_awaiting_approval: "The group owner must approve this device. CharP2P keeps retrying while it waits.",
+  join_group_full: "This group has reached its maximum number of devices.",
   join_unauthorized: "The group owner did not accept this invitation.",
   join_unsupported_profile: "The group uses an unsupported security profile.",
   synchronization_busy: "The group peer is busy. Try again shortly.",

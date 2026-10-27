@@ -23,7 +23,8 @@ use charp2p_mls::{
     validate_group_profile, validate_key_refresh_commit, validate_member_admission_commit,
     validate_member_removal_commit, validate_profile_key_package, validate_staged_commit_profile,
     PrepareMemberAdmissionError, PrepareMemberRemovalError, ProfileKeyPackageError,
-    ProfileProvider, RemovalCutoff, CIPHERSUITE, MAX_MLS_WIRE_BYTES, MAX_PAST_EPOCHS,
+    ProfileProvider, RemovalCutoff, CIPHERSUITE, MAX_GROUP_MEMBERS, MAX_MLS_WIRE_BYTES,
+    MAX_PAST_EPOCHS,
 };
 use charp2p_store::{
     AdmittingInvitation, EventStore, MessageCursor, StoreError, MAX_ENCRYPTED_JOIN_RESPONSE_BYTES,
@@ -224,6 +225,7 @@ pub(crate) enum MemberAdmissionError {
     Unauthorized,
     UnsupportedProfile,
     Unavailable,
+    GroupFull,
     /// The owner has not approved the device yet (ADR-041).
     AwaitingApproval,
 }
@@ -2033,6 +2035,11 @@ impl MlsProviderService {
         let mut removed_author = None;
         if protocol.epoch() == group.epoch() {
             let members_before = member_device_ids(&group)?;
+            if event.kind() == EventKind::MemberAdded
+                && members_before.len() >= MAX_GROUP_MEMBERS
+            {
+                return Err(ApplyGroupCommitError::Unreadable);
+            }
             let processed = group
                 .process_message(&*provider, protocol)
                 .map_err(|_| ApplyGroupCommitError::Unreadable)?;
@@ -3040,6 +3047,7 @@ fn map_preparation_error(error: PrepareMemberAdmissionError) -> MemberAdmissionE
             | ProfileKeyPackageError::UnsupportedCapabilities,
         ) => MemberAdmissionError::UnsupportedProfile,
         PrepareMemberAdmissionError::InvalidKeyPackage(_) => MemberAdmissionError::Unauthorized,
+        PrepareMemberAdmissionError::GroupFull => MemberAdmissionError::GroupFull,
         _ => MemberAdmissionError::Unavailable,
     }
 }

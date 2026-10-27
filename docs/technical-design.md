@@ -1108,7 +1108,9 @@ Before protocol implementation:
    protocol version.
 5. ~~Threat-model joins, removal, conflicting membership events, and lost owner
    keys.~~ See `docs/threat-model.md`.
-6. Decide supported Windows and Android versions.
+6. ~~Decide supported Windows and Android versions.~~ Serviced x86-64 Windows
+   11 releases and Android 10 (API level 29) or later; see
+   `docs/decisions/0057-supported-platform-versions.md`.
 
 Before public node deployment:
 

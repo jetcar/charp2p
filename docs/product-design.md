@@ -182,4 +182,4 @@ nodes.
 - Maximum supported group size.
 - Whether Android contributes DHT routing while foregrounded or always acts as
   a light client.
-- Accessibility, localization, and minimum supported OS versions.
+- Accessibility and localization.

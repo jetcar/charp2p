@@ -11,6 +11,10 @@ The first release targets small private groups. It does not promise continuous
 delivery: a joining device waits until the group owner device is online, and
 an out-of-date device waits until a group member returns.
 
+The MVP interface is English-only. Dates, times, and numbers use the explicit
+US English locale so the interface does not mix English text with the operating
+system language or vary by device locale.
+
 ## User roles
 
 ### Group owner
@@ -184,4 +188,5 @@ nodes.
 
 ## Product decisions still to validate
 
-- Accessibility and localization.
+- Accessibility verification with keyboard-only Windows use and Android
+  screen readers.

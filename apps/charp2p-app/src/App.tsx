@@ -157,6 +157,7 @@ type MemberActivity = { deviceId: string; lastSignedAtUnixMs: number };
 type DeviceSequenceConflict = { deviceId: string; conflictingSequences: number; firstSequence: number };
 
 const ADVERTISEMENT_STATUS_INTERVAL_MS = 30_000;
+const APP_LOCALE = "en-US";
 const ADVERTISEMENT_RETRY_INTERVAL_MS = 5_000;
 const INVITATION_EXPIRY_CHECK_INTERVAL_MS = 1_000;
 const ISSUED_INVITATION_REFRESH_INTERVAL_MS = 15_000;
@@ -367,7 +368,7 @@ function shortPeerId(peerId: string) {
 }
 
 function messageTime(createdAtUnixMs: number) {
-  return new Date(createdAtUnixMs).toLocaleString([], {
+  return new Date(createdAtUnixMs).toLocaleString(APP_LOCALE, {
     dateStyle: "medium",
     timeStyle: "short",
   });
@@ -407,7 +408,7 @@ async function readShownMessages(
 }
 
 function messageClockTime(createdAtUnixMs: number) {
-  return new Date(createdAtUnixMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return new Date(createdAtUnixMs).toLocaleTimeString(APP_LOCALE, { hour: "2-digit", minute: "2-digit" });
 }
 
 function messageDayLabel(createdAtUnixMs: number) {
@@ -416,7 +417,7 @@ function messageDayLabel(createdAtUnixMs: number) {
   const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
   if (day.toDateString() === today.toDateString()) return "Today";
   if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return day.toLocaleDateString([], { dateStyle: "medium" });
+  return day.toLocaleDateString(APP_LOCALE, { dateStyle: "medium" });
 }
 
 // Group list rows show the clock time for today's messages, "Yesterday", or
@@ -425,7 +426,7 @@ function previewTimeLabel(createdAtUnixMs: number) {
   const day = messageDayLabel(createdAtUnixMs);
   if (day === "Today") return messageClockTime(createdAtUnixMs);
   if (day === "Yesterday") return day;
-  return new Date(createdAtUnixMs).toLocaleDateString([], { day: "numeric", month: "short" });
+  return new Date(createdAtUnixMs).toLocaleDateString(APP_LOCALE, { day: "numeric", month: "short" });
 }
 
 // Tablet widths and Android use the navigation rail and Chats column layout;
@@ -501,7 +502,7 @@ function expiryDescription(expiresAtUnix: number) {
 
 function synchronizationDescription(synchronizedAtUnix: number | null) {
   if (synchronizedAtUnix === null) return "Not yet";
-  return new Date(synchronizedAtUnix * 1000).toLocaleString([], {
+  return new Date(synchronizedAtUnix * 1000).toLocaleString(APP_LOCALE, {
     dateStyle: "medium",
     timeStyle: "short",
   });
@@ -549,14 +550,14 @@ function ownerSyncPill(status: AdvertisementResult["status"] | null, retrying: b
 
 function signedActivityDescription(lastSignedAtUnixMs: number | undefined) {
   if (lastSignedAtUnixMs === undefined) return "No signed activity received";
-  return `Last signed activity ${new Date(lastSignedAtUnixMs).toLocaleString([], {
+  return `Last signed activity ${new Date(lastSignedAtUnixMs).toLocaleString(APP_LOCALE, {
     dateStyle: "medium",
     timeStyle: "short",
   })}`;
 }
 
 function approvalRequestDescription(request: ApprovalRequest) {
-  const requested = new Date(request.lastRequestedAtUnix * 1000).toLocaleString([], {
+  const requested = new Date(request.lastRequestedAtUnix * 1000).toLocaleString(APP_LOCALE, {
     dateStyle: "medium",
     timeStyle: "short",
   });
@@ -966,7 +967,7 @@ function MembersView({
     if (right.deviceId === ownerDeviceId) return 1;
     if (left.deviceId === profile?.peerId) return -1;
     if (right.deviceId === profile?.peerId) return 1;
-    return left.deviceId.localeCompare(right.deviceId);
+    return left.deviceId.localeCompare(right.deviceId, APP_LOCALE);
   });
   const query = search.trim().toLowerCase();
   const visible = query
@@ -1356,7 +1357,7 @@ const NETWORK_STATUS_REFRESH_MS = 5_000;
 function networkConnectionDescription(status: NetworkStatus) {
   if (status.connectionType === null) return "Not connected yet";
   if (status.connectionType === "offline") return "Offline";
-  const observed = new Date(status.connectionObservedAtUnix * 1000).toLocaleTimeString();
+  const observed = new Date(status.connectionObservedAtUnix * 1000).toLocaleTimeString(APP_LOCALE);
   return `${connectionTypeDescription(status.connectionType)} · last seen ${observed}`;
 }
 
@@ -3895,7 +3896,7 @@ function App() {
         )}
         {nearLimit && (
           <p className={`message-size ${overLimit ? "over-limit" : ""}`} id={sizeId}>
-            {outgoingMessageBytes.toLocaleString()} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString()} bytes
+            {outgoingMessageBytes.toLocaleString(APP_LOCALE)} / {MESSAGE_TEXT_LIMIT_BYTES.toLocaleString(APP_LOCALE)} bytes
           </p>
         )}
         {receipt && <p className="message-receipt" role="status">{receipt}</p>}
@@ -4059,7 +4060,7 @@ function App() {
       if (right.deviceId === ownerDeviceId) return 1;
       if (left.deviceId === profile?.peerId) return -1;
       if (right.deviceId === profile?.peerId) return 1;
-      return left.deviceId.localeCompare(right.deviceId);
+      return left.deviceId.localeCompare(right.deviceId, APP_LOCALE);
     });
     return (
       <aside aria-labelledby="group-details-title" className="group-details-pane">

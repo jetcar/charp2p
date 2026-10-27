@@ -86,3 +86,7 @@ does not log discovery keys or connected peer IDs.
 Relay operators can still observe source and destination peer metadata, timing,
 and traffic volume; relayed peer streams remain end-to-end authenticated and
 encrypted.
+
+See [`docs/node-logging-retention.md`](../../docs/node-logging-retention.md)
+for the complete data inventory and the retention policy for project-operated
+nodes.

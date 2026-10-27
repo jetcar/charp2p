@@ -1113,7 +1113,8 @@ Before protocol implementation:
 Before public node deployment:
 
 1. Load-test DHT and relay quotas.
-2. Document logging and retention.
+2. ~~Document logging and retention.~~ See
+   `docs/node-logging-retention.md`.
 3. Publish node terms, privacy information, and security contact.
 4. Run an independent protocol and cryptography review.
 5. Provide at least two independently deployable bootstrap configurations.

@@ -4559,13 +4559,14 @@ function App() {
     appShell && groupPageOpen && showGroupInfo && !pendingGroup && !showMembers ? joinedGroup ?? localGroup : null;
 
   return (
-    <main
+    <div
       className={
         appShell
           ? `app-shell${compactShell ? ` compact${chatsColumnOpen ? " with-chats" : ""}` : ""}${detailsGroup ? " with-details" : ""}`
           : "onboarding-shell"
       }
     >
+      <a className="skip-link" href="#main-content">Skip to main content</a>
       {appShell && profile && compactShell ? (
         <>
           <nav className="app-rail" aria-label="CharP2P navigation">
@@ -4869,7 +4870,7 @@ function App() {
         </section>
       )}
 
-      <section className={appShell ? "app-main" : "setup-panel"}>
+      <main className={appShell ? "app-main" : "setup-panel"} id="main-content" tabIndex={-1}>
         <div className="setup-content">
           {informationView ? (
             <InformationView view={informationView} onClose={() => setInformationView(null)} />
@@ -5552,9 +5553,9 @@ function App() {
             )}
           </footer>
         )}
-      </section>
+      </main>
       {detailsGroup && renderGroupDetailsPane(detailsGroup)}
-    </main>
+    </div>
   );
 }
 

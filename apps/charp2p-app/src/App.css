@@ -12,6 +12,26 @@ html, body, #root { min-height: 100%; margin: 0; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 1000;
+  padding: 10px 14px;
+  border-radius: 8px;
+  color: #fff;
+  background: #006f69;
+  font-weight: 700;
+  transform: translateY(calc(-100% - 24px));
+}
+
+.skip-link:focus { transform: translateY(0); }
+
+:where(a, button, input, textarea, select, summary):focus-visible {
+  outline: 3px solid #007f78;
+  outline-offset: 3px;
+}
+
 .onboarding-shell {
   min-height: 100vh;
   display: grid;

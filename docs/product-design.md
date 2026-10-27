@@ -30,6 +30,11 @@ A node operator can contribute DHT routing and optionally relay capacity. An
 operator controls only their node: limits, logs, blocked peer identities, and
 availability. A node operator does not become a group administrator.
 
+Routing and relay contribution are desktop-only opt-ins. Android devices stay
+light peers: they discover and connect to group peers and advertise or serve
+their own groups while active, but do not route unrelated peers or provide
+relay capacity.
+
 ## Primary flows
 
 ### Create a group
@@ -180,6 +185,4 @@ nodes.
 ## Product decisions still to validate
 
 - Maximum supported group size.
-- Whether Android contributes DHT routing while foregrounded or always acts as
-  a light client.
 - Accessibility and localization.

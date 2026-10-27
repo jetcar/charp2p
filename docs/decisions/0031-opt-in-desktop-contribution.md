@@ -6,7 +6,7 @@ Accepted
 
 ## Date
 
-2026-10-06
+2026-10-06; Android role finalized 2026-10-27
 
 ## Context
 
@@ -15,8 +15,9 @@ bandwidth limits (product design, page 9). The technical design describes a
 routing peer for opted-in desktop installations and a relay peer that accepts
 bounded circuit-relay reservations. Application peers currently run only as
 Kademlia clients with the relay client transport (ADR-005, ADR-026). Android
-remains a light client until the open product decision on Android routing is
-validated.
+background execution is resource-constrained and may be stopped or denied
+network access by the operating system, so it cannot offer dependable routing
+or relay availability.
 
 ## Decision
 
@@ -40,6 +41,12 @@ per-peer and per-IP rate limiters stay enabled.
 The preference is device-local, contains no secrets, and is not synchronized
 to other devices.
 
+Android remains a light peer for the MVP, including while the application is
+in the foreground. It may advertise its own group rendezvous keys and serve
+its own groups while active, but it does not answer DHT routing queries for
+unrelated peers or accept relay reservations. Contribution controls remain
+unavailable on Android builds.
+
 ## Consequences
 
 - Desktop users who opt in add DHT routing and, optionally, bounded relay
@@ -54,3 +61,4 @@ to other devices.
 
 - https://github.com/libp2p/specs/tree/master/kad-dht
 - https://libp2p.github.io/rust-libp2p/libp2p_relay/struct.Config.html
+- https://developer.android.com/develop/background-work/background-tasks/bg-work-restrictions

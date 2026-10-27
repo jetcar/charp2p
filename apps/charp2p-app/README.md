@@ -5,6 +5,9 @@ Adaptive Tauri 2 client shell for Windows and Android.
 The supported platform floor is Android 10 (API level 29) and serviced x86-64
 Windows 11 releases with a current WebView2 Evergreen Runtime. See
 [`ADR-057`](../../docs/decisions/0057-supported-platform-versions.md).
+Android always runs as a light peer in the MVP; routing and relay contribution
+remain desktop-only opt-ins under
+[`ADR-031`](../../docs/decisions/0031-opt-in-desktop-contribution.md).
 
 ```powershell
 pnpm install

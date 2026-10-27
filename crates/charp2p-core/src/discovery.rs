@@ -1,3 +1,5 @@
+use std::fmt;
+
 use libp2p_identity::PeerId;
 
 use crate::Invitation;
@@ -5,8 +7,17 @@ use crate::Invitation;
 const DISCOVERY_KEY_DOMAIN: &[u8] = b"charp2p-rendezvous-v1\0";
 
 /// Opaque DHT key shared only by holders of a group invitation secret.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct DiscoveryKey([u8; 32]);
+
+impl fmt::Debug for DiscoveryKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("DiscoveryKey")
+            .field(&"[REDACTED]")
+            .finish()
+    }
+}
 
 impl DiscoveryKey {
     /// Restores a previously derived rendezvous key from protected storage.
@@ -87,5 +98,15 @@ mod tests {
         let key = DiscoveryKey::derive(GroupIdentity::generate().group_id(), &[7; 32]);
 
         assert_eq!(DiscoveryKey::from_bytes(*key.as_bytes()), key);
+    }
+
+    #[test]
+    fn debug_output_redacts_the_discovery_key() {
+        let key = DiscoveryKey::from_bytes([0xab; 32]);
+        let debug = format!("{key:?}");
+
+        assert_eq!(debug, "DiscoveryKey(\"[REDACTED]\")");
+        assert!(!debug.contains("171"));
+        assert!(!debug.to_ascii_lowercase().contains("ab"));
     }
 }

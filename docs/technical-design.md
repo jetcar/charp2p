@@ -159,6 +159,13 @@ address before taking its current addresses as hints.
 Invitation parsing is bounded and fully validated before network use. An
 invitation is a bearer credential and must be treated as sensitive.
 
+Diagnostics must not print an encoded invitation, its discovery secret, a
+derived discovery key, MLS KeyPackage or Welcome bytes, or protected message
+payloads. Secret-bearing protocol types either have no `Debug` implementation
+or provide a redacted implementation that exposes only safe lengths and public
+metadata. Application errors cross the Tauri boundary as fixed codes rather
+than formatted request values (ADR-061).
+
 Clients accept only the raw encoded payload, the exact custom URI form above,
 or the exact HTTPS host and path above. The HTTPS form must carry the payload in
 the fragment. Query-string credentials and lookalike hosts are rejected. The UI

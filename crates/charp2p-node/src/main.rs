@@ -258,6 +258,9 @@ fn blocked_peer_changes(current: &[PeerId], reloaded: &[PeerId]) -> (Vec<PeerId>
 
 enum OperatorSignal {
     Stop,
+    // Windows has no SIGHUP equivalent, but keeping one signal enum lets the
+    // event loop share its shutdown path across platforms.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "reload is delivered by SIGHUP"))]
     Reload,
 }
 

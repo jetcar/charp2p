@@ -6363,34 +6363,39 @@ mod tests {
                 .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
                 .unwrap();
 
-            let advertise = service.advertise(owner, owner_signer, &invitation);
-            tokio::pin!(advertise);
+            let advertisement = service
+                .advertise(owner, owner_signer, &invitation)
+                .await
+                .expect("the owner advertisement should start");
+            assert_eq!(advertisement.status, "advertising");
             let mut poll = interval(Duration::from_millis(20));
             let notice = timeout(PROVIDER_SEARCH_TIMEOUT, async {
                 let mut dialed = false;
                 loop {
                     tokio::select! {
-                        result = &mut advertise => {
-                            panic!("announcement window ended early: {result:?}");
-                        }
                         _ = poll.tick(), if !dialed => {
-                            let addresses = service
+                            let port = service
                                 .owner_addresses
                                 .lock()
                                 .unwrap()
                                 .iter()
-                                .filter(|address| {
-                                    address
+                                .find_map(|address| {
+                                    let ipv4 = address
                                         .iter()
-                                        .any(|protocol| matches!(protocol, Protocol::Ip4(_)))
-                                        && address
-                                            .iter()
-                                            .any(|protocol| matches!(protocol, Protocol::QuicV1))
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            if !addresses.is_empty() {
-                                requester.dial_peer_at(owner_id, addresses).unwrap();
+                                        .any(|protocol| matches!(protocol, Protocol::Ip4(_)));
+                                    let quic = address
+                                        .iter()
+                                        .any(|protocol| matches!(protocol, Protocol::QuicV1));
+                                    address.iter().find_map(|protocol| match protocol {
+                                        Protocol::Udp(port) if ipv4 && quic => Some(port),
+                                        _ => None,
+                                    })
+                                });
+                            if let Some(port) = port {
+                                let loopback = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                                    .parse()
+                                    .unwrap();
+                                requester.dial_peer_at(owner_id, vec![loopback]).unwrap();
                                 dialed = true;
                             }
                         }

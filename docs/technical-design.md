@@ -65,6 +65,12 @@ Android, an app-private preferences vault encrypted by Android Keystore. Secret
 bytes remain in Rust, are zeroized after protected-storage operations, and are
 never returned to the webview. ADR-007 records the adapter and record format.
 
+Android automatic cloud backup and device-to-device app-data transfer are
+disabled. Restoring the database without its device-bound Keystore material
+would leave unreadable secrets, while transferring both would clone one device
+identity onto another installation. Identity recovery therefore uses only the
+explicit encrypted backup flow. ADR-063 records this boundary.
+
 An encrypted identity backup holds the display name and encoded device key,
 sealed with XChaCha20-Poly1305 under a key derived from a user passphrase with
 Argon2id at fixed per-version parameters. It excludes group state. ADR-028

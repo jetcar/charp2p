@@ -1101,7 +1101,10 @@ and security-contact information before public access.
 - Script injection into the webview: the packaged app sets a Content Security
   Policy that only allows bundled scripts and styles, `data:` images for
   invitation QR codes, and Tauri IPC connections, with no inline or evaluated
-  scripts, plugins, or remote content.
+  scripts, plugins, or remote content. The main webview capability grants only
+  event listening and removal plus reading the current deep link; it cannot use
+  Tauri's core path, window, menu, tray, resource, image, or event-emission
+  commands (ADR-064).
 - Compromised member-device revocation for future access.
 
 The MVP does not claim to prevent an authorized member from copying plaintext,

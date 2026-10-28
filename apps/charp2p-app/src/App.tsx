@@ -982,6 +982,12 @@ function MembersView({
       ? () => document.getElementById("member-invitation-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })
       : null);
 
+  function closeMemberDetails() {
+    const openerId = selectedDeviceId ? `member-details-toggle-${selectedDeviceId}` : "";
+    setSelectedDeviceId(null);
+    window.requestAnimationFrame(() => document.getElementById(openerId)?.focus());
+  }
+
   function renderMemberDetails(member: GroupMemberDevice) {
     const isOwner = member.deviceId === ownerDeviceId;
     const isLocal = member.deviceId === profile?.peerId;
@@ -989,10 +995,10 @@ function MembersView({
     const mayInvite = invitePermittedDeviceIds.includes(member.deviceId);
     const conflict = sequenceConflicts[member.deviceId];
     return (
-      <aside className="member-details-pane" aria-labelledby="member-details-title">
+      <aside className="member-details-pane" aria-labelledby="member-details-title" id="member-details-pane">
         <header>
           <h2 id="member-details-title">Member details</h2>
-          <button aria-label="Close member details" className="details-close" onClick={() => setSelectedDeviceId(null)} type="button">×</button>
+          <button aria-label="Close member details" className="details-close" onClick={closeMemberDetails} type="button">×</button>
         </header>
         <div className="member-details-avatar" aria-hidden="true">{isOwner ? "♛" : "●"}</div>
         <h3 className="details-name">{memberName(member.deviceId)}</h3>
@@ -1059,7 +1065,7 @@ function MembersView({
   }
 
   return (
-    <div className={`members-page${selected ? " with-member-details" : ""}`}>
+    <div className={`members-page${selected ? " with-member-details" : ""}`} id="members-view">
     <section className="setup-form members-card">
       <header className="members-page-header">
         <div className="members-page-icon" aria-hidden="true">👥</div>
@@ -1124,9 +1130,11 @@ function MembersView({
                 type="button"
               >{copiedDeviceId === member.deviceId ? "✓" : "⧉"}</button>
               <button
+                aria-controls="member-details-pane"
                 aria-expanded={isSelected}
                 aria-label={`${isSelected ? "Hide" : "Show"} details for ${memberName(member.deviceId)}`}
                 className="member-open"
+                id={`member-details-toggle-${member.deviceId}`}
                 onClick={() => setSelectedDeviceId(isSelected ? null : member.deviceId)}
                 type="button"
               >{isSelected ? "‹" : "›"}</button>
@@ -3996,14 +4004,22 @@ function App() {
           {sync.label}
         </span>
         <button
+          aria-controls="group-details-pane"
           aria-expanded={showGroupInfo}
           className="conversation-info-button"
+          id="group-details-toggle"
           onClick={() => setShowGroupInfo((shown) => !shown)}
           type="button"
         >
           {showGroupInfo ? "Hide details" : "Details"}
         </button>
-        <button className="conversation-info-button" onClick={() => setShowMembers(true)} type="button">
+        <button
+          aria-controls="members-view"
+          className="conversation-info-button"
+          id="members-view-toggle"
+          onClick={() => setShowMembers(true)}
+          type="button"
+        >
           Members{memberCount > 0 ? ` (${memberCount})` : ""}
         </button>
       </header>
@@ -4039,6 +4055,16 @@ function App() {
     }
   }
 
+  function closeGroupDetails() {
+    setShowGroupInfo(false);
+    window.requestAnimationFrame(() => document.getElementById("group-details-toggle")?.focus());
+  }
+
+  function closeMembersView() {
+    setShowMembers(false);
+    window.requestAnimationFrame(() => document.getElementById("members-view-toggle")?.focus());
+  }
+
   // Side pane for the open conversation: identity, members, connection and the
   // group facts that used to sit above the timeline.
   function renderGroupDetailsPane(group: LocalGroup | JoinedGroup) {
@@ -4063,10 +4089,10 @@ function App() {
       return left.deviceId.localeCompare(right.deviceId, APP_LOCALE);
     });
     return (
-      <aside aria-labelledby="group-details-title" className="group-details-pane">
+      <aside aria-labelledby="group-details-title" className="group-details-pane" id="group-details-pane">
         <header>
           <h2 id="group-details-title">Group details</h2>
-          <button aria-label="Close group details" className="details-close" onClick={() => setShowGroupInfo(false)} type="button">×</button>
+          <button aria-label="Close group details" className="details-close" onClick={closeGroupDetails} type="button">×</button>
         </header>
         <div className={`details-icon ${group.icon !== null ? `icon-${group.icon}` : ""}`} aria-hidden="true">
           {group.icon !== null ? GROUP_ICONS[group.icon] : "✓"}
@@ -5065,7 +5091,7 @@ function App() {
               onLeave={joinedGroup ? leaveJoinedGroup : null}
               leaving={leavingGroup}
               onInvite={localGroup ? openOwnerInvitationsFromMembers : null}
-              onClose={() => setShowMembers(false)}
+              onClose={closeMembersView}
               ownerDeviceId={joinedGroup?.inviterDeviceId ?? profile?.peerId ?? ""}
               ownerName={joinedGroup?.inviterName ?? profile?.deviceName ?? "Owner"}
               profile={profile}

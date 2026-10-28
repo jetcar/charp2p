@@ -4585,6 +4585,61 @@ function App() {
   conversationShownRef.current = groupPageOpen && !pendingGroup && !showMembers;
   const detailsGroup =
     appShell && groupPageOpen && showGroupInfo && !pendingGroup && !showMembers ? joinedGroup ?? localGroup : null;
+  const mainPageKey = informationView
+    ? `information:${informationView}`
+    : networkView
+      ? "network"
+      : settingsView
+        ? "settings"
+        : backupView
+          ? "backup"
+          : restoreView
+            ? "restore"
+            : loading
+              ? "loading"
+              : joinMode
+                ? `join:${invitationPreview?.groupId ?? "input"}`
+                : createGroupMode
+                  ? "create-group"
+                  : pendingGroup
+                    ? `pending:${pendingGroup.groupId}`
+                    : showMembers
+                      ? `members:${openGroupId}`
+                      : joinedGroup
+                        ? `joined:${joinedGroup.groupId}`
+                        : localGroup
+                          ? `owned:${localGroup.groupId}`
+                          : `setup:${step}`;
+  const previousMainPageRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const previousPage = previousMainPageRef.current;
+    previousMainPageRef.current = mainPageKey;
+    const main = document.getElementById("main-content");
+    const heading = main?.querySelector<HTMLElement>("h1, h2") ?? null;
+    if (!heading) return;
+
+    const title = heading.textContent?.trim();
+    if (title) document.title = `${title} · CharP2P`;
+    // Initial protected-storage loading hands focus to the first useful form
+    // control. Later page changes announce their heading like a normal
+    // document navigation without leaving focus on a removed button.
+    if (
+      previousPage === null ||
+      previousPage === "loading" ||
+      previousPage === mainPageKey
+    )
+      return;
+
+    heading.tabIndex = -1;
+    heading.focus({ preventScroll: true });
+    const removeTemporaryTabStop = () => heading.removeAttribute("tabindex");
+    heading.addEventListener("blur", removeTemporaryTabStop, { once: true });
+    return () => {
+      heading.removeEventListener("blur", removeTemporaryTabStop);
+      removeTemporaryTabStop();
+    };
+  }, [mainPageKey]);
 
   return (
     <div
